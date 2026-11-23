@@ -134,6 +134,8 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/process.cpp
     shims/window.cpp
     shims/dstorage.cpp
+    shims/com_shim.cpp
+    shims/bcrypt_rng.cpp
   )
   add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
@@ -370,6 +372,27 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(ws2_32_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(ws2_32_offline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(ws2_32_offline_test PRIVATE /OPT:NOREF)
+  # COM lifecycle and helper shims for api-ms-win-core-com-l1-1-*.dll.
+  add_executable(com_shim_test
+    test/com_shim_test.cpp
+    shims/com_shim.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(com_shim_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(com_shim_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(com_shim_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(com_shim_test PRIVATE /OPT:NOREF)
+
+  # BCrypt RNG and algorithm provider shims.
+  add_executable(bcrypt_rng_test
+    test/bcrypt_rng_test.cpp
+    shims/bcrypt_rng.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(bcrypt_rng_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(bcrypt_rng_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(bcrypt_rng_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(bcrypt_rng_test PRIVATE /OPT:NOREF)
 
   # Synthetic tests for the atomic API reference lifecycle.
   add_executable(api_ref_state_test test/api_ref_state_test.cpp)
@@ -649,6 +672,17 @@ if(BUILD_TESTING)
     target_compile_options(tiny_exe PRIVATE /W4 /permissive- /utf-8 /GS-)
     set_target_properties(tiny_exe PROPERTIES
       OUTPUT_NAME tiny_exe
+      RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
+      MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+
+    # An EXE built with /GA reads its TLS at index 0 without _tls_index; loader_tls_test maps it and reads it from
+    # threads that existed before load() and from ones that did not.
+    add_executable(tiny_ga_tls test/fixtures/tiny_ga_tls.cpp)
+    target_compile_definitions(tiny_ga_tls PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(tiny_ga_tls PRIVATE /W4 /permissive- /utf-8 /GS- /GA)
+    set_target_properties(tiny_ga_tls PROPERTIES
+      OUTPUT_NAME tiny_ga_tls
       RUNTIME_OUTPUT_DIRECTORY "${TINY_FIXTURE_DIR}"
       MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     )
@@ -986,7 +1020,7 @@ if(BUILD_TESTING)
     )
     target_compile_definitions(loader_tls_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(loader_tls_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
-    add_dependencies(loader_tls_test tiny_tls tiny_tls_cb_only gta6rt_tls_host)
+    add_dependencies(loader_tls_test tiny_tls tiny_tls_cb_only tiny_ga_tls gta6rt_tls_host)
     add_test(NAME loader_tls
       COMMAND loader_tls_test "$<TARGET_FILE:tiny_tls>"
     )
@@ -1280,6 +1314,14 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET ws2_32_offline_test)
     add_test(NAME ws2_32_offline COMMAND ws2_32_offline_test)
+  endif()
+  if(WIN32 AND TARGET com_shim_test)
+    add_test(NAME com_shim COMMAND com_shim_test)
+  endif()
+  if(WIN32 AND TARGET bcrypt_rng_test)
+    add_test(NAME bcrypt_rng COMMAND bcrypt_rng_test)
+    add_test(NAME bcrypt_rng_seeded COMMAND bcrypt_rng_test --seeded)
+    set_tests_properties(bcrypt_rng_seeded PROPERTIES ENVIRONMENT "LEONIDA_RNG_SEED=0x123456789abcdef0")
   endif()
   if(WIN32 AND TARGET api_ref_state_test)
     add_test(NAME api_ref_state COMMAND api_ref_state_test)
@@ -1870,6 +1912,13 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_com COMMAND d3d12_com_test)
     set_tests_properties(d3d12_com PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Where the device finds its translated shaders (shader_path.txt, a path that is not UTF-8). No GPU.
+    add_executable(d3d12_shader_path_test test/d3d12_shader_path_test.cpp)
+    target_link_libraries(d3d12_shader_path_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_shader_path_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_shader_path_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_shader_path COMMAND d3d12_shader_path_test)
+
     # Multi-threaded concurrent submissions across two D3D12 queues + resource creation/destruction churn.
     add_executable(d3d12_multithread_test test/d3d12_multithread_test.cpp)
     target_link_libraries(d3d12_multithread_test PRIVATE gta6rt_d3d12_com)
@@ -2094,6 +2143,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_depth_view_format_support_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_depth_view_format_support COMMAND d3d12_depth_view_format_support_test)
     set_tests_properties(d3d12_depth_view_format_support PROPERTIES SKIP_RETURN_CODE 77)
+
+    # A placed buffer keeps its heap's arena range after the application releases the heap.
+    add_executable(d3d12_placed_heap_lifetime_test test/d3d12_placed_heap_lifetime_test.cpp)
+    target_link_libraries(d3d12_placed_heap_lifetime_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_placed_heap_lifetime_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_placed_heap_lifetime_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_placed_heap_lifetime COMMAND d3d12_placed_heap_lifetime_test)
+    set_tests_properties(d3d12_placed_heap_lifetime PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # ClearUnorderedAccessViewUint/Float on buffers and textures, read back through D3D12.
     add_executable(d3d12_uav_clear_test test/d3d12_uav_clear_test.cpp)
@@ -3023,6 +3081,16 @@ if(TARGET Vulkan::Headers)
     add_test(NAME dxgi_host_parity COMMAND dxgi_host_parity_test)
     set_tests_properties(dxgi_host_parity PROPERTIES SKIP_RETURN_CODE 77)
 
+    # Host-parity test for DXGI waitable swap chain frame-latency semaphore behavior.
+    add_executable(dxgi_waitable_latency_test test/dxgi_waitable_latency_test.cpp)
+    target_link_libraries(dxgi_waitable_latency_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(dxgi_waitable_latency_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(dxgi_waitable_latency_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME dxgi_waitable_latency COMMAND dxgi_waitable_latency_test)
+    set_tests_properties(dxgi_waitable_latency PROPERTIES
+      SKIP_RETURN_CODE 77
+      FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
     # Synthetic (no GPU): VulkanSwapchain's DXGI BufferCount contract when Vulkan returns more images than the
     # app asked for, or the surface minimum exceeds the request (D3D-389).
     add_executable(dxgi_swapchain_count_test test/dxgi_swapchain_count_test.cpp)
@@ -3081,6 +3149,10 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME d3d12_indirect_rt COMMAND d3d12_indirect_rt_test)
     set_tests_properties(d3d12_indirect_rt PROPERTIES SKIP_RETURN_CODE 77)
+    # Upload heaps in system memory, as on a GPU without Resizable BAR: their VAs can lie below the arena and wrap.
+    add_test(NAME d3d12_indirect_rt_upload_sysmem COMMAND d3d12_indirect_rt_test)
+    set_tests_properties(d3d12_indirect_rt_upload_sysmem PROPERTIES SKIP_RETURN_CODE 77
+                         ENVIRONMENT "LEONIDA_UPLOAD_SYSMEM=1")
 
     # The compute path: root signature, compute PSO from a translator-style index, root arguments, dispatch. Its
     # shader is GLSL written to the translator's push-constant/address contract, compiled here.
@@ -3545,15 +3617,27 @@ if(TARGET Vulkan::Headers)
                  COMMAND ${CMAKE_COMMAND} -DGTA6RT=$<TARGET_FILE:gta6rt> -DGUEST=$<TARGET_FILE:tiny_guest_draw>
                          -DFIXTURE=${LEONIDA_M15_DIR} -P ${CMAKE_CURRENT_SOURCE_DIR}/test/run_guest_draw.cmake)
         set_tests_properties(d3d12_translated_draw_guest PROPERTIES TIMEOUT 180)
-        if(LEONIDA_GUEST_SCENE AND Python3_Interpreter_FOUND)
+      else()
+        message(STATUS "tiny_guest_draw will build. For an external synthetic M1.5 fixture or Wine run see runtime/README.md.")
+      endif()
+      if(LEONIDA_GUEST_SCENE AND Python3_Interpreter_FOUND AND TARGET d3d12_translated_draw_test)
+        set(_scene_wine_args)
+        if(CMAKE_CROSSCOMPILING AND CMAKE_CROSSCOMPILING_EMULATOR)
+          set(_scene_emulator ${CMAKE_CROSSCOMPILING_EMULATOR})
+          list(POP_FRONT _scene_emulator _scene_launcher)
+          list(APPEND _scene_wine_args "--wine=${_scene_launcher}")
+          foreach(_arg IN LISTS _scene_emulator)
+            list(APPEND _scene_wine_args "--wine-arg=${_arg}")
+          endforeach()
+          add_dependencies(tiny_guest_draw d3d12_translated_draw_test gta6rt)
+        endif()
+        if((CMAKE_HOST_WIN32 AND NOT CMAKE_CROSSCOMPILING) OR _scene_wine_args)
           add_test(NAME d3d12_guest_scene
                    COMMAND "${Python3_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/run_guest_scene.py"
                            --loader $<TARGET_FILE:gta6rt> --guest $<TARGET_FILE:tiny_guest_draw>
-                           --shaders "${LEONIDA_M15_DIR}" --negative-controls)
+                           --shaders "${LEONIDA_M15_DIR}" --negative-controls ${_scene_wine_args})
           set_tests_properties(d3d12_guest_scene PROPERTIES TIMEOUT 900)
         endif()
-      else()
-        message(STATUS "tiny_guest_draw will build. For an external synthetic M1.5 fixture or Wine run see runtime/README.md.")
       endif()
     endif()
     # bvh_builder_test can put the package's XboxBvhBuilder on this device too (LEONIDA_BVH_DEVICE=vulkan).
@@ -3602,6 +3686,16 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_copy_offset_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_copy_offset COMMAND replay_copy_offset_test)
+    # KHR CopyRaytracingAccelerationStructure (CLONE, COMPACT) and COMPACTED_SIZE postbuild (no GPU).
+    add_executable(replay_khr_as_copy_postbuild_test test/replay_khr_as_copy_postbuild_test.cpp)
+    target_link_libraries(replay_khr_as_copy_postbuild_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_khr_as_copy_postbuild_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    if(MSVC)
+      target_compile_options(replay_khr_as_copy_postbuild_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME replay_khr_as_copy_postbuild COMMAND replay_khr_as_copy_postbuild_test)
     # PreparedList::wrote_readback and readback_src_stages match the actual producer stage (depth24, rgb96, UAV clear; no GPU).
     add_executable(replay_readback_stages_test test/replay_readback_stages_test.cpp)
     target_link_libraries(replay_readback_stages_test PRIVATE Vulkan::Headers)
@@ -3665,6 +3759,12 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(d3d12_state_map_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME d3d12_state_map COMMAND d3d12_state_map_test)
+    add_executable(indirect_dispatch_count_alloc_test test/indirect_dispatch_count_alloc_test.cpp)
+    target_link_libraries(indirect_dispatch_count_alloc_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(indirect_dispatch_count_alloc_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME indirect_dispatch_count_alloc COMMAND indirect_dispatch_count_alloc_test)
     # A buffer UAV clear writes where its resource starts in a shared VkBuffer (no GPU).
     add_executable(replay_uav_clear_offset_test test/replay_uav_clear_offset_test.cpp)
     target_link_libraries(replay_uav_clear_offset_test PRIVATE Vulkan::Headers)

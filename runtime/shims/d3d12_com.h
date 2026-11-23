@@ -19,6 +19,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/vulkan_backend.h"
 
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <span>
@@ -222,6 +223,12 @@ struct VulkanDeviceInfo {
 // A Vulkan-backed ID3D12Device (PC ABI, up to ID3D12Device11) on caller-owned Vulkan objects, which must outlive
 // the device and every object it created. Wrap it in rt::d3d12_xs::create_device_proxy for the Xbox ABI.
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out);
+
+// The folder of translated shaders a device loads when VulkanDeviceInfo::shader_dir is empty: LEONIDA_SHADERS, else
+// the path make_game recorded in shader_path.txt next to the executable (`config` names another file, for tests).
+// Empty when neither names one, or when the path cannot be converted (a shader_path.txt that is not UTF-8); the reason
+// is in `*error` then. Never throws.
+std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config = {});
 
 // The same, on a Vulkan device of its own (destroyed with the D3D12 device), made on the process's one Vulkan
 // instance: the first call creates it and it is kept until the process ends, so hooks that cached its handles stay
