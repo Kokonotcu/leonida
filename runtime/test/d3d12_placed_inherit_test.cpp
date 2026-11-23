@@ -3,8 +3,9 @@
 // buffer already holds reads them ("Memory Aliasing and Data Inheritance": for buffers "the resource transition state
 // is not important and all states are compatible"), and the buffer that held them keeps them.
 // https://learn.microsoft.com/en-us/windows/win32/direct3d12/memory-aliasing-and-data-inheritance
-// Checked on the Vulkan-backed device and, on Windows, on the host devices too (hardware and WARP). CPU-only: an
-// upload heap, its placed buffers mapped. No shaders or game data. Skips (77) without the standalone device.
+// Checked on the Vulkan-backed device and, on Windows, on the host devices too (hardware and WARP); what a
+// CREATE_NOT_ZEROED heap holds only on the Vulkan-backed device (check_not_zeroed). CPU-only: an upload heap, its
+// placed buffers mapped. No shaders or game data. Skips (77) without the standalone device.
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 
@@ -125,6 +126,69 @@ int check(ID3D12Device* device, const char* who) {
     return 0;
 }
 
+// The heap at `heap_desc` with a buffer placed over all of it and mapped: its console VA and its bytes.
+struct Placed {
+    Ref<ID3D12Heap> heap;
+    Ref<ID3D12Resource> buffer;
+    std::uint8_t* bytes = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS va = 0;
+};
+
+bool make(ID3D12Device* device, const D3D12_HEAP_DESC& heap_desc, Placed& out) {
+    if (FAILED(device->CreateHeap(&heap_desc, IID_PPV_ARGS(&out.heap.p)))) return false;
+    if (FAILED(place(device, out.heap.p, 0, heap_desc.SizeInBytes, &out.buffer.p))) return false;
+    if (FAILED(out.buffer->Map(0, nullptr, reinterpret_cast<void**>(&out.bytes))) || !out.bytes) return false;
+    out.va = out.buffer->GetGPUVirtualAddress();
+    return true;
+}
+
+void drop(Placed& placed) {
+    if (placed.bytes) placed.buffer->Unmap(0, nullptr);
+    placed.bytes = nullptr;
+    placed.buffer.reset();
+    placed.heap.reset();
+}
+
+// D3D12_HEAP_FLAG_CREATE_NOT_ZEROED: the heap keeps whatever its memory held. D3D12 leaves those bytes undefined,
+// so this runs on the Vulkan-backed device only, where a heap is a range of the GPU address arena and a released
+// range is handed to the next heap that fits (first fit). A heap made with the flag over a range an earlier heap
+// filled reads those stale bytes, and a heap made without it over the same range reads zero: a device that zeroes
+// every heap, or none, fails here.
+int check_not_zeroed(ID3D12Device* device, const char* who) {
+    const D3D12_HEAP_DESC zeroed = upload_heap(2 * k64K);
+    D3D12_HEAP_DESC not_zeroed = zeroed;
+    not_zeroed.Flags = D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+
+    Placed first;
+    EXPECT(make(device, zeroed, first));
+    for (UINT64 i = 0; i < 2 * k64K; ++i) first.bytes[i] = pattern(i);
+    const D3D12_GPU_VIRTUAL_ADDRESS range = first.va;
+    drop(first);
+
+    Placed stale;
+    EXPECT(make(device, not_zeroed, stale));
+    EXPECT(stale.va == range);  // the arena handed back the range the pattern is in
+    const UINT64 stale_kept = first_mismatch(stale.bytes, 0, 2 * k64K, pattern);
+    if (stale_kept != 2 * k64K)
+        std::fprintf(stderr, "%s: a CREATE_NOT_ZEROED heap's byte %llu reads 0x%02x, the range held 0x%02x\n", who,
+                     static_cast<unsigned long long>(stale_kept), stale.bytes[stale_kept], pattern(stale_kept));
+    EXPECT(stale_kept == 2 * k64K);
+    drop(stale);
+
+    Placed fresh;
+    EXPECT(make(device, zeroed, fresh));
+    EXPECT(fresh.va == range);
+    const UINT64 fresh_zero = first_mismatch(fresh.bytes, 0, 2 * k64K, [](UINT64) { return std::uint8_t(0); });
+    if (fresh_zero != 2 * k64K)
+        std::fprintf(stderr, "%s: a heap without CREATE_NOT_ZEROED reads byte %llu as 0x%02x, not 0\n", who,
+                     static_cast<unsigned long long>(fresh_zero), fresh.bytes[fresh_zero]);
+    EXPECT(fresh_zero == 2 * k64K);
+    drop(fresh);
+
+    std::printf("%s: a CREATE_NOT_ZEROED heap keeps the range's bytes; one without it reads as zeroed\n", who);
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -134,6 +198,7 @@ int main() {
         return 77;
     }
     int failures = check(ours.p, "vulkan");
+    failures += check_not_zeroed(ours.p, "vulkan");
     ours.reset();
 
     Ref<IDXGIFactory4> factory;
