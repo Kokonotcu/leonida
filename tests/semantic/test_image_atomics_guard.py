@@ -73,11 +73,18 @@ def parse_blocks(spv):
     return blocks
 
 
-def find_guarded_texel_block(spv):
+def find_guarded_texel_block(spv, *, require_active_load=False):
     """Verify every OpImageTexelPointer sits inside a basic block entered via an OpSelectionMerge
-    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions."""
+    conditional branch whose condition is an OpLoad %bool %active, and return that block's instructions.
+
+    Since #4473 the translator reuses the value it last stored to %active instead of loading it again, so a value
+    stored to %active counts too. A shader that never writes EXEC folds the guard to the constant %true
+    (exec_static_true), which counts unless require_active_load is set."""
     blocks = parse_blocks(spv)
     active_loads = set(re.findall(r"^\s*(%\w+) = OpLoad %bool %active\b", spv, re.M))
+    active_loads |= set(re.findall(r"^\s*OpStore %active (%\w+)\b", spv, re.M))
+    if not require_active_load:
+        active_loads.add("%true")
     guarded_targets = set()
     for insns in blocks.values():
         for i, ln in enumerate(insns):
@@ -148,6 +155,19 @@ class ImageAtomicsGuardTests(unittest.TestCase):
                         )
                         self.assertEqual(has_glc_store, bool(glc),
                                          f"glc={bool(glc)} mismatch for v0 write-back in guarded block")
+
+    def test_exec_write_keeps_the_active_load_guard(self):
+        # With an EXEC write the guard must read %active, not fold to %true.
+        for dim, addr in (("dim:SQ_RSRC_IMG_2D", "v[1:2]"), ("dim:SQ_RSRC_IMG_3D", "v[1:3]")):
+            with self.subTest(dim=dim):
+                spv = translate([
+                    "v_mov_b32_e32 v0, 5", "v_mov_b32_e32 v1, 1",
+                    "v_mov_b32_e32 v2, 2", "v_mov_b32_e32 v3, 3",
+                    "s_mov_b32 exec_lo, 1",
+                    f"image_atomic_add v0, {addr}, s[4:11] dmask:0x1 {dim} unorm",
+                ])
+                validate_spirv(spv)
+                self.assertEqual(len(find_guarded_texel_block(spv, require_active_load=True)), 1)
 
     def test_image_atomic_inc_and_dec_cas_2d_3d_and_a16(self):
         cases = [
