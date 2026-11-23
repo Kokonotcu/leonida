@@ -834,6 +834,13 @@ void check_run_time_load() {
             if (same) release(same);
         }
         check(all, "IXPackageImpl3 answers for IXPackageImpl and IXPackageImpl2 too");
+        // IXPackageImpl4 (tools/gdk_runtime_classes.json: IXPackageImpl3 plus XPackageGetPackageKind). A title whose
+        // xgameruntime.lib asks for it reaches every XPackage function through this answer, so the class has to
+        // hand out the same object for it as for the rest of the chain.
+        const GUID package4 = {0x0b9d556e, 0xab70, 0x43f4, {0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40}};
+        void* pk4 = nullptr;
+        check(query(&package_cls, package4, &pk4) == S_OK && pk4 == pk, "IXPackageImpl4 answers with the same object");
+        if (pk4) release(pk4);
         release(pk);
     }
     {
