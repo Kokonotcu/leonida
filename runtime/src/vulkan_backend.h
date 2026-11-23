@@ -1164,8 +1164,15 @@ public:
     }
 
     // A shader can access a storage image or an initially unbound sparse image before any command names it.
-    // The first shader submission moves it to GENERAL, the descriptor's layout, ahead of its lists.
+    // The first shader submission moves it to GENERAL, the descriptor's layout, ahead of its lists. An image the
+    // tracker has in a defined layout everywhere was initialized already: nothing to do, and no other queue has to
+    // wait for a submission (a title creates UAVs over the same textures every frame, in ring heaps). Call with no
+    // lock held that comes after tracker_mutex_ (descriptor_mutex, submit_mutex_).
     void note_shader_image(ResourceId id) {
+        {
+            std::lock_guard tlock(tracker_mutex_);
+            if (tracker_.defined(id)) return;
+        }
         std::lock_guard lock(storage_mutex_);
         storage_pending_.insert(id);
     }
@@ -2699,8 +2706,9 @@ private:
                 storage_init_seen_ = context_.storage_init_version_;
             }
             // The set this submission binds may be a new generation whose table another queue's submission uploads,
-            // or the same one with entries that submission adds in place: wait for it, as for the storage images (the table's buffers are used by one queue family only:
-            // every D3D12 queue of the device is made in info.queue_family).
+            // or the same one with entries that submission adds in place: wait for it, as for the storage images
+            // (the table's buffers are used by one queue family only: every D3D12 queue of the device is made in
+            // info.queue_family).
             if (context_.bindless_upload_semaphore_ && context_.bindless_upload_semaphore_ != progress_ &&
                 context_.bindless_upload_version_ != bindless_upload_seen_) {
                 waits_.push_back(context_.bindless_upload_semaphore_);
@@ -2721,12 +2729,15 @@ private:
             context_.vk.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &filled, 0, nullptr, 0, nullptr);
         }
+        // Only an image this submission actually initializes (one still UNDEFINED) makes other queues wait for it.
+        bool storage_initialized = false;
         for (const ResourceId id : storage_images) {
             const ResourceBinding* image = context_.resolve(id);
             if (!image || !image->image) continue;
             const VkImageSubresourceRange range{image->aspects, 0, image->mip_levels, 0, image->array_layers};
             auto pieces = detail::current(&next_tracker, id, range, VK_IMAGE_LAYOUT_UNDEFINED);
-            detail::initialize(replay, command_buffer, *image, id, pieces, VK_IMAGE_LAYOUT_GENERAL, &next_tracker);
+            storage_initialized |= detail::initialize(replay, command_buffer, *image, id, pieces,
+                                                      VK_IMAGE_LAYOUT_GENERAL, &next_tracker);
         }
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
@@ -2797,7 +2808,7 @@ private:
             context_.storage_pending_.insert(storage_images.begin(), storage_images.end());
             context_.zero_pending_.insert(context_.zero_pending_.end(), zero_buffers.begin(), zero_buffers.end());
         }
-        if (submitted && (!storage_images.empty() || !zero_buffers.empty())) {
+        if (submitted && (storage_initialized || !zero_buffers.empty())) {
             std::lock_guard lock(context_.storage_mutex_);
             context_.storage_init_semaphore_ = progress_;
             context_.storage_init_value_ = submitted_;

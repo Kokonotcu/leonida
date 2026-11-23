@@ -640,6 +640,14 @@ public:
 
     void forget(ResourceId id) { entries_.erase(id); }
     bool tracked(ResourceId id) const { return entries_.count(id) != 0; }
+    // Tracked, and no subresource is UNDEFINED (never used): every part has been initialized.
+    bool defined(ResourceId id) const {
+        const auto it = entries_.find(id);
+        if (it == entries_.end()) return false;
+        for (const VkImageLayout layout : it->second.layouts)
+            if (layout == VK_IMAGE_LAYOUT_UNDEFINED) return false;
+        return true;
+    }
 
     // Current layout of one D3D12 subresource; UNDEFINED when the resource or index is unknown.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) const {
@@ -1550,12 +1558,14 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
 // Images registered with the tracker in UNDEFINED have never been used. D3D12 committed resources start zeroed,
 // so each such piece is zero-filled (clear for uncompressed images, zero-buffer copy for block-compressed formats
 // when a zero page or transfer scratch is available) and moved to `layout`, the layout the operation about to run
-// expects; with not_zeroed, it is only moved. The tracker records it.
-inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
+// expects; with not_zeroed, it is only moved. The tracker records it. True when any piece was initialized.
+inline bool initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
                        ResourceId id, LayoutPieces& pieces, VkImageLayout layout, LayoutTracker* tracker) {
     constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    bool initialized = false;
     for (auto& piece : pieces) {
         if (piece.layout != VK_IMAGE_LAYOUT_UNDEFINED) continue;
+        initialized = true;
         const BlockFormat fmt = block_format(resource.format, VK_IMAGE_ASPECT_COLOR_BIT);
         const bool color = piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
         const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
@@ -1599,6 +1609,7 @@ inline void initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
         piece.layout = layout;
         if (tracker) tracker->set(id, piece.range, layout);
     }
+    return initialized;
 }
 
 inline bool within(std::uint64_t offset, std::uint64_t size, std::uint64_t total) {
