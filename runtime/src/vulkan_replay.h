@@ -48,7 +48,9 @@
 #include <map>
 #include <memory>
 #include <type_traits>
+#include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -631,13 +633,38 @@ public:
     bool separate_depth_stencil_layouts() const { return separate_; }
 
     void track(ResourceId id, const ResourceBinding& resource, VkImageLayout layout) {
+        save(id);
         Entry entry{resource.mip_levels, resource.array_layers, two_planes(resource) ? 2u : 1u,
                     separate_ && two_planes(resource), {}};
         entry.layouts.assign(std::size_t(entry.mips) * entry.layers * (entry.two_planes ? 2 : 1), layout);
         entries_[id] = std::move(entry);
     }
 
-    void forget(ResourceId id) { entries_.erase(id); }
+    void forget(ResourceId id) {
+        save(id);
+        entries_.erase(id);
+    }
+
+    // A submission's changes, kept by commit() once it was submitted and undone by rollback() when it was not, instead
+    // of a copy of every tracked image per ExecuteCommandLists (review I2). Each image's state before the first change
+    // inside the transaction is journaled once; the caller holds the tracker's lock from begin() to the end.
+    void begin() {
+        journal_.clear();
+        journaled_.clear();
+        in_transaction_ = true;
+    }
+    void commit() {
+        journal_.clear();
+        journaled_.clear();
+        in_transaction_ = false;
+    }
+    void rollback() {
+        for (auto& [id, before] : journal_) {
+            if (before) entries_[id] = std::move(*before);
+            else entries_.erase(id);
+        }
+        commit();
+    }
     bool tracked(ResourceId id) const { return entries_.count(id) != 0; }
 
     // Current layout of one D3D12 subresource; UNDEFINED when the resource or index is unknown.
@@ -680,6 +707,7 @@ public:
     void set(ResourceId id, const VkImageSubresourceRange& range, VkImageLayout layout) {
         const auto it = entries_.find(id);
         if (it == entries_.end()) return;
+        if (in_transaction_ && journaled_.insert(id).second) journal_.emplace_back(id, it->second);
         Entry& e = it->second;
         visit(e, range, [&](std::size_t index, VkImageAspectFlags, std::uint32_t, std::uint32_t) {
             e.layouts[index] = layout;
@@ -714,8 +742,18 @@ private:
         }
     }
 
+    // Inside a transaction: journals the image's state (or its absence) before its first change.
+    void save(ResourceId id) {
+        if (!in_transaction_ || !journaled_.insert(id).second) return;
+        const auto it = entries_.find(id);
+        journal_.emplace_back(id, it == entries_.end() ? std::optional<Entry>{} : std::optional<Entry>{it->second});
+    }
+
     bool separate_;
     std::unordered_map<ResourceId, Entry> entries_;
+    bool in_transaction_ = false;
+    std::vector<std::pair<ResourceId, std::optional<Entry>>> journal_;
+    std::unordered_set<ResourceId> journaled_;
 };
 
 // Each physical slot records one non-overlapping interval. Logical queries can share slots.
