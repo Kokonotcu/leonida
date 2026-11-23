@@ -2034,12 +2034,12 @@ public:
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
             if (context_.scratch_) context_.scratch_->forget(progress_);
-        }
-        if (progress_) {
-            // This queue is idle, so whatever initialisation it published (storage images, zero-filled buffers) has
-            // finished: the next submission on another queue must not wait on a semaphore that is about to go.
-            std::lock_guard lock(context_.storage_mutex_);
+            // This queue is idle, so whatever initialisation (storage images, zero-filled buffers) or bindless table
+            // upload it published has finished: clear both under tracker_mutex_ + storage_mutex_ so no other queue's
+            // submission can wait on a semaphore that is about to go.
+            std::lock_guard storage_lock(context_.storage_mutex_);
             if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
+            if (context_.bindless_upload_semaphore_ == progress_) context_.bindless_upload_semaphore_ = VK_NULL_HANDLE;
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) context_.destroy_or_defer_progress_semaphore(progress_);

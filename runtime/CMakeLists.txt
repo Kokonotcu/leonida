@@ -1539,6 +1539,23 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_device_lost COMMAND vk_device_lost_test)
     set_tests_properties(vk_device_lost PROPERTIES SKIP_RETURN_CODE 77)
+  # ~VulkanQueue() clears context_.bindless_upload_semaphore_ before destroying progress_, preventing
+  # another queue's next vkQueueSubmit from waiting on a destroyed VkSemaphore handle.
+  add_executable(vk_bindless_upload_semaphore_test test/vk_bindless_upload_semaphore_test.cpp)
+  target_link_libraries(vk_bindless_upload_semaphore_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_bindless_upload_semaphore_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(vk_bindless_upload_semaphore_test PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_bindless_upload_semaphore_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_bindless_upload_semaphore COMMAND vk_bindless_upload_semaphore_test)
+    set_tests_properties(vk_bindless_upload_semaphore PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
   endif()
   # With LEONIDA_VK_VALIDATION=1: synchronization validation reports a missing barrier (and not a present one), so
   # the other GPU tests' "0 validation errors" was checked by an active layer. 77 without validation or a device.
