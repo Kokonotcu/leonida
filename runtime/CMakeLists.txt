@@ -3103,6 +3103,17 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_stores_atomics_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_stores_atomics COMMAND d3d12_stores_atomics_test)
       set_tests_properties(d3d12_stores_atomics PROPERTIES SKIP_RETURN_CODE 77)
+      # docs/aot_pipelines.md step 2: shader objects draw the pipeline path's pixels, also from stored driver binaries.
+      add_executable(shader_object_draw_test test/shader_object_draw_test.cpp ${LEONIDA_TEST_VS_FULLSCREEN}
+                     ${LEONIDA_TEST_PS})
+      target_link_libraries(shader_object_draw_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(shader_object_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_FULLSCREEN_SPV="${LEONIDA_TEST_VS_FULLSCREEN}"
+                                 LEONIDA_TEST_PS_SPV="${LEONIDA_TEST_PS}")
+      target_compile_options(shader_object_draw_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME shader_object_draw COMMAND shader_object_draw_test)
+      set_tests_properties(shader_object_draw PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
       # D3D-29: mesh-shader PSOs from pipeline state streams and DispatchMesh (skips without VK_EXT_mesh_shader).
       set(LEONIDA_TEST_MS ${CMAKE_CURRENT_BINARY_DIR}/generated/ms_draw.spv)

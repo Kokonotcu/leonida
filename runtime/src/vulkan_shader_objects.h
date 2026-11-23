@@ -40,7 +40,8 @@ namespace leonida::shader_objects {
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetBlendConstants)
 
 // Optional: only when the device enabled VK_EXT_conservative_rasterization.
-#define LEONIDA_SHADER_OBJECT_OPTIONAL(X) X(vkCmdSetConservativeRasterizationModeEXT)
+#define LEONIDA_SHADER_OBJECT_OPTIONAL(X) \
+    X(vkCmdSetConservativeRasterizationModeEXT) X(vkCmdSetExtraPrimitiveOverestimationSizeEXT)
 
 struct Functions {
 #define LEONIDA_SO_MEMBER(name) PFN_##name name = nullptr;
@@ -75,6 +76,18 @@ inline VkShaderStageFlags next_stages(VkShaderStageFlagBits stage, bool geometry
         default:
             return 0;
     }
+}
+
+// A pipeline stage's create flags as shader-object create flags (the two subgroup bits are the only ones the runtime
+// sets), plus NO_TASK_SHADER for a mesh shader: the game has no task shaders (VUID-VkShaderCreateInfoEXT-flags-08414).
+inline VkShaderCreateFlagsEXT shader_flags(VkShaderStageFlagBits stage, VkPipelineShaderStageCreateFlags pipeline_flags) {
+    VkShaderCreateFlagsEXT flags = 0;
+    if (pipeline_flags & VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT)
+        flags |= VK_SHADER_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT_EXT;
+    if (pipeline_flags & VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT)
+        flags |= VK_SHADER_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+    if (stage == VK_SHADER_STAGE_MESH_BIT_EXT) flags |= VK_SHADER_CREATE_NO_TASK_SHADER_BIT_EXT;
+    return flags;
 }
 
 // The one push-constant range every graphics shader object declares, and the one for compute.
@@ -247,9 +260,11 @@ inline std::vector<std::uint8_t> binary_of(const Functions& fn, VkDevice device,
 
 // ---------------------------------------------------------------- the PSO's state at the draw
 
-// Everything a pipeline built from `r` would have baked in, as dynamic state. `colors` is the number of colour
-// attachments bound at the draw (the blend arrays cover that many; extra attachments are written with mask 0).
-inline void emit_state(const Functions& fn, VkCommandBuffer cb, const pso::Recipe& r, bool conservative_supported) {
+// Everything a pipeline built from `r` would have baked in, as dynamic state. `strides[slot]` (slot < stride_count)
+// is the stride the draw binds for that vertex-buffer slot, which the pipeline path also takes as dynamic state; a slot
+// past it keeps the recipe's. The primitive restart enable and topology stay the replay's (already dynamic there).
+inline void emit_state(const Functions& fn, VkCommandBuffer cb, const pso::Recipe& r, bool conservative_supported,
+                       const VkDeviceSize* strides = nullptr, std::uint32_t stride_count = 0) {
     fn.vkCmdSetRasterizerDiscardEnable(cb, r.rasterizer_discard);
     fn.vkCmdSetCullMode(cb, r.cull_mode);
     fn.vkCmdSetFrontFace(cb, VkFrontFace(r.front_face));
@@ -258,10 +273,14 @@ inline void emit_state(const Functions& fn, VkCommandBuffer cb, const pso::Recip
     fn.vkCmdSetPolygonModeEXT(cb, VkPolygonMode(r.polygon_mode));
     fn.vkCmdSetDepthClampEnableEXT(cb, r.depth_clamp);
     fn.vkCmdSetLineWidth(cb, r.line_width);
-    if (conservative_supported && fn.vkCmdSetConservativeRasterizationModeEXT)
+    // With VK_EXT_conservative_rasterization enabled a shader-object draw must have set the mode (and, while it is
+    // OVERESTIMATE, the extra size); the pipeline path's 0.0 extra size is kept.
+    if (conservative_supported && fn.vkCmdSetConservativeRasterizationModeEXT) {
         fn.vkCmdSetConservativeRasterizationModeEXT(cb, r.conservative
                                                             ? VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT
                                                             : VK_CONSERVATIVE_RASTERIZATION_MODE_DISABLED_EXT);
+        if (fn.vkCmdSetExtraPrimitiveOverestimationSizeEXT) fn.vkCmdSetExtraPrimitiveOverestimationSizeEXT(cb, 0.0f);
+    }
 
     fn.vkCmdSetRasterizationSamplesEXT(cb, VkSampleCountFlagBits(r.samples));
     const VkSampleMask mask[2] = {r.sample_mask, ~0u};
@@ -304,24 +323,56 @@ inline void emit_state(const Functions& fn, VkCommandBuffer cb, const pso::Recip
     }
 
     if (!r.mesh) {
-        // Strides come from the draw's vertex buffers (vkCmdBindVertexBuffers2 sets them); the descriptions here
-        // carry the recipe's strides, which the bind then overrides, exactly as the pipeline path's dynamic stride.
+        // The draw's strides (the pipeline path's VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE), the recipe's for a
+        // slot the draw did not report.
         std::vector<VkVertexInputBindingDescription2EXT> bindings;
         std::vector<VkVertexInputAttributeDescription2EXT> attributes;
         for (const VkVertexInputBindingDescription& b : r.bindings) {
             std::uint32_t divisor = 1;
             for (const auto& d : r.divisors)
                 if (d.binding == b.binding) divisor = d.divisor;
+            const std::uint32_t stride =
+                strides && b.binding < stride_count ? std::uint32_t(strides[b.binding]) : b.stride;
             bindings.push_back({VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, nullptr, b.binding,
-                                b.stride, b.inputRate, divisor});
+                                stride, b.inputRate, divisor});
         }
         for (const VkVertexInputAttributeDescription& a : r.attributes)
             attributes.push_back({VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, nullptr, a.location,
                                   a.binding, a.format, a.offset});
         fn.vkCmdSetVertexInputEXT(cb, std::uint32_t(bindings.size()), bindings.data(),
                                   std::uint32_t(attributes.size()), attributes.data());
-        fn.vkCmdSetPrimitiveRestartEnable(cb, r.primitive_restart);
     }
+}
+
+// The shader objects of one PSO, by stage. Every graphics stage the device has gets a binding at each draw: the PSO's
+// shader or VK_NULL_HANDLE (a stage the device enabled but the PSO leaves out must be bound to null explicitly).
+struct GraphicsShaders {
+    VkShaderEXT vertex = VK_NULL_HANDLE, geometry = VK_NULL_HANDLE, fragment = VK_NULL_HANDLE, mesh = VK_NULL_HANDLE;
+};
+
+struct DeviceStages {
+    bool geometry = false, tessellation = false, mesh = false, task = false;
+};
+
+inline void bind(const Functions& fn, VkCommandBuffer cb, const GraphicsShaders& s, const DeviceStages& device) {
+    VkShaderStageFlagBits stages[7];
+    VkShaderEXT shaders[7];
+    std::uint32_t n = 0;
+    const auto add = [&](VkShaderStageFlagBits stage, VkShaderEXT shader) {
+        stages[n] = stage;
+        shaders[n] = shader;
+        ++n;
+    };
+    add(VK_SHADER_STAGE_VERTEX_BIT, s.vertex);
+    add(VK_SHADER_STAGE_FRAGMENT_BIT, s.fragment);
+    if (device.geometry) add(VK_SHADER_STAGE_GEOMETRY_BIT, s.geometry);
+    if (device.tessellation) {
+        add(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, VK_NULL_HANDLE);
+        add(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_NULL_HANDLE);
+    }
+    if (device.mesh) add(VK_SHADER_STAGE_MESH_BIT_EXT, s.mesh);
+    if (device.task) add(VK_SHADER_STAGE_TASK_BIT_EXT, VK_NULL_HANDLE);
+    fn.vkCmdBindShadersEXT(cb, n, stages, shaders);
 }
 
 }  // namespace leonida::shader_objects

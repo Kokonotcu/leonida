@@ -2525,6 +2525,7 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
     prebuild_recorded_pipelines(out)
+    prebuild_shader_binaries(out)
     log("pipelines: done")
 
 
@@ -2552,6 +2553,23 @@ def prebuild_recorded_pipelines(out: str) -> None:
         log("pipelines: prebuilding the recorded pipelines failed; the game will compile them as it meets them")
         return
     log("pipelines: recorded pipelines prebuilt into the runtime pipeline cache")
+
+
+def prebuild_shader_binaries(out: str) -> None:
+    """Compile every translated graphics shader to this GPU's machine code once, as a shader object binary
+    (docs/aot_pipelines.md, step 2): with LEONIDA_SHADER_OBJECTS=1 the game creates its shaders from these and
+    compiles none, even on its first run. Skipped where the device has no VK_EXT_shader_object."""
+    gta6rt = os.path.join(out, "gta6rt.exe")
+    if not os.path.isfile(gta6rt):
+        return
+    cmd = [gta6rt, "--prebuild-shaders"] if os.name == "nt" else [os.path.join(out, "gta6rt.sh"), "--prebuild-shaders"]
+    code = run(cmd, check=False)
+    if code == 0:
+        log("pipelines: shader binaries written to shader_binaries beside gta6rt.exe")
+    elif code == 5:
+        log("pipelines: this GPU's driver has no VK_EXT_shader_object; the game uses the pipeline cache instead")
+    else:
+        log("pipelines: prebuilding shader binaries failed; the game compiles its shaders from SPIR-V")
 
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the

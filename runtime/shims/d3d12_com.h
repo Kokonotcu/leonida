@@ -127,6 +127,11 @@ struct VulkanDeviceInfo {
     // VK_EXT_conservative_rasterization is enabled on the logical device. Tier 1/2 depend on the physical
     // precision/overestimation properties; Tier 2 also requires post-snap degenerate triangles.
     bool conservative_rasterization = false;
+    // VK_EXT_shader_object and its shaderObject feature are enabled (LEONIDA_SHADER_OBJECTS=1 on a device that has
+    // them, docs/aot_pipelines.md step 2): graphics PSOs bind shader objects, made from the build's stored driver
+    // binaries where they fit, and set their fixed-function state dynamically, so no graphics pipeline is compiled.
+    bool shader_objects = false;
+    bool tessellation_shader = false;  // tessellationShader enabled: a shader-object draw binds those stages to null
     // Opt in only for shader libraries whose InnerCoverage input contract uses FullyCoveredEXT. The device
     // still checks physical Tier 2 and fullyCoveredFragmentShaderInputVariable properties. The standalone
     // device leaves this false until the Xbox PS input mapping is confirmed (synthetic GLSL is not that ABI).
@@ -227,6 +232,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out,
 // device a game run creates and saves the pipeline cache. 0 done, 2 nothing to build with, 3 recipes from another
 // set-0 layout, 4 every pipeline failed. `threads` 0: half the hardware threads.
 int prebuild_recorded_pipelines(const std::filesystem::path& recipes, unsigned threads = 0);
+
+// gta6rt --prebuild-shaders (docs/aot_pipelines.md step 2): every translated graphics shader as a shader object on the
+// game's device, its driver binary stored for LEONIDA_SHADER_OBJECTS=1 runs. 0 done, 2 nothing to build with, 4 every
+// shader failed, 5 no VK_EXT_shader_object on this device.
+int prebuild_shader_binaries(unsigned threads = 0);
 
 // Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's
 // GetDevice must return. No reference is taken: the outer object owns the device. `outer` may be the proxy's
