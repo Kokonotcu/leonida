@@ -266,6 +266,12 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_include_directories(cpu_emulation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_compile_definitions(cpu_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(cpu_emulation_test PRIVATE /W4 /permissive- /utf-8)
+  # The same instructions replaced ahead of time (src/cpu_patch.h): patched and run natively against the reference.
+  add_executable(cpu_patch_test test/cpu_patch_test.cpp)
+  target_include_directories(cpu_patch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(cpu_patch_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(cpu_patch_test PRIVATE /W4 /permissive- /utf-8)
+  add_test(NAME cpu_patch COMMAND cpu_patch_test)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -3482,6 +3488,13 @@ if(TARGET Vulkan::Headers)
     add_executable(pso_recipe_test test/pso_recipe_test.cpp)
     target_link_libraries(pso_recipe_test PRIVATE Vulkan::Headers)
     add_test(NAME pso_recipe COMMAND pso_recipe_test)
+    # D3D-324: consecutive draws into the same attachments share one rendering scope (mocked Vulkan, no GPU).
+    add_executable(replay_draw_scope_test test/replay_draw_scope_test.cpp)
+    target_link_libraries(replay_draw_scope_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_draw_scope_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_draw_scope COMMAND replay_draw_scope_test)
     add_executable(conservative_raster_test test/conservative_raster_test.cpp)
     add_test(NAME conservative_raster COMMAND conservative_raster_test)
     # The GPU address arena's size from LEONIDA_ARENA_MB and synthetic device buffer limits.

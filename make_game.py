@@ -2381,6 +2381,8 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
             f.write(wine_launcher(out, work or os.path.join(out, "work"), v["expected_exe"]))
         os.chmod(start, os.stat(start).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     image = os.path.join(game, v["expected_exe"])
+    if os.path.isfile(image):
+        write_cpu_sites(image, out)
     if not os.path.isfile(image):
         log(f"runtime: built, but {v['expected_exe']} is missing from your copy, so there is nothing to run yet.")
     elif os.name == "nt":
@@ -2403,6 +2405,34 @@ def positive_int(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return value
+
+
+def write_cpu_sites(image: str, out: str) -> None:
+    """cpu_sites.txt beside gta6rt.exe: the executable's Zen 2 instruction sites, which the loader replaces with
+    native code before the game runs (runtime/src/cpu_patch.h, docs/cpu_features.md). Made once per executable: a
+    file whose `image` line already names this one is kept. Needs MSVC's dumpbin on PATH (tools/cpu_feature_scan.py);
+    without it the sites stay with the #UD emulation, which is correct, only slower on an Intel CPU."""
+    sites = os.path.join(out, "cpu_sites.txt")
+    sys.path.insert(0, TOOLS)
+    import cpu_sites  # noqa: E402
+    try:
+        size_of_image, stamp = cpu_sites.image_identity(image)
+    except (OSError, ValueError) as e:
+        log(f"runtime: cannot read {os.path.basename(image)} for its CPU sites: {e}")
+        return
+    try:
+        with open(sites, encoding="utf-8") as f:
+            if f"image {size_of_image:x} {stamp:x}" in f.read():
+                return
+    except OSError:
+        pass
+    if not shutil.which("dumpbin"):
+        log("runtime: dumpbin is not on PATH (run from a Visual Studio developer prompt), so the executable's Zen 2 "
+            "instructions stay with the #UD emulation")
+        return
+    log("runtime: finding the executable's Zen 2 instruction sites (a few minutes, once)")
+    if run([sys.executable, "-I", os.path.join(TOOLS, "cpu_sites.py"), image, sites], check=False) != 0:
+        log("runtime: the CPU site scan failed; those instructions stay with the #UD emulation")
 
 
 def pipeline_check_exe(runtime_build: str | None = None) -> str | None:

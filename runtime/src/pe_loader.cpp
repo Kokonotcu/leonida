@@ -19,6 +19,7 @@
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
 #include "base_reservation.h"
+#include "cpu_patch.h"
 
 namespace rt {
 
@@ -566,6 +567,44 @@ HostTlsState g_host_tls;
 bool module_is_dll(const Module& m) {
     const auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
     return (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
+}
+
+// The Zen 2 instruction sites this CPU lacks, replaced in the main executable before any of its code runs
+// (src/cpu_patch.h, docs/cpu_features.md). The sites come from cpu_sites.txt beside gta6rt.exe (make_game.py writes
+// it from tools/cpu_feature_scan.py; LEONIDA_CPU_SITES names another file) and must name this image; anything not
+// replaced stays with the #UD emulation. LEONIDA_CPU_PATCH=0 leaves every site to the emulation.
+void patch_cpu_sites(Module& m) {
+    char off[4] = {};
+    size_t off_length = 0;
+    if (getenv_s(&off_length, off, sizeof(off), "LEONIDA_CPU_PATCH") == 0 && off_length == 2 && off[0] == '0') return;
+    std::filesystem::path path;
+    {
+        wchar_t custom[MAX_PATH] = {};
+        if (const DWORD n = GetEnvironmentVariableW(L"LEONIDA_CPU_SITES", custom, MAX_PATH); n && n < MAX_PATH) {
+            path = custom;
+        } else {
+            std::wstring self(32768, L'\0');
+            const DWORD length = GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size()));
+            if (!length || length >= self.size()) return;
+            self.resize(length);
+            path = std::filesystem::path(self).parent_path() / L"cpu_sites.txt";
+        }
+    }
+    const rt::cpu_patch::SitesFile file = rt::cpu_patch::read_sites(path);
+    if (file.sites.empty()) return;
+    if (!rt::cpu_patch::same_image(file, m.base)) {
+        std::fprintf(stderr, "[rt] loader: %s: cpu_sites.txt was made for another executable; its sites are left to the "
+                             "#UD emulation\n", m.name.c_str());
+        return;
+    }
+    const rt::cpu_patch::HostFeatures host = rt::cpu_patch::host_features();
+    if (host.sse4a && host.monitorx && host.clwb) return;  // an AMD Zen 2 or later: nothing to replace
+    rt::cpu_patch::StubArena arena(m.base, m.size);
+    const rt::cpu_patch::Result r = rt::cpu_patch::patch_image(m.base, m.size, file.sites, host, arena);
+    std::fprintf(stderr,
+                 "[rt] loader: %s: %zu Zen 2 instruction sites: %zu replaced by NOPs, %zu by native stubs, %zu left to "
+                 "the #UD emulation, %zu not recognised\n",
+                 m.name.c_str(), file.sites.size(), r.nop, r.stub, r.left, r.unrecognised);
 }
 
 void init_host_tls(DWORD index) {
@@ -1169,6 +1208,7 @@ Module& Loader::load(const std::filesystem::path& image) {
     try {
         mapped = &map_image(image, narrow_key);
         mapped->dynamic_load = runtime_loads_ > 0;  // before bind_imports: its dependencies are marked the same way
+        if (!module_is_dll(*mapped)) patch_cpu_sites(*mapped);  // before the code is read-only and before it runs
         bind_imports(*mapped);  // loads every bundled module m imports first, so they land in init_order_ before m
         protect_sections(*mapped);
         register_unwind(*mapped);
