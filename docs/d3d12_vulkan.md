@@ -3234,13 +3234,16 @@ queue they came on (one `VkQueue` behind all of them).
   and the matching `*_surface_maintenance1`) a vsync swapchain is created with `VkSwapchainPresentModesCreateInfoKHR`
   listing FIFO plus IMMEDIATE (FIFO_RELAXED when the surface does not list IMMEDIATE as compatible with FIFO,
   checked with `VkSurfacePresentModeCompatibilityKHR`), and a present that tears chains `VkSwapchainPresentModeInfoKHR`
-  with that mode. The extension and its feature are enabled only where the GPU has them. Without them, or without
-  either mode, the threshold is ignored and logged once, and a late frame waits for its vblank as before.
+  with that mode. A chained mode also holds for the presents after it, so every other present on that swapchain chains
+  FIFO (`detail::chained_present_mode`, `runtime/src/vulkan_present_mode.h`): a late frame does not leave the frames
+  after it in the tear mode. The extension and its feature are enabled only where the GPU has them. Without them, or
+  without either mode, the threshold is ignored and logged once, and a late frame waits for its vblank as before.
   `LEONIDA_PRESENT_NO_TEAR=1` turns it off. Caveats: FIFO_RELAXED tears only when the queue is empty and a vblank was
   missed (close to the semantics, but the driver decides), and the lateness is measured on the pacer's clock (a
   timer, not the display's real scan), so on a real display the tear position is whatever the driver does at that
-  moment. What is checked is that the immediate mode is chosen and presented with 0 VUIDs in our runs with `LEONIDA_VK_VALIDATION=1`; no scan-out
-  or tearing was observed.
+  moment. What is checked is that the immediate mode is chosen and presented with 0 VUIDs in our runs with
+  `LEONIDA_VK_VALIDATION=1`, and that the present after a tearing one chains FIFO again (`vk_present_mode_test` on the
+  CPU, `vk_presenter_sync_test` on a real swapchain); no scan-out or tearing was observed.
 - *Tokens*: what the console does with a null, repeated or out-of-order token is **unmeasured**, and a title that
   presents a loading screen with `Token = 0`, presents again with one token, or presents from a render thread out of
   order must not freeze. So those are presented anyway and logged once per kind; only a token that was never handed

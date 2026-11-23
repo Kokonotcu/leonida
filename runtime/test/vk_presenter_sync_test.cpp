@@ -7,6 +7,8 @@
 //   3. Concurrent present() + VulkanQueue::execute() + add_resource()/remove_resource() follows VulkanContext's
 //      resource_mutex_ -> tracker_mutex_ -> submit_mutex_ lock hierarchy without data races or deadlocks.
 //   4. A swapchain-destroy WSI layer which calls vkDeviceWaitIdle cannot overlap vkQueueSubmit on another thread.
+//   5. With VK_*_swapchain_maintenance1 and a tear mode, every present on the switchable swapchain chains its mode
+//      (the tear mode, else FIFO): a chained mode persists to later presents, so one tear must not leave it torn.
 // Skips with exit code 77 when no Vulkan 1.3 device with Win32 presentation is available. No game data.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -66,6 +68,7 @@ PFN_vkDeviceWaitIdle real_device_wait_idle = nullptr;
 std::atomic<VkResult> fail_next_submit{VK_SUCCESS};
 std::atomic<VkResult> fail_next_wait{VK_SUCCESS};
 std::function<void()> on_next_present;
+std::atomic<std::int32_t> last_present_mode{-1};  // mode chained in VkSwapchainPresentModeInfo by the last present, -1: none
 std::atomic<bool> observe_capture{false};
 std::atomic<bool> saw_capture_waw{false};
 std::atomic<std::uint32_t> capture_copies{0};
@@ -106,6 +109,15 @@ VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, 
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL queue_present(VkQueue queue, const VkPresentInfoKHR* info) {
+    std::int32_t mode = -1;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+    for (auto* s = static_cast<const VkBaseInStructure*>(info->pNext); s; s = s->pNext) {
+        if (s->sType != VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT) continue;
+        const auto* chained = reinterpret_cast<const VkSwapchainPresentModeInfoEXT*>(s);
+        if (chained->swapchainCount && chained->pPresentModes) mode = std::int32_t(chained->pPresentModes[0]);
+    }
+#endif
+    last_present_mode.store(mode);
     if (on_next_present) {
         auto cb = std::move(on_next_present);
         on_next_present = {};
@@ -521,6 +533,45 @@ int main() {
         EXPECT(!driver::unexpected_submit_error.load());
         EXPECT(queue.idle() && worker_queue.idle());
         std::printf("presenter sync: synthetic WSI device-idle during swapchain destruction serialized ok\n");
+
+        // 5. Tearing on request. The vsync swapchain is created with {FIFO, tear mode}; VkSwapchainPresentModeInfo sets
+        //    the mode for that present and every later one, so a present that does not tear has to chain FIFO again.
+        //    A second window, since the first one's surface still has the presenter above's swapchain.
+        HWND tear_window = CreateWindowExW(0, wc.lpszClassName, L"Leonida presenter tear test", WS_OVERLAPPEDWINDOW,
+                                           240, 80, fr.right - fr.left, fr.bottom - fr.top, nullptr, nullptr,
+                                           wc.hInstance, nullptr);
+        EXPECT(tear_window);
+        ShowWindow(tear_window, SW_SHOWNOACTIVATE);
+        UpdateWindow(tear_window);
+        pump();
+        {
+            surface_info.hwnd = tear_window;
+            VkSurfaceKHR tear_surface = VK_NULL_HANDLE;
+            EXPECT(create_surface(d.instance, &surface_info, nullptr, &tear_surface) == VK_SUCCESS);
+            VulkanPresenter tearing(context, driver::get_instance, d.instance, d.physical, d.queue, d.family,
+                                    tear_surface, d.swapchain_maintenance1);
+            EXPECT(tearing.ok());
+            std::printf("presenter sync: swapchain_maintenance1 %s, tear mode %d\n",
+                        d.swapchain_maintenance1 ? "yes" : "no", int(tearing.tear_mode()));
+            if (tearing.tear_supported()) {
+                EXPECT(tearing.present(1, true, nullptr, true) == VK_SUCCESS);
+                EXPECT(tearing.last_present_tore());
+                EXPECT(driver::last_present_mode.load() == std::int32_t(tearing.tear_mode()));
+                EXPECT(tearing.present(1, true, nullptr, false) == VK_SUCCESS);
+                EXPECT(!tearing.last_present_tore());
+                EXPECT(driver::last_present_mode.load() == std::int32_t(VK_PRESENT_MODE_FIFO_KHR));
+                EXPECT(tearing.present(1, true, nullptr, true) == VK_SUCCESS);
+                EXPECT(driver::last_present_mode.load() == std::int32_t(tearing.tear_mode()));
+                EXPECT(tearing.present_blank(true) == VK_SUCCESS);
+                EXPECT(driver::last_present_mode.load() == std::int32_t(VK_PRESENT_MODE_FIFO_KHR));
+                EXPECT(tearing.tear_presents() == 2);
+                std::printf("presenter sync: a present after a tearing one chains FIFO again ok\n");
+            } else {
+                std::printf("presenter sync: no tear mode on this device, tearing check skipped\n");
+            }
+        }
+        DestroyWindow(tear_window);
+        pump();
     }
 
     DestroyWindow(window);

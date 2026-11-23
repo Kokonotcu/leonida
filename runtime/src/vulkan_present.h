@@ -22,11 +22,13 @@
 //
 // Tearing on request (PresentX's ImmediateThresholdPercent): with VK_KHR_swapchain_maintenance1 (or the EXT original)
 // the vsync swapchain is created with FIFO plus IMMEDIATE (FIFO_RELAXED when the surface cannot switch to IMMEDIATE),
-// and a present that asks for it is queued in that mode alone. Without the extension, or without either mode, a
-// request is ignored and the frame waits for the vblank.
+// and a present that asks for it is queued in that mode alone. Every present on that swapchain chains its mode (the
+// tear mode or FIFO, vulkan_present_mode.h), since a chained mode also holds for the presents after it. Without the
+// extension, or without either mode, a request is ignored and the frame waits for the vblank.
 
 #include "vulkan_backend.h"
 #include "vulkan_present_compose.h"
+#include "vulkan_present_mode.h"
 
 // Use the original EXT spellings. They are aliases of the promoted KHR types and are available in older headers.
 #if defined(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && defined(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
@@ -556,12 +558,16 @@ private:
         present.pSwapchains = &swapchain_;
         present.pImageIndices = &image;
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
-        // The swapchain was created with FIFO and tear_mode_ (both come from the same recreate).
+        // The swapchain was created with FIFO and tear_mode_ (both come from the same recreate). A chained mode lasts
+        // for later presents too, so every present on that swapchain names its own: tear_mode_ or FIFO.
         VkSwapchainPresentModeInfoEXT present_mode{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT};
-        const bool tearing = tear && vsync_ && tear_supported();
-        if (tearing) {
+        const VkPresentModeKHR chosen_mode = detail::chained_present_mode(vsync_, tear, tear_mode_);
+        // Taken from the chained mode so the accounting cannot drift from it: with `tear` set, a mode is chained only
+        // when it is tear_mode_.
+        const bool tearing = tear && chosen_mode != VK_PRESENT_MODE_MAX_ENUM_KHR;
+        if (chosen_mode != VK_PRESENT_MODE_MAX_ENUM_KHR) {
             present_mode.swapchainCount = 1;
-            present_mode.pPresentModes = &tear_mode_;
+            present_mode.pPresentModes = &chosen_mode;
             present.pNext = &present_mode;
         }
 #else
