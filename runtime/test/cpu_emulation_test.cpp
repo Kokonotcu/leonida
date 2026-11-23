@@ -252,6 +252,21 @@ void test_live(const ce::Host& host) {
               "clzero on a read-only line raises an access violation");
         VirtualFree(ro, 0, MEM_RELEASE);
     }
+    // The same after the page was written, so it is resident and the handler answers from the working set: it must
+    // still see the read-only protection, and a guard page must still report its guard.
+    if (auto* ro = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE))) {
+        std::memset(ro, 0x5A, 4096);
+        DWORD old = 0;
+        VirtualProtect(ro, 4096, PAGE_READONLY, &old);
+        check(!run(clz, ro + 128, nullptr, &ex) && ex == STATUS_ACCESS_VIOLATION,
+              "clzero on a resident read-only line raises an access violation");
+        VirtualProtect(ro, 4096, PAGE_READWRITE | PAGE_GUARD, &old);
+        check(!run(clz, ro + 128, nullptr, &ex) && ex == STATUS_GUARD_PAGE_VIOLATION,
+              "clzero on a resident guard page raises a guard-page violation");
+        check(run(clz, ro + 128, nullptr, &ex) && ro[128] == 0 && ro[191] == 0 && ro[192] == 0x5A,
+              "clzero after the guard is gone zeroes the line");
+        VirtualFree(ro, 0, MEM_RELEASE);
+    }
     if (!host.clzero) {  // the emulated path accepts the 66 prefix: mov rax,rcx; 66 clzero; ret
         Code clz66({0x48, 0x89, 0xC8, 0x66, 0x0F, 0x01, 0xFC, 0xC3});
         std::memset(lines, 0x5A, sizeof lines);

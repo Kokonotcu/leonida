@@ -135,6 +135,7 @@ inline uint64_t extract_bits(uint64_t src, unsigned len, unsigned idx) {
 #ifdef _WIN32
 #include <windows.h>
 #include <intrin.h>
+#include <psapi.h>
 
 #include <atomic>
 #include <cstdio>
@@ -191,6 +192,18 @@ inline std::atomic<uint64_t>& count(Op op) {
 // 0 when the page holding `addr` can be written; otherwise the exception a write raises there. A guard page loses
 // its guard on that first touch and reports STATUS_GUARD_PAGE_VIOLATION, as the system does for a real access.
 inline DWORD writable(uint64_t addr) {
+    // A resident page answers from the working set in constant time, while VirtualQuery's cost grows with the rest
+    // of the region (it sizes the run of pages with the same attributes): up to 0.7 ms in a large heap, per line
+    // (#7111 review). A page that is not resident, or not plainly writable, takes the VirtualQuery path below.
+    PSAPI_WORKING_SET_EX_INFORMATION ws{};
+    ws.VirtualAddress = reinterpret_cast<void*>(addr & ~uint64_t(0xFFF));
+    if (QueryWorkingSetEx(GetCurrentProcess(), &ws, sizeof ws) && ws.VirtualAttributes.Valid) {
+        const DWORD wp = DWORD(ws.VirtualAttributes.Win32Protection);
+        const DWORD p = wp & 0xFF;
+        if (!(wp & PAGE_GUARD) && (p == PAGE_READWRITE || p == PAGE_WRITECOPY || p == PAGE_EXECUTE_READWRITE ||
+                                   p == PAGE_EXECUTE_WRITECOPY))
+            return 0;
+    }
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT)
         return DWORD(STATUS_ACCESS_VIOLATION);
@@ -278,7 +291,11 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (info->ExceptionRecord->ExceptionCode != STATUS_ILLEGAL_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
     CONTEXT* c = info->ContextRecord;
     uint8_t code[15] = {};
-    const std::size_t avail = readable(c->Rip, sizeof code);  // the instruction may end at a page boundary
+    // The CPU fetched this instruction from RIP's page, so only bytes past that page need a (slow) query; the
+    // instruction may end at the page boundary.
+    const std::size_t in_page = std::size_t(0x1000 - (c->Rip & 0xFFF));
+    const std::size_t avail =
+        in_page >= sizeof code ? sizeof code : in_page + readable(c->Rip + in_page, sizeof code - in_page);
     std::memcpy(code, reinterpret_cast<const void*>(c->Rip), avail);
     const Decoded d = decode(code, avail);
     if (d.op == Op::none) return EXCEPTION_CONTINUE_SEARCH;
