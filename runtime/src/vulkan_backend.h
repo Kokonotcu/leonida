@@ -1720,6 +1720,30 @@ public:
     // hold batches until one is (queue_holds.h).
     QueueHolds<VkSemaphore>& holds() { return holds_; }
 
+    // A cached view of `range` (every field of it counts) in r.format, made on first use and destroyed with the image
+    // (remove_resource). Called from prepare; protected by views_mutex_ so concurrent shared_lock readers are safe.
+    VkImageView view(const ResourceBinding& r, const VkImageSubresourceRange& range) {
+        std::lock_guard lock(views_mutex_);
+        const auto key = std::make_tuple(r.image, range.aspectMask, range.baseMipLevel, range.levelCount,
+                                         range.baseArrayLayer, range.layerCount, r.format);
+        if (const auto it = views_.find(key); it != views_.end()) return it->second;
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        info.image = r.image;
+        info.viewType = r.line ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;  // 1D images take no 2D view
+        info.format = r.format;
+        info.subresourceRange = range;
+        // Attachment views need only color-attachment usage. Inheriting STORAGE usage from a mutable/extended
+        // resource (typeless views such as RGBA8 sRGB, or R32_UINT-backed R9G9B9E5 UAV images) would require unrelated usages.
+        VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        if (r.typeless || (range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && r.color_attachment))
+            info.pNext = &usage;
+        VkImageView view = VK_NULL_HANDLE;
+        if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+        views_[key] = view;
+        return view;
+    }
+
 private:
     friend class VulkanQueue;
     friend class VulkanPresenter;
@@ -1743,29 +1767,6 @@ private:
     const ResourceBinding* resolve(ResourceId id) const {
         const auto it = resources_.find(id);
         return it == resources_.end() ? nullptr : &it->second;
-    }
-
-    // Called from prepare; protected by views_mutex_ so concurrent shared_lock readers are safe.
-    VkImageView view(const ResourceBinding& r, const VkImageSubresourceRange& range) {
-        std::lock_guard lock(views_mutex_);
-        const auto key = std::make_tuple(r.image, range.aspectMask, range.baseMipLevel, range.baseArrayLayer,
-                                         range.layerCount, r.format);
-        if (const auto it = views_.find(key); it != views_.end()) return it->second;
-        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        info.image = r.image;
-        info.viewType = r.line ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;  // 1D images take no 2D view
-        info.format = r.format;
-        info.subresourceRange = range;
-        // Attachment views need only color-attachment usage. Inheriting STORAGE usage from a mutable/extended
-        // resource (typeless views such as RGBA8 sRGB, or R32_UINT-backed R9G9B9E5 UAV images) would require unrelated usages.
-        VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
-        usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        if (r.typeless || (range.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && r.color_attachment))
-            info.pNext = &usage;
-        VkImageView view = VK_NULL_HANDLE;
-        if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
-        views_[key] = view;
-        return view;
     }
 
     // The render pass and framebuffer that resolve one layer of a depth-only multisampled image into one layer of
@@ -1886,7 +1887,10 @@ private:
     VkSemaphore storage_init_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t storage_init_value_ = 0;
     std::uint64_t storage_init_version_ = 0;
-    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>, VkImageView> views_;
+    // Keyed by everything view() puts in the view: image, aspects, mips (base, count), layers (base, count), format.
+    std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>,
+             VkImageView>
+        views_;
     // depth_resolve_framebuffer's caches, under views_mutex_ like views_.
     std::map<std::tuple<VkFormat, std::uint32_t, VkImageLayout, VkImageLayout, VkResolveModeFlagBits>, VkRenderPass>
         resolve_passes_;
