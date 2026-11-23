@@ -407,6 +407,12 @@ private:
 
 struct SparseResource;
 
+// An object that frees itself once the GPU is done with it (DeferredDeletionQueue::Kind::release): a range of a
+// suballocated memory block goes back to its block this way (vulkan_suballocator.h).
+struct DeferredRelease {
+    void (*release)(DeferredRelease* self) = nullptr;
+};
+
 // Zero-allocation O(1) Ring Buffer deferred deletion queue tied to the device timeline semaphore.
 class DeferredDeletionQueue {
 public:
@@ -419,6 +425,7 @@ public:
         device_memory,
         acceleration_structure,
         framebuffer,
+        release,  // handle: a DeferredRelease*
     };
 
     struct Item {
@@ -509,6 +516,10 @@ public:
                 break;
             case Kind::framebuffer:
                 vk.vkDestroyFramebuffer(device, reinterpret_cast<VkFramebuffer>(item.handle), nullptr);
+                break;
+            case Kind::release:
+                if (auto* release = reinterpret_cast<DeferredRelease*>(item.handle); release->release)
+                    release->release(release);
                 break;
             }
         }
@@ -1187,6 +1198,16 @@ public:
 
     void add_sparse_resource(ResourceId id, const ResourceBinding& binding, std::shared_ptr<SparseResource> sparse) {
         std::unique_lock lock(resource_mutex_);
+        if (!binding.image) {
+            auto [it, inserted] = sparse_resources_.try_emplace(id, std::move(sparse));
+            try {
+                set_resource_locked(id, binding);
+            } catch (...) {
+                if (inserted) sparse_resources_.erase(it);
+                throw;
+            }
+            return;
+        }
         set_resource_locked(id, binding);
         sparse_resources_.emplace(id, std::move(sparse));
         if (binding.image) {
@@ -1764,11 +1785,20 @@ private:
     // resources_[id] = binding, with the VA index kept in step (a re-registered ID drops its old range first).
     void set_resource_locked(ResourceId id, const ResourceBinding& binding) {
         auto [it, inserted] = resources_.try_emplace(id, binding);
+        if (addressable(binding)) {
+            try {
+                buffer_vas_.insert(binding.va, binding.size, id);
+            } catch (...) {
+                if (inserted) resources_.erase(it);
+                throw;
+            }
+        }
         if (!inserted) {
-            unindex_buffer(id, it->second);
+            // A same-VA insert updates its size in place; removing the old key would remove the new range.
+            if (addressable(it->second) && (!addressable(binding) || it->second.va != binding.va))
+                unindex_buffer(id, it->second);
             it->second = binding;
         }
-        if (addressable(binding)) buffer_vas_.insert(binding.va, binding.size, id);
     }
 
     const ResourceBinding* resolve(ResourceId id) const {
@@ -2045,7 +2075,14 @@ public:
         type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
         ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress_) == VK_SUCCESS;
-        context_.holds().attach(this);
+        try {
+            context_.holds().attach(this);
+        } catch (...) {
+            // A failed registration leaves no queue to run the destructor for these Vulkan handles.
+            if (progress_) vk.vkDestroySemaphore(context.device(), progress_, nullptr);
+            if (pool_) vk.vkDestroyCommandPool(context.device(), pool_, nullptr);
+            throw;
+        }
     }
 
     ~VulkanQueue() {
@@ -2687,7 +2724,10 @@ private:
         }
         replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
         const bool bindless_uploaded = std::exchange(context_.bindless_upload_pending_, false);
-        auto next_tracker = context_.tracker_;
+        // The submission changes the tracker in place, journaled (review I2: no copy of every tracked image); it is
+        // committed below once submitted and rolled back when not. tracker_lock is held throughout.
+        context_.tracker_.begin();
+        LayoutTracker& next_tracker = context_.tracker_;
         // Bindless images that may already be visible to shaders are initialized on a submission that runs shaders.
         // initialize() zeroes committed storage images and only transitions sparse images.
         bool runs_shaders = false;
@@ -2821,8 +2861,9 @@ private:
             wait_values_.pop_back();
         }
         if (breadcrumbs) breadcrumbs->submitted(std::move(marks), submitted);  // "submitted" is CPU knowledge only
+        if (!submitted) context_.tracker_.rollback();
         if (submitted) {
-            context_.tracker_ = std::move(next_tracker);
+            context_.tracker_.commit();
             slot->predicate = std::move(batch);
             slot->predicated_copy = std::move(copy_batch);
             slot->counted_dispatch = std::move(counted_batch);

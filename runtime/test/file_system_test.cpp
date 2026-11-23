@@ -252,6 +252,21 @@ void run_checks(const std::filesystem::path& root) {
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
     }
 
+    // Device names (CON, NUL, AUX, COM1, LPT1, ...) in any component, with any extension, would open a Win32 device once
+    // joined under the package or the overlay; they are refused. A name that only starts like one is an ordinary file.
+    for (const wchar_t* device : {L"GAME:\\aux.log", L"GAME:\\data\\NUL.txt", L"GAME:\\data\\com1", L"GAME:\\Con \\x.txt",
+                                  L"GAME:/data/lpt9.dat", L"T:\\nul"}) {
+        HANDLE h = create_w(device, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE, "a device name in a console path is refused, never opened");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+    {
+        HANDLE h = create_w(L"GAME:\\data\\nullable.aux", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "a name that only starts like a device is an ordinary file");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(delete_w(L"GAME:\\data\\nullable.aux"), "and it can be deleted again");
+    }
+
     // --trace: a failed open of a guest path is a "file_open_failed" event, a successful one is not, and with the
     // trace off nothing is written.
     {
@@ -709,6 +724,45 @@ void run_checks(const std::filesystem::path& root) {
               "and the new folder is empty: only . and ..");
     }
 
+    // Recreating a removed package directory clears its own marker, but not nested deletion markers.
+    {
+        std::filesystem::create_directories(package / "recreate_dir");
+        const auto mark = overlay / ".gta6rt-deleted" / "recreate_dir" / ".gta6rt-dir";
+        check(rmdir_w(L"GAME:\\recreate_dir") != FALSE && std::filesystem::exists(mark),
+              "removing a package directory creates its marker");
+        check(mkdir_w(L"GAME:\\recreate_dir", nullptr) != FALSE, "recreating the package directory succeeds");
+        const DWORD attrs = attributes_w(L"GAME:\\recreate_dir");
+        check(attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY), "recreated directory has directory attributes");
+        check(count(list(first_w, next_w, find_close, L"GAME:\\*"), L"recreate_dir") == 1,
+              "recreated directory is listed once");
+        check(!std::filesystem::exists(mark), "recreated directory has no removal marker");
+        check(mkdir_w(L"GAME:\\never_removed_dir", nullptr) != FALSE &&
+                  std::filesystem::is_directory(overlay / "never_removed_dir") &&
+                  !std::filesystem::exists(overlay / ".gta6rt-deleted" / "never_removed_dir"),
+              "creating a never-removed directory is unchanged");
+    }
+
+    // A marker held without delete sharing makes recreation fail and rolls back the overlay directory.
+    {
+        std::filesystem::create_directories(package / "held_marker_dir");
+        const auto mark = overlay / ".gta6rt-deleted" / "held_marker_dir" / ".gta6rt-dir";
+        check(rmdir_w(L"GAME:\\held_marker_dir") != FALSE, "removing the directory creates a marker to hold");
+        const HANDLE held = ::CreateFileW(mark.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                          FILE_ATTRIBUTE_NORMAL, nullptr);
+        check(held != INVALID_HANDLE_VALUE, "opened the removal marker without delete sharing");
+        if (held != INVALID_HANDLE_VALUE) {
+            const BOOL created = mkdir_w(L"GAME:\\held_marker_dir", nullptr);
+            const DWORD error = GetLastError();
+            check(!created && (error == ERROR_SHARING_VIOLATION || error == ERROR_ACCESS_DENIED),
+                  "recreating a directory reports the marker deletion error");
+            check(!std::filesystem::exists(overlay / "held_marker_dir") && std::filesystem::exists(mark),
+                  "failed recreation removes the overlay directory and keeps the marker");
+            ::CloseHandle(held);
+            check(mkdir_w(L"GAME:\\held_marker_dir", nullptr) != FALSE,
+                  "recreating the directory succeeds after releasing the marker");
+        }
+    }
+
     // MoveFile: the destination is in the overlay; a moved package file is deleted by a marker.
     {
         check(move_w(L"GAME:\\misc\\one.txt", L"GAME:\\misc\\moved.txt") != FALSE, "MoveFileW moves a package file");
@@ -832,6 +886,19 @@ void run_checks(const std::filesystem::path& root) {
             BOOL cancel = TRUE;
             block.dwCopyFlags = 0;
             block.pfCancel = &cancel;
+            const auto parent = fallback ? "copy2_package_fallback" : "copy2_package_host";
+            const auto destination = fallback ? L"GAME:\\copy2_package_fallback\\copy.txt" :
+                                                L"GAME:\\copy2_package_host\\copy.txt";
+            std::filesystem::create_directories(package / parent);
+            check(copy2(L"GAME:\\misc\\keep.txt", destination, &block) ==
+                          HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED) &&
+                      !std::filesystem::exists(overlay / parent),
+                  ("a cancelled copy does not create its overlay parent" + mode).c_str());
+            cancel = FALSE;
+            check(copy2(L"GAME:\\misc\\keep.txt", destination, &block) == S_OK &&
+                      read_path(overlay / parent / "copy.txt") == "keep",
+                  ("an uncancelled copy creates its overlay parent" + mode).c_str());
+            cancel = TRUE;
             check(copy2(L"GAME:\\misc\\keep.txt", to(L"cancelled.txt").c_str(), &block) ==
                           HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED) &&
                       !std::filesystem::exists(out / "cancelled.txt"),

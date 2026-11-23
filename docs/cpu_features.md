@@ -62,3 +62,21 @@ in the image.
   answers is not measured here.
 
 Not measured: which of these sites a boot reaches, and in which order.
+
+## Replaced ahead of time (local work branch)
+
+The emulation costs a `#UD` round trip (about 1-2 µs) on every execution. `runtime/src/cpu_patch.h` removes that for
+the sites it can: `make_game.py`'s runtime stage writes `cpu_sites.txt` beside `gta6rt.exe` once
+(`tools/cpu_sites.py` over this page's scan; the file names the executable by SizeOfImage and TimeDateStamp and stays
+on the player's machine), and the loader rewrites the main image before any of its code runs, only for what the host
+lacks: MONITORX and CLWB become NOPs, MWAITX a PAUSE, every INSERTQ/EXTRQ immediate form a JMP to an SSE2 stub (flags
+and borrowed registers kept), and every 12-byte CLZERO loop (`clzero; add rax, 40h; cmp rax, R; jb`) a stub that
+zeroes the same lines. Anything else stays with the emulation. `cpu_patch_test` runs every patched form natively
+against `cpu_emulation`'s reference.
+
+On an i7-11800H (no SSE4a, CLZERO, MONITORX; has CLWB), `--dry-run` on 1.0.2.1: 41 sites, 25 native stubs (the 19
+SSE4a sites are all INSERTQ immediates; 6 CLZERO loops), 4 NOPs; the 4 CLZERO sites of the routine's address-overflow
+fallback stay with the emulation.
+
+Switches: `LEONIDA_CPU_PATCH=0` leaves every site to the emulation; `LEONIDA_CPU_SITES=<file>` reads the sites from
+another file than `cpu_sites.txt` beside `gta6rt.exe`.

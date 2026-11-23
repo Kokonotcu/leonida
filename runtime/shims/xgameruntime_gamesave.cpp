@@ -10,7 +10,8 @@
 // Offline the saves are files, in the layout tools/saves.py imports into (docs/saves.md):
 //   <root>\local-user\<container>\<blob>      root = LEONIDA_SAVE_DIR, else %LOCALAPPDATA%\Leonida\saves
 // Container and blob names are %-encoded: [A-Za-z0-9_-] and '.' (except as the first character) stay, every other
-// UTF-8 byte becomes %XX. A container's display name is kept in "<container>\.display", which no encoded blob name
+// UTF-8 byte becomes %XX, and so do a final '.' and the first character of a Windows device name (CON, NUL, COM1, ...
+// before the first '.'), which Win32 would not keep as a file of their own. A container's display name is kept in "<container>\.display", which no encoded blob name
 // can collide with (an encoded name never starts with '.'). Names ending in '~' are temporary files of an update in
 // progress; an encoded name never ends in '~' either.
 //
@@ -25,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -108,6 +110,19 @@ std::string encode_name(std::string_view name) {
             out += hex[c >> 4];
             out += hex[c & 15];
         }
+    }
+    // Two spellings Win32 would not keep as a file of their own: a final '.' (stripped, so "a." would be the blob
+    // "a"), and a device name as the part before the first '.' (CON, PRN, AUX, NUL, COM1-9, LPT1-9, any case: "CON"
+    // or "nul.dat" would open the device and block the save call). Their last or first character is %-encoded.
+    if (!out.empty() && out.back() == '.') out.replace(out.size() - 1, 1, "%2E");
+    std::string base = out.substr(0, out.find('.'));
+    for (char& ch : base) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    const bool device = base == "con" || base == "prn" || base == "aux" || base == "nul" ||
+                        (base.size() == 4 && (base.compare(0, 3, "com") == 0 || base.compare(0, 3, "lpt") == 0) &&
+                         base[3] >= '1' && base[3] <= '9');
+    if (device) {
+        const auto c = static_cast<unsigned char>(out[0]);
+        out = std::string{'%', hex[c >> 4], hex[c & 15]} + out.substr(1);
     }
     return out;
 }

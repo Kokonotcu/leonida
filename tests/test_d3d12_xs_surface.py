@@ -126,6 +126,7 @@ if __name__ == "__main__":
     test_unrecovered_console_iids_stay_outside_the_table()
     test_sdk_include_override_accepts_a_trailing_separator()
     test_sdk_discovery_sorts_versions_numerically()
+    test_runtime_guid_table_is_the_tools_output()
     # Call the two optional checks through their real definitions so this runner cannot drift from them; both
     # raise unittest.SkipTest when their inputs (SDK headers, SCARAB_REF) are absent.
     for optional in (test_standard_iids_match_sdk, test_scarab_cross_check):

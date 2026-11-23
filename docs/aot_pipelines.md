@@ -12,6 +12,11 @@ gta6rt.exe --run game_scarlett_master.exe --game-dir <package>
 gta6rt.exe --prebuild-pipelines          # without shader objects: compile what the last run recorded
 ```
 
+Switches: `LEONIDA_SHADER_OBJECTS=1` (shader objects, off by default), `LEONIDA_SHADER_BINARIES=<dir>` (where the
+binaries are, default `shader_binaries` beside `gta6rt.exe`), `LEONIDA_PSO_RECORD=0` (record no recipes),
+`LEONIDA_PSO_RECIPES=<file>` (record elsewhere than `pso_recipes.jsonl`), and `LEONIDA_DRAW_SCOPES=0` (one rendering
+scope per draw again instead of one for consecutive draws into the same attachments; vulkan_replay.h emit).
+
 `make_game.py`'s pipelines stage runs both prebuilds. Checked on an RTX 3080 Laptop (NVIDIA 617.42) by
 `shader_object_draw_test`: the shader-object draw writes the pipeline draw's pixels, and after `--prebuild-shaders`
 a new device makes its shaders from the stored binaries (0 compiled from SPIR-V) and draws the same pixels.

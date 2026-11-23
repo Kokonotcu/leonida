@@ -5,9 +5,14 @@ repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the
 separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
 `DllMain`s without an exception
 ([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
-trace tool for the first boot. The executable's `ws2_32.dll` imports are served by the offline Winsock2 shim
-([`runtime_imports.md`](runtime_imports.md#winsock2-offline)), like `winhttp.dll`, so no socket or DNS query leaves the
+trace tool for the first boot. The executable's `ws2_32.dll` imports are served by the offline Winsock2 shim, like
+`winhttp.dll` (`runtime/shims/ws2_32_offline.cpp`), so no socket or DNS query leaves the
 process. Nothing here quotes game data; a real trace stays on the player's machine.
+
+Loader switches for the first boot: `LEONIDA_TLS_GA_PATCH=0` turns off the rewrite of the executable's index-0 TLS
+reads (`gs:[58h]`, pe_loader.cpp); `LEONIDA_HEAP_PROBE=1` validates the CRT heap at each `GetModuleHandleW` and logs it
+(library_loader.cpp), to find which call first sees a corrupt heap; `LEONIDA_CPU_PATCH=0` and `LEONIDA_CPU_SITES` are
+in [cpu_features.md](cpu_features.md).
 
 ## 1. What the first boot produces
 
@@ -24,7 +29,8 @@ Two traces are written independently:
 * **startup trace** (`--trace FILE`): one JSON object per line, flushed per event, so it survives a crash. Kinds
   and fields are in [`runtime/README.md`](../runtime/README.md) ("Startup trace").
 * **D3D12 trace** (`--trace-d3d12`): one `[d3d12-trace] #<seq> <method> <outcome>` line per call, on stderr. The
-  ordinary `[rt]` diagnostics stay separate.
+  ordinary `[rt]` diagnostics stay separate. A present is one `XboxPresentation::PresentX` line (`ok` or `failed`),
+  so the presents of a run are a count of those lines.
 
 `tools/boot_trace.py` reads both and prints the triage units: modules, unimplemented calls and callers,
 DllMain/TLS results, exceptions with their stack frames, the exit, and the D3D12 calls by outcome and first call
@@ -73,6 +79,9 @@ Useful switches:
   printing the caller's `module+RVA` and the argument registers (with a debugger attached it breaks instead). Start
   with `log`, then use `stop` to pin the first blocker and `fail` to see how the game's own failure path reacts.
   This switch covers imports only; it does not affect the D3D12 outcomes.
+* `LEONIDA_SKIP_CPU_CHECK=1` skips the AVX preflight of `--init` and `--run`, which otherwise exits 4 with one line
+  naming the missing feature on a host without AVX (a QEMU `qemu64` guest; under Rosetta, set
+  `ROSETTA_ADVERTISE_AVX=1` instead). The game itself still needs AVX, so this is for the #UD emulation work.
 * `LEONIDA_SKIP_INT3=1` (with `--trace`) steps over each int3 in guest code and logs it once per address as an
   `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file

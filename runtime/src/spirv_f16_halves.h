@@ -123,6 +123,22 @@ constexpr std::uint32_t kStoragePrivate = 6;
 constexpr std::uint32_t kDecorationLocation = 30;
 constexpr std::uint32_t kGlslUnpackHalf2x16 = 62;
 
+inline constexpr bool is_interface_only_decoration(std::uint32_t dec) {
+    switch (dec) {
+    case 13:  // NoPerspective
+    case 14:  // Flat
+    case 15:  // Patch
+    case 16:  // Centroid
+    case 17:  // Sample
+    case 18:  // Invariant
+    case kDecorationLocation:
+    case 31:  // Component
+        return true;
+    default:
+        return false;
+    }
+}
+
 struct Inst {
     std::uint16_t opcode = 0;
     std::vector<std::uint32_t> words;
@@ -411,6 +427,15 @@ inline std::set<std::uint32_t> collect_non_demotable_vars(const Module& mod, std
 }
 
 }  // namespace spirv_detail
+
+// Highest usable vec4 Location (capped at 29, MoltenVK's 124-component limit) for a device's stage interface limits.
+// Reserves 4 components for BuiltIn Position (so 128 -> 29, 124 -> 29, 64 -> 14).
+inline constexpr std::uint32_t f16_half_top_location(std::uint32_t max_vertex_output_components,
+                                                     std::uint32_t max_fragment_input_components) {
+    const std::uint32_t limit = std::min(max_vertex_output_components, max_fragment_input_components);
+    if (limit < 8) return 0;
+    return std::min<std::uint32_t>(29u, limit / 4u - 2u);
+}
 
 // Specializes/patches `vs_words` and (if needed) `ps_words` so that every entry in `ps_entry.f16_halves` is
 // exported by the VS at the exact smooth location the PS reads, within `0..top_location` (default 29, MoltenVK's
