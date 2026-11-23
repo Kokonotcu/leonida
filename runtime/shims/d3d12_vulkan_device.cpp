@@ -2348,9 +2348,9 @@ public:
             device_.context->wait_retire_ticket(device_.context->submitted_retire_ticket());
             auto& vk = device_.context->vk;
             if (buffer_) vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
-            if (memory_) vk.vkFreeMemory(device_.info.device, memory_, nullptr);
+            if (memory_) vk.vkFreeMemory(device_.info.device, memory_.memory, nullptr);
             buffer_ = VK_NULL_HANDLE;
-            memory_ = VK_NULL_HANDLE;
+            memory_ = {};
         }
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
         if (image_ && !sparse_image_)
@@ -2601,15 +2601,15 @@ public:
                                               need_bda ? static_cast<const void*>(&flags) : &import};
                 allocate.allocationSize = bytes;
                 allocate.memoryTypeIndex = i;
-                if (vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_) == VK_SUCCESS)
+                if (vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &memory_.memory) == VK_SUCCESS)
                     memory_flags_ = device_.memory.memoryTypes[i].propertyFlags;
                 else
-                    memory_ = VK_NULL_HANDLE;
+                    memory_ = {};
             }
             if (memory_) break;
         }
         if (!memory_) return E_OUTOFMEMORY;
-        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, offset) != VK_SUCCESS) return E_OUTOFMEMORY;
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_.memory, offset) != VK_SUCCESS) return E_OUTOFMEMORY;
         mapped_ = address;
         host_import_ = true;
         va_ = start;
@@ -5694,6 +5694,9 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        // Opt-in: the console-addressed descriptor heap reports the title's VA but does not back it (d3d12_xs_device.h).
+        if (const char* v = std::getenv("LEONIDA_CONSOLE_HEAP_VA"); v && v[0] == '1')
+            rt::d3d12_xs::set_console_descriptor_heap_handler(&create_console_descriptor_heap);
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
@@ -7904,6 +7907,18 @@ public:
             case 10: return D3D12_RESOURCE_STATE_RESOLVE_DEST;
             default: return D3D12_RESOURCE_STATE_COMMON;
         }
+    }
+
+    // create_console_descriptor_heap: a heap that reports the title's console address as its handles' start.
+    HRESULT create_console_heap(const D3D12_DESCRIPTOR_HEAP_DESC& desc, D3D12_GPU_VIRTUAL_ADDRESS console_address,
+                                std::uint64_t console_size, REFIID riid, void** out) {
+        auto* heap = new DescriptorHeap(state_, desc, console_address, console_size);
+        heap->attach_device(identity());
+        if (!heap->ok()) {
+            heap->Release();
+            return E_OUTOFMEMORY;
+        }
+        return hand_out(heap, riid, out);
     }
 
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,
@@ -11167,14 +11182,7 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_INVALIDARG;
-
-    auto* heap = new DescriptorHeap(d->state(), *desc, console_address, console_size);
-    heap->attach_device(d->identity());
-    if (!heap->ok()) {
-        heap->Release();
-        return E_OUTOFMEMORY;
-    }
-    return hand_out(heap, riid, out);
+    return d->create_console_heap(*desc, console_address, console_size, riid, out);
 }
 
 }  // namespace rt::d3d12
