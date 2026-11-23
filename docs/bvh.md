@@ -978,7 +978,9 @@ with dyadic inputs.
 the destination buffer:
 
 1. one thread per triangle (TRI0 leaves, remap `0x09`) or per instance (128-byte records, the world-to-object
-   inverse, the BLAS root and identity-rotation flag);
+   inverse, the BLAS root and identity-rotation flag). An `R16_UINT` index is read as a half of the aligned 32-bit
+   word that holds it: D3D12 aligns an R16 index buffer to 2 bytes only, so it can start at an address that is 2
+   mod 4 (`blas_grid_u16_offset2`);
 2. a 30-bit Morton key of each box centre, then a stable sort: up to 1,024 keys in one workgroup's shared memory
    (one dispatch), more with a radix sort of 8 passes of 4-bit digits over 256-element tiles (24 dispatches
    whatever the count, no padding to a power of two);

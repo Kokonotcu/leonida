@@ -4,7 +4,8 @@
 // `python -I tools/xdxr_bvh.py check-build <out dir>` then validates every structure and traces rays through it
 // against brute force (ctest runs both; see CMakeLists.txt).
 //
-// Cases: one triangle; five (two levels); 1000 random triangles; an indexed R16 grid with a 16-byte vertex stride;
+// Cases: one triangle; five (two levels); 1000 random triangles; an indexed R16 grid with a 16-byte vertex stride, and
+// the same grid with its R16 indices 2 bytes into the buffer (D3D12 requires only 2-byte alignment for them);
 // R32 indices with R32G32 vertices; a geometry transform; two geometries with an inactive (NaN) triangle; no
 // triangles; 5000 triangles (many radix-sort tiles); updates (refits) in place and into another buffer; clones and a
 // compaction (CopyRaytracingAccelerationStructure) with the postbuild size; a TLAS of four instances (rotated and scaled, one with mask 0, one with no BLAS);
@@ -102,6 +103,7 @@ struct Geometry {
     bool xy = false;
     std::vector<std::uint32_t> indices;       // empty = none
     bool u16 = false;
+    std::uint32_t index_offset = 0;           // bytes before the first index in its buffer
     bool transform = false;
     float m[12] = {};
     std::uint32_t triangle_count = 0;
@@ -130,6 +132,7 @@ struct Built {
     std::uint64_t address = 0;
     std::size_t size = 0;              // as the header gives it
     std::vector<Tri> tris;
+    std::vector<char> bytes;           // the structure as built (not for updates)
 };
 
 // With `moved` (the same geometries with new vertex positions) the BLAS is then updated: refitted in place, or with
@@ -157,15 +160,18 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
         keep.push_back(v);
         vertex_buffers.push_back(v);
         if (!geo.indices.empty()) {
-            Buffer ib = make(gpu, geo.indices.size() * 4);
+            Buffer ib = make(gpu, geo.index_offset + geo.indices.size() * 4);
             EXPECT(ib.buffer);
+            char* at = static_cast<char*>(ib.map) + geo.index_offset;
             if (geo.u16) {
-                auto* p = static_cast<std::uint16_t*>(ib.map);
-                for (std::size_t i = 0; i < geo.indices.size(); ++i) p[i] = std::uint16_t(geo.indices[i]);
+                for (std::size_t i = 0; i < geo.indices.size(); ++i) {
+                    const std::uint16_t v = std::uint16_t(geo.indices[i]);
+                    std::memcpy(at + 2 * i, &v, 2);
+                }
             } else {
-                std::memcpy(ib.map, geo.indices.data(), geo.indices.size() * 4);
+                std::memcpy(at, geo.indices.data(), geo.indices.size() * 4);
             }
-            d.indices = ib.address;
+            d.indices = ib.address + geo.index_offset;
             d.index_type = geo.u16 ? 1 : 2;
             keep.push_back(ib);
         }
@@ -209,6 +215,8 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
     };
     if (!moved) {
         EXPECT(dump(name, dst, base, built.tris));
+        const char* bytes = static_cast<const char*>(dst.map) + (base - dst.address);
+        built.bytes.assign(bytes, bytes + built.size);
         std::printf("%s: %u triangles, %u bytes, %u nodes\n", name.c_str(), total, layout.size, layout.nodes);
         return 0;
     }
@@ -339,6 +347,15 @@ int main(int argc, char** argv) {
     Geometry g16 = grid(12, 4, false);
     g16.u16 = true;
     if (build_blas(gpu, builder, dir, "blas_grid_u16_stride16", {g16}, grid16)) return 1;
+    // The same grid with its R16 indices at an address that is 2 mod 4: the same structure, byte for byte (its
+    // records are position-independent and the build is deterministic).
+    {
+        Geometry off2 = g16;
+        off2.index_offset = 2;
+        Built grid16_off2;
+        if (build_blas(gpu, builder, dir, "blas_grid_u16_offset2", {off2}, grid16_off2)) return 1;
+        EXPECT(grid16_off2.bytes == grid16.bytes);
+    }
     if (build_blas(gpu, builder, dir, "blas_grid_u32_xy", {grid(9, 2, true)}, xy32)) return 1;
     Geometry gt = grid(6, 3, false);
     gt.transform = true;
