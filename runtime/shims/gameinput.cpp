@@ -46,6 +46,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "gameinput.h"
@@ -752,6 +753,7 @@ struct Event {
     uint32_t current, previous;
     bool pressed;
     GameInputCallbackToken only;  // enumeration: deliver to this callback only
+    bool overrun = false;         // Reading events: older readings of this device were dropped from the queue
 };
 
 // One effect a title created, on the device it belongs to. The object and its parameters belong to the title; SDL's
@@ -828,10 +830,42 @@ State& g() {
     return *s;
 }
 
-void queue_event(const Event& e) {
+bool matches(const Callback& c, const Event& e);
+
+// Readings one device may have waiting in the queue. With a dispatcher the queue only drains when the title calls
+// Dispatch, which it may not do for seconds (a loading screen) while a pad streams 125-500 readings a second.
+constexpr size_t kQueuedReadingsCap = 256;
+
+// Under g().mu. An event no registered callback would take is not queued at all (deliver_event matches again, and a
+// callback is never reactivated, so nothing is lost). Past kQueuedReadingsCap the device's oldest queued reading is
+// dropped and the new one carries hasOverrunOccurred, as the console's reading callbacks report a lost input.
+void queue_event(Event e) {
+    State& s = g();
+    bool wanted = false;
+    for (const Callback& c : s.callbacks)
+        if (matches(c, e)) {
+            wanted = true;
+            break;
+        }
+    if (!wanted) return;
+    if (e.type == CbType::Reading) {
+        size_t queued = 0, oldest = s.queue.size();
+        for (size_t i = 0; i < s.queue.size(); ++i)
+            if (s.queue[i].type == CbType::Reading && s.queue[i].device == e.device) {
+                if (oldest == s.queue.size()) oldest = i;
+                ++queued;
+            }
+        if (queued >= kQueuedReadingsCap) {
+            const Event dropped = s.queue[oldest];
+            s.queue.erase(s.queue.begin() + static_cast<std::ptrdiff_t>(oldest));
+            if (dropped.device) dropped.device->Release();
+            if (dropped.reading) dropped.reading->Release();
+            e.overrun = true;
+        }
+    }
     if (e.device) e.device->AddRef();
     if (e.reading) e.reading->AddRef();
-    g().queue.push_back(e);
+    s.queue.push_back(e);
 }
 
 bool matches(const Callback& c, const Event& e) {
@@ -855,7 +889,7 @@ void call(const Callback& c, const Event& e) {
             reinterpret_cast<GameInputDeviceCallback>(c.fn)(c.token, c.context, e.device, e.timestamp, e.current, e.previous);
             break;
         case CbType::Reading:
-            reinterpret_cast<GameInputReadingCallback>(c.fn)(c.token, c.context, e.reading, false);
+            reinterpret_cast<GameInputReadingCallback>(c.fn)(c.token, c.context, e.reading, e.overrun);
             break;
         case CbType::Guide:
             reinterpret_cast<GameInputGuideButtonCallback>(c.fn)(c.token, c.context, e.device, e.timestamp, e.pressed);
@@ -1210,45 +1244,64 @@ Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
 
 // Raw HID (RT-175): opens the pad's HID device with the current backend and builds the report tables from its report
 // descriptor. A pad the backend cannot open, or whose descriptor cannot be read or declares no report, gets no raw
-// I/O: no GameInputKindRawDeviceReport, no report tables, and E_NOTIMPL from the raw device calls. Under g().mu.
-void open_raw(Device* d, const char* path) {
-    std::lock_guard lock(d->hid_mu);
-    if (d->hid) d->hid_backend->close(d->hid);
-    d->hid = nullptr;
-    d->hid_ids = false;
-    d->raw_in.clear();
-    d->raw_out.clear();
-    d->raw_feature.clear();
+// I/O: no GameInputKindRawDeviceReport, no report tables, and E_NOTIMPL from the raw device calls. Opening it is device
+// I/O (an enumeration, the open, the descriptor read: tens to hundreds of ms on a wireless pad), so probe_raw runs on
+// the poll thread before g().mu is taken; publish_raw then installs the result under g().mu.
+struct OpenedHid {
+    void* h = nullptr;
+    const rt::gameinput::HidBackend* backend = nullptr;
+    bool ids = false;
+    std::vector<GameInputRawDeviceReportInfo> in, out, feature;
+};
+
+OpenedHid probe_raw(const char* name, const char* path, uint16_t vendor, uint16_t product) {
+    OpenedHid r;
     const rt::gameinput::HidBackend* b = g_hid.load();
-    void* h = b->open(path, d->info.vendorId, d->info.productId);
+    void* h = b->open(path, vendor, product);
     if (!h) {
         // SDL reads Xbox pads on Windows through XInput ("XInput#n"); SDL's hidapi skips their XInput HID interface
         // (&IG_ in the path), which carries no full HID reports, so they have no raw I/O here.
         const bool xinput = path && std::strncmp(path, "XInput#", 7) == 0;
-        std::fprintf(stderr, "[rt] gameinput: %s: no raw HID (%s)\n", d->name.c_str(),
+        std::fprintf(stderr, "[rt] gameinput: %s: no raw HID (%s)\n", name,
                      xinput             ? "an XInput pad: SDL's hidapi does not open XInput HID interfaces"
                      : path && *path    ? "its HID device could not be opened"
                                         : "SDL reports no device path");
-        return;
+        return r;
     }
     std::vector<uint8_t> desc(4096);
     const int n = b->descriptor(h, desc.data(), desc.size());
     std::vector<rt::gameinput::RawReportSize> reports;
     const bool parsed = n > 0 && rt::gameinput::parse_report_descriptor(desc.data(), static_cast<size_t>(n), &reports);
     if (!parsed || reports.empty()) {
-        std::fprintf(stderr, "[rt] gameinput: %s: no raw HID (%s)\n", d->name.c_str(),
+        std::fprintf(stderr, "[rt] gameinput: %s: no raw HID (%s)\n", name,
                      n <= 0 ? "no report descriptor" : !parsed ? "malformed report descriptor" : "no reports declared");
         b->close(h);
-        return;
+        return r;
     }
-    for (const rt::gameinput::RawReportSize& r : reports) {
-        const GameInputRawDeviceReportInfo info{static_cast<GameInputRawDeviceReportKind>(r.kind), r.id, r.bytes, 0, nullptr};
-        (r.kind == GameInputRawInputReport ? d->raw_in : r.kind == GameInputRawOutputReport ? d->raw_out : d->raw_feature)
+    for (const rt::gameinput::RawReportSize& rep : reports) {
+        const GameInputRawDeviceReportInfo info{static_cast<GameInputRawDeviceReportKind>(rep.kind), rep.id, rep.bytes, 0,
+                                                nullptr};
+        (rep.kind == GameInputRawInputReport ? r.in : rep.kind == GameInputRawOutputReport ? r.out : r.feature)
             .push_back(info);
-        d->hid_ids |= r.id != 0;
+        r.ids |= rep.id != 0;
     }
-    d->hid = h;
-    d->hid_backend = b;
+    r.h = h;
+    r.backend = b;
+    return r;
+}
+
+// Under g().mu, after fill_info. close_pad already closed the pad's previous handle, so there is none to close here.
+void publish_raw(Device* d, OpenedHid&& r) {
+    {
+        std::lock_guard lock(d->hid_mu);
+        d->hid = r.h;
+        if (r.h) d->hid_backend = r.backend;
+        d->hid_ids = r.ids;
+        d->raw_in = std::move(r.in);
+        d->raw_out = std::move(r.out);
+        d->raw_feature = std::move(r.feature);
+    }
+    if (!d->hid) return;
     GameInputDeviceInfo& i = d->info;
     i.supportedInput |= GameInputKindRawDeviceReport;
     i.inputReportCount = static_cast<uint32_t>(d->raw_in.size());
@@ -1259,10 +1312,14 @@ void open_raw(Device* d, const char* path) {
     i.featureReportInfo = d->raw_feature.empty() ? nullptr : d->raw_feature.data();
 }
 
-void close_raw(Device* d) {
+// Unlinks the pad's HID handle under its hid_mu (waiting out a title's raw call in flight); the caller closes it once
+// g().mu is released.
+OpenedHid detach_raw(Device* d) {
     std::lock_guard lock(d->hid_mu);
-    if (d->hid) d->hid_backend->close(d->hid);
-    d->hid = nullptr;
+    OpenedHid r;
+    r.h = std::exchange(d->hid, nullptr);
+    r.backend = d->hid_backend;
+    return r;
 }
 
 // Drains the input reports pending since the last poll; the newest one the pad declares goes into snap. With none
@@ -1294,6 +1351,10 @@ void read_raw(Device* d, Snapshot* snap) {
     }
 }
 
+// Opening a pad is device I/O: the haptic device, the HID device and its report descriptor, the sensor enables and
+// the player LED and lightbar writes. All of it runs on the poll thread before g().mu is taken, because every title
+// call takes g().mu and a plug-in or a wireless wake-up would otherwise stall the game thread for the whole I/O. Only
+// the poll thread opens and closes pads and changes s.connected, so what it reads between the locks stays true.
 void open_pad(SDL_JoystickID jid, uint64_t ts) {
     State& s = g();
     SDL_Gamepad* p = SDL_OpenGamepad(jid);
@@ -1309,6 +1370,55 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     id_bytes(identity, guid, &base);
 
     const SDL_PropertiesID props = SDL_GetGamepadProperties(p);
+    const bool is_dualsense = SDL_GetGamepadType(p) == SDL_GAMEPAD_TYPE_PS5;
+    const bool has_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
+    const bool has_trigger_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false);
+    // Motion needs both sensors; SDL's orientation quaternion is left alone (no title asks for it, and a synthesised
+    // one would lie). Enabling at open: SDL delivers samples only for enabled sensors.
+    const bool has_motion = SDL_GamepadHasSensor(p, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(p, SDL_SENSOR_ACCEL);
+    if (has_motion) {
+        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_GYRO, kMotionSensorRate);
+        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_ACCEL, kMotionSensorRate);
+    }
+    // Force feedback: SDL opens a wheel or a stick as a joystick with a haptic device behind it and never through the
+    // gamepad API, so it is opened from the joystick and closed with the pad. Only what the device really reports is
+    // passed on: no haptic device, no motor, and an effect kind SDL does not list is not offered to a title.
+    void* haptic = haptics().open_joystick(SDL_GetGamepadJoystick(p));
+    uint32_t ff_features = 0;
+    int max_effects = 1;
+    if (haptic) {
+        ff_features = haptics().features(haptic);
+        if (ff_features) {
+            max_effects = std::max(1, haptics().max_effects(haptic));
+        } else {
+            haptics().close(haptic);
+            haptic = nullptr;
+        }
+    }
+    const char* sdl_name = SDL_GetGamepadName(p);
+    OpenedHid raw = probe_raw(sdl_name ? sdl_name : "Gamepad", path, SDL_GetGamepadVendor(p), SDL_GetGamepadProduct(p));
+
+    // Player LEDs and SDL's default lightbar colour follow the slot: the lowest one not in use. Set before the pad is
+    // published, so a light the title sets afterwards is never overwritten by these defaults.
+    int player = 0;
+    bool lightbar_set;
+    uint8_t lightbar[3];
+    bool ds_triggers;
+    {
+        std::lock_guard lock(s.mu);
+        for (bool used = true; used; ++player) {
+            used = false;
+            for (Device* c : s.connected) used |= c->player == player;
+            if (!used) break;
+        }
+        lightbar_set = s.config.lightbar_set;
+        std::memcpy(lightbar, s.config.lightbar, sizeof lightbar);
+        ds_triggers = s.config.ds_triggers != rt::gameinput::DsTriggerMode::Off;
+    }
+    SDL_SetGamepadPlayerIndex(p, player);
+    if (lightbar_set && SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false))
+        SDL_SetGamepadLED(p, lightbar[0], lightbar[1], lightbar[2]);
+
     std::lock_guard lock(s.mu);
     // The same pad coming back gets its old object. Pads with the same GUID and serial or path (identical pads with
     // neither, mostly) are twins sharing one base id, told apart by order alone: the lowest disconnected twin is
@@ -1337,49 +1447,33 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->pad = p;
     d->id = jid;
     d->family = family_of(jid, p);
-    d->is_dualsense = SDL_GetGamepadType(p) == SDL_GAMEPAD_TYPE_PS5;
-    d->has_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
-    d->has_trigger_rumble = SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false);
-    // Motion needs both sensors; SDL's orientation quaternion is left alone (no title asks for it, and a synthesised
-    // one would lie). Enabling at open: SDL delivers samples only for enabled sensors.
-    d->has_motion = SDL_GamepadHasSensor(p, SDL_SENSOR_GYRO) && SDL_GamepadHasSensor(p, SDL_SENSOR_ACCEL);
-    if (d->has_motion) {
-        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_GYRO, kMotionSensorRate);
-        SDL_SetGamepadSensorEnabled(p, SDL_SENSOR_ACCEL, kMotionSensorRate);
-    }
-    d->has_trigger_output = d->has_trigger_rumble ||
-                            (d->is_dualsense && s.config.ds_triggers != rt::gameinput::DsTriggerMode::Off);
-    // Force feedback: SDL opens a wheel or a stick as a joystick with a haptic device behind it and never through the
-    // gamepad API, so it is opened from the joystick and closed with the pad. Only what the device really reports is
-    // passed on: no haptic device, no motor, and an effect kind SDL does not list is not offered to a title.
-    d->haptic = haptics().open_joystick(SDL_GetGamepadJoystick(p));
+    d->is_dualsense = is_dualsense;
+    d->has_rumble = has_rumble;
+    d->has_trigger_rumble = has_trigger_rumble;
+    d->has_motion = has_motion;
+    d->has_trigger_output = has_trigger_rumble || (is_dualsense && ds_triggers);
+    d->haptic = haptic;
     d->ff_features = 0;
     d->ff_motor_info = {};
     d->sent_gain = -1;
-    if (d->haptic) {
-        const uint32_t features = haptics().features(d->haptic);
-        if (features) {
-            GameInputForceFeedbackMotorInfo& m = d->ff_motor_info;
-            d->ff_features = features;
-            m.supportedAxes = GameInputFeedbackAxisLinearX;  // the axis a wheel's or a stick's motor acts on
-            m.location = GameInputLocationChassis;
-            m.locationId = 0;
-            m.maxSimultaneousEffects = static_cast<uint32_t>(std::max(1, haptics().max_effects(d->haptic)));
-            m.isConstantEffectSupported = (features & SDL_HAPTIC_CONSTANT) != 0;
-            m.isRampEffectSupported = (features & SDL_HAPTIC_RAMP) != 0;
-            m.isSineWaveEffectSupported = (features & SDL_HAPTIC_SINE) != 0;
-            m.isSquareWaveEffectSupported = (features & SDL_HAPTIC_SQUARE) != 0;
-            m.isTriangleWaveEffectSupported = (features & SDL_HAPTIC_TRIANGLE) != 0;
-            m.isSawtoothUpWaveEffectSupported = (features & SDL_HAPTIC_SAWTOOTHUP) != 0;
-            m.isSawtoothDownWaveEffectSupported = (features & SDL_HAPTIC_SAWTOOTHDOWN) != 0;
-            m.isSpringEffectSupported = (features & SDL_HAPTIC_SPRING) != 0;
-            m.isFrictionEffectSupported = (features & SDL_HAPTIC_FRICTION) != 0;
-            m.isDamperEffectSupported = (features & SDL_HAPTIC_DAMPER) != 0;
-            m.isInertiaEffectSupported = (features & SDL_HAPTIC_INERTIA) != 0;
-        } else {
-            haptics().close(d->haptic);
-            d->haptic = nullptr;
-        }
+    if (haptic) {
+        GameInputForceFeedbackMotorInfo& m = d->ff_motor_info;
+        d->ff_features = ff_features;
+        m.supportedAxes = GameInputFeedbackAxisLinearX;  // the axis a wheel's or a stick's motor acts on
+        m.location = GameInputLocationChassis;
+        m.locationId = 0;
+        m.maxSimultaneousEffects = static_cast<uint32_t>(max_effects);
+        m.isConstantEffectSupported = (ff_features & SDL_HAPTIC_CONSTANT) != 0;
+        m.isRampEffectSupported = (ff_features & SDL_HAPTIC_RAMP) != 0;
+        m.isSineWaveEffectSupported = (ff_features & SDL_HAPTIC_SINE) != 0;
+        m.isSquareWaveEffectSupported = (ff_features & SDL_HAPTIC_SQUARE) != 0;
+        m.isTriangleWaveEffectSupported = (ff_features & SDL_HAPTIC_TRIANGLE) != 0;
+        m.isSawtoothUpWaveEffectSupported = (ff_features & SDL_HAPTIC_SAWTOOTHUP) != 0;
+        m.isSawtoothDownWaveEffectSupported = (ff_features & SDL_HAPTIC_SAWTOOTHDOWN) != 0;
+        m.isSpringEffectSupported = (ff_features & SDL_HAPTIC_SPRING) != 0;
+        m.isFrictionEffectSupported = (ff_features & SDL_HAPTIC_FRICTION) != 0;
+        m.isDamperEffectSupported = (ff_features & SDL_HAPTIC_DAMPER) != 0;
+        m.isInertiaEffectSupported = (ff_features & SDL_HAPTIC_INERTIA) != 0;
     }
     // Haptic motors: the trigger motors, one waveform each. The waveform identifier is this shim's choice, an
     // intensity (HID physical-interface usage 0x0F/0x58), because an intensity is the one thing SDL lets it send.
@@ -1405,19 +1499,8 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     d->motors_sent_at = d->triggers_sent_at = d->battery_at = 0;
     d->wanted = {};
     fill_info(d, p, id);
-    open_raw(d, path);
-
-    // Player LEDs and SDL's default lightbar colour follow the slot: the lowest one not in use.
-    int player = 0;
-    for (bool used = true; used; ++player) {
-        used = false;
-        for (Device* c : s.connected) used |= c->player == player;
-        if (!used) break;
-    }
+    publish_raw(d, std::move(raw));
     d->player = player;
-    SDL_SetGamepadPlayerIndex(p, player);
-    if (s.config.lightbar_set && SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false))
-        SDL_SetGamepadLED(p, s.config.lightbar[0], s.config.lightbar[1], s.config.lightbar[2]);
 
     uint32_t status = kConnectedStatus;
     if (d->info.capabilities & GameInputDeviceCapabilityWireless) status |= GameInputDeviceWireless;
@@ -1435,33 +1518,40 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
                  d->haptic ? ", force feedback" : "");
 }
 
+// The pad is unlinked under g().mu, and its SDL gamepad, HID handle and haptic device are closed after the lock is
+// released (device I/O, see open_pad). Title calls reach those handles only under g().mu (the HID one under hid_mu),
+// so once they are unlinked no title call can use them.
 void close_pad(Device* d, uint64_t ts) {
     State& s = g();
     g_tracker.forget(d->id);  // poll-thread state: a pad that comes back starts from a fresh baseline
-    std::lock_guard lock(s.mu);
-    const uint32_t old = d->status.exchange(GameInputDeviceNoStatus);
-    SDL_CloseGamepad(d->pad);
-    close_raw(d);
-    d->pad = nullptr;
-    d->player = -1;
-    // The haptic device belongs to the joystick, which goes with the gamepad. Effects a title still holds stay alive
-    // and pick up again when the pad comes back.
-    if (d->haptic) {
-        haptics().close(d->haptic);
-        d->haptic = nullptr;
+    SDL_Gamepad* pad;
+    OpenedHid raw;
+    void* haptic;
+    {
+        std::lock_guard lock(s.mu);
+        const uint32_t old = d->status.exchange(GameInputDeviceNoStatus);
+        pad = std::exchange(d->pad, nullptr);
+        raw = detach_raw(d);
+        d->player = -1;
+        // The haptic device belongs to the joystick, which goes with the gamepad. Effects a title still holds stay
+        // alive and pick up again when the pad comes back.
+        haptic = std::exchange(d->haptic, nullptr);
+        d->retired.clear();
+        d->ff_features = 0;
+        d->ff_motor_info = {};
+        d->sent_gain = -1;
+        d->haptic_motors = 0;
+        for (ForceFeedbackEffect* e : d->effects) e->orphan();
+        for (uint32_t m = 0; m < kHapticMotors; ++m) d->haptic_intensity[m] = 0, d->haptic_until[m] = 0;
+        if (!d->history.empty()) d->evicted_order = d->history.back()->order();  // the history ends with the session
+        for (Reading* r : d->history) r->Release();
+        d->history.clear();
+        s.connected.erase(std::remove(s.connected.begin(), s.connected.end(), d), s.connected.end());
+        queue_event({CbType::Device, d, nullptr, ts, GameInputDeviceNoStatus, old, false, 0});
     }
-    d->retired.clear();
-    d->ff_features = 0;
-    d->ff_motor_info = {};
-    d->sent_gain = -1;
-    d->haptic_motors = 0;
-    for (ForceFeedbackEffect* e : d->effects) e->orphan();
-    for (uint32_t m = 0; m < kHapticMotors; ++m) d->haptic_intensity[m] = 0, d->haptic_until[m] = 0;
-    if (!d->history.empty()) d->evicted_order = d->history.back()->order();  // the history ends with the session
-    for (Reading* r : d->history) r->Release();
-    d->history.clear();
-    s.connected.erase(std::remove(s.connected.begin(), s.connected.end(), d), s.connected.end());
-    queue_event({CbType::Device, d, nullptr, ts, GameInputDeviceNoStatus, old, false, 0});
+    if (haptic) haptics().close(haptic);  // before its joystick goes with the gamepad
+    if (raw.h) raw.backend->close(raw.h);
+    SDL_CloseGamepad(pad);
     std::fprintf(stderr, "[rt] gameinput: disconnected %s\n", d->name.c_str());
 }
 
