@@ -101,7 +101,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdDrawMeshTasksIndirectEXT) X(vkCmdDrawMeshTasksIndirectCountEXT)                                    \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)                                                              \
-    X(vkCmdWriteBufferMarkerAMD) X(vkGetDeviceFaultInfoEXT) X(vkGetPipelineCacheData) /* optional: device-lost diagnostics (LEONIDA_DRED) */
+    X(vkCmdWriteBufferMarkerAMD) X(vkGetDeviceFaultInfoEXT) /* optional: device-lost diagnostics (LEONIDA_DRED) */
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
