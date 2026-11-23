@@ -1161,9 +1161,9 @@ int check_xbox_slots() {
     const IID list_iid = __uuidof(ID3D12GraphicsCommandList);
     void* list = nullptr;
     EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list_iid), word(&list))) == S_OK);
-    EXPECT(xs::is_command_list_proxy(list));
-    EXPECT(xs::command_list_proxy_real_list(list) &&
-           reinterpret_cast<Mock*>(xs::command_list_proxy_real_list(list))->kind == Kind::command_list);
+    // The default (#8977) layout: a PC list IID gets the real list; ListProxy is LEONIDA_XS_LIST_LAYOUT=shifted's
+    // (check_console_command_list).
+    EXPECT(list && reinterpret_cast<Mock*>(list)->kind == Kind::command_list);
     EXPECT(mock->calls[73] == 0 && mock->calls[12] == 1 && xs::device_slot_hits(73) == 1);
     EXPECT(mock->args[12][0] == 0 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_DIRECT);
     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);

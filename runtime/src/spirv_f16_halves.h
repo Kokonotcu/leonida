@@ -464,6 +464,25 @@ inline bool link_f16_halves(std::vector<std::uint32_t>& vs_words, const ShaderEn
                 break;
             }
         }
+        // A VS static half the PS does not take still writes its locations: if the PS reads one of them as a raw
+        // input, it would read half bits there, so that pair goes the slow way, which demotes unused halves.
+        if (already_linked) {
+            std::set<std::uint32_t> unused_half_locs;
+            for (const auto& [param, vs_pair] : vs_entry.f16_halves)
+                if (!ps_entry.f16_halves.count(param)) unused_half_locs.insert(vs_pair.begin(), vs_pair.end());
+            if (!unused_half_locs.empty()) {
+                spirv_detail::Module ps_probe;
+                if (!ps_probe.parse(ps_words)) return fail("f16_halves: malformed PS SPIR-V");
+                const auto ps_slots = spirv_detail::interface_var_location_slots(ps_probe, top_location + 1u);
+                for (const auto& [loc, var_id] : spirv_detail::collect_located_vars(ps_probe, spirv_detail::kStorageInput)) {
+                    if (seen_fast_locs.count(loc)) continue;  // a half pair the PS takes, not a raw input
+                    const auto sit = ps_slots.find(var_id);
+                    const std::uint32_t slots = sit != ps_slots.end() ? sit->second : 1u;
+                    for (std::uint32_t s = 0; s < slots && already_linked; ++s)
+                        if (unused_half_locs.count(loc + s)) already_linked = false;
+                }
+            }
+        }
         if (already_linked) return true;
     }
 
