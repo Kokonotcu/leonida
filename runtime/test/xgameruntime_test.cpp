@@ -840,6 +840,8 @@ void check_run_time_load() {
         const GUID package4 = {0x0b9d556e, 0xab70, 0x43f4, {0xba, 0xa0, 0x99, 0x99, 0xac, 0x4c, 0xb0, 0x40}};
         void* pk4 = nullptr;
         check(query(&package_cls, package4, &pk4) == S_OK && pk4 == pk, "IXPackageImpl4 answers with the same object");
+        check(pk4 && reinterpret_cast<Stub>(slot(pk4, 41))(pk4) == E_NOTIMPL,
+              "slot 41 (XPackageGetPackageKind) exists and is E_NOTIMPL, not a read past the vtable");
         if (pk4) release(pk4);
         release(pk);
     }
