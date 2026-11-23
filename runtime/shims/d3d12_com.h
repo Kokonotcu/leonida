@@ -150,6 +150,12 @@ struct VulkanDeviceInfo {
     // them, docs/aot_pipelines.md step 2): graphics PSOs bind shader objects, made from the build's stored driver
     // binaries where they fit, and set their fixed-function state dynamically, so no graphics pipeline is compiled.
     bool shader_objects = false;
+    // VK_EXT_graphics_pipeline_library (with VK_KHR_pipeline_library) and its graphicsPipelineLibrary feature are
+    // enabled, and graphics PSOs are linked from per-shader libraries (docs/aot_pipelines.md step 3; LEONIDA_GPL, on by
+    // default where shader objects are not in use and the device links fast). `gpl_fast_linking`:
+    // graphicsPipelineLibraryFastLinking, which the default needs.
+    bool graphics_pipeline_library = false;
+    bool gpl_fast_linking = false;
     bool tessellation_shader = false;  // tessellationShader enabled: a shader-object draw binds those stages to null
     // Opt in only for shader libraries whose InnerCoverage input contract uses FullyCoveredEXT. The device
     // still checks physical Tier 2 and fullyCoveredFragmentShaderInputVariable properties. The standalone
@@ -375,6 +381,16 @@ struct PipelineCacheStats {
     std::size_t bytes = 0;
 };
 PipelineCacheStats pipeline_cache_stats(ID3D12Device* device);
+// Pipeline libraries (VulkanDeviceInfo::graphics_pipeline_library, docs/aot_pipelines.md step 3): how many shared
+// shader parts the device made and how many of those the pipeline cache answered, and how many PSO pipelines it
+// linked (and how many of those links the cache answered). All 0 on another device. For tests.
+struct PipelineLibraryStats {
+    std::uint32_t parts_made = 0;
+    std::uint32_t parts_cached = 0;
+    std::uint32_t links = 0;
+    std::uint32_t links_cached = 0;
+};
+PipelineLibraryStats pipeline_library_stats(ID3D12Device* device);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be

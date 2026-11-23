@@ -848,6 +848,9 @@ struct GraphicsPipeline {
     // The shaders bind_shaders binds, one per stage the PSO has (generated commands name them,
     // VkGeneratedCommandsShaderInfoEXT); null entries are unused.
     std::array<VkShaderEXT, 4> shader_objects{};
+    // A pipeline linked from pipeline libraries (docs/aot_pipelines.md step 3, src/pso_library.h): sets, after the
+    // pipeline is bound, the state the libraries leave dynamic that a whole pipeline bakes in. Null otherwise.
+    std::function<void(VkCommandBuffer)> set_state;
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -4487,6 +4490,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                       std::uint32_t(d.vertex_strides.size()));
             } else {
                 vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
+                if (graphics.set_state) graphics.set_state(command_buffer);
                 vk.set_viewport(command_buffer, 0, 1, &viewport);
                 vk.set_scissor(command_buffer, 0, 1, &d.scissor);
             }

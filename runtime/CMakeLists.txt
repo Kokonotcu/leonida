@@ -3392,6 +3392,16 @@ if(TARGET Vulkan::Headers)
       add_test(NAME shader_object_draw COMMAND shader_object_draw_test)
       set_tests_properties(shader_object_draw PROPERTIES SKIP_RETURN_CODE 77
                            FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+      # docs/aot_pipelines.md step 3: PSOs linked from pipeline libraries draw the whole pipelines' pixels, and after
+      # --prebuild-shaders a new device makes every shared shader part from the pipeline cache.
+      add_executable(gpl_draw_test test/gpl_draw_test.cpp ${LEONIDA_TEST_VS_DEPTH} ${LEONIDA_TEST_FS_SOLID})
+      target_link_libraries(gpl_draw_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(gpl_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_DEPTH_SPV="${LEONIDA_TEST_VS_DEPTH}"
+                                 LEONIDA_TEST_FS_SOLID_SPV="${LEONIDA_TEST_FS_SOLID}")
+      target_compile_options(gpl_draw_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME gpl_draw COMMAND gpl_draw_test)
+      set_tests_properties(gpl_draw PROPERTIES SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
       # D3D-29: mesh-shader PSOs from pipeline state streams and DispatchMesh (skips without VK_EXT_mesh_shader).
       set(LEONIDA_TEST_MS ${CMAKE_CURRENT_BINARY_DIR}/generated/ms_draw.spv)
