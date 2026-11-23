@@ -301,6 +301,26 @@ int main() {
               aquota == (int64_t{1} << 30) - static_cast<int64_t>(story.size()),
           "GetRemainingQuotaAsync subtracts what the saves hold");
 
+    // ---- Windows device names and a final '.' are ordinary blobs ----
+    check(at<Create>(save, 23)(save, container, nullptr, &update) == S_OK, "an update with device-named blobs");
+    check(at<Write>(save, 25)(save, update, "CON", reinterpret_cast<const uint8_t*>("con"), 3) == S_OK &&
+              at<Write>(save, 25)(save, update, "a.", reinterpret_cast<const uint8_t*>("dot"), 3) == S_OK &&
+              at<Submit>(save, 27)(save, update) == S_OK,
+          "a blob named CON and one named a. commit");
+    at<Close>(save, 24)(save, update);
+    check(std::filesystem::file_size(dir / L"%43ON") == 3 && std::filesystem::file_size(dir / L"a%2E") == 3,
+          "they are files of their own (%43ON, a%2E), never the CON device");
+    {
+        const char* device_names[] = {"CON", "a."};
+        uint32_t device_count = 2;
+        std::vector<uint64_t> device_buffer(64);
+        auto* dout = reinterpret_cast<Blob*>(device_buffer.data());
+        check(at<Read>(save, 20)(save, container, device_names, &device_count, device_buffer.size() * 8, dout) == S_OK &&
+                  device_count == 2 && dout[0].info.size == 3 && std::memcmp(dout[0].data, "con", 3) == 0 &&
+                  dout[1].info.size == 3 && std::memcmp(dout[1].data, "dot", 3) == 0,
+              "and they read back under their own names");
+    }
+
     // ---- delete the container ----
     async = XAsyncBlock{};
     check(at<ByNameAsync>(save, 11)(save, provider, "slots/SAVE_00.sav-1", &async) == S_OK && finished(&async) &&
