@@ -2354,6 +2354,26 @@ The trace will enumerate them.
 - `CreateCommittedResource`: allocate an aligned range in the arena for a buffer, or a separate `VkDeviceMemory`
   for an image; record the initial state. Map `D3D12_HEAP_TYPE_DEFAULT` to device-local memory, `UPLOAD`/`READBACK`
   to separate host-visible buffers. This remains the path for buffers and for any PC-style committed resource.
+- **Resource memory is suballocated** (`runtime/src/vulkan_suballocator.h`, `DeviceState::allocate_resource`).
+  Committed and placed textures, upload and readback buffers, default-heap buffers outside the arena and the
+  `WriteToSubresource`/`ReadFromSubresource` staging buffers take a range of a shared `VkDeviceMemory` block instead
+  of a `vkAllocateMemory` each: the Windows drivers report `maxMemoryAllocationCount` = 4096, far fewer than the
+  resources a game makes, and each allocation is slow. A pool is one memory type, images or buffers (images never
+  share a block with buffers, so `bufferImageGranularity` never applies), with or without
+  `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT`, mapped or not; a mapped block is mapped once, whole, and a buffer's
+  pointer is the block's plus its offset. A pool's first block is 64 MiB and each new one doubles the largest it
+  has, up to 256 MiB (1/16 of a smaller heap, such as the 256 MiB BAR window, and never above
+  `maxMemoryAllocationSize`). Ranges are taken best fit and merge with free neighbours when freed; an empty block is
+  freed unless it is its pool's one spare. A resource larger than half the largest block, or one whose
+  `VkMemoryDedicatedRequirements` prefers or requires it, keeps its own allocation (with
+  `VkMemoryDedicatedAllocateInfo`). Memory types are tried in `memory_type_order`, as before, and the spill to
+  system memory is logged the same way. A range goes back to its block through the deletion queue
+  (`DeferredDeletionQueue::Kind::release`) at the point where the memory used to be freed, after the resource's image
+  or buffer, so no range the GPU may still read is handed out again. `LEONIDA_SUBALLOCATE=0` gives every resource
+  its own allocation, to compare. `suballocator_test` checks the bookkeeping without a GPU; `d3d12_suballocation_test`
+  counts the layer's `vkAllocateMemory` calls for 6000 textures, 2000 upload buffers and 256 CPU-visible textures,
+  holding live allocations to `maxMemoryAllocationCount` as a driver may. Not suballocated: the GPU address arena,
+  heaps and their sparse tile backing (`TileHeapAllocation`), the copy and D24 scratch buffers, and the swapchain.
 - `ID3D12Resource::GetDesc` returns the description with its defaults filled in, as the PC runtime does: `MipLevels`
   0 becomes the full chain, and `Alignment` 0 becomes the placement alignment, 64 KiB, or 4 MiB for a multisampled
   texture (an alignment the description asked for is kept). **Implemented** and compared field by field with the

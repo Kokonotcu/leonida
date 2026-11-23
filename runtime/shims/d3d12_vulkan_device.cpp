@@ -25,6 +25,7 @@
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
+#include "../src/vulkan_suballocator.h"
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
 #include "../src/conservative_raster.h"
@@ -684,7 +685,14 @@ struct DeviceState {
     PFN_vkGetPhysicalDeviceImageFormatProperties image_format_properties = nullptr;
     PFN_vkGetPhysicalDeviceImageFormatProperties2 image_format_properties2 = nullptr;
     PFN_vkGetDeviceImageMemoryRequirements image_requirements = nullptr;  // Vulkan 1.3 or VK_KHR_maintenance4
-    LUID luid{};       // VkPhysicalDeviceIDProperties::deviceLUID; zero when the driver reports none
+    // Vulkan 1.1 or VK_KHR_get_memory_requirements2: what VkMemoryDedicatedRequirements says about a resource.
+    PFN_vkGetImageMemoryRequirements2 image_requirements2 = nullptr;
+    PFN_vkGetBufferMemoryRequirements2 buffer_requirements2 = nullptr;
+    // Committed resources' memory comes from shared blocks (allocate_resource); LEONIDA_SUBALLOCATE=0 gives every
+    // resource its own vkAllocateMemory again, to compare.
+    leonida::Suballocator suballocator;
+    bool suballocate = true;
+    LUID luid{};     // VkPhysicalDeviceIDProperties::deviceLUID; zero when the driver reports none
     // An integrated GPU (VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU): D3D12_FEATURE_ARCHITECTURE answers UMA, the custom
     // heap equivalents are in MEMORY_POOL_L0 and custom heaps in L1 are refused, as the host runtime does there.
     bool uma = false;
@@ -1678,31 +1686,178 @@ struct DeviceState {
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr,
                             bool device_address = false, std::uint32_t* chosen_type = nullptr) const {
-        VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
-        flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         for (const std::uint32_t i :
              leonida::memory_type_order(memory, requirements.memoryTypeBits, required, preferred, requirements.size)) {
-            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            if (device_address) allocate.pNext = &flags_info;
-            allocate.allocationSize = requirements.size;
-            allocate.memoryTypeIndex = i;
-            VkDeviceMemory out = VK_NULL_HANDLE;
-            if (context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS) {
+            if (const VkDeviceMemory out = allocate_type(i, requirements.size, device_address, nullptr)) {
                 if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
                 if (chosen_type) *chosen_type = i;
-                if (leonida::spilled_to_host(required, preferred, memory.memoryTypes[i].propertyFlags))
-                    std::call_once(spill_logged, [&] {
-                        const std::uint32_t heap = memory.memoryTypes[i].heapIndex;
-                        std::fprintf(stderr,
-                                     "[rt] d3d12: a %llu-byte allocation did not fit in device-local memory and went "
-                                     "to memory type %u (heap %u, %llu MiB); later ones are not logged\n",
-                                     static_cast<unsigned long long>(requirements.size), i, heap,
-                                     static_cast<unsigned long long>(memory.memoryHeaps[heap].size >> 20));
-                    });
+                note_spill(required, preferred, i, requirements.size);
                 return out;
             }
         }
         return VK_NULL_HANDLE;
+    }
+
+    // One vkAllocateMemory of `type`; `next` chains a VkMemoryDedicatedAllocateInfo.
+    VkDeviceMemory allocate_type(std::uint32_t type, VkDeviceSize size, bool device_address, const void* next) const {
+        VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, next};
+        flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        allocate.pNext = device_address ? &flags_info : next;
+        allocate.allocationSize = size;
+        allocate.memoryTypeIndex = type;
+        VkDeviceMemory out = VK_NULL_HANDLE;
+        return context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS ? out : VK_NULL_HANDLE;
+    }
+
+    void note_spill(VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred, std::uint32_t type,
+                    VkDeviceSize size) const {
+        if (!leonida::spilled_to_host(required, preferred, memory.memoryTypes[type].propertyFlags)) return;
+        std::call_once(spill_logged, [&] {
+            const std::uint32_t heap = memory.memoryTypes[type].heapIndex;
+            std::fprintf(stderr,
+                         "[rt] d3d12: a %llu-byte allocation did not fit in device-local memory and went "
+                         "to memory type %u (heap %u, %llu MiB); later ones are not logged\n",
+                         static_cast<unsigned long long>(size), type, heap,
+                         static_cast<unsigned long long>(memory.memoryHeaps[heap].size >> 20));
+        });
+    }
+
+    // The memory behind a committed resource (vulkan_suballocator.h): a range of a block shared with resources of
+    // the same memory type, class (image or buffer) and flags, or, for one larger than half a block, one the driver
+    // asks a dedicated allocation for, or with LEONIDA_SUBALLOCATE=0, an allocation of its own. Memory types are
+    // tried in leonida::memory_type_order as allocate() tries them. Mapped memory (`map`, for upload and readback
+    // buffers and staging) is mapped once per block; `mapped` is the range's own pointer.
+    struct MemoryNode final : leonida::DeferredRelease {
+        DeviceState* device = nullptr;
+        leonida::Suballocator::Allocation allocation;
+    };
+    struct MemoryRange {
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        void* mapped = nullptr;
+        MemoryNode* node = nullptr;  // null: the memory is the resource's own
+        explicit operator bool() const { return memory != VK_NULL_HANDLE; }
+    };
+
+    MemoryRange allocate_resource(VkImage image, VkBuffer buffer, VkMemoryPropertyFlags required,
+                                  VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen, bool device_address,
+                                  bool map) {
+        auto& vk = context->vk;
+        VkMemoryDedicatedRequirements dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
+        VkMemoryRequirements2 requirements2{VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dedicated};
+        const bool query2 = suballocate && (image ? image_requirements2 != nullptr : buffer_requirements2 != nullptr);
+        if (query2 && image) {
+            VkImageMemoryRequirementsInfo2 query{VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2};
+            query.image = image;
+            image_requirements2(info.device, &query, &requirements2);
+        } else if (query2) {
+            VkBufferMemoryRequirementsInfo2 query{VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2};
+            query.buffer = buffer;
+            buffer_requirements2(info.device, &query, &requirements2);
+        } else if (image) {
+            vk.vkGetImageMemoryRequirements(info.device, image, &requirements2.memoryRequirements);
+        } else {
+            vk.vkGetBufferMemoryRequirements(info.device, buffer, &requirements2.memoryRequirements);
+        }
+        const VkMemoryRequirements& requirements = requirements2.memoryRequirements;
+        MemoryRange out;
+        const auto map_own = [&](MemoryRange& range) {
+            if (map && vk.vkMapMemory(info.device, range.memory, 0, VK_WHOLE_SIZE, 0, &range.mapped) != VK_SUCCESS) {
+                vk.vkFreeMemory(info.device, range.memory, nullptr);
+                range = {};
+            }
+        };
+        if (!suballocate) {
+            out.memory = allocate(requirements, required, preferred, chosen, device_address);
+            if (out.memory) map_own(out);
+            return out;
+        }
+        const bool driver_asks = dedicated.prefersDedicatedAllocation || dedicated.requiresDedicatedAllocation;
+        VkMemoryDedicatedAllocateInfo dedicated_info{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+        dedicated_info.image = image;
+        dedicated_info.buffer = image ? VK_NULL_HANDLE : buffer;
+        for (const std::uint32_t type :
+             leonida::memory_type_order(memory, requirements.memoryTypeBits, required, preferred, requirements.size)) {
+            const VkMemoryPropertyFlags flags = memory.memoryTypes[type].propertyFlags;
+            const auto sizes = leonida::suballoc_block_sizes(memory.memoryHeaps[memory.memoryTypes[type].heapIndex].size,
+                                                             info.max_memory_allocation_size);
+            if (leonida::suballoc_dedicated(requirements.size, sizes, driver_asks)) {
+                out.memory = allocate_type(type, requirements.size, device_address, query2 ? &dedicated_info : nullptr);
+                if (!out.memory) continue;
+                map_own(out);
+                if (!out.memory) return out;
+            } else {
+                const leonida::SuballocPool pool{type, image != VK_NULL_HANDLE, device_address,
+                                                 map && (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)};
+                leonida::Suballocator::Allocation range;
+                if (!suballocator.allocate(pool, requirements.size, requirements.alignment, range)) {
+                    // A new block, halved while the driver refuses it and half still holds the resource.
+                    VkDeviceSize block = suballocator.next_block_size(pool, sizes, requirements.size);
+                    VkDeviceMemory memory_block = VK_NULL_HANDLE;
+                    while (!(memory_block = allocate_type(type, block, device_address, nullptr)) &&
+                           block / 2 >= requirements.size && block / 2 >= leonida::kSuballocMiB)
+                        block /= 2;
+                    if (!memory_block) continue;
+                    void* base = nullptr;
+                    if (pool.mapped &&
+                        vk.vkMapMemory(info.device, memory_block, 0, VK_WHOLE_SIZE, 0, &base) != VK_SUCCESS) {
+                        vk.vkFreeMemory(info.device, memory_block, nullptr);
+                        return out;
+                    }
+                    range = suballocator.add_block(pool, memory_handle(memory_block), base, block, requirements.size);
+                }
+                auto* node = new MemoryNode;
+                node->release = [](leonida::DeferredRelease* self) {
+                    auto* own = static_cast<MemoryNode*>(self);
+                    own->device->free_node(own);
+                };
+                node->device = this;
+                node->allocation = range;
+                out.memory = memory_handle(range.memory);
+                out.offset = range.offset;
+                out.mapped = range.mapped;
+                out.node = node;
+            }
+            if (chosen) *chosen = flags;
+            note_spill(required, preferred, type, requirements.size);
+            return out;
+        }
+        return out;
+    }
+
+    // Gives a resource's memory back once the GPU is done with it: after the submissions so far (the deletion
+    // queue, where its image or buffer goes too), or at once when `now` (nothing submitted can still use it).
+    void release_resource(const MemoryRange& range, bool now = false) {
+        if (!range) return;
+        if (!range.node) {
+            if (now) context->vk.vkFreeMemory(info.device, range.memory, nullptr);
+            else context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, range.memory);
+        } else if (now) {
+            free_node(range.node);
+        } else {
+            context->defer_destroy(leonida::DeferredDeletionQueue::Kind::release,
+                                   static_cast<leonida::DeferredRelease*>(range.node));
+        }
+    }
+
+    void free_node(MemoryNode* node) {
+        if (const std::uint64_t block = suballocator.free(node->allocation))
+            context->vk.vkFreeMemory(info.device, memory_handle(block), nullptr);  // unmaps it
+        delete node;
+    }
+
+    // The device's teardown, after the deletion queue has run: the blocks left are the pools' spares.
+    void release_blocks() {
+        for (const std::uint64_t block : suballocator.release_all())
+            context->vk.vkFreeMemory(info.device, memory_handle(block), nullptr);
+    }
+
+    static std::uint64_t memory_handle(VkDeviceMemory memory) {
+        return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(memory));
+    }
+    static VkDeviceMemory memory_handle(std::uint64_t memory) {
+        return reinterpret_cast<VkDeviceMemory>(static_cast<std::uintptr_t>(memory));
     }
 };
 
@@ -2113,7 +2268,7 @@ public:
         if (image_ && !sparse_image_)
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
         if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
-        if (memory_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, memory_);
+        device_.release_resource(memory_);  // after the image or buffer, once the GPU is done with both
     }
 
     leonida::ResourceId id() const { return resource_id(this); }
@@ -2203,20 +2358,20 @@ public:
         }
         device_.share(info);
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
-        VkMemoryRequirements requirements{};
-        vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
         // Readback buffers prefer cached memory, which the CPU reads quickly. Upload buffers prefer VRAM the CPU
         // writes through Resizable BAR, where the GPU reads them quickly (D3D-96); without it, system memory.
         VkMemoryPropertyFlags host_preferred = 0;
         if (heap_.Type == D3D12_HEAP_TYPE_READBACK) host_preferred = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
         if (heap_.Type == D3D12_HEAP_TYPE_UPLOAD && device_.upload_in_vram)
             host_preferred = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-        memory_ = host ? device_.allocate(requirements,
-                                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                          host_preferred, &memory_flags_, addressable || need_bda)
-                       : device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_,
-                                          addressable || need_bda);
-        if (!memory_ || vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS)
+        memory_ = host ? device_.allocate_resource(VK_NULL_HANDLE, buffer_,
+                                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                                   host_preferred, &memory_flags_, addressable || need_bda, true)
+                       : device_.allocate_resource(VK_NULL_HANDLE, buffer_, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                   &memory_flags_, addressable || need_bda, false);
+        if (!memory_ ||
+            vk.vkBindBufferMemory(device_.info.device, buffer_, memory_.memory, memory_.offset) != VK_SUCCESS)
             return E_OUTOFMEMORY;
         if (addressable) {
             VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -2226,8 +2381,8 @@ public:
                            desc_.Width);
         }
         if (host) {
-            if (vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &mapped_) != VK_SUCCESS)
-                return E_OUTOFMEMORY;
+            mapped_ = memory_.mapped;  // mapped once with its block (DeviceState::allocate_resource)
+            if (!mapped_) return E_OUTOFMEMORY;
             std::memset(mapped_, 0, std::size_t(desc_.Width));  // committed resources start zeroed
         }
         if (need_bda && vk.vkGetBufferDeviceAddress) {
@@ -2434,10 +2589,10 @@ public:
             }
             return E_OUTOFMEMORY;
         }
-        VkMemoryRequirements requirements{};
-        vk.vkGetImageMemoryRequirements(device_.info.device, image_, &requirements);
-        memory_ = device_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_);
-        if (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_, 0) != VK_SUCCESS)
+        memory_ = device_.allocate_resource(image_, VK_NULL_HANDLE, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                            &memory_flags_, false, false);
+        if (!memory_ ||
+            vk.vkBindImageMemory(device_.info.device, image_, memory_.memory, memory_.offset) != VK_SUCCESS)
             return E_OUTOFMEMORY;
 
         leonida::ResourceBinding binding{};
@@ -2728,19 +2883,24 @@ private:
         info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;  // storage: D24 depth conversion
         device_.share(info);
         if (vk.vkCreateBuffer(dev, &info, nullptr, &staging.buffer) != VK_SUCCESS) return E_OUTOFMEMORY;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        void* mapped = nullptr;
-        const auto release = [&](HRESULT hr) {
-            if (memory) vk.vkFreeMemory(dev, memory, nullptr);  // unmaps it
-            vk.vkDestroyBuffer(dev, staging.buffer, nullptr);
+        DeviceState::MemoryRange memory;
+        // At once when the copy was waited for or never submitted; after the submissions so far when a submitted
+        // copy failed, since its range of a shared block may be handed out again at once.
+        const auto release = [&](HRESULT hr, bool submitted = false) {
+            if (submitted) {
+                device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, staging.buffer);
+            } else {
+                vk.vkDestroyBuffer(dev, staging.buffer, nullptr);
+            }
+            device_.release_resource(memory, !submitted);
             return hr;
         };
-        VkMemoryRequirements requirements{};
-        vk.vkGetBufferMemoryRequirements(dev, staging.buffer, &requirements);
-        memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-                                  write ? 0 : VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-        if (!memory || vk.vkBindBufferMemory(dev, staging.buffer, memory, 0) != VK_SUCCESS ||
-            vk.vkMapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS)
+        memory = device_.allocate_resource(VK_NULL_HANDLE, staging.buffer,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                           write ? 0 : VK_MEMORY_PROPERTY_HOST_CACHED_BIT, nullptr, false, true);
+        void* const mapped = memory.mapped;
+        if (!memory || !mapped ||
+            vk.vkBindBufferMemory(dev, staging.buffer, memory.memory, memory.offset) != VK_SUCCESS)
             return release(E_OUTOFMEMORY);
         if (write) pack(static_cast<std::byte*>(mapped), pitch);
 
@@ -2778,7 +2938,7 @@ private:
         device_.context->remove_resource(staging_id);
         if (result != leonida::ReplayResult::success) {
             log_once("WriteToSubresource/ReadFromSubresource staging copy failed; replay result", int(result));
-            return release(E_FAIL);
+            return release(E_FAIL, true);
         }
         if (!write) unpack(static_cast<const std::byte*>(mapped), pitch);
         return release(S_OK);
@@ -2805,7 +2965,7 @@ private:
     D3D12_HEAP_FLAGS heap_flags_;
     VkImage image_ = VK_NULL_HANDLE;
     VkBuffer buffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory memory_ = VK_NULL_HANDLE;
+    DeviceState::MemoryRange memory_;  // a range of a shared block, or the resource's own allocation
     VkMemoryPropertyFlags memory_flags_ = 0;
     VkAccelerationStructureKHR accel_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
@@ -2976,8 +3136,9 @@ bool equal_semantic(const std::string& a, const char* b) {
     return true;
 }
 // A heap (section 3.3): a range of the GPU address arena, as large as the game asked for, so a placed buffer can
-// name any 64 KiB-aligned offset in it. Textures placed in it still get their own VkDeviceMemory; the offset is only
-// their key, which keeps optimal-tiling images out of the arena's memory type.
+// name any 64 KiB-aligned offset in it. Textures placed in it still get memory apart from it, a range of a
+// suballocator block as a committed texture does; the offset is only their key, which keeps optimal-tiling images out
+// of the arena's memory type.
 class Heap final
     : public Child<Heap, ID3D12Heap1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Heap,
                    ID3D12Heap1> {
@@ -5352,6 +5513,17 @@ public:
             if (!state_.image_requirements)
                 state_.image_requirements =
                     reinterpret_cast<PFN_vkGetDeviceImageMemoryRequirements>(get_device(info.device, name));
+        state_.image_requirements2 = reinterpret_cast<PFN_vkGetImageMemoryRequirements2>(
+            leonida::device_proc_or_khr(get_device, info.device, "vkGetImageMemoryRequirements2"));
+        state_.buffer_requirements2 = reinterpret_cast<PFN_vkGetBufferMemoryRequirements2>(
+            leonida::device_proc_or_khr(get_device, info.device, "vkGetBufferMemoryRequirements2"));
+        {
+            char text[4] = {};
+            size_t length = 0;
+            state_.suballocate = !(getenv_s(&length, text, "LEONIDA_SUBALLOCATE") == 0 && length > 1 && text[0] == '0');
+            if (!state_.suballocate)
+                std::fprintf(stderr, "[rt] d3d12: every resource gets its own memory allocation (LEONIDA_SUBALLOCATE=0)\n");
+        }
 
         if (info.physical && info.get_instance_proc) {
             const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
@@ -5766,6 +5938,7 @@ public:
                 state_.context->vk.vkDeviceWaitIdle(state_.info.device);
             }
             state_.context->drain_deleted_resources(UINT64_MAX);
+            state_.release_blocks();  // every resource's range came back in the drain; the spares are left
             state_.context->set_bindless_release(nullptr, nullptr);
             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
         }
