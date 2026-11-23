@@ -525,6 +525,15 @@ int main() {
         const bool reference_ok = live ? SUCCEEDED(warp[i]) : c.warp_ok;
         const bool layer_ok = SUCCEEDED(layer[i]);
         const bool want_layer_ok = c.known == Known::match ? reference_ok : !reference_ok;
+        // A known difference that this host's WARP does not show: the WARP here answers unlike the measured column
+        // (an older runtime: Windows 10's WARP refuses the unaligned copies a newer one takes) and the layer agrees
+        // with it. That is the host, not a change in the layer, so it is reported and not failed.
+        if (c.known != Known::match && live && SUCCEEDED(warp[i]) != c.warp_ok && layer_ok == reference_ok) {
+            std::printf("  this host's WARP agrees with the layer here; the known difference is against the measured "
+                        "column\n");
+            ++matched;
+            continue;
+        }
         if (layer_ok != want_layer_ok) {
             if (c.known == Known::match)
                 std::fprintf(stderr, "FAIL %s: layer Close %s, WARP %s\n", c.name, text(layer[i]).c_str(),

@@ -337,7 +337,30 @@ bool check_tracking_lifetime_and_direct_indexing(DeviceHeaps& ours) {
     const auto di_flags = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED |
                           D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED;
     rs_desc.Desc_1_0 = {1, &p, 0, nullptr, di_flags};
-    const auto blob = d3d12test::serialize_root_signature(rs_desc);
+    auto blob = d3d12test::serialize_root_signature(rs_desc);
+    if (blob.empty()) {
+        // The in-box serializer of Windows 10 (d3d12.dll before the SM 6.6 flags) refuses the two flags. Serialize
+        // the same description without them and set them in the RTS0 header (u32 flags at payload offset 20); the
+        // container checksum is cleared, as a hand-built container has none.
+        rs_desc.Desc_1_0.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+        blob = d3d12test::serialize_root_signature(rs_desc);
+        CHECK(blob.size() >= 32 && std::memcmp(blob.data(), "DXBC", 4) == 0);
+        std::uint32_t chunks = 0;
+        std::memcpy(&chunks, blob.data() + 28, 4);
+        bool patched = false;
+        for (std::uint32_t i = 0; i < chunks && 32 + 4 * i + 4 <= blob.size(); ++i) {
+            std::uint32_t offset = 0;
+            std::memcpy(&offset, blob.data() + 32 + 4 * i, 4);
+            if (offset + 8 + 24 > blob.size() || std::memcmp(blob.data() + offset, "RTS0", 4) != 0) continue;
+            const std::uint32_t flags = di_flags;
+            std::memcpy(blob.data() + offset + 8 + 20, &flags, 4);
+            patched = true;
+        }
+        CHECK(patched);
+        std::memset(blob.data() + 4, 0, 16);
+        std::puts("note: the host serializer refuses the directly-indexed root-signature flags (Windows 10 in-box "
+                  "d3d12.dll); the flags were set in the RTS0 header of a blob serialized without them");
+    }
     CHECK(!blob.empty());
     Ptr<ID3D12RootSignature> root;
     CHECK(SUCCEEDED(ours.device->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p))));

@@ -41,7 +41,19 @@ struct HostContext {
     D3D12_SHADER_BYTECODE ps_unorm{};
     D3D12_SHADER_BYTECODE ps_uint{};
     D3D12_SHADER_BYTECODE cs{};
+    UINT dynamic_flags = 0;  // DYNAMIC_DEPTH_BIAS / DYNAMIC_INDEX_BUFFER_STRIP_CUT, when the host supports them
 };
+
+// A case with a dynamic-state flag the host does not support is not compared with that host (it refuses the flag
+// whatever the layer does); said once per case and host.
+bool host_lacks_flags(const HostContext& hc, UINT flags, const char* label) {
+    constexpr UINT dynamic = D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS |
+                             D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT;
+    if (!(flags & dynamic & ~hc.dynamic_flags)) return false;
+    std::printf("note [%s]: host %s does not support the flag (older runtime or driver); not compared\n", label,
+                hc.name.c_str());
+    return true;
+}
 
 bool compile_hlsl(pD3DCompile compile, const char* src, const char* profile, Ref<ID3DBlob>& out) {
     Ref<ID3DBlob> err;
@@ -172,6 +184,18 @@ int main() {
                         hc->ps_unorm = {hlsl_ps_unorm->GetBufferPointer(), hlsl_ps_unorm->GetBufferSize()};
                         hc->ps_uint = {hlsl_ps_uint->GetBufferPointer(), hlsl_ps_uint->GetBufferSize()};
                         hc->cs = {hlsl_cs->GetBufferPointer(), hlsl_cs->GetBufferSize()};
+                        // The dynamic-state PSO flags the host takes: an older runtime (Windows 10's in-box
+                        // d3d12.dll) knows neither D3D12_OPTIONS15 nor OPTIONS16 and refuses both flags.
+                        D3D12_FEATURE_DATA_D3D12_OPTIONS15 options15{};
+                        if (SUCCEEDED(hc->device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS15, &options15,
+                                                                      sizeof(options15))) &&
+                            options15.DynamicIndexBufferStripCutSupported)
+                            hc->dynamic_flags |= D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT;
+                        D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16{};
+                        if (SUCCEEDED(hc->device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, &options16,
+                                                                      sizeof(options16))) &&
+                            options16.DynamicDepthBiasSupported)
+                            hc->dynamic_flags |= D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS;
                         hosts.push_back(std::move(hc));
                     }
                 }
@@ -223,6 +247,7 @@ int main() {
                                   use_uint_ps ? hc.ps_uint : hc.ps_unorm);
             if (use_uint_ps) hdesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UINT;
             mutator(hdesc);
+            if (host_lacks_flags(hc, UINT(hdesc.Flags), label)) continue;
             const HRESULT hhr = create_graphics(hc.device.p, hdesc);
             if (hhr != actual) {
                 std::fprintf(stderr, "FAIL [%s]: layer 0x%08lx != host %s 0x%08lx\n", label,
@@ -265,6 +290,7 @@ int main() {
             hdesc.pRootSignature = hc.root.p;
             hdesc.CS = hc.cs;
             mutator(hdesc);
+            if (host_lacks_flags(hc, UINT(hdesc.Flags), label)) continue;
             const HRESULT hhr = create_compute(hc.device.p, hdesc);
             if (hhr != actual) {
                 std::fprintf(stderr, "FAIL [%s]: layer 0x%08lx != host %s 0x%08lx\n", label,

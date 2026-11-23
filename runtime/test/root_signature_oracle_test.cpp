@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #include "root_signature.h"
@@ -357,8 +358,36 @@ int main() {
     {
         Blobs out;
         RootSignature got;
-        if (serialize_desc(flagged11, out, "1.1 with every root-signature flag") &&
-            parse_checked(out.blob, "1.1 with every root-signature flag", got)) {
+        bool serialized = false;
+        // The in-box serializer of Windows 10 predates the heap-direct (SM 6.6) bits and refuses them. Then the same
+        // signature is serialized without flags and the whole word is set in the RTS0 header (u32 at payload offset
+        // 20), so the parser is still checked on the full word; the note says which path ran.
+        if (D3D12SerializeVersionedRootSignature(&flagged11, &out.blob, &out.error) == S_OK) {
+            serialized = true;
+        } else {
+            if (out.error) out.error->Release();
+            out.error = nullptr;
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC unflagged = flagged11;
+            unflagged.Desc_1_1.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+            if (serialize_desc(unflagged, out, "1.1 with no flags (to carry every flag)")) {
+                auto* bytes = static_cast<uint8_t*>(out.blob->GetBufferPointer());
+                const size_t size = out.blob->GetBufferSize();
+                uint32_t chunks = 0;
+                if (size >= 32 && std::memcmp(bytes, "DXBC", 4) == 0) std::memcpy(&chunks, bytes + 28, 4);
+                for (uint32_t i = 0; i < chunks && 32 + 4 * size_t(i) + 4 <= size; ++i) {
+                    uint32_t offset = 0;
+                    std::memcpy(&offset, bytes + 32 + 4 * size_t(i), 4);
+                    if (size_t(offset) + 8 + 24 > size || std::memcmp(bytes + offset, "RTS0", 4) != 0) continue;
+                    std::memcpy(bytes + offset + 8 + 20, &every_pc_flag, 4);
+                    std::memset(bytes + 4, 0, 16);  // the checksum no longer holds; a hand-built container has none
+                    serialized = true;
+                }
+                check_named(serialized, "1.1 with every root-signature flag", "the serialized blob has an RTS0 chunk");
+                std::printf("note: this host's serializer refuses the heap-direct root-signature flags (Windows 10 "
+                            "in-box d3d12.dll); every flag was set in the RTS0 header of an unflagged blob\n");
+            }
+        }
+        if (serialized && parse_checked(out.blob, "1.1 with every root-signature flag", got)) {
             check_named(got.flags == every_pc_flag, "1.1 with every root-signature flag",
                         "the whole PC flag word round-trips (heap-direct bits included)");
             const std::vector<uint8_t> bytes = encode_canonical(got);

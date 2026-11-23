@@ -166,6 +166,21 @@ int run_host(IDXGIAdapter1* adapter, const char* label, bool on) {
         std::printf("%s: no D3D12 device, skipped\n", label);
         return 77;
     }
+    // ID3D12DeviceRemovedExtendedData2 (DRED 1.2, GetDeviceState) arrived with Windows build 20348; the in-box
+    // runtime of Windows 10 (19041-19045) answers only DRED and DRED1. The host is then no reference for the layer's
+    // three interfaces, so it is skipped and says so; the two older ones must still be there.
+    Ref<ID3D12DeviceRemovedExtendedData2> d2;
+    const HRESULT has_d2 = device->QueryInterface(IID_PPV_ARGS(&d2.p));
+    if (has_d2 == E_NOINTERFACE) {
+        Ref<ID3D12DeviceRemovedExtendedData> d0;
+        Ref<ID3D12DeviceRemovedExtendedData1> d1;
+        EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&d0.p))));
+        EXPECT(SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&d1.p))));
+        std::printf("%s: SKIP, this D3D12 runtime has no ID3D12DeviceRemovedExtendedData2 (DRED 1.2 needs Windows "
+                    "build 20348 or later); the host comparison did not run\n", label);
+        return 77;
+    }
+    d2.reset();
     return check_device(label, device.p, on, true);
 }
 

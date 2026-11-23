@@ -467,8 +467,9 @@ int part_c(vktest::Device& d) {
     return 0;
 }
 
-// Part D: every D3D12 sync bit against every access bit, as global, buffer and texture barriers. Whatever pair the
-// application names, the Vulkan barrier must be valid, so every access has a stage in its scope that can perform it
+// Part D: every D3D12 sync bit against every access bit, as global, buffer and texture barriers. The list refuses
+// the pairs D3D12 refuses; for every pair it keeps, the Vulkan barrier must be valid, so every access has a stage in
+// its scope that can perform it
 // (vulkan_barrier_scope). Under LEONIDA_VK_VALIDATION=1 a pair that breaks that rule is a validation error. The
 // image is simultaneous-access, so it stays in GENERAL, which every access may use: only the stage/access rule is
 // under test.
@@ -515,16 +516,29 @@ int part_d(vktest::Device& d) {
                                       a::raytracing_acceleration_structure_write, a::shading_rate_source,
                                       a::video_decode_read, a::no_access};
     const BarrierSubresourceRange all{all_subresources, 0, 0, 0, 0, 0};
+    // The list refuses a pair D3D12 itself refuses (an access no stage of the sync scope performs; the PC runtime's
+    // Close then fails, d3d12_barrier_validation_test), and the three barrier kinds agree. ALL takes every access,
+    // COMMON and NO_ACCESS go with every sync, and every access has a narrower sync that takes it. Every pair the
+    // list keeps is replayed, so each has to make a valid Vulkan barrier.
     CommandList list;
-    unsigned pairs = 0;
+    unsigned pairs = 0, refused = 0;
+    std::uint32_t narrow_accesses = 0;  // the accesses some sync other than ALL accepted
     for (const std::uint32_t sync : syncs) {
         for (const std::uint32_t access : accesses) {
-            EXPECT(list.barrier(GlobalBarrier{sync, sync, access, access}));
-            EXPECT(list.barrier(BufferBarrier{sync, sync, access, access, buffer_id}));
-            EXPECT(list.barrier(TextureBarrier{sync, sync, access, access, l::common, l::common, image_id, all, 0}));
-            ++pairs;
+            const bool kept = list.barrier(GlobalBarrier{sync, sync, access, access});
+            EXPECT(list.barrier(BufferBarrier{sync, sync, access, access, buffer_id}) == kept);
+            EXPECT(list.barrier(TextureBarrier{sync, sync, access, access, l::common, l::common, image_id, all, 0}) ==
+                   kept);
+            if (sync == y::all || access == a::common || access == a::no_access) EXPECT(kept);
+            if (kept && sync != y::all) narrow_accesses |= access == a::common ? 0u : access;
+            pairs += kept;
+            refused += !kept;
         }
     }
+    std::uint32_t all_accesses = 0;
+    for (const std::uint32_t access : accesses) all_accesses |= access;
+    EXPECT(narrow_accesses == all_accesses);
+    EXPECT(!list.barrier(GlobalBarrier{y::copy, y::copy, a::render_target, a::render_target}) && refused > 0);
     EXPECT(list.close());
     const unsigned errors_before = d.validation_errors();
     const bool ok = d.run([&](VkCommandBuffer cb) {
@@ -533,7 +547,8 @@ int part_d(vktest::Device& d) {
     });
     EXPECT(ok);
     const unsigned errors = d.validation_errors() - errors_before;
-    std::printf("D: %u sync/access pairs as global, buffer and texture barriers%s\n", pairs,
+    std::printf("D: %u valid sync/access pairs as global, buffer and texture barriers (%u refused as on D3D12)%s\n",
+                pairs, refused,
                 d.validation ? (errors ? ": validation errors" : ", no validation errors") : " (validation off)");
     return 0;
 }

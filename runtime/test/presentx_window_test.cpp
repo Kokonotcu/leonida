@@ -211,6 +211,13 @@ bool make_texture(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Command
 }  // namespace
 
 int main() {
+    // The host d3d12.dll stays loaded for the whole process, as it does in the runtime (d3d12_xs.cpp never frees it).
+    // This test does not import it, and a driver that presents a windowed Vulkan swapchain through DXGI (NVIDIA) loads
+    // it for the swapchain and frees it at teardown while D3D12Core.dll's worker threads still read it: an access
+    // violation in D3D12Core.dll on an address of the unloaded d3d12.dll, in roughly one run in four on an RTX 3080
+    // Laptop with driver 617.42 (Windows 10). Holding a reference of our own keeps it mapped.
+    LoadLibraryExW(L"d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+
     vktest::Device vk;
     if (!vk.create(true)) {
         std::printf("presentx_window: no Vulkan device with presentation: skipped\n");
@@ -243,12 +250,14 @@ int main() {
     info.queue_family = vk.family;
     info.presentation = true;
     info.swapchain_maintenance1 = vk.swapchain_maintenance1;
-    Ref<ID3D12Device> inner;
-    EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner.p))));
+    // create_device_proxy takes the layer device's only reference: the proxy releases it with its own last
+    // reference, so `inner` is a borrowed pointer and is never released here.
+    ID3D12Device* inner = nullptr;
+    EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
     Ref<ID3D12Device> device;
-    EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner.p, __uuidof(ID3D12Device),
+    EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
                                                        reinterpret_cast<void**>(&device.p))));
-    rt::d3d12::set_device_outer(inner.p, device.p);
+    rt::d3d12::set_device_outer(inner, device.p);
 
     rt::d3d12_xs::set_xbox_presentation_factory(&test_factory);
     rt::d3d12_xs::set_device_presentation_window(device.p, reinterpret_cast<std::uint64_t>(g_window));
@@ -340,8 +349,7 @@ int main() {
     texture.reset();
     queue.reset();
     g_presentation = nullptr;
-    device.reset();
-    inner.reset();
+    device.reset();  // releases the presenter, then the layer device (`inner`)
     DestroyWindow(g_window);
     return 0;
 }
