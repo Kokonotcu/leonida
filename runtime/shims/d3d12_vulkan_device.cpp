@@ -688,11 +688,16 @@ struct DeviceState {
     leonida::cached_pso::Identity pso_identity;  // what GetCachedBlob records and CachedPSO is checked against
     std::once_flag pipeline_cache_once;
     VkPipelineCache pipeline_cache_handle = VK_NULL_HANDLE;
-    // D3D-704: the file teardown saves the cache to (empty: not kept), what the cache started from, and its data
-    // size then.
+    // D3D-704: the file the cache is saved to (empty: not kept), what the cache started from, and its data size at the
+    // last save (or the load): a save at that size has nothing new to write.
     std::filesystem::path saved_pipeline_cache;
     LoadedPipelineCache pipeline_cache_loaded;
-    std::size_t pipeline_cache_loaded_bytes = 0;
+    std::size_t pipeline_cache_saved_bytes = 0;
+    // Checkpoints while the device lives (null with LEONIDA_PIPELINE_CACHE_PERSIST=0 or
+    // LEONIDA_PIPELINE_CACHE_CHECKPOINT_S=0). Its worker is the only caller of checkpoint_pipeline_cache(); teardown
+    // stops it before the final save, so the two saves never overlap and pipeline_cache_saved_bytes needs no lock.
+    leonida::pipeline_cache::CheckpointLog pipeline_cache_checkpoint_log;
+    std::unique_ptr<leonida::pipeline_cache::CheckpointWorker> pipeline_cache_checkpoints;
 
     VkPipelineCache pipeline_cache() {
         std::call_once(pipeline_cache_once, [this] {
@@ -701,15 +706,85 @@ struct DeviceState {
             saved_pipeline_cache = saved_pipeline_cache_path(pso_identity);
             pipeline_cache_loaded = create_pipeline_cache(vk, info.device, pso_identity, saved_pipeline_cache);
             pipeline_cache_handle = pipeline_cache_loaded.cache;
-            pipeline_cache_loaded_bytes = pipeline_cache_data_size(vk, info.device, pipeline_cache_handle);
+            pipeline_cache_saved_bytes = pipeline_cache_data_size(vk, info.device, pipeline_cache_handle);
+            if (!pipeline_cache_handle || saved_pipeline_cache.empty() || !vk.vkGetPipelineCacheData) return;
+            const auto interval = pipeline_cache_checkpoint_interval();
+            if (interval.count() == 0) return;
+            pipeline_cache_checkpoints = std::make_unique<leonida::pipeline_cache::CheckpointWorker>(
+                interval, [this] { return checkpoint_pipeline_cache(); });
         });
         // Without EXTERNALLY_SYNCHRONIZED_BIT the driver synchronizes concurrent pipeline creation using this cache.
         return pipeline_cache_handle;
     }
 
-    // At device teardown, once no pipeline is being created: write the cache for the next launch when it grew.
+    // After every pipeline created with pipeline_cache(): counts it for the checkpoint worker (a short lock, no write).
+    void pipeline_created() {
+        if (pipeline_cache_checkpoints) pipeline_cache_checkpoints->created();
+    }
+
+    // At device teardown, once no pipeline is being created: stop the checkpoints, then write the cache for the next
+    // launch when it grew since the last save.
     void save_pipeline_cache() {
-        if (!pipeline_cache_handle || saved_pipeline_cache.empty() || !context->vk.vkGetPipelineCacheData) return;
+        if (pipeline_cache_checkpoints) pipeline_cache_checkpoints->stop();
+        using leonida::pipeline_cache::Saved;
+        const auto result = write_pipeline_cache();
+        const auto name = leonida::pipeline_cache::file_name(pso_identity);
+        if (result.saved == Saved::written)
+            std::fprintf(stderr, "[rt] d3d12: saved %zu bytes of pipeline cache to %s\n", result.bytes, name.c_str());
+        else if (result.saved == Saved::failed)
+            std::fprintf(stderr, "[rt] d3d12: saving the pipeline cache to %s failed (%s); the previous file is kept\n",
+                         name.c_str(), result.error.c_str());
+    }
+
+    // A checkpoint, on the worker thread while pipelines may be created on others. vkGetPipelineCacheData's
+    // pipelineCache is not an externally synchronized parameter (Vulkan spec, "Threading Behavior"; vk.xml gives it no
+    // externsync), and vkCreate*Pipelines' is one only with VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT,
+    // which this cache is not created with, so no lock is held around the read. A cache that grows between the size
+    // query and the read gives VK_INCOMPLETE, which pipeline_cache_snapshot retries with a larger buffer.
+    bool checkpoint_pipeline_cache() {
+        using leonida::pipeline_cache::Saved;
+        const auto result = write_pipeline_cache();
+        if (result.saved == Saved::written || result.saved == Saved::failed) {
+            std::uint64_t skipped = 0;
+            if (pipeline_cache_checkpoint_log.take(std::chrono::steady_clock::now(), skipped)) {
+                const auto name = leonida::pipeline_cache::file_name(pso_identity);
+                if (result.saved == Saved::written)
+                    std::fprintf(stderr, "[rt] d3d12: checkpoint: saved %zu bytes of pipeline cache to %s",
+                                 result.bytes, name.c_str());
+                else
+                    std::fprintf(stderr, "[rt] d3d12: checkpoint: saving the pipeline cache to %s failed (%s)",
+                                 name.c_str(), result.error.c_str());
+                if (skipped)
+                    std::fprintf(stderr, " (%llu checkpoints since the last line)",
+                                 static_cast<unsigned long long>(skipped));
+                std::fputc('\n', stderr);
+            }
+        }
+        return result.saved != Saved::failed;
+    }
+
+    // LEONIDA_PIPELINE_CACHE_CHECKPOINT_S, or 60 when unset or not a whole number of seconds.
+    static std::chrono::seconds pipeline_cache_checkpoint_interval() {
+        const std::wstring wide = environment_text(L"LEONIDA_PIPELINE_CACHE_CHECKPOINT_S");
+        if (wide.empty()) return leonida::pipeline_cache::default_checkpoint_interval;
+        std::string text;
+        for (const wchar_t c : wide) text += c < 0x80 ? char(c) : '?';
+        if (const auto seconds = leonida::pipeline_cache::parse_checkpoint_seconds(text)) {
+            if (seconds->count() == 0)
+                std::fprintf(stderr, "[rt] d3d12: LEONIDA_PIPELINE_CACHE_CHECKPOINT_S=0: the pipeline cache is saved "
+                                     "at device teardown only\n");
+            return *seconds;
+        }
+        std::fprintf(stderr, "[rt] d3d12: LEONIDA_PIPELINE_CACHE_CHECKPOINT_S=%s is not a whole number of seconds; "
+                             "using %lld\n", text.c_str(),
+                     static_cast<long long>(leonida::pipeline_cache::default_checkpoint_interval.count()));
+        return leonida::pipeline_cache::default_checkpoint_interval;
+    }
+
+    // The save both paths share: the whole cache through the atomic writer when it grew since the last save.
+    leonida::pipeline_cache::SaveResult write_pipeline_cache() {
+        if (!pipeline_cache_handle || saved_pipeline_cache.empty() || !context->vk.vkGetPipelineCacheData)
+            return {leonida::pipeline_cache::Saved::unchanged};
         const auto get_data = context->vk.vkGetPipelineCacheData;
         const VkDevice device = info.device;
         const VkPipelineCache cache = pipeline_cache_handle;
@@ -720,14 +795,9 @@ struct DeviceState {
             std::filesystem::create_directories(saved_pipeline_cache.parent_path(), ignored);
             return write_pipeline_cache_file(saved_pipeline_cache, data, size);
         };
-        const auto name = leonida::pipeline_cache::file_name(pso_identity);
-        using leonida::pipeline_cache::Saved;
-        const auto result = leonida::pipeline_cache::save(get, snapshot, write, pipeline_cache_loaded_bytes);
-        if (result.saved == Saved::written)
-            std::fprintf(stderr, "[rt] d3d12: saved %zu bytes of pipeline cache to %s\n", result.bytes, name.c_str());
-        else if (result.saved == Saved::failed)
-            std::fprintf(stderr, "[rt] d3d12: saving the pipeline cache to %s failed (%s); the previous file is kept\n",
-                         name.c_str(), result.error.c_str());
+        const auto result = leonida::pipeline_cache::save(get, snapshot, write, pipeline_cache_saved_bytes);
+        if (result.saved == leonida::pipeline_cache::Saved::written) pipeline_cache_saved_bytes = result.bytes;
+        return result;
     }
 
     QueueClock clock;  // what every queue's GetClockCalibration uses
@@ -4111,6 +4181,7 @@ public:
                 },
                 pipeline_info) != VK_SUCCESS)
             return E_FAIL;
+        device_.pipeline_created();
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
@@ -4219,6 +4290,7 @@ private:
                 create.info) != VK_SUCCESS)
             return VK_NULL_HANDLE;
         if (leonida::pso::Recorder* recorder = device_.pso_recorder()) recorder->record(recipe);
+        device_.pipeline_created();
         return pipeline;
     }
 
@@ -8892,7 +8964,13 @@ PipelineCacheSources pipeline_cache_sources(ID3D12Device* device) {
     if (!real) real = device;
     const Device* d = Device::from<Device>(real);
     if (!d) return {};
-    return {d->state().pipeline_cache_loaded.seed_bytes, d->state().pipeline_cache_loaded.saved_bytes};
+    const DeviceState& state = d->state();
+    PipelineCacheSources out{state.pipeline_cache_loaded.seed_bytes, state.pipeline_cache_loaded.saved_bytes};
+    if (state.pipeline_cache_checkpoints) {
+        out.checkpoints = state.pipeline_cache_checkpoints->runs();
+        out.checkpoint_saves = state.pipeline_cache_checkpoints->saves();
+    }
+    return out;
 }
 
 namespace {

@@ -6,7 +6,11 @@
 //   - a file from another driver (pipelineCacheUUID), a truncated one and one of junk are left out, the PSO is still
 //     created, and teardown replaces them with a valid file;
 //   - a save that cannot be written (the name is a directory) is logged and the device still goes away cleanly;
-//   - LEONIDA_PIPELINE_CACHE_PERSIST=0 neither reads nor writes the file.
+//   - LEONIDA_PIPELINE_CACHE_PERSIST=0 neither reads nor writes the file, checkpoints included;
+//   - with LEONIDA_PIPELINE_CACHE_CHECKPOINT_S=1 a checkpoint writes the file while the device lives (a run killed
+//     before teardown keeps it), Vulkan takes it, teardown leaves it alone and the next device loads it;
+//   - a checkpoint after a creation that added nothing to the cache does not write, and none runs without a creation;
+//   - LEONIDA_PIPELINE_CACHE_CHECKPOINT_S=0: no checkpoint, and teardown still saves.
 // The shader is test/glsl/cs_user_data.comp, as in d3d12_compute_test. No game data. A driver whose pipeline cache
 // keeps nothing (only the header) is reported as a skip. Set LEONIDA_VK_VALIDATION=1 to run under the validation layer.
 #include "d3d12_test_shaders.h"
@@ -18,13 +22,16 @@
 #include "../src/pipeline_cache_persist.h"
 #include "../src/shader_library.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef LEONIDA_TEST_CS_SPV
@@ -51,13 +58,15 @@ void put_file(const fs::path& path, const std::string& bytes) {
 
 struct Session {
     bool pso_created = false;
+    bool during_ok = true;  // what `during` returned
     rt::d3d12::PipelineCacheSources sources;
 };
 
-// One layer device on the test's Vulkan device: a root signature, one compute PSO, then everything released, which
-// tears the layer device down and saves its cache.
+// One layer device on the test's Vulkan device: a root signature, one compute PSO, then `during` while the device
+// still lives, then everything released, which tears the layer device down and saves its cache.
 Session run_session(const vktest::Device& d, const fs::path& library, const std::vector<std::uint8_t>& root_blob,
-                    const std::vector<std::uint8_t>& container) {
+                    const std::vector<std::uint8_t>& container,
+                    const std::function<bool(ID3D12Device*)>& during = {}) {
     Session out;
     rt::d3d12::VulkanDeviceInfo info{};
     info.get_instance_proc = d.instance_proc;
@@ -82,9 +91,24 @@ Session run_session(const vktest::Device& d, const fs::path& library, const std:
         desc.CS = {container.data(), container.size()};
         Ref<ID3D12PipelineState> pso;
         out.pso_created = SUCCEEDED(device->CreateComputePipelineState(&desc, IID_PPV_ARGS(&pso.p))) && pso.p;
+        if (during) out.during_ok = during(device.p);
         out.sources = rt::d3d12::pipeline_cache_sources(device.p);
     }
     return out;  // the Refs release the PSO, the root signature and the device here
+}
+
+// Polls `predicate` for up to `limit`.
+bool wait_for(const std::function<bool()>& predicate, std::chrono::milliseconds limit) {
+    const auto end = std::chrono::steady_clock::now() + limit;
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() > end) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return true;
+}
+
+void set_checkpoint_seconds(const wchar_t* seconds) {
+    SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_CHECKPOINT_S", seconds);
 }
 
 }  // namespace
@@ -143,6 +167,7 @@ int main() {
 
     EXPECT(SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_DIR", caches.wstring().c_str()));
     EXPECT(SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_PERSIST", nullptr) || GetLastError() == ERROR_ENVVAR_NOT_FOUND);
+    set_checkpoint_seconds(nullptr);  // sessions 1 to 4 end long before the default 60 s checkpoint
     const fs::path saved = caches / leonida::pipeline_cache::file_name(identity);
     const auto run = [&] { return run_session(d, library, root_blob, container); };
     const auto valid_file = [&] {
@@ -196,19 +221,80 @@ int main() {
     EXPECT(fs::remove(saved));
     std::printf("session 4: a failed save left nothing behind\n");
 
-    // 5. LEONIDA_PIPELINE_CACHE_PERSIST=0: the file is neither read nor written.
+    // 5. LEONIDA_PIPELINE_CACHE_PERSIST=0: the file is neither read nor written, by a checkpoint either.
     put_file(saved, first);
     EXPECT(SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_PERSIST", L"0"));
+    set_checkpoint_seconds(L"1");
     session = run();
     EXPECT(session.pso_created);
     EXPECT(session.sources.saved_bytes == 0);
     EXPECT(fs::remove(saved));
-    session = run();
-    EXPECT(session.pso_created);
+    session = run_session(d, library, root_blob, container, [&](ID3D12Device*) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));  // two checkpoint intervals
+        return !fs::exists(saved);
+    });
+    EXPECT(session.pso_created && session.during_ok);
+    EXPECT(session.sources.checkpoints == 0);
     EXPECT(!fs::exists(saved));
     SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_PERSIST", nullptr);
     std::printf("session 5: LEONIDA_PIPELINE_CACHE_PERSIST=0 neither read nor wrote the file\n");
 
-    std::printf("pipeline cache persistence: saved at teardown, loaded by the next device\n");
+    // 6. A checkpoint while the device lives (LEONIDA_PIPELINE_CACHE_CHECKPOINT_S=1): the file appears before teardown,
+    // with this device's header, and Vulkan takes it. A run killed here would keep it. Teardown finds nothing new and
+    // leaves it alone, and the next device loads it.
+    const auto create_cache = d.fn<PFN_vkCreatePipelineCache>("vkCreatePipelineCache");
+    const auto destroy_cache = d.fn<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache");
+    EXPECT(create_cache && destroy_cache);
+    std::string checkpointed;
+    session = run_session(d, library, root_blob, container, [&](ID3D12Device* device) {
+        if (!wait_for([&] { return rt::d3d12::pipeline_cache_sources(device).checkpoint_saves >= 1; },
+                      std::chrono::seconds(10)))
+            return false;
+        if (!fs::exists(saved) || !valid_file()) return false;
+        checkpointed = contents(saved);
+        const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0,
+                                               checkpointed.size(), checkpointed.data()};
+        VkPipelineCache cache = VK_NULL_HANDLE;
+        if (create_cache(d.device, &create, nullptr, &cache) != VK_SUCCESS) return false;
+        destroy_cache(d.device, cache, nullptr);
+        return true;
+    });
+    EXPECT(session.pso_created && session.during_ok);
+    EXPECT(session.sources.checkpoints == 1 && session.sources.checkpoint_saves == 1);
+    EXPECT(contents(saved) == checkpointed);  // teardown had nothing to add
+    std::printf("session 6: a checkpoint saved %zu bytes before teardown; Vulkan took them\n", checkpointed.size());
+    const auto checkpoint_written = fs::last_write_time(saved);
+
+    // 7. The same PSO again with the checkpointed file loaded: the creation is counted, the checkpoint finds the cache
+    // as loaded and writes nothing, and with no creation after it no other checkpoint runs.
+    session = run_session(d, library, root_blob, container, [&](ID3D12Device* device) {
+        if (!wait_for([&] { return rt::d3d12::pipeline_cache_sources(device).checkpoints >= 1; },
+                      std::chrono::seconds(10)))
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        return rt::d3d12::pipeline_cache_sources(device).checkpoints == 1;
+    });
+    EXPECT(session.pso_created && session.during_ok);
+    EXPECT(session.sources.saved_bytes == checkpointed.size());
+    EXPECT(session.sources.checkpoints == 1 && session.sources.checkpoint_saves == 1);
+    EXPECT(contents(saved) == checkpointed);
+    EXPECT(fs::last_write_time(saved) == checkpoint_written);
+    std::printf("session 7: loaded the checkpoint; one checkpoint found nothing new and wrote nothing\n");
+
+    // 8. LEONIDA_PIPELINE_CACHE_CHECKPOINT_S=0: no checkpoint while the device lives; teardown still saves.
+    EXPECT(fs::remove(saved));
+    set_checkpoint_seconds(L"0");
+    session = run_session(d, library, root_blob, container, [&](ID3D12Device*) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+        return !fs::exists(saved);
+    });
+    EXPECT(session.pso_created && session.during_ok);
+    EXPECT(session.sources.checkpoints == 0);
+    EXPECT(valid_file());
+    set_checkpoint_seconds(nullptr);
+    std::printf("session 8: LEONIDA_PIPELINE_CACHE_CHECKPOINT_S=0 wrote nothing before teardown; teardown saved\n");
+
+    std::printf("pipeline cache persistence: checkpoints while the device lives, saved at teardown, loaded by the "
+                "next device\n");
     return 0;
 }

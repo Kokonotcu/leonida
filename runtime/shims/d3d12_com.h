@@ -275,10 +275,14 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 std::uint64_t device_arena_size(ID3D12Device* device);
 
 // D3D-704: what the device's VkPipelineCache took in when its first PSO created it, in bytes: the build's
-// pipeline_cache.bin and the file an earlier session saved (0 for one absent, foreign or declined). For tests.
+// pipeline_cache.bin and the file an earlier session saved (0 for one absent, foreign or declined); and the
+// checkpoints its worker ran while the device lives, and how many of those wrote the file or found nothing new
+// (both 0 without a worker). For tests.
 struct PipelineCacheSources {
     std::size_t seed_bytes = 0;
     std::size_t saved_bytes = 0;
+    std::uint64_t checkpoints = 0;
+    std::uint64_t checkpoint_saves = 0;
 };
 PipelineCacheSources pipeline_cache_sources(ID3D12Device* device);
 

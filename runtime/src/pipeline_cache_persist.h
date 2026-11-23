@@ -7,6 +7,9 @@
 // was loaded, through a same-directory temporary file and a rename, so a failed save leaves the old file as it was.
 // The vendor and device in the name keep two GPUs of one machine from replacing each other's file; a driver update
 // changes the UUID, so the old file is ignored once and then replaced.
+// A run that never reaches device teardown (killed by a debugger, crashed, timed out) would keep nothing, so the device
+// also writes checkpoints while it lives (CheckpointWorker below): one worker thread saves the cache the same way when
+// pipelines were created since the last checkpoint, at most once per LEONIDA_PIPELINE_CACHE_CHECKPOINT_S seconds.
 // Portable: no Vulkan device and no Windows API here, so runtime/test/pipeline_cache_persist_test.cpp runs anywhere.
 #pragma once
 
@@ -14,13 +17,21 @@
 
 #include <vulkan/vulkan_core.h>
 
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <functional>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <system_error>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace leonida::pipeline_cache {
@@ -115,5 +126,159 @@ SaveResult save(Get get, Snapshot snapshot, Write write, std::size_t loaded_byte
     }
     return out;
 }
+
+// ---- Checkpoints while the device lives ----
+
+constexpr std::chrono::seconds default_checkpoint_interval{60};
+// After the first checkpoint line, at most one line per this long.
+constexpr std::chrono::seconds checkpoint_log_interval{300};
+
+// LEONIDA_PIPELINE_CACHE_CHECKPOINT_S: whole seconds between checkpoints, 0 for none. Empty, signed, fractional or
+// not a number (or more than nine digits): nullopt, and the caller uses default_checkpoint_interval.
+inline std::optional<std::chrono::seconds> parse_checkpoint_seconds(std::string_view text) {
+    if (text.empty() || text.size() > 9) return std::nullopt;
+    long long seconds = 0;
+    for (const char c : text) {
+        if (c < '0' || c > '9') return std::nullopt;
+        seconds = seconds * 10 + (c - '0');
+    }
+    return std::chrono::seconds(seconds);
+}
+
+// When a checkpoint is due: pipelines were created since the last one (a counter, so an idle device never asks the
+// driver for its cache) and the interval has passed since the last one ran, or since the cache was loaded. Pure: the
+// caller passes the clock and the counter, so pipeline_cache_persist_test drives it without waiting.
+class CheckpointPolicy {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    CheckpointPolicy() = default;
+    CheckpointPolicy(Clock::duration interval, Clock::time_point start) : interval_(interval), last_(start) {}
+
+    bool enabled() const { return interval_ > Clock::duration::zero(); }
+    // Pipelines were created after the last checkpoint that saved (or found nothing new).
+    bool pending(std::uint64_t created) const { return created != saved_created_; }
+    // The earliest time the next checkpoint may run.
+    Clock::time_point next() const { return last_ + interval_; }
+    bool due(std::uint64_t created, Clock::time_point now) const {
+        return enabled() && pending(created) && now >= next();
+    }
+    // A checkpoint that read the counter as `created` finished at `now`. When it wrote the file or found the cache
+    // unchanged, those pipelines count as saved; after a failed one they are tried again an interval later.
+    void finished(std::uint64_t created, Clock::time_point now, bool saved) {
+        last_ = now;
+        if (saved) saved_created_ = created;
+    }
+
+private:
+    Clock::duration interval_{};
+    Clock::time_point last_{};
+    std::uint64_t saved_created_ = 0;
+};
+
+// Which checkpoints get a log line: the first, then at most one per checkpoint_log_interval. The rest are counted, so
+// the next line can say how many went unlogged.
+class CheckpointLog {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    // True when the checkpoint at `now` is logged; `skipped` is then the number left out since the last line.
+    bool take(Clock::time_point now, std::uint64_t& skipped) {
+        if (logged_ && now - last_ < checkpoint_log_interval) {
+            ++skipped_;
+            return false;
+        }
+        skipped = skipped_;
+        skipped_ = 0;
+        logged_ = true;
+        last_ = now;
+        return true;
+    }
+
+private:
+    bool logged_ = false;
+    Clock::time_point last_{};
+    std::uint64_t skipped_ = 0;
+};
+
+// The one thread that writes checkpoints. Pipeline creation calls created() (a short lock and a counter, never a
+// write); the worker sleeps until a creation, then until the policy's next(), and calls `save` with no lock held.
+// Only the worker calls `save`, so writes never overlap; stop() (and the destructor) joins it, after which the caller
+// does the final save at teardown. `save` returns true when the cache is on disk or held nothing new.
+class CheckpointWorker {
+public:
+    using Clock = CheckpointPolicy::Clock;
+
+    CheckpointWorker(Clock::duration interval, std::function<bool()> save)
+        : policy_(interval, Clock::now()), save_(std::move(save)) {
+        if (policy_.enabled()) thread_ = std::thread([this] { run(); });
+    }
+    ~CheckpointWorker() { stop(); }
+    CheckpointWorker(const CheckpointWorker&) = delete;
+    CheckpointWorker& operator=(const CheckpointWorker&) = delete;
+
+    bool enabled() const { return policy_.enabled(); }
+
+    void created() {
+        const std::lock_guard lock(mutex_);
+        ++created_;
+        if (idle_) wake_.notify_one();
+    }
+
+    // Waits for a checkpoint in progress; none starts afterwards.
+    void stop() {
+        {
+            const std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        wake_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    }
+
+    // For tests: checkpoints that called `save`, and the ones that returned true.
+    std::uint64_t runs() const {
+        const std::lock_guard lock(mutex_);
+        return runs_;
+    }
+    std::uint64_t saves() const {
+        const std::lock_guard lock(mutex_);
+        return saves_;
+    }
+
+private:
+    void run() {
+        std::unique_lock lock(mutex_);
+        while (!stopping_) {
+            if (!policy_.pending(created_)) {
+                idle_ = true;
+                wake_.wait(lock, [&] { return stopping_ || policy_.pending(created_); });
+                idle_ = false;
+                continue;
+            }
+            if (Clock::now() < policy_.next()) {
+                wake_.wait_until(lock, policy_.next(), [&] { return stopping_; });
+                continue;
+            }
+            const std::uint64_t created = created_;
+            lock.unlock();
+            const bool saved = save_();
+            lock.lock();
+            ++runs_;
+            if (saved) ++saves_;
+            policy_.finished(created, Clock::now(), saved);
+        }
+    }
+
+    CheckpointPolicy policy_;
+    std::function<bool()> save_;
+    mutable std::mutex mutex_;
+    std::condition_variable wake_;
+    std::uint64_t created_ = 0;
+    std::uint64_t runs_ = 0;
+    std::uint64_t saves_ = 0;
+    bool idle_ = false;
+    bool stopping_ = false;
+    std::thread thread_;  // last: started after every other member is ready
+};
 
 }  // namespace leonida::pipeline_cache

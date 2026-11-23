@@ -2053,10 +2053,24 @@ Pipeline creation:
     same) or holds only the header (llvmpipe keeps nothing).
   - A truncated, foreign (other GPU or `pipelineCacheUUID`) or junk file is logged and left out. The device starts
     without it and replaces it at teardown.
-  - `LEONIDA_PIPELINE_CACHE_PERSIST=0` neither reads nor writes the file; the seed is still used.
+  - Checkpoints while the device lives: a run that never reaches teardown (killed by a debugger, crashed, timed out)
+    would otherwise keep nothing. One worker thread per device saves the cache the same way (temporary file, rename)
+    when pipelines were created since its last checkpoint, at most once per `LEONIDA_PIPELINE_CACHE_CHECKPOINT_S`
+    seconds (default 60; `0` turns checkpoints off and teardown still saves). Every compute and graphics pipeline
+    created with the cache, the draw-time graphics variants included, is counted; the count is a short lock, so
+    creation never waits for a write. A checkpoint whose cache did not grow writes nothing, a failed one is tried
+    again an interval later, and teardown stops the worker (waiting for a write in progress) before its own save, so
+    writes never overlap. `vkGetPipelineCacheData` runs on the worker with no lock while other threads create
+    pipelines: its `pipelineCache` is not externally synchronized (spec, "Threading Behavior"; no `externsync` in
+    `vk.xml`), and `vkCreate*Pipelines`' is only with `VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT`, which
+    this cache does not use. The first checkpoint is logged, then at most one line per 5 minutes.
+  - `LEONIDA_PIPELINE_CACHE_PERSIST=0` neither reads nor writes the file, checkpoints included; the seed is still used.
   - The saved file holds the seed's entries too, so with a full-corpus seed it is about as large as the seed.
   `d3d12_pipeline_cache_persist_test` checks this on a device: a saved 1552-byte cache was loaded and left
-  unchanged by the next session (RADV, gfx1036).
+  unchanged by the next session; with `LEONIDA_PIPELINE_CACHE_CHECKPOINT_S=1` a checkpoint wrote it before teardown,
+  Vulkan took it and the next device loaded it; a checkpoint over a cache that did not grow wrote nothing; with `0`
+  nothing was written until teardown (RADV, gfx1036). `pipeline_cache_persist_test` checks the rate limit and the
+  creation counter on an injected clock, and the worker on short intervals (no GPU).
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
   bindings and the standard 144-byte push-constant range.
   `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description

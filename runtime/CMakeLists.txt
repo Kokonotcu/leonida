@@ -2814,7 +2814,7 @@ if(TARGET Vulkan::Headers)
       target_compile_options(d3d12_compute_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_compute COMMAND d3d12_compute_test)
       set_tests_properties(d3d12_compute PROPERTIES SKIP_RETURN_CODE 77)
-      # D3D-704: the device's VkPipelineCache saved at teardown and loaded by the next device, with the same shader.
+      # D3D-704: the device's VkPipelineCache saved by a checkpoint and at teardown, and loaded by the next device.
       add_executable(d3d12_pipeline_cache_persist_test test/d3d12_pipeline_cache_persist_test.cpp
                      shims/d3d12_xs_device.cpp ${LEONIDA_TEST_CS})
       target_link_libraries(d3d12_pipeline_cache_persist_test PRIVATE gta6rt_d3d12_com)
@@ -3281,7 +3281,8 @@ if(TARGET Vulkan::Headers)
     add_executable(pipeline_cache_snapshot_test test/pipeline_cache_snapshot_test.cpp)
     target_link_libraries(pipeline_cache_snapshot_test PRIVATE Vulkan::Headers)
     add_test(NAME pipeline_cache_snapshot COMMAND pipeline_cache_snapshot_test)
-    # D3D-704: the saved pipeline cache's header check and teardown write (src/pipeline_cache_persist.h), no GPU.
+    # D3D-704: the saved pipeline cache's header check, teardown write and checkpoints (src/pipeline_cache_persist.h),
+    # no GPU.
     add_executable(pipeline_cache_persist_test test/pipeline_cache_persist_test.cpp)
     target_link_libraries(pipeline_cache_persist_test PRIVATE Vulkan::Headers)
     if(WIN32)
