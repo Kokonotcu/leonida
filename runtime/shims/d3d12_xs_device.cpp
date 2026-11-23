@@ -2709,12 +2709,14 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
     note_slot(108);
     DeviceProxy* proxy = nullptr;
     D3D12_RESOURCE_ALLOCATION_INFO* ret = nullptr;
+    bool console_abi = false;  // the title's C form: return buffer first
     if (is_device_proxy(self)) {
         proxy = self;
         ret = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(a1);
     } else if (is_device_proxy(reinterpret_cast<const void*>(a1))) {
         proxy = reinterpret_cast<DeviceProxy*>(a1);
         ret = reinterpret_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(self);
+        console_abi = true;
     }
     if (!ret) return 0;
     if (!proxy) {
@@ -2756,7 +2758,8 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
         ID3D12Device*, D3D12_RESOURCE_ALLOCATION_INFO*, UINT, UINT, const D3D12_RESOURCE_DESC1*,
         D3D12_RESOURCE_ALLOCATION_INFO1*);
     reinterpret_cast<Fn>(proxy->real_vtable[68])(proxy->real, ret, visible_mask, count, descs_to_pass, info1);
-    if (ret->SizeInBytes == UINT64_MAX && descs_to_pass && count) {
+    // As slot 25: only the console caller gets a size for a description the PC layer refuses.
+    if (console_abi && ret->SizeInBytes == UINT64_MAX && descs_to_pass && count) {
         D3D12_RESOURCE_DESC base{};
         std::memcpy(&base, reinterpret_cast<const std::uint8_t*>(descs_to_pass), sizeof(base));
         *ret = fallback_allocation(base);
@@ -3212,9 +3215,11 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
     apply_console_placement(descs, desc_count, info, nullptr,
                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
-    // A format the PC layer cannot map comes back as UINT64_MAX. The console still has a size for it; answer one the
-    // title accepts (alignment 0x10000, below 4 GiB) instead of its int3 on a >32-bit size.
-    if (info.SizeInBytes == UINT64_MAX && descs && desc_count) info = fallback_allocation(descs[0]);
+    // A format the PC layer cannot map comes back as UINT64_MAX. The console still has a size for it; answer the
+    // console caller (the title's C-ABI call) one it accepts (alignment 0x10000, below 4 GiB) instead of its int3 on
+    // a >32-bit size. A PC-ABI caller keeps the host's refusal, as the PC runtime gives it.
+    if (call.console_abi && info.SizeInBytes == UINT64_MAX && descs && desc_count)
+        info = fallback_allocation(descs[0]);
     static std::atomic<unsigned> alloc_logs{0};
     const unsigned alloc_call = alloc_logs.fetch_add(1, std::memory_order_relaxed);
     if (alloc_call < 40 || (info.SizeInBytes >> 32) != 0 || info.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {
