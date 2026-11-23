@@ -133,6 +133,11 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
         if (name == "GameInputCreate" || name == "#1") return ReturnClass::HResult;
     } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll" || dll == "xcrdapi.dll") {
         if (name == "DStorageGetFactory") return ReturnClass::HResult;
+    } else if (dll == "acphal.dll") {
+        if (name == "AcpHalAllocateShapeContexts" || name == "AcpHalCreate" ||
+            name == "AcpHalReleaseShapeContexts" || name == "ApuAlloc" ||
+            name == "ApuCreateHeap")
+            return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
         if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;
         for (const char* n : kNotHResult)

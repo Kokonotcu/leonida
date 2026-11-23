@@ -1,4 +1,5 @@
-// Checks the registered audio boot shims (AcpHal.dll, xapu.dll, chad.dll) the way the retail executable reaches them.
+// Checks the registered audio boot shims the way the retail executable reaches them: xapu.dll and chad.dll from
+// audio_stub.cpp, and acphal.dll (shims/acphal.cpp, which has its own unit test) in the measured boot sequence.
 //
 // Every function is resolved through rt::shims::find, the same table the loader binds imports to. The test calls each
 // with valid, null and fake arguments. The three functions whose measured callers dereference an output get a real
@@ -17,8 +18,6 @@
 namespace {
 
 constexpr int32_t kOk = 0;
-constexpr int32_t kInvalidArg = static_cast<int32_t>(0x80070057u);
-constexpr int32_t kOutOfMemory = static_cast<int32_t>(0x8007000Eu);
 constexpr int32_t kNoWork = static_cast<int32_t>(0x80070490u);
 
 int g_checks = 0;
@@ -62,9 +61,6 @@ using AcpHalReleaseShapeContextsFn = int32_t(__stdcall*)();
 using ApuAllocFn = int32_t(__stdcall*)(void**, uint32_t, uint32_t, uint32_t, uint32_t);
 using ApuFreeFn = int32_t(__stdcall*)(void*);
 using ApuCreateHeapFn = int32_t(__stdcall*)(uint32_t, uint32_t);
-using ApuIsVirtualAddressValidFn = BOOL(__stdcall*)(const void*, uint32_t);
-using ApuMapApuAddressFn = void*(__stdcall*)(uint32_t);
-using ApuMapVirtualAddressFn = uint32_t(__stdcall*)(const void*);
 
 using XApuConnectFn = int32_t(__stdcall*)(void*, void*, void*);
 using XApuDisconnectFn = int32_t(__stdcall*)(void*);
@@ -78,13 +74,10 @@ using XDspDeactivateFn = int32_t(__stdcall*)(void*);
 using XDspDisconnectFn = int32_t(__stdcall*)(void*);
 using XDspSubmitCommandFn = int32_t(__stdcall*)(void*, void*);
 
-void* fake_pointer(uintptr_t value) { return reinterpret_cast<void*>(value); }
-
 constexpr uintptr_t kFakeAddress = 0xA0000001u;
 void* const kFakeHandle = reinterpret_cast<void*>(kFakeAddress);
 
 // The vtable the fake AcpHal object exposes; slot numbers are the offsets the measured caller uses.
-using HalSlotSimple = int32_t(__stdcall*)(void*);
 using HalSlotTwo = int32_t(__stdcall*)(void*, uint32_t, uint32_t);
 using HalSlotSix = int32_t(__stdcall*)(void*, uint32_t, uint32_t, uint32_t, void*, uint32_t);
 
@@ -96,107 +89,6 @@ void test_registry() {
           "an unserved acphal.dll name is NULL");
     check(rt::shims::find("acphal.dll", "#1") == nullptr,
           "no ordinal alias is registered: this executable imports all 19 names by name");
-}
-
-void test_acphal(AcpHalCreateFn create, AcpHalAllocateShapeContextsFn allocate,
-                 AcpHalReleaseShapeContextsFn release) {
-    alignas(16) uint8_t slot[0x40] = {};
-    std::memset(slot, 0xcc, sizeof slot);
-    check(create(nullptr) == kInvalidArg, "AcpHalCreate(NULL) returns E_INVALIDARG");
-    check(create(kFakeHandle) == kInvalidArg, "AcpHalCreate(fake pointer) returns E_INVALIDARG");
-
-    check(create(slot) == kOk, "AcpHalCreate(valid out) returns S_OK");
-    void* object = *reinterpret_cast<void**>(slot);
-    check(object != nullptr, "AcpHalCreate writes a non-null object");
-    void** vtable = object ? *reinterpret_cast<void***>(object) : nullptr;
-    check(vtable != nullptr, "the fake AcpHal object has a vtable");
-    if (vtable) {
-        check(reinterpret_cast<HalSlotTwo>(vtable[0])(object, 0x1000, 0x1000) == kOk,
-              "AcpHal object vtable[0] returns S_OK");
-        check(reinterpret_cast<HalSlotSimple>(vtable[1])(object) == kOk,
-              "AcpHal object vtable[1] returns S_OK");
-        uint32_t format = 0xc0;
-        check(reinterpret_cast<HalSlotSix>(vtable[2])(object, 2, 0xf0f0f0f0u, 0xffffffffu, &format, 0) == kOk,
-              "AcpHal object vtable[2] returns S_OK");
-        check(reinterpret_cast<HalSlotSimple>(vtable[5])(object) == kOk,
-              "AcpHal object vtable[5] returns S_OK");
-    }
-
-    check(allocate(nullptr) == kInvalidArg, "AcpHalAllocateShapeContexts(NULL) returns E_INVALIDARG");
-    check(allocate(kFakeHandle) == kInvalidArg,
-          "AcpHalAllocateShapeContexts(fake pointer) returns E_INVALIDARG");
-
-    alignas(16) uint8_t config[0x100] = {};
-    *reinterpret_cast<uint32_t*>(config + 0x10) = 4;
-    *reinterpret_cast<void**>(config + 0x38) = fake_pointer(0x1234);
-    check(allocate(config) == kOk, "AcpHalAllocateShapeContexts(count 4) returns S_OK");
-    void* contexts = *reinterpret_cast<void**>(config + 0x38);
-    check(contexts != nullptr && contexts != fake_pointer(0x1234),
-          "AcpHalAllocateShapeContexts writes a non-null context array");
-    if (contexts) {
-        check(zeroed(contexts, 4 * 64), "the context array is zeroed");
-        check(writable_pattern(contexts, 4 * 64), "the context array is readable and writable");
-    }
-
-    *reinterpret_cast<uint32_t*>(config + 0x10) = 0xffffffffu;
-    void* before = *reinterpret_cast<void**>(config + 0x38);
-    check(allocate(config) == kInvalidArg, "an absurd context count returns E_INVALIDARG");
-    check(*reinterpret_cast<void**>(config + 0x38) == before,
-          "the context out pointer is unchanged after a rejected count");
-
-    *reinterpret_cast<uint32_t*>(config + 0x10) = 0;
-    check(allocate(config) == kOk, "a zero context count returns S_OK");
-    check(*reinterpret_cast<void**>(config + 0x38) != nullptr, "a zero context count still writes a non-null array");
-
-    check(release() == kOk, "AcpHalReleaseShapeContexts returns S_OK");
-    check(release() == kOk, "AcpHalReleaseShapeContexts is repeatable");
-}
-
-void test_apu(ApuAllocFn allocate, ApuFreeFn free_block, ApuCreateHeapFn create_heap,
-              ApuIsVirtualAddressValidFn valid, ApuMapApuAddressFn map_apu, ApuMapVirtualAddressFn map_virtual) {
-    void* block = fake_pointer(0x1234);
-    check(allocate(nullptr, 0, 0x1000, 0x800, 0) == kInvalidArg, "ApuAlloc(NULL out) returns E_INVALIDARG");
-    check(allocate(reinterpret_cast<void**>(const_cast<void*>(kFakeHandle)), 0, 0x1000, 0x800, 0) == kInvalidArg,
-          "ApuAlloc(fake out) returns E_INVALIDARG");
-
-    check(allocate(&block, 0, 0x1000, 0x800, 0) == kOk, "ApuAlloc(4096, align 0x800) returns S_OK");
-    check(block != nullptr && block != fake_pointer(0x1234), "ApuAlloc writes a non-null pointer");
-    check((reinterpret_cast<uintptr_t>(block) & 0xfffu) == 0, "ApuAlloc returns a page-aligned pointer");
-    check(zeroed(block, 0x1000), "ApuAlloc memory is zeroed");
-    check(writable_pattern(block, 0x1000), "ApuAlloc memory is readable and writable");
-    check(free_block(block) == kOk, "ApuFree releases an ApuAlloc block");
-    check(free_block(block) == kOk, "ApuFree is safe to repeat");
-    check(free_block(nullptr) == kOk, "ApuFree(NULL) returns S_OK");
-    check(free_block(kFakeHandle) == kOk, "ApuFree(fake handle) returns S_OK");
-
-    void* empty = nullptr;
-    check(allocate(&empty, 0, 0, 0x800, 0) == kOk, "ApuAlloc(size 0) returns S_OK");
-    check(empty != nullptr, "ApuAlloc(size 0) still writes a non-null pointer");
-    check(free_block(empty) == kOk, "ApuFree releases the size-0 block");
-
-    void* untouched = fake_pointer(0x1234);
-    check(allocate(&untouched, 0, 0xffffffffu, 0x800, 0) == kOutOfMemory,
-          "ApuAlloc(4 GiB) returns E_OUTOFMEMORY");
-    check(untouched == fake_pointer(0x1234), "the ApuAlloc out pointer is unchanged on failure");
-
-    untouched = fake_pointer(0x1234);
-    check(allocate(&untouched, 0, 0x1000, 3, 0) == kInvalidArg, "ApuAlloc(non-power-of-two alignment) is rejected");
-    check(untouched == fake_pointer(0x1234), "the ApuAlloc out pointer is unchanged after bad alignment");
-
-    void* aligned = nullptr;
-    check(allocate(&aligned, 0, 0x1000, 0x10000, 0) == kOk, "ApuAlloc(align 64 KiB) returns S_OK");
-    check(aligned && (reinterpret_cast<uintptr_t>(aligned) & 0xffffu) == 0,
-          "ApuAlloc(align 64 KiB) returns a 64 KiB-aligned pointer");
-    if (aligned) free_block(aligned);
-
-    check(create_heap(0, 0x226e00) == kOk, "ApuCreateHeap returns S_OK");
-    check(create_heap(0xffffffffu, 0xffffffffu) == kOk, "ApuCreateHeap accepts arbitrary size words");
-
-    int local = 0;
-    check(valid(&local, sizeof local) == FALSE, "ApuIsVirtualAddressValid returns FALSE for host memory");
-    check(valid(nullptr, 0) == FALSE, "ApuIsVirtualAddressValid(NULL) returns FALSE");
-    check(map_apu(0x1234) == nullptr, "ApuMapApuAddress returns null");
-    check(map_virtual(&local) == 0, "ApuMapVirtualAddress returns 0");
 }
 
 void test_xapu(XApuConnectFn connect, XApuDisconnectFn disconnect, XApuDequeueResultFn dequeue,
@@ -320,9 +212,6 @@ int main() {
     const auto apu_alloc = require<ApuAllocFn>("acphal.dll", "ApuAlloc");
     const auto apu_free = require<ApuFreeFn>("acphal.dll", "ApuFree");
     const auto apu_create_heap = require<ApuCreateHeapFn>("acphal.dll", "ApuCreateHeap");
-    const auto apu_valid = require<ApuIsVirtualAddressValidFn>("acphal.dll", "ApuIsVirtualAddressValid");
-    const auto apu_map = require<ApuMapApuAddressFn>("acphal.dll", "ApuMapApuAddress");
-    const auto apu_map_virtual = require<ApuMapVirtualAddressFn>("acphal.dll", "ApuMapVirtualAddress");
 
     const auto xapu_connect = require<XApuConnectFn>("xapu.dll", "XApuConnect");
     const auto xapu_disconnect = require<XApuDisconnectFn>("xapu.dll", "XApuDisconnect");
@@ -337,8 +226,6 @@ int main() {
     const auto dsp_disconnect = require<XDspDisconnectFn>("chad.dll", "XDspDisconnect");
     const auto dsp_submit = require<XDspSubmitCommandFn>("chad.dll", "XDspSubmitCommand");
 
-    test_acphal(create, allocate, release);
-    test_apu(apu_alloc, apu_free, apu_create_heap, apu_valid, apu_map, apu_map_virtual);
     test_xapu(xapu_connect, xapu_disconnect, xapu_dequeue, xapu_enqueue, xapu_count);
     test_chad(dsp_activate, dsp_connect_max, dsp_deactivate, dsp_disconnect, dsp_submit);
     test_measured_boot_sequence(create, allocate, release, apu_alloc, apu_free, apu_create_heap, xapu_connect,

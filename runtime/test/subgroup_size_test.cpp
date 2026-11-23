@@ -117,6 +117,10 @@ int main() {
         CHECK(r.outcome == SubgroupOutcome::emulated && r.size == 0 && r.flags == 0);
         // Where 64 can be had, no native wave64 pipeline is refused.
         CHECK(!subgroup_refused(decide_subgroup_size(entry("cs", true), caps)));
+        auto native = entry("cs", true, {64, 1, 1});
+        native.wave64_exchange = "halves";
+        r = decide_subgroup_size(native, caps);
+        CHECK(r.outcome == SubgroupOutcome::required && r.size == 64);
     }
 
     // --- NVIDIA-like: 32 only ----------------------------------------------------------------------------------
