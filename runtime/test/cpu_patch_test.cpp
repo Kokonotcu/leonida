@@ -145,6 +145,46 @@ int main() {
         expect(reinterpret_cast<int (*)(Xmm*)>(fn)(&dummy) == 42, "the NOP'd function runs");
     }
 
+    // A CLZERO zeroing loop (`clzero; add rax, 40h; cmp rax, R; jb back`, R = rdx or r10) becomes a stub that zeroes
+    // the same 64-byte lines (do-while: at least one), leaves rax where the loop would, and keeps r11.
+    for (const bool r10_limit : {false, true}) {
+        // rcx = start, rdx = end, r8 -> r11's value in and out; returns rax.
+        std::vector<std::uint8_t> c = {0x4D, 0x8B, 0x18,                  // mov r11, [r8]
+                                       0x48, 0x89, 0xC8};                 // mov rax, rcx
+        if (r10_limit) c.insert(c.end(), {0x49, 0x89, 0xD2});            // mov r10, rdx
+        const std::size_t site = c.size();
+        c.insert(c.end(), {0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40});    // clzero; add rax, 40h
+        if (r10_limit) c.insert(c.end(), {0x4C, 0x39, 0xD0});            // cmp rax, r10
+        else c.insert(c.end(), {0x48, 0x39, 0xD0});                       // cmp rax, rdx
+        c.insert(c.end(), {0x72, 0xF4,                                    // jb the clzero
+                           0x4D, 0x89, 0x18,                              // mov [r8], r11
+                           0xC3});
+        std::uint8_t* fn = page + 0x19400 + (r10_limit ? 0x100 : 0);
+        std::memcpy(fn, c.data(), c.size());
+        const Result r = patch_image(page, 0x1A000, {std::uint32_t(fn + site - page)}, none, arena);
+        expect(r.stub == 1, "the CLZERO loop was replaced by a stub", r10_limit);
+        if (r.stub != 1) return 1;
+        alignas(64) static std::uint8_t buffer[1024];
+        using Loop = std::uint64_t (*)(std::uint8_t*, std::uint8_t*, std::uint64_t*);
+        struct Case { std::size_t start, end; };
+        for (const Case k : {Case{64, 448}, Case{80, 300}, Case{128, 128}, Case{0, 1000}}) {
+            std::memset(buffer, 0xAB, sizeof buffer);
+            std::uint64_t r11 = 0x1122334455667788ull;
+            const std::uint64_t rax = reinterpret_cast<Loop>(fn)(buffer + k.start, buffer + k.end, &r11);
+            // The lines the loop zeroes: those holding start, start + 64, ... while below end (at least the first).
+            std::size_t lines = 1;
+            while (k.start + 64 * lines < k.end) ++lines;
+            const std::size_t first = k.start & ~std::size_t(63), last = ((k.start + 64 * (lines - 1)) & ~std::size_t(63)) + 64;
+            bool ok = true;
+            for (std::size_t i = 0; i < sizeof buffer; ++i)
+                ok = ok && buffer[i] == ((i >= first && i < last) ? 0 : 0xAB);
+            expect(ok, "CLZERO loop: exactly the loop's lines are zeroed", r10_limit, int(k.start), int(k.end));
+            expect(rax == reinterpret_cast<std::uint64_t>(buffer + k.start + 64 * lines), "CLZERO loop: rax ends where "
+                   "the loop's does", r10_limit, int(k.start));
+            expect(r11 == 0x1122334455667788ull, "CLZERO loop: r11 is kept", r10_limit);
+        }
+    }
+
     // A site that is not one of the forms is counted and left alone.
     {
         std::uint8_t* fn = page + 0x19800;

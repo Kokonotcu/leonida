@@ -339,6 +339,68 @@ inline Result patch_image(std::uint8_t* base, std::size_t image_size, const std:
                 ++r.stub;
                 continue;
             }
+            case Op::clzero: {
+                // A zeroing loop `clzero; add rax, 40h; cmp rax, R; jb <the clzero>` (12 bytes, R a 64-bit register):
+                // replaced as a whole by a stub that zeroes the same lines with plain stores, leaves rax and the
+                // flags as the loop would, and borrows r11 (or r10 when R is r11) through push/pop.
+                if (host.clzero) continue;
+                const std::size_t avail = image_size - rva;
+                const std::uint8_t* s = site;
+                const bool loop = d.length == 3 && avail >= 12 && s[3] == 0x48 && s[4] == 0x83 && s[5] == 0xC0 &&
+                                  s[6] == 0x40 && (s[7] == 0x48 || s[7] == 0x4C) && s[8] == 0x39 &&
+                                  (s[9] & 0xC7) == 0xC0 && s[10] == 0x72 && s[11] == 0xF4;
+                if (!loop) {
+                    ++r.left;
+                    continue;
+                }
+                const int limit = ((s[9] >> 3) & 7) | (s[7] == 0x4C ? 8 : 0);
+                if (limit == 0 || limit == 4) {  // cmp rax, rax / rsp: not a zeroing loop
+                    ++r.left;
+                    continue;
+                }
+                const int temp = limit == 11 ? 10 : 11;
+                std::uint8_t* stub = arena.take(112);
+                if (!stub) {
+                    ++r.left;
+                    continue;
+                }
+                detail::Emitter e(stub);
+                e.b(0x41);
+                e.b(std::uint8_t(0x50 | (temp & 7)));                       // push temp
+                std::uint8_t* top = e.at();
+                e.b(0x49);
+                e.b(0x89);
+                e.b(std::uint8_t(0xC0 | (temp & 7)));                       // mov temp, rax
+                e.b(0x49);
+                e.b(0x83);
+                e.b(std::uint8_t(0xE0 | (temp & 7)));
+                e.b(0xC0);                                                  // and temp, -64
+                for (int q = 0; q < 8; ++q) {                               // mov qword [temp + 8q], 0
+                    e.b(0x49);
+                    e.b(0xC7);
+                    e.b(std::uint8_t(0x40 | (temp & 7)));
+                    if ((temp & 7) == 4) e.b(0x24);
+                    e.b(std::uint8_t(8 * q));
+                    e.d32(0);
+                }
+                e.b(0x48);
+                e.b(0x83);
+                e.b(0xC0);
+                e.b(0x40);                                                  // add rax, 40h
+                e.b(s[7]);
+                e.b(0x39);
+                e.b(s[9]);                                                  // cmp rax, R (as the loop)
+                e.b(0x72);
+                e.b(std::uint8_t(top - (e.at() + 1)));                      // jb top
+                e.b(0x41);
+                e.b(std::uint8_t(0x58 | (temp & 7)));                       // pop temp (flags kept)
+                e.jmp_to(site + 12);
+                detail::Emitter j(site);
+                j.jmp_to(stub);
+                detail::nops(site + 5, 7);
+                ++r.stub;
+                continue;
+            }
             case Op::none:
                 ++r.unrecognised;
                 continue;
