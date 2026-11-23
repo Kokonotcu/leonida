@@ -1775,7 +1775,8 @@ def runtime_gpu_max_push_constants():
 # Source and data files that produce the translated modules, metadata and partner stubs.
 TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "wave64_emulate_opt.py", "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
-                       "spirv_opt.py", "report_paths.py", "replace_retry.py", "gfx10_formats.json")
+                       "spirv_opt.py", "report_paths.py", "replace_retry.py", "fssm_unpack.py", "shader_stage_manifest.py",
+                       "gfx10_formats.json")
 
 
 def sources_digest(folder: str, names, lead: str = "") -> str:
@@ -2407,6 +2408,13 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         log(f"runtime: built. Inspect the game's imports with Wine:\n  {shlex.join([start, '--dry-run'])}")
 
 
+def nonempty_path(text: str) -> str:
+    """--game/--out/--work/--runtime-build: an empty value would read as 'not given' and fall back to a default."""
+    if text.strip() == "":
+        raise argparse.ArgumentTypeError("must not be empty")
+    return text
+
+
 def positive_int(text: str) -> int:
     """--jobs: 0 or less would start no translation shard and merge an empty index as if the step had finished."""
     try:
@@ -2489,7 +2497,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     cache = os.path.join(out, "pipeline_cache.bin")
     inflight = os.path.join(out, "pipeline_inflight.txt")
     skip = os.path.join(out, "pipeline_crashes.txt")
-    drop(inflight, skip)   # every module gets a fresh chance on each run (a new translator may have fixed it)
+    report = os.path.join(out, "pipeline_crashes.json")
+    drop(inflight, skip, report)   # every module gets a fresh chance on each run (a new translator may have fixed it)
     # --jobs: make_game.py's own; without it vk_pipeline_check uses half the hardware threads whatever was asked
     base = [exe, spirv, cache, *(["--jobs", str(jobs)] if jobs else [])]
     if not checker_supports(exe, "--inflight-file", "--skip-file"):
@@ -2536,6 +2545,10 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
                         return first
                     second = check_range(start + half, count - half)
                     return second or first
+                # The give-up path is exactly when a durable record matters: a module was named earlier,
+                # but the driver now aborts before it can name another one. fail() raises, so write first.
+                if crashed:
+                    record_crashes(out, spirv, crashed)
                 fail(f"vk_pipeline_check exited with {exit_label(code)} while no module could be named as the cause; "
                      "the checker could not finish even this range in a fresh process; check available memory "
                      "and report it if it keeps happening")
@@ -2544,6 +2557,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             crashed.extend(suspects)
             with open(skip, "w", encoding="utf-8", newline="\n") as f:
                 f.write("".join(n + "\n" for n in crashed))
+        if crashed:
+            record_crashes(out, spirv, crashed)
         fail(f"vk_pipeline_check still crashed after {PIPELINE_CRASH_RETRIES} retries; modules that took it down: "
              + ", ".join(crashed))
 
@@ -2560,10 +2575,12 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             break
     if crashed and not code:
         code = 1
+    if crashed:
+        record_crashes(out, spirv, crashed)
     drop(inflight)
     if code != 0:
-        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
-            if crashed else ""
+        why = f"; {len(crashed)} module(s) took the driver down and were counted as failed (with their SPIR-V " \
+              f"hashes in pipeline_crashes.json): " + ", ".join(crashed) if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
     prebuild_recorded_pipelines(out)
     prebuild_shader_binaries(out)
@@ -2611,6 +2628,24 @@ def prebuild_shader_binaries(out: str) -> None:
         log("pipelines: this GPU's driver has no VK_EXT_shader_object; the game uses the pipeline cache instead")
     else:
         log("pipelines: prebuilding shader binaries failed; the game compiles its shaders from SPIR-V")
+def record_crashes(out: str, spirv: str, crashed: "list[str]") -> None:
+    """pipeline_crashes.json: name and SHA-256 of each module that took the driver down, so a report names the
+    exact translation without attaching the shader. OSError (a missing .spv) leaves that module's hash null."""
+    def digest(name: str) -> "str | None":
+        try:
+            with open(os.path.join(spirv, name + ".spv"), "rb") as f:
+                return hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return None
+    doc = {"modules": [{"name": n, "spv_sha256": digest(n)} for n in crashed]}
+    try:
+        with open(os.path.join(out, "pipeline_crashes.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=1)
+            f.write("\n")
+    except OSError as error:
+        # The durable record is best-effort. A report path that cannot be written must not
+        # replace the checker diagnostic that names the modules which took the driver down.
+        log(f"pipelines: cannot write pipeline_crashes.json: {error.strerror or error}")
 
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the
@@ -2817,12 +2852,12 @@ def run_build_stages(stages: list, *, game: str, work: str, out: str, v: dict, w
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build the PC port from your own copy of the game.")
-    ap.add_argument("--game", help="your package folder (found automatically if left out; a share path "
+    ap.add_argument("--game", type=nonempty_path, help="your package folder (found automatically if left out; a share path "
                                     "\\\\server\\share\\... goes here)")
     ap.add_argument("--pick", action="store_true", help="choose your package folder in a folder dialog")
-    ap.add_argument("--out", help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
+    ap.add_argument("--out", type=nonempty_path, help="folder for the finished port (default Documents/Leonida; ~/Leonida on a Mac "
                                   "whose Documents iCloud syncs)")
-    ap.add_argument("--work", help="folder for intermediate files (hundreds of GB; default <out>/work)")
+    ap.add_argument("--work", type=nonempty_path, help="folder for intermediate files (hundreds of GB; default <out>/work)")
     ap.add_argument("--stages", help="comma list from: " + ",".join(STAGES))
     ap.add_argument("--check", action="store_true", help="only check the game files")
     ap.add_argument("--full-check", action="store_true", help="also compare SHA-256 of every file (slow)")
@@ -2830,7 +2865,7 @@ def main() -> int:
                     help="also decode the Ogg Opus audio to 16-bit PCM WAV (much larger; needs ffmpeg)")
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--find", action="store_true", help="only list the game copies found on this PC")
-    ap.add_argument("--runtime-build", metavar="DIR",
+    ap.add_argument("--runtime-build", metavar="DIR", type=nonempty_path,
                     help="a Windows build of runtime/ (gta6rt.exe and gta6rt_tls_host.dll) for the runtime stage "
                          "instead of building it (off Windows: instead of the clang-cl + xwin cross-build); "
                          "on Windows, also use vk_pipeline_check.exe from DIR if present")

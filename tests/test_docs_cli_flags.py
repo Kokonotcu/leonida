@@ -22,8 +22,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FLAG = re.compile(r"(?<![\w-])(--[a-z][\w-]*)")
 SOURCE_SUFFIXES = (".py", ".ps1", ".cpp", ".cc", ".c", ".h", ".hpp", ".cmake", ".txt", ".cs", ".cjs", ".js", ".html",
                    ".bat", ".sh", ".yml", ".yaml", ".csproj")
-# Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself.
-FOREIGN = {"--search", "--state", "--index-url", "--help"}
+# Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself, and
+# the spirv-opt passes docs/embedded_shaders.md tried on one module.
+FOREIGN = {"--search", "--state", "--index-url", "--help",
+           "--ssa-rewrite", "--eliminate-dead-code-aggressive", "--eliminate-dead-branches", "--merge-blocks",
+           "--cfg-cleanup", "--merge-return", "--scalar-replacement"}
 # Pages that quote another project's tree (SCARAB, americas-recomp).
 OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
 COMMAND = re.compile(r"\bpython3?(?: -I)? ((?:tools|scripts)/[\w/]+\.py|make_game\.py)\b")
@@ -41,7 +44,7 @@ def tracked_files():
     except (OSError, subprocess.CalledProcessError):
         found = []
         for root, dirs, files in os.walk(ROOT):
-            dirs[:] = [d for d in dirs if d not in (".git", "build", "__pycache__", "node_modules")]
+            dirs[:] = [d for d in dirs if d not in (".git", "build", "__pycache__", "node_modules", ".pytest_cache")]
             found += [os.path.relpath(os.path.join(root, f), ROOT).replace(os.sep, "/") for f in files]
         return found
 

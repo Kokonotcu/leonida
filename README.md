@@ -8,9 +8,6 @@
   <b>Leonida</b>
   <br>
 </h1>
-  <h3 align="center">
-    <i>Só mais 72h gigi!</i> 🚀
-  </h3>
 
 <h4 align="center">Grand Theft Auto VI (Xbox Series) running natively on Windows, built on your PC from your own copy.
 </h4>
@@ -23,7 +20,7 @@
   <a href="#want-to-help">Want to help?</a> |
   <a href="#credits">Credits</a> |
   <a href="#license">License</a> |
-  <a href="https://discord.gg/rexed">Discord</a>
+  <a href="https://discord.gg/xsqS3DqqVF">Discord</a>
 </p>
 
 Leonida is a static recompilation project. The Xbox Series CPU is x86-64 like a PC, so the game's code is loaded
@@ -37,7 +34,7 @@ happens **on your PC, from your own copy of the game**.
 > Everything the build creates (the generated shaders, extracted assets, the runtime folder and your saves) comes
 > from your game and stays on your PC. Never share those files.
 
-Discord: https://discord.gg/rexed
+Discord: https://discord.gg/xsqS3DqqVF
 
 Custom Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 <br>
@@ -246,7 +243,7 @@ in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEON
 | Piece | What it does | Where |
 |---|---|---|
 | Version check | Every package file's name, size and SHA-256 for each supported version | `game/`, `make_game.py` |
-| Shader pipeline | Carves DXBC containers from `shaders.rpf` without its encrypted table of contents. Unpacks the `XBCH` → `FSSM` native RDNA2 program, disassembles it with LLVM (`gfx1013`) and translates it to SPIR-V | `tools/shader_carve.py`, `fssm_unpack.py`, `shader_disasm.py`, `rdna2spirv.py` |
+| Shader pipeline | Carves DXBC containers from `shaders.rpf` without its encrypted table of contents. Unpacks the `XBCH` → `FSSM` native RDNA2 program, disassembles it with LLVM (`gfx1013`) and translates it to SPIR-V | `tools/shader_carve.py` ([optional Rust scanner](tools/shader_carve_native/README.md)), `fssm_unpack.py`, `shader_disasm.py`, `rdna2spirv.py` |
 | Asset export | Finds validated resources inside RPF9 archives and the loose `.ttpf` texture pools | `tools/rpf9dump` (on rpf9-explorer's Core) |
 | Runtime | Maps the PE image, resolves imports to shims (GDK, XMem, `d3d12_xs`) | `runtime/` |
 | Research tools | PE/RTTI inspection, raw carving, texture tiling probes, GPU test harnesses | `tools/`, `runtime/test/` |
