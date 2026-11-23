@@ -47,6 +47,7 @@ struct Decoded {
 inline Decoded decode(const uint8_t* code, std::size_t avail) {
     Decoded d;
     std::size_t i = 0;
+    if (avail > 15) avail = 15;  // an x86 instruction is at most 15 bytes; a longer one is #UD on the CPU too
     bool p66 = false, pf2 = false, pf3 = false;
     uint8_t rex = 0;
     // Legacy prefixes and REX bytes in any order; only a REX right before the opcode counts, an earlier one is
@@ -69,8 +70,9 @@ inline Decoded decode(const uint8_t* code, std::size_t avail) {
         if (i >= avail) return {};
         const uint8_t m = code[i++];
         // AMD CPUs run CLZERO with 66, F2 or F3 in front (measured on Zen 3 in #7055's reviews). For FA/FB an F3
-        // selects another instruction (F3 0F 01 FA is MCOMMIT), so those stay #UD with F2/F3.
-        if ((pf2 || pf3) && m != 0xFC) return {};
+        // selects another instruction (F3 0F 01 FA is MCOMMIT), and no 66 or F2 form is measured, so MONITORX and
+        // MWAITX are only taken without those prefixes (the title's own sites carry none).
+        if ((p66 || pf2 || pf3) && m != 0xFC) return {};
         d.op = m == 0xFC ? Op::clzero : m == 0xFA ? Op::monitorx : m == 0xFB ? Op::mwaitx : Op::none;
         d.length = i;
         return d.op == Op::none ? Decoded{} : d;

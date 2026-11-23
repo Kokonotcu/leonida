@@ -67,6 +67,21 @@ void test_decode() {
     d = dec({0x48, 0x48, 0x0F, 0x01, 0xFC});
     check(d.op == ce::Op::clzero && d.length == 5, "clzero with two REX bytes");
     check(dec({0xF2, 0x0F, 0x01, 0xFB}).op == ce::Op::none, "F2 0F 01 FB is not mwaitx");
+    check(dec({0x66, 0x0F, 0x01, 0xFA}).op == ce::Op::none, "66 0F 01 FA is not monitorx");
+    check(dec({0x66, 0x0F, 0x01, 0xFB}).op == ce::Op::none, "66 0F 01 FB is not mwaitx");
+    {
+        // An instruction is at most 15 bytes: 12 prefixes + 0F 01 FC fit, 13 do not.
+        std::vector<uint8_t> v(12, 0x3E);
+        v.insert(v.end(), {0x0F, 0x01, 0xFC});
+        d = ce::decode(v.data(), v.size());
+        check(d.op == ce::Op::clzero && d.length == 15, "clzero behind 12 prefixes (15 bytes)");
+        v.insert(v.begin(), 0x3E);
+        v.insert(v.end(), {0x90, 0x90});  // more readable bytes after it must not help
+        check(ce::decode(v.data(), v.size()).op == ce::Op::none, "a 16-byte clzero is #UD");
+        std::vector<uint8_t> w(11, 0x3E);
+        w.insert(w.end(), {0x66, 0x0F, 0x78, 0xC0, 0x08, 0x04, 0x90});
+        check(ce::decode(w.data(), w.size()).op == ce::Op::none, "a 17-byte extrq is #UD");
+    }
     d = dec({0x48, 0x66, 0x0F, 0x78, 0xC1, 1, 1});
     check(d.op == ce::Op::extrq_imm && d.dst == 1, "a REX before 66 does not extend extrq's register");
     d = dec({0x66, 0x0F, 0x01, 0xFC});
