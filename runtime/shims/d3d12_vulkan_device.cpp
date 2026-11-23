@@ -6156,7 +6156,22 @@ public:
             break;
         default: return E_NOTIMPL;
         }
-        return create_command_signature(kind, desc->ByteStride, riid, out, identity());
+        // Review B2: the draw or dispatch arguments come last in each record, after any root arguments or views. The
+        // replay reads them from there; the leading ones are not applied yet (the per-record expansion of
+        // docs/d3d12_vulkan.md 4.7), which the first such signature says once.
+        UINT arguments_offset = 0;
+        for (UINT i = 0; i + 1 < desc->NumArgumentDescs; ++i) {
+            const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
+            arguments_offset += arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW ? sizeof(D3D12_VERTEX_BUFFER_VIEW)
+                                : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW ? sizeof(D3D12_INDEX_BUFFER_VIEW)
+                                : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT ? 4u * arg.Constant.Num32BitValuesToSet
+                                : arg.Type == compat::kIndirectArgumentIncrementingConstant ? 4u
+                                : UINT(sizeof(D3D12_GPU_VIRTUAL_ADDRESS));
+        }
+        if (arguments_offset)
+            log_once("ExecuteIndirect: a signature's root arguments/views before its draw are not applied yet; bytes",
+                     int(arguments_offset));
+        return create_command_signature(kind, desc->ByteStride, riid, out, identity(), arguments_offset);
     }
 
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(

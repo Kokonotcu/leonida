@@ -137,15 +137,19 @@ public:
     // {9a4e1c2b-55d8-4f7a-b012-3c8e7a1f6d90}
     static constexpr GUID kTag{0x9a4e1c2b, 0x55d8, 0x4f7a, {0xb0, 0x12, 0x3c, 0x8e, 0x7a, 0x1f, 0x6d, 0x90}};
 
-    CommandSignature(leonida::IndirectKind kind, UINT byte_stride) : kind_(kind), stride_(byte_stride) {}
+    CommandSignature(leonida::IndirectKind kind, UINT byte_stride, UINT arguments_offset)
+        : kind_(kind), stride_(byte_stride), arguments_offset_(arguments_offset) {}
 
     leonida::IndirectKind kind() const { return kind_; }
     UINT stride() const { return stride_; }
+    // Where the draw or dispatch arguments start in each record: after the root arguments and views before them.
+    UINT arguments_offset() const { return arguments_offset_; }
     static CommandSignature* from(IUnknown* object) { return Child::from<CommandSignature>(object); }
 
 private:
     leonida::IndirectKind kind_;
     UINT stride_;
+    UINT arguments_offset_;
 };
 
 class CommandAllocator final
@@ -837,8 +841,8 @@ public:
                                            ID3D12Resource* count_buffer, UINT64 count_buffer_offset) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         leonida::IndirectKind kind = leonida::IndirectKind::draw;
-        UINT stride = 0;
-        if (!command_signature_info(signature, kind, stride) || !argument_buffer)
+        UINT stride = 0, arguments_offset = 0;
+        if (!command_signature_info(signature, kind, stride, &arguments_offset) || !argument_buffer)
             return check(false);
         const auto arg_desc = argument_buffer->GetDesc();
         if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
@@ -857,9 +861,9 @@ public:
                 : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
                 : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
                 : 0;
-            if (!record_size || stride < record_size || stride % 4 != 0)
+            if (!record_size || stride < arguments_offset + record_size || stride % 4 != 0)
                 return check(false);
-            const UINT64 required = UINT64(max_command_count - 1) * stride + record_size;
+            const UINT64 required = UINT64(max_command_count - 1) * stride + arguments_offset + record_size;
             if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
                 return check(false);
         }
@@ -879,7 +883,9 @@ public:
         cmd.stride = stride;
         cmd.max_count = max_command_count;
         cmd.argument_buffer = resource_id(argument_buffer);
-        cmd.argument_offset = argument_buffer_offset;
+        // The draw/dispatch arguments of record k start at offset + k * stride + arguments_offset: the replay reads them
+        // from there, past the record's leading root arguments (which are not applied yet).
+        cmd.argument_offset = argument_buffer_offset + arguments_offset;
         cmd.count_buffer = count_buffer ? resource_id(count_buffer) : 0;
         cmd.count_offset = count_buffer ? count_buffer_offset : 0;
         if (kind == leonida::IndirectKind::dispatch && max_command_count) {  // the pipeline and root arguments a Dispatch would record
@@ -2073,19 +2079,21 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
 }
 
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
-                                 IUnknown* device) {
+                                 IUnknown* device, UINT arguments_offset) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* sig = new CommandSignature(kind, byte_stride);
+    auto* sig = new CommandSignature(kind, byte_stride, arguments_offset);
     sig->attach_device(device);
     return hand_out(sig, riid, out);
 }
 
-bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride) {
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride,
+                            UINT* arguments_offset) {
     const CommandSignature* s = CommandSignature::from(signature);
     if (!s) return false;
     kind = s->kind();
     byte_stride = s->stride();
+    if (arguments_offset) *arguments_offset = s->arguments_offset();
     return true;
 }
 
