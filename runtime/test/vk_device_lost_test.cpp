@@ -201,6 +201,67 @@ int lose(const char* label, Scene& scene, bool gpu, bool fault_enabled, mock::Fa
     std::fclose(out);
     EXPECT(count(report, "[rt] d3d12 DRED: ") >= 2);
     EXPECT(count(report, "lists did not complete") + count(report, "GPU progress UNKNOWN (no") == 1);  // once
+    EXPECT(count(report, "[rt] d3d12: DEVICE LOST:") == 1 && report.find("; breadcrumbs follow") != std::string::npos);
+    return 0;
+}
+
+// I3: without LEONIDA_DRED (no breadcrumbs) a loss still prints one line: the queue whose submission was lost, a
+// queue with a submission unfinished (held back by a gate the CPU opens later) and its last debug marker, and the
+// first fault address VK_EXT_device_fault reports.
+int summary(Scene& scene) {
+    const char* label = "device lost summary";
+    mock::reset(mock::Fault::data);
+    std::FILE* out = temp_file();
+    EXPECT(out);
+    {
+        VulkanContext context(mock::get_device, scene.d.device, true);
+        EXPECT(context.loaded());
+        context.set_report_output(out);
+        context.set_device_fault_enabled(true);
+        EXPECT(!context.breadcrumbs());
+        ResourceBinding src{}, dst{};
+        src.buffer = scene.src;
+        src.size = 64;
+        dst.buffer = scene.dst;
+        dst.size = 64;
+        context.add_resource(1, src);
+        context.add_resource(2, dst);
+        VulkanQueue busy(context, scene.d.queue, scene.d.family);
+        VulkanQueue copy(context, scene.d.queue, scene.d.family, VulkanQueue::QueueKind::copy);
+        EXPECT(busy.ok() && copy.ok());
+        VulkanFence gate(context, 0);
+        EXPECT(gate.semaphore() != VK_NULL_HANDLE);
+        context.holds().signaled(gate.semaphore(), 1);  // counts as submitted: the batch below is not held
+        busy.wait(gate.semaphore(), 1);
+        CommandList marked;
+        EXPECT(marked.marker(DebugMarker::Kind::set, "shadow pass") && marked.copy_buffer({2, 32, 1, 32, 16}) &&
+               marked.close());
+        const CommandList* pm = &marked;
+        EXPECT(busy.execute({&pm, 1}) == ReplayResult::success);  // waits for the gate on the GPU
+        mock::lose_next_submit = true;
+        const CommandList* pb = &scene.b;
+        EXPECT(copy.execute({&pb, 1}) == ReplayResult::unsupported);
+        EXPECT(context.is_device_lost());
+        // Open the gate (the device is not really lost) so the queues can go idle.
+        VkSemaphoreSignalInfo open{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        open.semaphore = gate.semaphore();
+        open.value = 1;
+        EXPECT(scene.d.fn<PFN_vkSignalSemaphore>("vkSignalSemaphore")(scene.d.device, &open) == VK_SUCCESS);
+        EXPECT(busy.idle() && copy.idle());
+    }
+    const std::string r = read_all(out);
+    std::fclose(out);
+    std::fputs(r.c_str(), stdout);
+    EXPECT(count(r, "[rt] d3d12: DEVICE LOST:") == 1);
+    EXPECT(r.find("direct queue ") != std::string::npos);
+    EXPECT(r.find("submissions 1..1 unfinished, last marker \"shadow pass\"") != std::string::npos);
+    EXPECT(r.find("copy queue ") != std::string::npos);
+    EXPECT(r.find("lost its submission 1 at vkQueueSubmit") != std::string::npos);
+    EXPECT(r.find("fault \"mock page fault\" at 0x12340000") != std::string::npos);
+    EXPECT(r.find("LEONIDA_DRED=1 adds per-command breadcrumbs") != std::string::npos);
+    EXPECT(r.find("[rt] d3d12 DRED:") == std::string::npos);
+    EXPECT(mock::fault_calls == 2 && mock::fault_violations == 0);
+    std::printf("device lost: one-line summary without DRED (lost queue, unfinished queue + marker, fault) ok\n");
     return 0;
 }
 
@@ -334,7 +395,7 @@ int main() {
     EXPECT(scene.a.copy_buffer({2, 0, 1, 0, 16}) && scene.a.close());
     EXPECT(scene.b.copy_buffer({2, 16, 1, 16, 16}) && scene.b.close());
 
-    if (scenarios(scene) || concurrent(scene) || busy_slots(scene)) return 1;
+    if (scenarios(scene) || concurrent(scene) || busy_slots(scene) || summary(scene)) return 1;
     const unsigned errors = d.validation_errors();
     std::printf("device lost: %u validation errors\n", errors);
     return errors ? 1 : 0;

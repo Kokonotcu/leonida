@@ -1692,6 +1692,92 @@ public:
     // Vulkan requires external synchronisation of a VkQueue; every D3D12 queue of the device may share one.
     std::mutex& submit_mutex() { return submit_mutex_; }
 
+    // What the device-lost summary says about each queue (I3): VulkanQueue keeps it, by its progress semaphore.
+    void track_queue(VkSemaphore progress, VkQueue queue, std::uint32_t family, const char* kind) {
+        std::lock_guard lock(queue_records_mutex_);
+        queue_records_.push_back({progress, queue, family, kind, 0, {}});
+    }
+    void untrack_queue(VkSemaphore progress) {
+        std::lock_guard lock(queue_records_mutex_);
+        std::erase_if(queue_records_, [&](const QueueRecord& r) { return r.progress == progress; });
+        if (lost_submission_ == progress) lost_submission_ = VK_NULL_HANDLE;
+    }
+    // A submission reached the queue (its progress timeline will reach `value`); `marker`: the last debug marker
+    // it carries, if any.
+    void note_queue_submitted(VkSemaphore progress, std::uint64_t value, std::string_view marker = {}) {
+        std::lock_guard lock(queue_records_mutex_);
+        for (QueueRecord& r : queue_records_)
+            if (r.progress == progress) {
+                r.submitted = value;
+                if (!marker.empty()) r.marker.assign(marker);
+            }
+    }
+    void note_queue_marker(VkSemaphore progress, std::string_view marker) {
+        std::lock_guard lock(queue_records_mutex_);
+        for (QueueRecord& r : queue_records_)
+            if (r.progress == progress && !marker.empty()) r.marker.assign(marker);
+    }
+    // vkQueueSubmit on this queue returned VK_ERROR_DEVICE_LOST.
+    void note_lost_submission(VkSemaphore progress) {
+        std::lock_guard lock(queue_records_mutex_);
+        if (!lost_submission_) lost_submission_ = progress;
+    }
+    // VK_EXT_device_fault and its deviceFault feature are enabled: the loss report asks it (LEONIDA_DRED or not).
+    void set_device_fault_enabled(bool enabled) { device_fault_enabled_ = enabled; }
+
+    // The one line every loss prints.
+    std::string device_lost_summary(bool fault, const std::vector<VkDeviceFaultAddressInfoEXT>& addresses,
+                                    const std::string& description) const {
+        std::string line = "[rt] d3d12: DEVICE LOST:";
+        char text[256];
+        bool any = false;
+        {
+            std::lock_guard lock(queue_records_mutex_);
+            for (const QueueRecord& r : queue_records_) {
+                std::uint64_t done = 0;
+                const bool known = vk.vkGetSemaphoreCounterValue &&
+                                   vk.vkGetSemaphoreCounterValue(device_, r.progress, &done) == VK_SUCCESS;
+                const bool lost_here = r.progress == lost_submission_;
+                if (!lost_here && (!r.submitted || (known && done >= r.submitted))) continue;
+                std::snprintf(text, sizeof text, "%s %s queue %p (family %u)", any ? ";" : "", r.kind,
+                              static_cast<void*>(r.queue), r.family);
+                line += text;
+                if (lost_here) {
+                    std::snprintf(text, sizeof text, " lost its submission %llu at vkQueueSubmit",
+                                  static_cast<unsigned long long>(r.submitted + 1));
+                    line += text;
+                }
+                if (r.submitted && (!known || done < r.submitted)) {
+                    if (known)
+                        std::snprintf(text, sizeof text, "%s submissions %llu..%llu unfinished", lost_here ? "," : "",
+                                      static_cast<unsigned long long>(done + 1),
+                                      static_cast<unsigned long long>(r.submitted));
+                    else
+                        std::snprintf(text, sizeof text, "%s %llu submitted, GPU progress unreadable",
+                                      lost_here ? "," : "", static_cast<unsigned long long>(r.submitted));
+                    line += text;
+                }
+                if (!r.marker.empty()) line += ", last marker \"" + r.marker + "\"";
+                any = true;
+            }
+        }
+        if (!any) line += " no queue had a submission in flight";
+        if (fault) {
+            line += "; fault \"" + description + "\"";
+            if (!addresses.empty()) {
+                const VkDeviceFaultAddressInfoEXT& a = addresses.front();
+                std::snprintf(text, sizeof text, " at %#llx (type %d%s)", static_cast<unsigned long long>(a.reportedAddress),
+                              static_cast<int>(a.addressType), addresses.size() > 1 ? ", more follow with LEONIDA_DRED" : "");
+                line += text;
+            }
+        } else {
+            line += device_fault_enabled_ ? "; the driver reports no fault information"
+                                          : "; no fault information (VK_EXT_device_fault not enabled)";
+        }
+        line += breadcrumbs_ ? "; breadcrumbs follow" : "; LEONIDA_DRED=1 adds per-command breadcrumbs";
+        return line;
+    }
+
     void mark_device_lost() noexcept {
         device_lost_.store(true, std::memory_order_release);
         if (fence_dispatcher_) {
@@ -1709,15 +1795,20 @@ public:
         return true;
     }
 
-    // Once, when the diagnostics are configured (LEONIDA_DRED): the breadcrumbs and VK_EXT_device_fault.
+    // Once per loss. Always one line (device_lost_summary): which queue lost a submission or still had submissions
+    // unfinished, its last debug marker, and VK_EXT_device_fault's first address. Then, when the diagnostics are
+    // configured (LEONIDA_DRED), the breadcrumbs and every fault address.
     void report_device_lost() const noexcept {
-        if (!breadcrumbs_ || lost_reported_.exchange(true, std::memory_order_acq_rel)) return;
+        if (lost_reported_.exchange(true, std::memory_order_acq_rel)) return;
         std::FILE* const out = report_out_;
         try {
-            breadcrumbs_->report(out);
             std::vector<VkDeviceFaultAddressInfoEXT> addresses;
             std::string description;
-            if (!device_fault(addresses, description)) {
+            const bool fault = device_fault(addresses, description);
+            std::fprintf(out, "%s\n", device_lost_summary(fault, addresses, description).c_str());
+            if (!breadcrumbs_) return;
+            breadcrumbs_->report(out);
+            if (!fault) {
                 std::fprintf(out, "[rt] d3d12 DRED: no device fault information (VK_EXT_device_fault)\n");
                 return;
             }
@@ -1877,6 +1968,18 @@ private:
     mutable std::atomic<bool> lost_reported_{false};
     bool device_fault_enabled_ = false;
     std::FILE* report_out_ = stderr;
+    // For the device-lost summary (track_queue). A leaf lock: nothing else is taken under it.
+    struct QueueRecord {
+        VkSemaphore progress;
+        VkQueue queue;
+        std::uint32_t family;
+        const char* kind;
+        std::uint64_t submitted;  // the progress value of the last submission that reached the queue
+        std::string marker;       // the last debug marker submitted on it
+    };
+    mutable std::mutex queue_records_mutex_;
+    std::vector<QueueRecord> queue_records_;
+    VkSemaphore lost_submission_ = VK_NULL_HANDLE;  // the queue whose vkQueueSubmit returned VK_ERROR_DEVICE_LOST
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
@@ -2076,6 +2179,11 @@ public:
         VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
         ok_ = ok_ && vk.vkCreateSemaphore(context.device(), &info, nullptr, &progress_) == VK_SUCCESS;
         try {
+            if (progress_)
+                context_.track_queue(progress_, queue_, family_,
+                                     kind_ == QueueKind::copy      ? "copy"
+                                     : kind_ == QueueKind::compute ? "compute"
+                                                                   : "direct");
             context_.holds().attach(this);
         } catch (...) {
             // A failed registration leaves no queue to run the destructor for these Vulkan handles.
@@ -2105,6 +2213,7 @@ public:
             }
         }
         if (lost) context_.mark_device_lost();
+        if (progress_) context_.untrack_queue(progress_);
         if (progress_) {
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
@@ -2731,10 +2840,15 @@ private:
         // Bindless images that may already be visible to shaders are initialized on a submission that runs shaders.
         // initialize() zeroes committed storage images and only transitions sparse images.
         bool runs_shaders = false;
+        const DebugMarker* last_marker = nullptr;  // named by the device-lost summary
         for (const CommandList* list : lists)
-            for (const auto& command : list->commands())
+            for (const auto& command : list->commands()) {
                 runs_shaders |= std::holds_alternative<Dispatch>(command) || std::holds_alternative<Draw>(command) ||
                                 std::holds_alternative<ExecuteIndirect>(command);
+                if (const auto* m = std::get_if<DebugMarker>(&command); m && m->kind != DebugMarker::Kind::end)
+                    last_marker = m;
+            }
+        submit_marker_ = last_marker ? last_marker->label : std::string();
         std::vector<ResourceId> storage_images;
         std::vector<VulkanContext::PendingZero> zero_buffers;
         {
@@ -2888,6 +3002,7 @@ private:
     }
 
     void marker_now(DebugMarker::Kind kind, const char* label) {
+        if (kind != DebugMarker::Kind::end && label && progress_) context_.note_queue_marker(progress_, label);
         const DebugLabelFunctions& f = context_.labels_;
         if (!f.complete()) return;
         if (kind == DebugMarker::Kind::end && !open_labels_) return;
@@ -3415,7 +3530,10 @@ private:
                 if (signals_fence) context_.holds().signaled(fence, value);
             }
         }
+        last_submit_result_ = res;
+        if (res == VK_SUCCESS) context_.note_queue_submitted(progress_, ticket, std::exchange(submit_marker_, {}));
         if (res == VK_ERROR_DEVICE_LOST) {
+            context_.note_lost_submission(progress_);
             context_.mark_device_lost();
             clear_waits();
             return false;
@@ -3433,6 +3551,8 @@ private:
     VulkanContext& context_;
     VkQueue queue_;
     QueueKind kind_ = QueueKind::direct;
+    std::string submit_marker_;  // the last debug marker of the lists the next submit() carries (device-lost summary)
+    VkResult last_submit_result_ = VK_SUCCESS;  // what the last vkQueueSubmit returned
     std::uint32_t family_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done

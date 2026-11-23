@@ -6099,6 +6099,7 @@ public:
             if (family.queueFlags & VK_QUEUE_COMPUTE_BIT)
                 state_.context->set_occlusion_resolve_memory(state_.memory);
         }
+        state_.context->set_device_fault_enabled(info.device_fault);  // the loss summary asks it, DRED or not
         if ((dred_requested() || info.buffer_marker) &&
             !state_.context->configure_breadcrumbs(state_.memory, info.buffer_marker, info.device_fault,
                                                    dred_level() >= 2))
@@ -10960,28 +10961,27 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
     }
 
-    // LEONIDA_DRED=1: device-lost diagnostics (vulkan_breadcrumbs.h), off by default.
+    // VK_EXT_device_fault whenever the device has it: every device loss prints a one-line summary with the faulting
+    // address (VulkanContext::report_device_lost). LEONIDA_DRED=1 adds the breadcrumbs (vulkan_breadcrumbs.h).
+    const auto device_has = [&](const char* name) {
+        return std::any_of(extensions.begin(), extensions.end(),
+                           [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+    };
 #if defined(VK_EXT_device_fault)
     VkPhysicalDeviceFaultFeaturesEXT fault_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (device_has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fault_features};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        info.device_fault = fault_features.deviceFault == VK_TRUE;
+        if (info.device_fault) {
+            fault_features.deviceFaultVendorBinary = VK_FALSE;  // the report reads no vendor dump
+            fault_features.pNext = *v13.next();  // since #1706
+            *v13.next() = &fault_features;
+        }
+    }
 #endif
     if (dred_requested()) {
-        const auto device_has = [&](const char* name) {
-            return std::any_of(extensions.begin(), extensions.end(),
-                               [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
-        };
         info.buffer_marker = device_has(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
-#if defined(VK_EXT_device_fault)
-        if (device_has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
-            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fault_features};
-            vkGetPhysicalDeviceFeatures2(info.physical, &query);
-            info.device_fault = fault_features.deviceFault == VK_TRUE;
-            if (info.device_fault) {
-                fault_features.deviceFaultVendorBinary = VK_FALSE;  // the report reads no vendor dump
-                fault_features.pNext = *v13.next();  // since #1706
-                *v13.next() = &fault_features;
-            }
-        }
-#endif
         std::fprintf(stderr, "[rt] d3d12 DRED: breadcrumbs %s, device fault %s\n",
                      info.buffer_marker ? "on" : "off (no VK_AMD_buffer_marker)",
                      info.device_fault ? "on" : "off (no VK_EXT_device_fault)");
