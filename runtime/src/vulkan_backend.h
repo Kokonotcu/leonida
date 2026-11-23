@@ -2337,11 +2337,13 @@ private:
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceSize offset = 0;
             std::uint64_t room = 64;  // one D3D12_RAYTRACING_INSTANCE_DESC
-            if (!va || !vk.buffer_at(va, room, buffer, offset) || room < 64 || va > UINT64_MAX - vk.heap_base) {
+            if (!va || !vk.buffer_at(va, room, buffer, offset) || room < 64) {
                 funcs.vkUnmapMemory(context_.device(), stage.memory);
                 discard();
                 return ReplayResult::invalid_copy;
             }
+            // heap_base + va wraps for a buffer below the arena (an UPLOAD buffer's VA is its device address minus the
+            // heap base), as every other VA-to-address conversion in the layer does; it must not be refused.
             const std::uint64_t device_address = vk.heap_base + va;
             std::memcpy(static_cast<std::uint8_t*>(mapped) + 8ull * i, &device_address, sizeof(device_address));
         }
