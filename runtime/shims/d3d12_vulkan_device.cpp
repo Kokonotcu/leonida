@@ -3146,24 +3146,7 @@ public:
     // {5d20c7a4-8e13-4b6d-9f27-3a1c94e0b7d8}
     static constexpr GUID kTag{0x5d20c7a4, 0x8e13, 0x4b6d, {0x9f, 0x27, 0x3a, 0x1c, 0x94, 0xe0, 0xb7, 0xd8}};
 
-    // A heap starts zeroed unless it was made with CREATE_NOT_ZEROED, as on D3D12; the arena range it takes may hold
-    // what an earlier resource left there. Placed buffers are ranges of it and write nothing when they are placed.
-    Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : device_(device), desc_(desc) {
-        VkDeviceSize offset = 0;
-        if (device_.arena.mapped &&
-            device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset,
-                                   DeviceState::arena_heap)) {
-            if (!(desc_.Flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED))
-                std::memset(device_.arena.mapped + offset, 0, std::size_t(desc_.SizeInBytes));
-            allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
-                new leonida::TileHeapAllocation{device_.arena.memory, offset, desc_.SizeInBytes,
-                                                device_.arena.memory_type},
-                [&device](const leonida::TileHeapAllocation* allocation) {
-                    device.arena_release(allocation->offset, allocation->size, DeviceState::arena_heap);
-                    delete allocation;
-                });
-        }
-    }
+    Heap(DeviceState& device, const D3D12_HEAP_DESC& desc) : device_(device), desc_(desc) {}
 
     // As the host reports it (measured against the PC runtime, d3d12_vulkan_device_test compare_heap_descs): the
     // alignment the heap was placed with (64 KiB for an Alignment of 0) and the one node for a node mask of 0, as the
@@ -3176,15 +3159,14 @@ public:
         return desc;
     }
 
-    // ID3D12Heap1: the layer has no protected resource sessions, so no heap belongs to one. The host runtime and
-    // WARP answer DXGI_ERROR_NOT_FOUND with a null interface for an unprotected heap, whatever the IID asked for.
-    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void** out) override {
-        if (out) *out = nullptr;
-        return DXGI_ERROR_NOT_FOUND;
+    // The heap's range in the GPU address arena, reserved when a buffer first needs it (a placed buffer, or buffer
+    // tiles sharing the arena): textures never use it, and a D3D12 heap has no GPU VA of its own, so a heap that only
+    // ever holds textures costs no arena space. False when the arena can't take the heap.
+    bool reserve_arena() {
+        std::lock_guard lock(backing_mutex_);
+        return reserve_arena_locked();
     }
-
-    bool reserved() const { return bool(allocation_); }
-    VkDeviceSize offset() const { return allocation_->offset; }
+    VkDeviceSize offset() const { return allocation_->offset; }   // after reserve_arena()
     UINT64 bytes() const { return desc_.SizeInBytes; }
     UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
     const D3D12_HEAP_PROPERTIES& properties() const { return desc_.Properties; }
@@ -3196,7 +3178,7 @@ public:
             (desc_.Flags & denied)) return {};
         std::lock_guard lock(backing_mutex_);
         if (!image && device_.tiles_share_arena()) {
-            if (tile_allocation_) return {};
+            if (tile_allocation_ || !reserve_arena_locked()) return {};
             arena_tiles_ = true;
             return allocation_;
         }
@@ -3233,6 +3215,26 @@ public:
     }
 
 private:
+    bool reserve_arena_locked() {
+        if (allocation_) return true;
+        VkDeviceSize offset = 0;
+        if (!device_.arena.mapped ||
+            !device_.arena_allocate(desc_.SizeInBytes, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, offset,
+                                    DeviceState::arena_heap))
+            return false;
+        // A heap reads as zeroed unless it was made with CREATE_NOT_ZEROED, as on D3D12 (#7559); the arena range may
+        // hold what an earlier resource left there. Zeroed here, when the range is taken, before any buffer uses it.
+        if (!(desc_.Flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED))
+            std::memset(device_.arena.mapped + offset, 0, std::size_t(desc_.SizeInBytes));
+        allocation_ = std::shared_ptr<const leonida::TileHeapAllocation>(
+            new leonida::TileHeapAllocation{device_.arena.memory, offset, desc_.SizeInBytes, device_.arena.memory_type},
+            [&device = device_](const leonida::TileHeapAllocation* allocation) {
+                device.arena_release(allocation->offset, allocation->size, DeviceState::arena_heap);
+                delete allocation;
+            });
+        return true;
+    }
+
     DeviceState& device_;
     D3D12_HEAP_DESC desc_;
     std::shared_ptr<const leonida::TileHeapAllocation> allocation_;
@@ -7559,13 +7561,12 @@ public:
                      int(desc->SizeInBytes / 1024));
             return E_NOTIMPL;
         }
-        if (!out) return S_FALSE;
+        // Its arena range is reserved by the first buffer placed in it (Heap::reserve_arena).
         auto* heap = new Heap(state_, *desc);
         heap->attach_device(identity());
-        if (!heap->reserved()) {
-            log_once("GPU address arena full (raise LEONIDA_ARENA_MB); heap size in KiB:", int(desc->SizeInBytes / 1024));
+        if (!out) {
             heap->Release();
-            return E_OUTOFMEMORY;
+            return S_FALSE;
         }
         return hand_out(heap, riid, out);
     }
@@ -7707,6 +7708,11 @@ public:
         }
         if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         const bool buffer = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        if (buffer && !heap->reserve_arena()) {
+            log_once("GPU address arena full (raise LEONIDA_ARENA_MB); heap of a placed buffer, size in KiB:",
+                     int(heap->bytes() / 1024));
+            return d3d12_trace::result(method, E_OUTOFMEMORY);
+        }
         if (buffer && !heap->use_as_placed_resource(true)) {
             log_once("placed buffer refused: heap uses a separate allocation for sparse tiles", 1);
             return d3d12_trace::result(method, E_NOTIMPL);
