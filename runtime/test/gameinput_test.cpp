@@ -139,8 +139,11 @@ DWORD g_reading_sleep_ms = 0;  // makes on_reading slow, for the Dispatch quota 
 SDL_Joystick* g_requeue_pad = nullptr;  // set: on_reading queues one more reading from inside the callback
 bool g_requeue_down = false;
 
-void CALLBACK on_reading(GameInputCallbackToken, void*, IGameInputReading* reading, bool) {
+int g_reading_overruns = 0;    // readings delivered with hasOverrunOccurred
+
+void CALLBACK on_reading(GameInputCallbackToken, void*, IGameInputReading* reading, bool overrun) {
     if (reading) ++g_reading_events;
+    if (overrun) ++g_reading_overruns;
     if (g_reading_sleep_ms) Sleep(g_reading_sleep_ms);
     if (g_requeue_pad) {
         g_requeue_down = !g_requeue_down;
@@ -515,12 +518,24 @@ void test_raw_report_during_reconnect(IGameInput* input) {
         got = held->GetRawReport(&report);
         SetEvent(read_done);
     });
-    const bool waited = WaitForSingleObject(read_done, 200) == WAIT_TIMEOUT;
+    // The HID open is device I/O and runs before any lock a title call takes, so the held reading answers at once
+    // while the reconnect is still stuck in it; the report tables are swapped later under the device's hid_mu.
+    const bool finished = WaitForSingleObject(read_done, 5000) == WAIT_OBJECT_0;
+    HANDLE call_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    std::thread caller([&] {
+        IGameInputReading* now = nullptr;
+        if (input->GetCurrentReading(GameInputKindGamepad, nullptr, &now) == S_OK && now) now->Release();
+        SetEvent(call_done);
+    });
+    const bool unblocked = in_open && WaitForSingleObject(call_done, 5000) == WAIT_OBJECT_0 &&
+                           WaitForSingleObject(g_raw.release_open, 0) == WAIT_TIMEOUT;
+    check(unblocked, "raw hid reconnect: a title call that takes the state lock returns during the HID open");
     SetEvent(g_raw.release_open);
     poller.join();
-    const bool finished = WaitForSingleObject(read_done, 5000) == WAIT_OBJECT_0;
     reader.join();
-    check(in_open && waited, "raw hid reconnect: GetRawReport waits while open_raw rebuilds the report tables");
+    caller.join();
+    CloseHandle(call_done);
+    check(in_open && finished, "raw hid reconnect: GetRawReport does not wait for the reconnect's HID open");
     auto* rr = static_cast<IGameInputRawDeviceReport*>(report);
     check(finished && got && rr && raw_bytes(rr) == std::vector<uint8_t>({0x44, 0x55, 0x66}),
           "raw hid reconnect: then it gives the held reading's report");
@@ -1914,6 +1929,15 @@ int main() {
             rt::gameinput::poll();
             while (dispatcher->Dispatch(UINT64_MAX)) {}
         }
+
+        // A title that stops calling Dispatch (a loading screen) while a pad streams readings: the queue keeps at most
+        // 256 readings per device, the oldest go, and the next delivered reading reports the overrun. 300 changes,
+        // ending with NORTH down as before.
+        const int before_flood = g_reading_events, overruns = g_reading_overruns;
+        queue_changes(300);
+        while (dispatcher->Dispatch(UINT64_MAX)) {}
+        check(g_reading_events - before_flood < 300 && g_reading_events > before_flood && g_reading_overruns > overruns,
+              "an undrained queue drops the oldest readings and reports hasOverrunOccurred");
     }
     if (wait) CloseHandle(wait);
     if (dispatcher) dispatcher->Release();
