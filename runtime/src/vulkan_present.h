@@ -577,6 +577,27 @@ private:
         VkResult submitted, result = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
+            // Besides the acquire, wait for every D3D12 queue's latest submission (taken under the submit lock, so it
+            // covers all work submitted before this present): the title may have rendered the frame on a VkQueue
+            // other than queue_ (review B5). Timeline values; the acquire is binary and its value is ignored.
+            std::vector<VkSemaphore> waits{frame.acquired};
+            std::vector<std::uint64_t> wait_values{0};
+            std::vector<VkPipelineStageFlags> wait_stages{wait_stage};
+            for (const auto& [semaphore, value] : context_.latest_pending_queue_values()) {
+                waits.push_back(semaphore);
+                wait_values.push_back(value);
+                wait_stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            }
+            VkTimelineSemaphoreSubmitInfo timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+            timeline.waitSemaphoreValueCount = std::uint32_t(wait_values.size());
+            timeline.pWaitSemaphoreValues = wait_values.data();
+            if (waits.size() > 1) {
+                timeline.pNext = submit_info.pNext;
+                submit_info.pNext = &timeline;
+                submit_info.waitSemaphoreCount = std::uint32_t(waits.size());
+                submit_info.pWaitSemaphores = waits.data();
+                submit_info.pWaitDstStageMask = wait_stages.data();
+            }
             submitted = vk.vkQueueSubmit(queue_, 1, &submit_info, frame.done);
             if (submitted != VK_SUCCESS) rollback();
             // Commit/rollback happened before releasing tracker_mutex_ inside submit_mutex(), preserving submission

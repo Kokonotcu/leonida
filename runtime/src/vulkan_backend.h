@@ -955,6 +955,19 @@ public:
         replay_.write_timestamp = vk.vkCmdWriteTimestamp;
         replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
         replay_.bind_pipeline = vk.vkCmdBindPipeline;
+        {
+            // D3D-324: LEONIDA_DRAW_SCOPES=0 gives every draw its own rendering scope again (to compare). Read here,
+            // once per context, not through a function-local static on a title thread.
+#ifdef _WIN32
+            char value[4] = {};
+            std::size_t length = 0;
+            replay_.merge_draw_scopes =
+                !(getenv_s(&length, value, sizeof(value), "LEONIDA_DRAW_SCOPES") == 0 && length == 2 && value[0] == '0');
+#else
+            const char* value = std::getenv("LEONIDA_DRAW_SCOPES");
+            replay_.merge_draw_scopes = !(value && value[0] == '0' && value[1] == '\0');
+#endif
+        }
         replay_.push_constants = vk.vkCmdPushConstants;
         replay_.bind_descriptor_sets = vk.vkCmdBindDescriptorSets;
         replay_.dispatch = vk.vkCmdDispatch;
@@ -1512,6 +1525,20 @@ public:
     // each recorded with its queue's timeline value, so this waits for every queue's timeline to pass what was
     // submitted to it, and never makes a queue wait.
     std::uint64_t submitted_retire_ticket() const { return submitted_ticket_.load(std::memory_order_acquire); }
+
+    // With submit_mutex() held: each queue's timeline at the latest of its submissions not yet seen complete, one entry
+    // per queue. A submit outside the D3D12 queues (the presenter's blit) waits for these to run after all the work
+    // submitted so far, whichever VkQueue the title rendered the frame on (review B5).
+    std::vector<std::pair<VkSemaphore, std::uint64_t>> latest_pending_queue_values() const {
+        std::vector<std::pair<VkSemaphore, std::uint64_t>> out;
+        for (const auto& [semaphore, value] :
+             retire_tickets_.pending_through(submitted_ticket_.load(std::memory_order_acquire))) {
+            auto it = std::find_if(out.begin(), out.end(), [&](const auto& e) { return e.first == semaphore; });
+            if (it == out.end()) out.emplace_back(semaphore, value);
+            else if (value > it->second) it->second = value;
+        }
+        return out;
+    }
 
     template<typename VkHandle>
     void defer_destroy(DeferredDeletionQueue::Kind kind, VkHandle handle) {
