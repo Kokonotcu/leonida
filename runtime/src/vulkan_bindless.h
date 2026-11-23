@@ -83,6 +83,9 @@ struct BindlessFeatures {
         VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT};
     // Descriptors in each binding, by binding number: bindless::bindings by default, or what size_bindings() chose.
     std::array<std::uint32_t, bindless::binding_count> counts = bindless::default_counts();
+    // maxUpdateAfterBindDescriptorsInAllPools with update_after_bind (size_bindings() sets it): every generation of
+    // the set has a pool of its own, and all that are alive count against it. No limit otherwise.
+    std::uint32_t pool_limit = 0xffffffffu;
 };
 
 namespace bindless {
@@ -240,6 +243,7 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     std::uint32_t resource_limit = uab ? v12.maxPerStageUpdateAfterBindResources : limits.maxPerStageResources;
     resource_limit -= std::min(resource_limit, std::min(limits.maxColorAttachments, 8u));
     const std::uint32_t pool_limit = uab ? v12.maxUpdateAfterBindDescriptorsInAllPools : 0xffffffffu;
+    features.pool_limit = pool_limit;
 
     auto& counts = features.counts;
     counts = default_counts();
@@ -308,6 +312,20 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     grow(storage, std::max(storage, max_storage_indices), growth_headroom, set_limit);
     apply(true);
     return full;
+}
+
+// How many retired generations of the set may wait for their submissions, at most `cap` (D4). Each generation has a
+// pool of the whole set's size, and a flush that replaces the table makes a new one while the current and the
+// retired ones are still alive: retired + 2 pools must fit features.pool_limit
+// (maxUpdateAfterBindDescriptorsInAllPools). Past it the owner waits for the oldest instead, as at `cap`. 0 when even
+// two generations do not fit (the replacing flush may then fail, as before).
+inline std::size_t retired_generation_cap(const BindlessFeatures& features, std::size_t cap) {
+    std::uint64_t per_set = 0;
+    for (std::uint32_t b = 0; b < binding_count; ++b)
+        if (binding_enabled(b, features)) per_set += features.counts[b];
+    if (!per_set || features.pool_limit == 0xffffffffu) return cap;
+    const std::uint64_t generations = features.pool_limit / per_set;
+    return generations < 2 ? 0 : std::size_t(std::min<std::uint64_t>(cap, generations - 2));
 }
 
 } // namespace bindless
