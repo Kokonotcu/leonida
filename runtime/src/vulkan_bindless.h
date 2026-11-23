@@ -358,6 +358,8 @@ public:
     }
     // Set 0 of every pipeline layout made for translated shaders.
     VkDescriptorSetLayout layout() const { return layout_; }
+    // What layout() was made from (SetLayout(features()) gives its create info again; pso_recipe.h records it).
+    const BindlessFeatures& features() const { return features_; }
     // Bound at set 0. flush() updates it in place until flush_replaces_table() is true: then the flush makes a new
     // set (and table buffers), so read set() again after it, when recording the commands that use it. A submission
     // that bound the previous set keeps it, intact, until release_retired() frees it.

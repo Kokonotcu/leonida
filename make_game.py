@@ -2524,7 +2524,34 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
         why = f"; {len(crashed)} module(s) took the driver down and were counted as failed: " + ", ".join(crashed) \
             if crashed else ""
         fail(f"vk_pipeline_check exited with {exit_label(code)}{why}")
+    prebuild_recorded_pipelines(out)
     log("pipelines: done")
+
+
+PSO_RECIPES = "pso_recipes.jsonl"   # beside gta6rt.exe: every graphics pipeline a run built (runtime/src/pso_recipe.h)
+
+
+def prebuild_recorded_pipelines(out: str) -> None:
+    """Compile every graphics pipeline an earlier run recorded, with the runtime's own device, ahead of the next run.
+
+    vk_pipeline_check above compiles each shader with stand-in fixed-function state, which seeds the driver's shader
+    cache but not the game's real pipelines (blend, formats, vertex input). The runtime records each pipeline it
+    builds in pso_recipes.jsonl; `gta6rt --prebuild-pipelines` creates its Vulkan device exactly as a game run does,
+    builds every recorded pipeline, and saves the runtime pipeline cache, so the game then compiles none of them."""
+    gta6rt = os.path.join(out, "gta6rt.exe")
+    recipes = os.path.join(out, PSO_RECIPES)
+    if not os.path.isfile(recipes):
+        log(f"pipelines: no {PSO_RECIPES} yet (written by a game run); only the shader-level cache was built")
+        return
+    if not os.path.isfile(gta6rt):
+        log("pipelines: gta6rt.exe is not built, so the recorded pipelines are not prebuilt")
+        return
+    cmd = [gta6rt, "--prebuild-pipelines"] if os.name == "nt" else [os.path.join(out, "gta6rt.sh"),
+                                                                     "--prebuild-pipelines"]
+    if run(cmd, check=False) != 0:
+        log("pipelines: prebuilding the recorded pipelines failed; the game will compile them as it meets them")
+        return
+    log("pipelines: recorded pipelines prebuilt into the runtime pipeline cache")
 
 
 # How many times the pipelines stage restarts vk_pipeline_check after a module takes it down (each costs at most the

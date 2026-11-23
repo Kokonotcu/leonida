@@ -30,6 +30,7 @@
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
+#include "../src/pso_recipe.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
 #include "../src/vulkan_present.h"
@@ -1085,6 +1086,38 @@ struct DeviceState {
         std::uint64_t address;
     };
     std::unique_ptr<leonida::BindlessSet> bindless;
+
+    // docs/aot_pipelines.md: every graphics pipeline this device builds goes to pso_recipes.jsonl beside gta6rt.exe,
+    // which `gta6rt --prebuild-pipelines` (and the build's pipelines stage) compiles ahead of the next run.
+    // LEONIDA_PSO_RECORD=0 records nothing; LEONIDA_PSO_RECIPES=<file> records elsewhere. Null when off.
+    std::once_flag pso_recorder_once;
+    std::unique_ptr<leonida::pso::Recorder> pso_recorder_;
+    leonida::pso::Recorder* pso_recorder() {
+        std::call_once(pso_recorder_once, [this] {
+            if (const char* off = std::getenv("LEONIDA_PSO_RECORD"); off && std::strcmp(off, "0") == 0) return;
+            std::filesystem::path path;
+            if (const char* where = std::getenv("LEONIDA_PSO_RECIPES"); where && *where) path = where;
+            else if (const auto cache = pipeline_cache_path(); !cache.empty()) path = cache.parent_path() / L"pso_recipes.jsonl";
+            if (path.empty()) return;
+            pso_recorder_ = std::make_unique<leonida::pso::Recorder>(path, set0_layout_desc());
+            if (!pso_recorder_->ok()) pso_recorder_.reset();
+        });
+        return pso_recorder_.get();
+    }
+    // The set-0 layout as pso_recipe.h records it: what bindless->layout() was created from, binding by binding.
+    leonida::pso::SetLayoutDesc set0_layout_desc() const {
+        leonida::pso::SetLayoutDesc desc;
+        if (!bindless) return desc;
+        const leonida::bindless::SetLayout layout(bindless->features());
+        desc.create_flags = layout.info.flags;
+        for (std::uint32_t i = 0; i < layout.info.bindingCount; ++i) {
+            const VkDescriptorSetLayoutBinding& b = layout.entries[i];
+            desc.bindings.push_back({b.binding, std::uint32_t(b.descriptorType), b.descriptorCount, b.stageFlags,
+                                     layout.flags[i]});
+        }
+        return desc;
+    }
+
     std::mutex descriptor_mutex;  // the set and the containers below
     // vkDeviceWaitIdle calls made for the bindless set (none, unless LEONIDA_BINDLESS_IDLE_WAIT restores the old wait).
     std::atomic<std::uint64_t> bindless_idle_waits{0};
@@ -3545,6 +3578,9 @@ public:
             info.module = module;
             info.pName = "main";
             subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
+            stage_meta_.push_back({std::uint32_t(stage.bit), stage.entry->name, std::uint32_t(info.flags),
+                                   info.pNext ? required_sizes[stage_infos.size()].requiredSubgroupSize : 0u,
+                                   leonida::pso::spirv_hash(stage.words)});
             stage_infos.push_back(info);
         }
         if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
@@ -3560,6 +3596,8 @@ public:
             info.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
             info.module = module;
             info.pName = "main";
+            stage_meta_.push_back({std::uint32_t(VK_SHADER_STAGE_FRAGMENT_BIT), "<depth24_depth_only>", 0u, 0u,
+                                   leonida::pso::spirv_hash(words)});
             stage_infos.push_back(info);
         }
 
@@ -3828,18 +3866,20 @@ public:
         for (const Stage& stage : stages)
             if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
                 graphics_.push_stages |= stage.bit;
-        const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
-        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layout_info.pushConstantRangeCount = 1;
-        layout_info.pPushConstantRanges = &push;
-        VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
-        if (uses_bindless) {
-            set0_layout = device_.bindless->layout();
-            layout_info.setLayoutCount = 1;
-            layout_info.pSetLayouts = &set0_layout;
-            graphics_.bindless_set = device_.bindless->set();
+        // The layout through pso_recipe.h's LayoutCreateInfo, as --prebuild-pipelines makes it again.
+        layout_push_stages_ = graphics_.push_stages;
+        layout_push_size_ = sizeof(leonida::ShaderUserData);
+        layout_bindless_ = uses_bindless;
+        {
+            leonida::pso::Recipe layout_recipe;
+            layout_recipe.push_stages = layout_push_stages_;
+            layout_recipe.push_size = layout_push_size_;
+            layout_recipe.bindless = layout_bindless_;
+            const leonida::pso::LayoutCreateInfo layout(layout_recipe,
+                                                        uses_bindless ? device_.bindless->layout() : VK_NULL_HANDLE);
+            if (uses_bindless) graphics_.bindless_set = device_.bindless->set();
+            if (vk.vkCreatePipelineLayout(dev, &layout.info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
         }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
@@ -4018,92 +4058,79 @@ private:
         VkPipelineColorBlendStateCreateInfo blend{};
     };
 
-    // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined.
-    VkPipeline build(std::uint32_t unbound) const {
-        // The stride state is last: a pipeline without vertex bindings (a full-screen pass that builds its vertices
-        // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
-        // (VUID-vkCmdDraw-pStrides-04913).
-        static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
-            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-            VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
+    // This PSO's pipeline for a draw that leaves the `unbound` slots (leonida::GraphicsPipeline::variant) unbound, as
+    // pso_recipe.h data: what build() creates and what pso_recipes.jsonl records for --prebuild-pipelines.
+    leonida::pso::Recipe to_recipe(std::uint32_t unbound) const {
         const Recipe& r = recipe_;
-        std::vector<VkFormat> colors = graphics_.color_formats;
-        for (std::size_t slot = 0; slot < colors.size(); ++slot)
-            if (unbound & (1u << slot)) colors[slot] = VK_FORMAT_UNDEFINED;
+        leonida::pso::Recipe out;
+        out.stages = stage_meta_;
+        out.mesh = r.mesh;
+        out.bindings = r.bindings;
+        out.attributes = r.attributes;
+        out.divisors = r.divisors;
+        out.topology = std::uint32_t(r.assembly.topology);
+        out.primitive_restart = r.assembly.primitiveRestartEnable;
+        out.depth_clamp = r.raster.depthClampEnable;
+        out.rasterizer_discard = r.raster.rasterizerDiscardEnable;
+        out.polygon_mode = std::uint32_t(r.raster.polygonMode);
+        out.cull_mode = r.raster.cullMode;
+        out.front_face = std::uint32_t(r.raster.frontFace);
+        out.depth_bias = r.raster.depthBiasEnable;
+        out.bias_constant = r.raster.depthBiasConstantFactor;
+        out.bias_clamp = r.raster.depthBiasClamp;
+        out.bias_slope = r.raster.depthBiasSlopeFactor;
+        out.line_width = r.raster.lineWidth;
+        out.conservative = r.conservative;
+        out.samples = std::uint32_t(r.multisample.rasterizationSamples);
+        out.sample_shading = r.multisample.sampleShadingEnable;
+        out.min_sample_shading = r.multisample.minSampleShading;
+        out.alpha_to_coverage = r.multisample.alphaToCoverageEnable;
+        out.alpha_to_one = r.multisample.alphaToOneEnable;
+        out.sample_mask = r.sample_mask;
+        out.depth_test = r.depth.depthTestEnable;
+        out.depth_write = r.depth.depthWriteEnable;
+        out.depth_compare = std::uint32_t(r.depth.depthCompareOp);
+        out.depth_bounds = r.depth.depthBoundsTestEnable;
+        out.stencil_test = r.depth.stencilTestEnable;
+        out.front = r.depth.front;
+        out.back = r.depth.back;
+        out.min_depth_bounds = r.depth.minDepthBounds;
+        out.max_depth_bounds = r.depth.maxDepthBounds;
+        out.logic_op_enable = r.blend.logicOpEnable;
+        out.logic_op = std::uint32_t(r.blend.logicOp);
+        std::memcpy(out.blend_constants, r.blend.blendConstants, sizeof(out.blend_constants));
+        out.blends = r.blends;
+        for (std::size_t slot = 0; slot < graphics_.color_formats.size(); ++slot)
+            out.colors.push_back((unbound & (1u << slot)) ? std::uint32_t(VK_FORMAT_UNDEFINED)
+                                                          : std::uint32_t(graphics_.color_formats[slot]));
         const bool depth_bound = !(unbound & leonida::GraphicsPipeline::unbound_depth);
-        VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
-        rendering.colorAttachmentCount = std::uint32_t(colors.size());
-        rendering.pColorAttachmentFormats = colors.data();
         if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
-            rendering.depthAttachmentFormat = graphics_.depth_format;
+            out.depth_format = std::uint32_t(graphics_.depth_format);
         if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
-            rendering.stencilAttachmentFormat = graphics_.depth_format;
+            out.stencil_format = std::uint32_t(graphics_.depth_format);
+        out.push_stages = layout_push_stages_;
+        out.push_size = layout_push_size_;
+        out.bindless = layout_bindless_;
+        return out;
+    }
 
-        VkPipelineVertexInputStateCreateInfo vertex_input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-        VkPipelineVertexInputDivisorStateCreateInfoEXT divisor_state{
-            VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT};
-        if (!r.divisors.empty()) {
-            divisor_state.vertexBindingDivisorCount = std::uint32_t(r.divisors.size());
-            divisor_state.pVertexBindingDivisors = r.divisors.data();
-            vertex_input.pNext = &divisor_state;
-        }
-        vertex_input.vertexBindingDescriptionCount = std::uint32_t(r.bindings.size());
-        vertex_input.pVertexBindingDescriptions = r.bindings.data();
-        vertex_input.vertexAttributeDescriptionCount = std::uint32_t(r.attributes.size());
-        vertex_input.pVertexAttributeDescriptions = r.attributes.data();
-        VkPipelineViewportStateCreateInfo viewport{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
-        viewport.viewportCount = 1;
-        viewport.scissorCount = 1;
-        VkPipelineMultisampleStateCreateInfo multisample = r.multisample;
-        VkPipelineRasterizationStateCreateInfo raster = r.raster;
-        VkPipelineRasterizationConservativeStateCreateInfoEXT conservative{
-            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_CONSERVATIVE_STATE_CREATE_INFO_EXT};
-        if (r.conservative) {
-            conservative.conservativeRasterizationMode = VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
-            conservative.extraPrimitiveOverestimationSize = 0.0f;
-            conservative.pNext = raster.pNext;
-            raster.pNext = &conservative;
-        }
-        multisample.pSampleMask = &r.sample_mask;
-        VkPipelineColorBlendStateCreateInfo blend = r.blend;
-        blend.attachmentCount = std::uint32_t(r.blends.size());
-        blend.pAttachments = r.blends.data();
-        // A mesh pipeline takes neither the topology nor the strides as dynamic state
-        // (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066).
-        static constexpr VkDynamicState mesh_dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS};
-        VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-        if (r.mesh) {
-            dynamic.dynamicStateCount = std::uint32_t(std::size(mesh_dynamic_states));
-            dynamic.pDynamicStates = mesh_dynamic_states;
-        } else {
-            dynamic.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
-            dynamic.pDynamicStates = dynamic_states;
-        }
-
-        VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
-        info.stageCount = std::uint32_t(r.stages.size());
-        info.pStages = r.stages.data();
-        info.pVertexInputState = r.mesh ? nullptr : &vertex_input;  // ignored with a mesh stage; null for clarity
-        info.pInputAssemblyState = r.mesh ? nullptr : &r.assembly;
-        info.pViewportState = &viewport;
-        info.pRasterizationState = &raster;
-        info.pMultisampleState = &multisample;
-        info.pDepthStencilState = &r.depth;
-        info.pColorBlendState = &blend;
-        info.pDynamicState = &dynamic;
-        info.layout = graphics_.layout;
+    // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined,
+    // made through pso_recipe.h's GraphicsCreateInfo (so --prebuild-pipelines makes the very same create info) and
+    // recorded in pso_recipes.jsonl once it exists.
+    VkPipeline build(std::uint32_t unbound) const {
+        const leonida::pso::Recipe recipe = to_recipe(unbound);
+        std::vector<VkShaderModule> modules;
+        for (const VkPipelineShaderStageCreateInfo& s : recipe_.stages) modules.push_back(s.module);
+        const leonida::pso::GraphicsCreateInfo create(recipe, modules, graphics_.layout);
         VkPipeline pipeline = VK_NULL_HANDLE;
         if (device_.create_pipeline(
-                [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& create) {
-                    return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &create,
+                [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& info) {
+                    return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &info,
                                                                          nullptr, &pipeline);
                 },
-                info) != VK_SUCCESS)
+                create.info) != VK_SUCCESS)
             return VK_NULL_HANDLE;
+        if (leonida::pso::Recorder* recorder = device_.pso_recorder()) recorder->record(recipe);
         return pipeline;
     }
 
@@ -4124,6 +4151,12 @@ private:
     leonida::ComputePipeline pipeline_;
     leonida::GraphicsPipeline graphics_;
     Recipe recipe_;
+    // What to_recipe() needs beyond recipe_: each stage's index name, flags, subgroup request and SPIR-V hash (in
+    // recipe_.stages order), and the layout's push range and set 0.
+    std::vector<leonida::pso::Stage> stage_meta_;
+    VkShaderStageFlags layout_push_stages_ = 0;
+    std::uint32_t layout_push_size_ = 0;
+    bool layout_bindless_ = false;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
     VkShaderModule module_ = VK_NULL_HANDLE;
