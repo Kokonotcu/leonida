@@ -9,6 +9,7 @@
 //   4. A swapchain-destroy WSI layer which calls vkDeviceWaitIdle cannot overlap vkQueueSubmit on another thread.
 //   5. With VK_*_swapchain_maintenance1 and a tear mode, every present on the switchable swapchain chains its mode
 //      (the tear mode, else FIFO): a chained mode persists to later presents, so one tear must not leave it torn.
+//   6. Concurrent present()s of sources in formats not seen yet fill the format-features cache one at a time.
 // Skips with exit code 77 when no Vulkan 1.3 device with Win32 presentation is available. No game data.
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -176,8 +177,29 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char*
     return real_get_device(device, name);
 }
 
+// Case 6: while armed, each format query stays inside for a while, so two threads that ask at the same time without
+// a lock between them overlap there.
+PFN_vkGetPhysicalDeviceFormatProperties real_format_properties = nullptr;
+std::atomic<bool> observe_format_queries{false};
+std::atomic<int> format_queries_inside{0};
+std::atomic<bool> format_queries_overlapped{false};
+
+VKAPI_ATTR void VKAPI_CALL format_properties(VkPhysicalDevice physical, VkFormat format, VkFormatProperties* out) {
+    if (observe_format_queries.load()) {
+        if (format_queries_inside.fetch_add(1) != 0) format_queries_overlapped.store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        format_queries_inside.fetch_sub(1);
+    }
+    real_format_properties(physical, format, out);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
     if (std::string_view(name) == "vkGetDeviceProcAddr") return reinterpret_cast<PFN_vkVoidFunction>(get_device);
+    if (std::string_view(name) == "vkGetPhysicalDeviceFormatProperties") {
+        real_format_properties = reinterpret_cast<PFN_vkGetPhysicalDeviceFormatProperties>(
+            real_get_instance(instance, name));
+        return reinterpret_cast<PFN_vkVoidFunction>(format_properties);
+    }
     return real_get_instance(instance, name);
 }
 
@@ -533,6 +555,42 @@ int main() {
         EXPECT(!driver::unexpected_submit_error.load());
         EXPECT(queue.idle() && worker_queue.idle());
         std::printf("presenter sync: synthetic WSI device-idle during swapchain destruction serialized ok\n");
+
+        // 6. present() asks for its source format's features outside present_mutex_, so two threads that present
+        //    sources of formats not asked about yet fill the per-format cache (a std::map) at the same time (B13). The
+        //    cache has its own lock: the two format queries do not overlap.
+        {
+            const VkImageUsageFlags usage =
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            const VkFormat formats[2] = {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT};
+            for (int i = 0; i < 2; ++i) {
+                ResourceBinding rb = side_rb;
+                rb.image = d.image(formats[i], 32, 32, 1, usage);
+                rb.format = formats[i];
+                EXPECT(rb.image != VK_NULL_HANDLE);
+                context.add_resource(ResourceId(2000 + i), rb, VK_IMAGE_LAYOUT_UNDEFINED);
+            }
+            driver::format_queries_overlapped.store(false);
+            driver::observe_format_queries.store(true);
+            std::atomic<int> started{0};
+            VkResult results[2] = {VK_ERROR_UNKNOWN, VK_ERROR_UNKNOWN};
+            const auto run = [&](int i) {
+                started.fetch_add(1);
+                while (started.load() < 2) std::this_thread::yield();
+                results[i] = presenter.present(ResourceId(2000 + i), false);
+            };
+            std::thread first(run, 0), second(run, 1);
+            first.join();
+            second.join();
+            driver::observe_format_queries.store(false);
+            for (const VkResult result : results)
+                EXPECT(result == VK_SUCCESS || result == VK_ERROR_FORMAT_NOT_SUPPORTED);
+            EXPECT(!driver::format_queries_overlapped.load());
+            EXPECT(queue.idle());
+            context.remove_resource(2000);
+            context.remove_resource(2001);
+            std::printf("presenter sync: concurrent first presents of two new formats query them one at a time ok\n");
+        }
 
         // 5. Tearing on request. The vsync swapchain is created with {FIFO, tear mode}; VkSwapchainPresentModeInfo sets
         //    the mode for that present and every later one, so a present that does not tear has to chain FIFO again.

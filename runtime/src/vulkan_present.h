@@ -894,8 +894,10 @@ private:
         return true;
     }
 
-    // vkGetPhysicalDeviceFormatProperties, optimal tiling, cached per format.
+    // vkGetPhysicalDeviceFormatProperties, optimal tiling, cached per format. present() and present_planes() ask
+    // outside present_mutex_, a deferred present under it on the pump thread: the cache has a lock of its own.
     VkFormatFeatureFlags format_features(VkFormat format) {
+        std::lock_guard lock(features_mutex_);
         const auto it = features_.find(format);
         if (it != features_.end()) return it->second;
         VkFormatProperties properties{};
@@ -1324,6 +1326,7 @@ private:
     std::function<VkExtent2D()> extent_fn_;
     std::function<VkSurfaceKHR()> recreate_surface_fn_;  // makes a new Win32 surface for the same window
     bool surface_lost_ = false;  // set by mark_surface_lost(); cleared once a new surface was created
+    std::mutex features_mutex_;  // features_ only; taken last, nothing is called under it but the format query
     std::map<VkFormat, VkFormatFeatureFlags> features_;
     bool warned_srgb_ = false;
     bool capture_ = false;
