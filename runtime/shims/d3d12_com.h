@@ -274,6 +274,14 @@ bool device_sparse_buffer_tiles(ID3D12Device* device);
 // The size in bytes of the device's GPU address arena, or 0 without one. For tests.
 std::uint64_t device_arena_size(ID3D12Device* device);
 
+// D3D-704: what the device's VkPipelineCache took in when its first PSO created it, in bytes: the build's
+// pipeline_cache.bin and the file an earlier session saved (0 for one absent, foreign or declined). For tests.
+struct PipelineCacheSources {
+    std::size_t seed_bytes = 0;
+    std::size_t saved_bytes = 0;
+};
+PipelineCacheSources pipeline_cache_sources(ID3D12Device* device);
+
 // The bindless set 0 a device with VulkanDeviceInfo::bindless keeps (vulkan_bindless.h), and its layout: what a
 // pipeline whose shader declares set-0 bindings is created with and binds. Null without such a set. The set is
 // brought up to date at every ExecuteCommandLists.

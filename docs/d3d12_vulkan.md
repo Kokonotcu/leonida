@@ -2043,6 +2043,20 @@ Pipeline creation:
 - Pipeline caches: graphics and compute PSOs use one `VkPipelineCache` per device. On first use the runtime reads
   the `pipelines` build stage's `pipeline_cache.bin` beside the executable if its Vulkan header matches the device
   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
+  The runtime also keeps what it learns (D3D-704, `runtime/src/pipeline_cache_persist.h`): device teardown writes the
+  cache to `pipeline_cache_runtime_<vendor>_<device>.bin` (hex IDs, e.g. `pipeline_cache_runtime_1002_164e.bin`)
+  beside the executable, or in `LEONIDA_PIPELINE_CACHE_DIR`. The next device takes that file in under the same header
+  check and merges it into the seed's cache with `vkMergePipelineCaches`.
+  - The write goes to a temporary file in the same folder and is renamed over the old one. A failed save is logged
+    and leaves the previous file as it was.
+  - Nothing is written when the cache did not grow since it was loaded (its `vkGetPipelineCacheData` size is the
+    same) or holds only the header (llvmpipe keeps nothing).
+  - A truncated, foreign (other GPU or `pipelineCacheUUID`) or junk file is logged and left out. The device starts
+    without it and replaces it at teardown.
+  - `LEONIDA_PIPELINE_CACHE_PERSIST=0` neither reads nor writes the file; the seed is still used.
+  - The saved file holds the seed's entries too, so with a full-corpus seed it is about as large as the seed.
+  `d3d12_pipeline_cache_persist_test` checks this on a device: a saved 1552-byte cache was loaded and left
+  unchanged by the next session (RADV, gfx1036).
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
   bindings and the standard 144-byte push-constant range.
   `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description
