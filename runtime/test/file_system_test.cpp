@@ -252,6 +252,21 @@ void run_checks(const std::filesystem::path& root) {
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
     }
 
+    // Device names (CON, NUL, AUX, COM1, LPT1, ...) in any component, with any extension, would open a Win32 device once
+    // joined under the package or the overlay; they are refused. A name that only starts like one is an ordinary file.
+    for (const wchar_t* device : {L"GAME:\\aux.log", L"GAME:\\data\\NUL.txt", L"GAME:\\data\\com1", L"GAME:\\Con \\x.txt",
+                                  L"GAME:/data/lpt9.dat", L"T:\\nul"}) {
+        HANDLE h = create_w(device, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE, "a device name in a console path is refused, never opened");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+    {
+        HANDLE h = create_w(L"GAME:\\data\\nullable.aux", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE, "a name that only starts like a device is an ordinary file");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(delete_w(L"GAME:\\data\\nullable.aux"), "and it can be deleted again");
+    }
+
     // --trace: a failed open of a guest path is a "file_open_failed" event, a successful one is not, and with the
     // trace off nothing is written.
     {

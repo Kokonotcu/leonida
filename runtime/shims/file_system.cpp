@@ -141,6 +141,20 @@ Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     return letter == L'g' ? Drive::Game : Drive::Scratch;
 }
 
+// Win32 turns these names, with any extension and in any folder, into devices: "GAME:\aux.log" joined under the package
+// would open \\.\AUX, and "x\NUL.txt" the null device, instead of a file. A console path never names a device, so a
+// component like that is refused. The base name is what precedes the first dot, with trailing spaces ignored, as Win32
+// compares it.
+bool device_name(const std::wstring& part) {
+    std::wstring base = lower(part.substr(0, part.find(L'.')));
+    while (!base.empty() && base.back() == L' ') base.pop_back();
+    if (base == L"con" || base == L"prn" || base == L"aux" || base == L"nul" || base == L"conin$" || base == L"conout$")
+        return true;
+    if (base.size() != 4 || (base.compare(0, 3, L"com") != 0 && base.compare(0, 3, L"lpt") != 0)) return false;
+    const wchar_t n = base[3];
+    return (n >= L'1' && n <= L'9') || n == L'\u00b9' || n == L'\u00b2' || n == L'\u00b3';
+}
+
 Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
     size_t prefix_length = 0;
     const Drive drive = console_drive(path, prefix_length);
@@ -164,7 +178,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
         if (part == L"..") {
             if (parts.size() <= floor) return false;
             parts.pop_back();
-        } else if (part.find(L':') != std::wstring::npos) {
+        } else if (part.find(L':') != std::wstring::npos || device_name(part)) {
             return false;
         } else {
             parts.push_back(part);
