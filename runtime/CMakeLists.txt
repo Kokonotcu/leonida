@@ -2269,6 +2269,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_queue_signal_claim_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_queue_signal_claim COMMAND d3d12_queue_signal_claim_test)
     set_tests_properties(d3d12_queue_signal_claim PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    # Samplers no heap slot holds are evicted when set 0's sampler array nears full (D5).
+    add_executable(d3d12_sampler_evict_test test/d3d12_sampler_evict_test.cpp)
+    target_link_libraries(d3d12_sampler_evict_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_sampler_evict_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_sampler_evict_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_sampler_evict COMMAND d3d12_sampler_evict_test)
+    set_tests_properties(d3d12_sampler_evict PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     # Xbox-ABI queue and fence proxies behind the device proxy, on the host runtime (WARP, a hardware adapter) and
     # on the Vulkan device: forwarding, refusal past the public chain, fence unwrapping. 77: no device at all.
     add_executable(queue_proxy_test test/queue_proxy_test.cpp)

@@ -63,10 +63,12 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 #include <cwchar>
 #include <vector>
 
@@ -1434,7 +1436,27 @@ struct DeviceState {
     std::map<leonida::DescriptorKey, ImageEntry> image_entries;
     std::multimap<std::uint64_t, leonida::DescriptorKey> image_keys;  // by the texture's address
     std::vector<ImageEntry> replaced_images;  // kept until their texture goes: work in flight may still use them
-    std::map<leonida::DescriptorKey, VkSampler> sampler_entries;
+    // A set-0 sampler and what keeps it: the heap slots that hold its S# (CreateSampler, CopyDescriptors; a slot
+    // overwritten, cleared or in a released heap lets go), or `pinned` for S#s no slot names. One no slot holds is
+    // idle (idle_seq, its place in idle_samplers, oldest first) and stays registered: a title may have copied the
+    // bytes where this layer does not see them. Only when set 0's sampler array gets near full are the oldest idle
+    // ones evicted (evict_idle_samplers), each released once the submissions made until then are done (D5).
+    struct SamplerEntry {
+        VkSampler sampler = VK_NULL_HANDLE;
+        std::uint32_t index = 0;
+        std::uint32_t slots = 0;
+        bool pinned = false;
+        bool evicting = false;       // a deferred release_sampler is queued for `epoch`
+        std::uint32_t epoch = 0;     // bumped when it is evicted or comes back: a stale release is skipped
+        std::uint64_t idle_seq = 0;  // its key in idle_samplers; 0 while in use
+    };
+    // By S#, by set-0 index, the S# each sampler-heap slot holds (by the slot's CPU address), the idle ones.
+    std::map<leonida::DescriptorKey, SamplerEntry> sampler_entries;
+    std::unordered_map<std::uint32_t, leonida::DescriptorKey> sampler_keys;
+    std::map<std::uintptr_t, leonida::DescriptorKey> sampler_slots;
+    std::map<std::uint64_t, leonida::DescriptorKey> idle_samplers;
+    std::uint64_t idle_sampler_seq = 0;
+    std::size_t evicting_samplers = 0;  // entries whose deferred release is queued
     struct CustomBorderColor {
         bool is_int = false;
         VkClearColorValue value{};
@@ -1651,13 +1673,158 @@ struct DeviceState {
         });
     }
 
-    // Gives the S# `words` a sampler in set 0 and an entry in the hash table, unless it has them.
+    // Gives the S# `words` a sampler in set 0 and an entry in the hash table, unless it has them, and keeps them for
+    // the device's life: for S#s no heap slot names (a shader's literal S#s, a root signature's static samplers).
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) {
-        namespace g = leonida::gfx10;
+        std::lock_guard lock(descriptor_mutex);
+        SamplerEntry* entry = sampler_entry(words);
+        if (!entry) return false;
+        entry->pinned = true;
+        keep(*entry);
+        return true;
+    }
+
+    // CreateSampler(2) wrote `words` into the sampler-heap slot at CPU address `slot`: the S# gets its sampler as
+    // bind_sampler gives it, and the S# the slot held before loses a slot (sampler_slots).
+    bool bind_sampler_slot(const leonida::gfx10::SamplerWords& words, std::uintptr_t slot) {
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return false;
         const leonida::DescriptorKey key = leonida::make_ssharp_key(words.data());
-        if (sampler_entries.count(key)) return true;
+        const auto held = sampler_slots.find(slot);
+        if (held != sampler_slots.end() && held->second == key) return true;
+        SamplerEntry* entry = sampler_entry(words);
+        if (entry) {
+            ++entry->slots;
+            keep(*entry);
+        }
+        if (held != sampler_slots.end()) {
+            const leonida::DescriptorKey previous = held->second;
+            if (entry) held->second = key;
+            else sampler_slots.erase(held);
+            unref_sampler(previous);
+        } else if (entry) {
+            sampler_slots.emplace(slot, key);
+        }
+        return entry != nullptr;
+    }
+
+    // The sampler-heap slots in [first, end) hold no S# any more: their heap is gone, or a slot was cleared.
+    void clear_sampler_slots(std::uintptr_t first, std::uintptr_t end) {
+        std::lock_guard lock(descriptor_mutex);
+        std::vector<leonida::DescriptorKey> released;
+        for (auto it = sampler_slots.lower_bound(first); it != sampler_slots.end() && it->first < end;) {
+            released.push_back(it->second);
+            it = sampler_slots.erase(it);
+        }
+        for (const auto& key : released) unref_sampler(key);
+    }
+
+    // CopyDescriptors(Simple) of a sampler heap: `count` slots from `source` to `destination`, a slot apart each.
+    void copy_sampler_slots(std::uintptr_t destination, std::uintptr_t source, std::size_t count) {
+        std::lock_guard lock(descriptor_mutex);
+        if (!bindless || !count) return;
+        std::vector<std::optional<leonida::DescriptorKey>> keys(count);  // read first: the ranges may overlap
+        for (std::size_t i = 0; i < count; ++i)
+            if (const auto it = sampler_slots.find(source + i * kDescriptorSize); it != sampler_slots.end())
+                keys[i] = it->second;
+        std::vector<leonida::DescriptorKey> released;
+        for (std::size_t i = 0; i < count; ++i) {
+            const std::uintptr_t slot = destination + i * kDescriptorSize;
+            const auto held = sampler_slots.find(slot);
+            if (held != sampler_slots.end() && keys[i] && held->second == *keys[i]) continue;
+            if (keys[i]) {
+                const auto entry = sampler_entries.find(*keys[i]);
+                if (entry != sampler_entries.end()) {
+                    ++entry->second.slots;
+                    keep(entry->second);
+                }
+            }
+            if (held != sampler_slots.end()) {
+                released.push_back(held->second);
+                if (keys[i]) held->second = *keys[i];
+                else sampler_slots.erase(held);
+            } else if (keys[i]) {
+                sampler_slots.emplace(slot, *keys[i]);
+            }
+        }
+        for (const auto& key : released) unref_sampler(key);
+    }
+
+    // The deferred release of an evicted sampler (DeferredDeletionQueue, at the ticket of every submission made when
+    // it was evicted): its key leaves the hash table, its index set 0, and the VkSampler is destroyed. Skipped when
+    // the S# came back into use since (another epoch). descriptor_mutex held.
+    void release_sampler(std::uint32_t index, std::uint32_t epoch) {
+        const auto by_index = sampler_keys.find(index);
+        if (by_index == sampler_keys.end()) return;
+        const auto it = sampler_entries.find(by_index->second);
+        if (it == sampler_entries.end()) return;
+        SamplerEntry& entry = it->second;
+        if (!entry.evicting || (entry.epoch & sampler_epoch_mask) != epoch) return;
+        bindless->erase_key(it->first);
+        bindless->remove_sampler(index);
+        context->vk.vkDestroySampler(info.device, entry.sampler, nullptr);
+        --evicting_samplers;
+        sampler_keys.erase(by_index);
+        sampler_entries.erase(it);
+    }
+
+    static constexpr std::uint32_t sampler_release_mark = 0x80000000u;  // high word of the deferred handle
+    static constexpr std::uint32_t sampler_epoch_mask = 0x7FFFFFFFu;
+
+    // In use again (a slot or a pin): no longer idle, and a queued eviction is called off. descriptor_mutex held.
+    void keep(SamplerEntry& entry) {
+        if (entry.idle_seq) {
+            idle_samplers.erase(entry.idle_seq);
+            entry.idle_seq = 0;
+        }
+        if (entry.evicting) {
+            entry.evicting = false;
+            ++entry.epoch;
+            --evicting_samplers;
+        }
+    }
+
+    // A slot let go of `key`. descriptor_mutex held.
+    void unref_sampler(const leonida::DescriptorKey& key) {
+        const auto it = sampler_entries.find(key);
+        if (it == sampler_entries.end()) return;
+        SamplerEntry& entry = it->second;
+        if (entry.slots) --entry.slots;
+        if (entry.slots || entry.pinned || entry.idle_seq || entry.evicting) return;
+        entry.idle_seq = ++idle_sampler_seq;
+        idle_samplers.emplace(entry.idle_seq, key);
+        evict_idle_samplers();
+    }
+
+    // Past the high-water mark of set 0's sampler array (all but an eighth of it, at least 16 left), the oldest idle
+    // samplers are evicted until it is below again. descriptor_mutex held.
+    void evict_idle_samplers() {
+        if (!bindless) return;
+        const std::size_t capacity = bindless->sampler_capacity();
+        const std::size_t headroom = std::max<std::size_t>(16, capacity / 8);
+        const std::size_t high_water = capacity > headroom ? capacity - headroom : capacity / 2;
+        while (sampler_entries.size() - evicting_samplers > high_water && !idle_samplers.empty()) {
+            const auto oldest = idle_samplers.begin();
+            SamplerEntry& entry = sampler_entries.at(oldest->second);
+            idle_samplers.erase(oldest);
+            entry.idle_seq = 0;
+            entry.evicting = true;
+            ++entry.epoch;
+            ++evicting_samplers;
+            const std::uint64_t handle =
+                (std::uint64_t(sampler_release_mark | (entry.epoch & sampler_epoch_mask)) << 32) | entry.index;
+            context->defer_destroy(leonida::DeferredDeletionQueue::Kind::bindless_slot, handle);
+        }
+    }
+
+    // The entry of the S# `words`, made (a VkSampler, a set-0 index, a hash-table key) when it has none; null when
+    // set 0 cannot take it. descriptor_mutex held.
+    SamplerEntry* sampler_entry(const leonida::gfx10::SamplerWords& words) {
+        namespace g = leonida::gfx10;
+        if (!bindless) return nullptr;
+        const leonida::DescriptorKey key = leonida::make_ssharp_key(words.data());
+        if (const auto it = sampler_entries.find(key); it != sampler_entries.end()) return &it->second;
+        evict_idle_samplers();  // room ahead of the new one
         const g::Sampler sampler = g::decode(words);
         VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler, max_sampler_lod_bias);
         // What vulkan_sampler leaves to its caller, and features this device may not have enabled.
@@ -1706,16 +1873,19 @@ struct DeviceState {
         VkSampler vk_sampler = VK_NULL_HANDLE;
         if (!context->vk.vkCreateSampler ||
             context->vk.vkCreateSampler(info.device, &sampler_info, nullptr, &vk_sampler) != VK_SUCCESS)
-            return false;
+            return nullptr;
         const std::uint32_t index = bindless->add_sampler(vk_sampler);
         if (!index) {
             log_once("the bindless sampler array is full; samplers", int(sampler_entries.size()));
             context->vk.vkDestroySampler(info.device, vk_sampler, nullptr);
-            return false;
+            return nullptr;
         }
-        sampler_entries.emplace(key, vk_sampler);
+        SamplerEntry entry;
+        entry.sampler = vk_sampler;
+        entry.index = index;
+        sampler_keys[index] = key;
         bindless->insert_key(key, index);
-        return true;
+        return &sampler_entries.emplace(key, entry).first->second;
     }
 
     // An optimal-tiling image of this format can take VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT.
@@ -2274,6 +2444,11 @@ public:
     }
 
     ~DescriptorHeap() override {
+        // Its slots hold no S# any more (DeviceState::sampler_slots).
+        if (desc_.Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && cpu_) {
+            const auto first = reinterpret_cast<std::uintptr_t>(cpu_);
+            device_.clear_sampler_slots(first, first + std::uintptr_t(desc_.NumDescriptors) * kDescriptorSize);
+        }
         if (in_arena_) device_.arena_release(arena_offset_, VkDeviceSize(desc_.NumDescriptors) * kDescriptorSize,
                                             DeviceState::arena_descriptor_heap);
     }
@@ -6031,7 +6206,11 @@ public:
             [](void* user, std::uint32_t dim, std::uint32_t idx) {
                 auto* st = static_cast<DeviceState*>(user);
                 std::lock_guard lock(st->descriptor_mutex);
-                if (st->bindless) st->bindless->remove_image(static_cast<leonida::ImageDimension>(dim), idx);
+                if (!st->bindless) return;
+                if (dim & DeviceState::sampler_release_mark)  // an evicted sampler (evict_idle_samplers)
+                    st->release_sampler(idx, dim & DeviceState::sampler_epoch_mask);
+                else
+                    st->bindless->remove_image(static_cast<leonida::ImageDimension>(dim), idx);
             },
             &state_);
         state_.context->set_bindless_prepare([this](VkCommandBuffer command_buffer) {
@@ -6194,9 +6373,13 @@ public:
         if (state_.context && state_.bindless) {
             // Every texture is gone by now (each held this device), and its views with it; samplers remain.
             std::lock_guard lock(state_.descriptor_mutex);
-            for (const auto& [key, sampler] : state_.sampler_entries)
-                state_.context->vk.vkDestroySampler(state_.info.device, sampler, nullptr);
+            for (const auto& [key, entry] : state_.sampler_entries)
+                state_.context->vk.vkDestroySampler(state_.info.device, entry.sampler, nullptr);
             state_.sampler_entries.clear();
+            state_.sampler_keys.clear();
+            state_.sampler_slots.clear();
+            state_.idle_samplers.clear();
+            state_.evicting_samplers = 0;
             state_.bindless.reset();
         }
         state_.destroy_shader_objects();
@@ -7159,9 +7342,10 @@ public:
                 ++s;
                 s_at = 0;
             } else {
-                std::memmove(reinterpret_cast<std::uint8_t*>(destinations[d].ptr) + std::size_t(d_at++) * kDescriptorSize,
-                             reinterpret_cast<const std::uint8_t*>(sources[s].ptr) + std::size_t(s_at++) * kDescriptorSize,
-                             kDescriptorSize);
+                const std::uintptr_t to = destinations[d].ptr + std::size_t(d_at++) * kDescriptorSize;
+                const std::uintptr_t from = sources[s].ptr + std::size_t(s_at++) * kDescriptorSize;
+                std::memmove(reinterpret_cast<void*>(to), reinterpret_cast<const void*>(from), kDescriptorSize);
+                if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) state_.copy_sampler_slots(to, from, 1);
             }
         }
     }
@@ -7176,6 +7360,7 @@ public:
         if (!count || !destination.ptr || !source.ptr) return;
         std::memmove(reinterpret_cast<void*>(destination.ptr), reinterpret_cast<const void*>(source.ptr),
                      std::size_t(count) * kDescriptorSize);
+        if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) state_.copy_sampler_slots(destination.ptr, source.ptr, count);
     }
 
     // A constant-buffer view is a 16-byte GFX10 raw buffer V# in the first half of the slot (zeros in the rest).
@@ -7524,10 +7709,13 @@ public:
         d3d12_trace::record("ID3D12Device::CreateSampler");
         if (!destination.ptr) return;
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
-        if (!desc) return;
+        if (!desc) {
+            state_.clear_sampler_slots(destination.ptr, destination.ptr + kDescriptorSize);
+            return;
+        }
         const leonida::gfx10::SamplerWords words = leonida::gfx10::encode(sampler_descriptor(*desc, &state_));
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-        state_.bind_sampler(words);
+        state_.bind_sampler_slot(words, destination.ptr);
     }
 
     // CreateSampler with a UINT border colour and non-normalized coordinates (D3D-28). A description the PC runtime
@@ -7545,7 +7733,7 @@ public:
         const leonida::gfx10::SamplerWords words = sampler2_words(*desc);
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-        state_.bind_sampler(words);
+        state_.bind_sampler_slot(words, destination.ptr);
     }
 
     // The S# of a D3D12_SAMPLER_DESC2 that sampler2_refusal accepts.
