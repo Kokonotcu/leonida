@@ -670,6 +670,20 @@ using Command = std::variant<TransitionBarrier, UavBarrier, AliasingBarrier, Glo
                              ExecuteIndirect, BuildAccelerationStructure, Dispatch, Draw, CopyAccelerationStructure,
                              AccelerationStructurePostbuild>;
 
+// The kind of a recorded command, as the D3D12 call that records it, for error reports (I4).
+inline const char* command_name(const Command& command) {
+    static constexpr const char* names[] = {
+        "ResourceBarrier (transition)", "ResourceBarrier (UAV)", "ResourceBarrier (aliasing)", "Barrier (global)",
+        "Barrier (buffer)", "Barrier (texture)", "ClearRenderTargetView", "ClearDepthStencilView",
+        "CopyBufferRegion", "CopyTextureRegion", "CopyResource", "ResolveSubresource(Region)", "SetPredication",
+        "ClearUnorderedAccessView", "DiscardResource", "WriteBufferImmediate", "AtomicCopyBuffer", "BeginQuery",
+        "EndQuery", "ResolveQueryData", "SetMarker/BeginEvent/EndEvent", "ExecuteIndirect",
+        "BuildRaytracingAccelerationStructure", "Dispatch", "Draw/DispatchMesh", "CopyRaytracingAccelerationStructure",
+        "EmitRaytracingAccelerationStructurePostbuildInfo"};
+    static_assert(std::size(names) == std::variant_size_v<Command>, "a name for every command kind");
+    return command.index() < std::size(names) ? names[command.index()] : "unknown";
+}
+
 class CommandList {
 public:
     // D3D12 split barriers: the begin half only marks the resource unusable until the end half, so the transition

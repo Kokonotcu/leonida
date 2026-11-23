@@ -2354,6 +2354,39 @@ public:
         return result;
     }
 
+    // What made the last ExecuteCommandLists this queue ran (now, or a held one when it was released) fail (I4):
+    // the list and the command prepare refused (none: a whole-list or submission failure), and the VkResult of
+    // the vkQueueSubmit when that was the failure. result is success when it did not fail.
+    struct Failure {
+        static constexpr std::size_t none = ~std::size_t(0);
+        ReplayResult result = ReplayResult::success;
+        std::size_t list = none;
+        std::size_t command = none;
+        const char* kind = nullptr;  // command_name of that command
+        VkResult vk_result = VK_SUCCESS;
+    };
+    Failure last_failure() {
+        std::lock_guard state(state_mutex_);
+        return failure_;
+    }
+    // "list 1, command 7 (CopyTextureRegion)", "the lists as a whole", plus ", vkQueueSubmit returned -4".
+    static std::string describe(const Failure& f) {
+        char text[160];
+        if (f.command != Failure::none)
+            std::snprintf(text, sizeof text, "list %zu, command %zu (%s)", f.list, f.command,
+                          f.kind ? f.kind : "unknown");
+        else if (f.list != Failure::none)
+            std::snprintf(text, sizeof text, "list %zu as a whole", f.list);
+        else
+            std::snprintf(text, sizeof text, "no single command");
+        std::string out = text;
+        if (f.vk_result != VK_SUCCESS) {
+            std::snprintf(text, sizeof text, ", vkQueueSubmit returned %d", static_cast<int>(f.vk_result));
+            out += text;
+        }
+        return out;
+    }
+
     // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far. Held behind earlier
     // held operations, so the fence does not run ahead of the work it follows. `pin` keeps the fence object alive
     // until the submission that signals it has completed, as D3D12 does: the application may release the fence
@@ -2552,9 +2585,22 @@ private:
 
     // For a held batch (LEONIDA_DRED): `identity`, the application's lists its copies stand for (their addresses
     // are the list ids), and `held_names`, their debug names when the batch was held.
+    // execute_lists, with what made it fail kept in failure_ (I4). state_mutex_ held.
     ReplayResult execute_now(std::span<const CommandList* const> lists,
                              std::span<const CommandList* const> identity = {},
                              std::span<const BreadcrumbRing::Names> held_names = {}) {
+        failure_ = {};
+        last_submit_result_ = VK_SUCCESS;
+        const ReplayResult result = execute_lists(lists, identity, held_names);
+        if (result != ReplayResult::success) {
+            failure_.result = result;
+            failure_.vk_result = last_submit_result_;
+        }
+        return result;
+    }
+
+    ReplayResult execute_lists(std::span<const CommandList* const> lists, std::span<const CommandList* const> identity,
+                               std::span<const BreadcrumbRing::Names> held_names) {
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
@@ -2704,7 +2750,13 @@ private:
         bool has_queries = false;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
-            if (result != ReplayResult::success) return result;
+            if (result != ReplayResult::success) {
+                failure_.list = i;
+                failure_.command = prepared[i].failed_command;
+                const auto commands = lists[i]->commands();
+                if (failure_.command < commands.size()) failure_.kind = command_name(commands[failure_.command]);
+                return result;
+            }
             if (prepared[i].segment_count > UINT32_MAX - segments ||
                 prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
                 return ReplayResult::unsupported;
@@ -3127,9 +3179,9 @@ private:
             if (result != ReplayResult::success) {
                 int none = static_cast<int>(ReplayResult::success);
                 held_failure_.compare_exchange_strong(none, static_cast<int>(result));
-                std::fprintf(stderr, "[rt] d3d12: a held ExecuteCommandLists failed when it was released (result %d); "
-                                     "nothing was submitted for it, and a Signal behind it still signals\n",
-                             static_cast<int>(result));
+                std::fprintf(stderr, "[rt] d3d12: a held ExecuteCommandLists failed when it was released (result %d, "
+                                     "%s); nothing was submitted for it, and a Signal behind it still signals\n",
+                             static_cast<int>(result), describe(failure_).c_str());
             }
             break;
         }
@@ -3553,6 +3605,7 @@ private:
     QueueKind kind_ = QueueKind::direct;
     std::string submit_marker_;  // the last debug marker of the lists the next submit() carries (device-lost summary)
     VkResult last_submit_result_ = VK_SUCCESS;  // what the last vkQueueSubmit returned
+    Failure failure_;  // the last execute_now's (state_mutex_)
     std::uint32_t family_;
     VkCommandPool pool_ = VK_NULL_HANDLE;
     VkSemaphore progress_ = VK_NULL_HANDLE;  // our own timeline: which command buffers are done

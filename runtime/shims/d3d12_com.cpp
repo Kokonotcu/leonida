@@ -22,6 +22,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1752,9 +1753,17 @@ public:
         }
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
-        if (last_result_ != leonida::ReplayResult::success)
-            std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
-                         name(last_result_));
+        if (last_result_ != leonida::ReplayResult::success) {
+            // Which list and command, of which kind, and the VkResult (I4); once per distinct cause, as a title
+            // repeats the same failing call every frame.
+            const leonida::VulkanQueue::Failure failure = queue_.last_failure();
+            if (reported_failures_
+                    .emplace(int(last_result_), failure.kind ? failure.kind : "", int(failure.vk_result))
+                    .second)
+                std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s at %s; nothing was submitted "
+                                     "(reported once per cause)\n",
+                             name(last_result_), leonida::VulkanQueue::describe(failure).c_str());
+        }
     }
 
     // A copy list's timestamps go to COPY_QUEUE_TIMESTAMP heaps and every other list's to TIMESTAMP heaps.
@@ -2024,6 +2033,8 @@ private:
     std::shared_ptr<void> queue_lease_;
     leonida::VulkanQueue queue_;
     leonida::ReplayResult last_result_ = leonida::ReplayResult::success;
+    // The ExecuteCommandLists failure causes already reported (result, command kind, VkResult), under mutex_.
+    std::set<std::tuple<int, std::string, int>> reported_failures_;
     VkQueue vk_queue_;
     std::uint32_t family_;
     QueueClock clock_;

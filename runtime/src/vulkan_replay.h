@@ -2527,6 +2527,10 @@ class PreparedList {
 public:
     const CommandList* list = nullptr;
     std::vector<detail::Prepared> commands;
+    // After prepare() failed: the index of the command it refused, or no_command when the failure is the whole
+    // list's (not closed, a query left open, a query plan). Meaningless after success.
+    static constexpr std::size_t no_command = ~std::size_t(0);
+    std::size_t failed_command = no_command;
     // The draws' own data, by Prepared::draw. Kept from one execution to the next like the PreparedList itself: the
     // first draw_count entries are this list's, and the rest keep their vectors' storage for later draws.
     std::vector<detail::PreparedDraw> draws;
@@ -2800,6 +2804,7 @@ inline bool zero_clear_unavailable(const PreparedList& prepared, const ReplayFun
 template<typename Resolve>
 ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFunctions& vk, PreparedList& out,
                      bool statistics_helpers = false) {
+    out.failed_command = PreparedList::no_command;
     if (!list.closed()) return ReplayResult::list_open;
     if (list.queries_open()) return ReplayResult::invalid_query;  // a Vulkan query must end in its command buffer
     const auto commands = list.commands();
@@ -2836,6 +2841,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.readback_src_stages = 0;
 
     for (std::size_t i = 0; i < commands.size(); ++i) {
+        out.failed_command = i;  // what a failure returned from this loop names (I4)
         const auto& command = commands[i];
         auto& p = out.commands[i];
         const auto bind = [&](ResourceId id) {
@@ -3375,6 +3381,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return r;
         }
     }
+    out.failed_command = PreparedList::no_command;  // a failure from here on is the list's, not one command's
     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
     out.statistics_overlaps = statistics_overlaps;
     if (statistics_overlaps) {

@@ -1693,6 +1693,23 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(vk_storage_init_wait PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
   endif()
+  # A failed ExecuteCommandLists names the list, command, kind and VkResult that made it fail (I4).
+  add_executable(vk_execute_failure_test test/vk_execute_failure_test.cpp)
+  target_link_libraries(vk_execute_failure_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_execute_failure_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(vk_execute_failure_test PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_execute_failure_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_execute_failure COMMAND vk_execute_failure_test)
+    set_tests_properties(vk_execute_failure PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+  endif()
   # VulkanContext::view() caches by the whole subresource range, mip count included (B19).
   add_executable(vk_view_cache_test test/vk_view_cache_test.cpp)
   target_link_libraries(vk_view_cache_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
