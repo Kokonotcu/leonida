@@ -4,6 +4,13 @@
 // Wraps VK_KHR_win32_surface + VkSwapchainKHR over a Win32 HWND, exposing acquire/present/resize
 // and ResourceBindings for the swapchain images (with presentable = true so D3D12_RESOURCE_STATE_PRESENT
 // maps to VK_IMAGE_LAYOUT_PRESENT_SRC_KHR).
+//
+// Present modes: each present() takes DXGI's SyncInterval and DXGI_PRESENT_ALLOW_TEARING. With
+// VK_KHR/EXT_swapchain_maintenance1 the swapchain is created in FIFO and also lists the IMMEDIATE and MAILBOX modes the
+// surface reports compatible with it, and each present is queued in the mode its arguments ask for
+// (VkSwapchainPresentModeInfoEXT, present_mode_for). When the swapchain cannot switch (no swapchain_maintenance1, or no
+// IMMEDIATE/MAILBOX mode compatible with FIFO) every present keeps the creation mode, the original behaviour: IMMEDIATE
+// (else MAILBOX) for a swapchain created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING, FIFO otherwise.
 
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
@@ -18,9 +25,16 @@
 #include "../src/vulkan_backend.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <mutex>
 #include <vector>
+
+// The EXT spellings of VK_*_swapchain_maintenance1 (aliases of the promoted KHR types), as vulkan_present.h uses them.
+#if !defined(LEONIDA_SWAPCHAIN_MAINTENANCE1) && defined(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) && \
+    defined(VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)
+#define LEONIDA_SWAPCHAIN_MAINTENANCE1 1
+#endif
 
 namespace leonida {
 
@@ -31,6 +45,7 @@ struct SwapchainFunctions {
     PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR surface_caps = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR surface_formats = nullptr;
     PFN_vkGetPhysicalDeviceSurfacePresentModesKHR surface_present_modes = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR surface_caps2 = nullptr;  // optional: present-mode compatibility
     PFN_vkCreateSwapchainKHR create_swapchain = nullptr;
     PFN_vkDestroySwapchainKHR destroy_swapchain = nullptr;
     PFN_vkGetSwapchainImagesKHR get_images = nullptr;
@@ -67,6 +82,7 @@ struct SwapchainFunctions {
         LOAD_I(surface_caps, vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
         LOAD_I(surface_formats, vkGetPhysicalDeviceSurfaceFormatsKHR);
         LOAD_I(surface_present_modes, vkGetPhysicalDeviceSurfacePresentModesKHR);
+        LOAD_I(surface_caps2, vkGetPhysicalDeviceSurfaceCapabilities2KHR);
         LOAD_I(mem_props, vkGetPhysicalDeviceMemoryProperties);
         LOAD_D(create_swapchain, vkCreateSwapchainKHR);
         LOAD_D(destroy_swapchain, vkDestroySwapchainKHR);
@@ -106,12 +122,15 @@ struct SwapchainFunctions {
 
 class VulkanSwapchain {
 public:
+    // `swapchain_maintenance1`: VK_KHR/EXT_swapchain_maintenance1 and its feature are enabled on `device`, with
+    // VK_KHR_get_surface_capabilities2 and the matching *_surface_maintenance1 on `instance` (VulkanDeviceInfo).
     VulkanSwapchain(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
                     PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkQueue queue, std::uint32_t queue_family,
-                    std::mutex& submit_mutex)
+                    std::mutex& submit_mutex, bool swapchain_maintenance1 = false)
         : instance_(instance), physical_(physical), device_(device), queue_(queue), queue_family_(queue_family),
           submit_mutex_(submit_mutex) {
         loaded_ = fn_.load(gipa, instance, gdpa, device);
+        maintenance1_ = swapchain_maintenance1 && fn_.surface_caps2 && fn_.surface_present_modes;
         if (loaded_) {
             VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
             if (fn_.create_fence(device_, &fi, nullptr, &acquire_fence_) != VK_SUCCESS) acquire_fence_ = VK_NULL_HANDLE;
@@ -218,7 +237,9 @@ public:
         return true;
     }
 
-    bool present(std::uint32_t back_buffer_index) {
+    // `sync_interval` and `allow_tearing` are Present's SyncInterval and DXGI_PRESENT_ALLOW_TEARING; they choose the
+    // frame's present mode when the swapchain can switch modes (present_mode_for).
+    bool present(std::uint32_t back_buffer_index, std::uint32_t sync_interval = 1, bool allow_tearing = false) {
         if (!swapchain_ || !presentable_ || back_buffer_index >= exposed_count_ || acquired_index_ >= images_.size())
             return false;
         std::uint32_t image_index = back_buffer_index;
@@ -226,15 +247,42 @@ public:
             if (!blit_to_swapchain(back_buffer_index)) return false;
             image_index = acquired_index_;
         }
+        const VkPresentModeKHR mode = present_mode_for(sync_interval, allow_tearing);
         VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pi.swapchainCount = 1;
         pi.pSwapchains = &swapchain_;
         pi.pImageIndices = &image_index;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+        VkSwapchainPresentModeInfoEXT per_present{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT};
+        if (switchable_count_ > 1) {  // the swapchain was created with these modes (rebuild)
+            per_present.swapchainCount = 1;
+            per_present.pPresentModes = &mode;
+            pi.pNext = &per_present;
+        }
+#endif
         std::lock_guard lock(submit_mutex_);
         const VkResult r = fn_.queue_present(queue_, &pi);
         presentable_ = false;  // handed to the engine (or abandoned): never present this image again
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) stale_ = true;
-        return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
+        const bool presented = r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
+        if (presented) last_present_mode_ = mode;
+        return presented;
+    }
+
+    // The mode for DXGI's SyncInterval and DXGI_PRESENT_ALLOW_TEARING, among the modes the swapchain can switch to.
+    // As in flip-model DXGI, only the per-present flag tears (Present rejects it without the swapchain flag): an
+    // interval of 1-4 waits for the vblank (FIFO), 0 with DXGI_PRESENT_ALLOW_TEARING tears (IMMEDIATE, else MAILBOX,
+    // else FIFO) and 0 without it does not wait but never tears (MAILBOX, else FIFO). When the swapchain cannot switch
+    // (no swapchain_maintenance1, or no IMMEDIATE/MAILBOX mode compatible with FIFO) it is the creation mode, the
+    // original behaviour. An interval of 2-4 is one vblank, not 2-4.
+    VkPresentModeKHR present_mode_for(std::uint32_t sync_interval, bool allow_tearing) const {
+        if (switchable_count_ < 2) return present_mode_;
+        if (sync_interval != 0) return VK_PRESENT_MODE_FIFO_KHR;
+        const auto end = switchable_.begin() + switchable_count_;
+        const auto has = [&](VkPresentModeKHR m) { return std::find(switchable_.begin(), end, m) != end; };
+        if (allow_tearing && has(VK_PRESENT_MODE_IMMEDIATE_KHR)) return VK_PRESENT_MODE_IMMEDIATE_KHR;
+        if (has(VK_PRESENT_MODE_MAILBOX_KHR)) return VK_PRESENT_MODE_MAILBOX_KHR;
+        return VK_PRESENT_MODE_FIFO_KHR;
     }
 
     // The native swapchain is out of date (a window resize, minimise or restore). With the offscreen ring the app's
@@ -290,6 +338,16 @@ public:
     VkExtent2D extent() const { return extent_; }
     bool is_offscreen() const { return !offscreen_images_.empty(); }
     VkPresentModeKHR present_mode() const { return present_mode_; }
+    // The mode the last successful present() was queued in; MAX_ENUM before the first. For tests.
+    VkPresentModeKHR last_present_mode() const {
+        std::lock_guard lock(submit_mutex_);
+        return last_present_mode_;
+    }
+    // The modes present() can switch between (FIFO first), or the creation mode alone when it cannot. For tests.
+    std::vector<VkPresentModeKHR> switchable_present_modes() const {
+        if (switchable_count_ < 2) return {present_mode_};
+        return {switchable_.begin(), switchable_.begin() + switchable_count_};
+    }
     VkImage image(std::uint32_t i) const {
         if (i >= exposed_count_) return VK_NULL_HANDLE;
         return is_offscreen() ? offscreen_images_[i] : images_[i];
@@ -585,34 +643,49 @@ private:
         std::uint32_t count = std::max(buffer_count, caps.minImageCount);
         if (caps.maxImageCount > 0) count = std::min(count, caps.maxImageCount);
 
-        VkPresentModeKHR chosen_present_mode = VK_PRESENT_MODE_FIFO_KHR;
-        if (allow_tearing_ && fn_.surface_present_modes) {
+        VkImageUsageFlags usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+        std::vector<VkPresentModeKHR> modes;  // the surface's
+        if (fn_.surface_present_modes) {
             std::uint32_t mode_count = 0;
             if (fn_.surface_present_modes(physical_, surface_, &mode_count, nullptr) == VK_SUCCESS && mode_count > 0) {
-                std::vector<VkPresentModeKHR> modes(mode_count);
-                if (fn_.surface_present_modes(physical_, surface_, &mode_count, modes.data()) == VK_SUCCESS) {
-                    bool has_immediate = false;
-                    bool has_mailbox = false;
-                    for (VkPresentModeKHR m : modes) {
-                        if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) has_immediate = true;
-                        if (m == VK_PRESENT_MODE_MAILBOX_KHR) has_mailbox = true;
-                    }
-                    if (has_immediate) chosen_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-                    else if (has_mailbox) chosen_present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
-                }
+                modes.resize(mode_count);
+                if (fn_.surface_present_modes(physical_, surface_, &mode_count, modes.data()) != VK_SUCCESS)
+                    mode_count = 0;
+                modes.resize(mode_count);
             }
+        }
+        const auto listed = [&](VkPresentModeKHR m) { return std::find(modes.begin(), modes.end(), m) != modes.end(); };
+        // The creation mode, which every present uses when the swapchain cannot switch modes.
+        VkPresentModeKHR chosen_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+        if (allow_tearing_) {
+            if (listed(VK_PRESENT_MODE_IMMEDIATE_KHR)) chosen_present_mode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            else if (listed(VK_PRESENT_MODE_MAILBOX_KHR)) chosen_present_mode = VK_PRESENT_MODE_MAILBOX_KHR;
         }
 
         VkSwapchainCreateInfoKHR ci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+        std::array<VkPresentModeKHR, 3> switchable{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_FIFO_KHR,
+                                                   VK_PRESENT_MODE_FIFO_KHR};
+        std::uint32_t switchable_count = 1;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+        // A FIFO swapchain that each Present switches to the mode its arguments ask for (present_mode_for).
+        VkSwapchainPresentModesCreateInfoEXT switchable_info{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT};
+        switchable_count = find_switchable_modes(modes, count, usage, ext, switchable);
+        if (switchable_count > 1) {
+            chosen_present_mode = VK_PRESENT_MODE_FIFO_KHR;
+            switchable_info.presentModeCount = switchable_count;
+            switchable_info.pPresentModes = switchable.data();
+            ci.pNext = &switchable_info;
+        }
+#endif
         ci.surface = surface_;
         ci.minImageCount = count;
         ci.imageFormat = chosen.format;
         ci.imageColorSpace = chosen.colorSpace;
         ci.imageExtent = ext;
         ci.imageArrayLayers = 1;
-        ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
-            ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        ci.imageUsage = usage;
         ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ci.preTransform = caps.currentTransform;
         ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -628,6 +701,8 @@ private:
         destroy_offscreen();
         swapchain_ = next;
         present_mode_ = chosen_present_mode;
+        switchable_ = switchable;
+        switchable_count_ = switchable_count;
         format_ = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : chosen.format;
         surface_extent_ = ext;
         extent_ = (width > 0 && height > 0) ? VkExtent2D{width, height} : ext;
@@ -660,8 +735,71 @@ private:
         return true;
     }
 
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+    // The modes a FIFO swapchain can switch between per present (VK_*_swapchain_maintenance1), FIFO first: then
+    // IMMEDIATE and MAILBOX when the surface lists them, reports them compatible with FIFO and accepts the swapchain's
+    // usage and extent in them. `min_images` is raised to a count every listed mode accepts. Returns how many modes
+    // `out` holds; 1 (FIFO alone, `min_images` unchanged) without the extension or another mode.
+    std::uint32_t find_switchable_modes(const std::vector<VkPresentModeKHR>& listed, std::uint32_t& min_images,
+                                        VkImageUsageFlags usage, VkExtent2D extent,
+                                        std::array<VkPresentModeKHR, 3>& out) const {
+        out = {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_FIFO_KHR};
+        if (!maintenance1_) return 1;
+        // The surface's capabilities in one present mode, and the modes it can switch to from there.
+        const auto ask = [&](VkPresentModeKHR asked, VkSurfaceCapabilitiesKHR& caps,
+                             std::array<VkPresentModeKHR, 16>* compatible, std::uint32_t* compatible_count) {
+            VkSurfacePresentModeEXT for_mode{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT};
+            for_mode.presentMode = asked;
+            VkPhysicalDeviceSurfaceInfo2KHR surface_info{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+                                                         &for_mode};
+            surface_info.surface = surface_;
+            VkSurfacePresentModeCompatibilityEXT compat{VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT};
+            if (compatible) {
+                compat.presentModeCount = static_cast<std::uint32_t>(compatible->size());
+                compat.pPresentModes = compatible->data();
+            }
+            VkSurfaceCapabilities2KHR result{VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+                                             compatible ? &compat : nullptr};
+            if (fn_.surface_caps2(physical_, &surface_info, &result) != VK_SUCCESS) return false;
+            caps = result.surfaceCapabilities;
+            if (compatible_count) *compatible_count = std::min<std::uint32_t>(compat.presentModeCount, 16);
+            return true;
+        };
+        VkSurfaceCapabilitiesKHR fifo_caps{};
+        std::array<VkPresentModeKHR, 16> compatible{};
+        std::uint32_t compatible_count = 0;
+        if (!ask(VK_PRESENT_MODE_FIFO_KHR, fifo_caps, &compatible, &compatible_count)) return 1;
+        const auto compatible_end = compatible.begin() + compatible_count;
+        std::uint32_t count = std::max(min_images, fifo_caps.minImageCount);
+        std::uint32_t most = fifo_caps.maxImageCount ? fifo_caps.maxImageCount : UINT32_MAX;
+        std::uint32_t n = 1;
+        for (const VkPresentModeKHR wanted : {VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR}) {
+            if (std::find(listed.begin(), listed.end(), wanted) == listed.end() ||
+                std::find(compatible.begin(), compatible_end, wanted) == compatible_end)
+                continue;
+            VkSurfaceCapabilitiesKHR mode_caps{};
+            if (!ask(wanted, mode_caps, nullptr, nullptr)) continue;
+            if ((mode_caps.supportedUsageFlags & usage) != usage) continue;
+            if (extent.width < mode_caps.minImageExtent.width || extent.height < mode_caps.minImageExtent.height ||
+                extent.width > mode_caps.maxImageExtent.width || extent.height > mode_caps.maxImageExtent.height)
+                continue;
+            const std::uint32_t mode_count = std::max(count, mode_caps.minImageCount);
+            const std::uint32_t mode_most =
+                std::min(most, mode_caps.maxImageCount ? mode_caps.maxImageCount : UINT32_MAX);
+            if (mode_count > mode_most) continue;
+            count = mode_count;
+            most = mode_most;
+            out[n++] = wanted;
+        }
+        if (n > 1) min_images = count;
+        return n;
+    }
+#endif
+
     SwapchainFunctions fn_{};
     bool loaded_ = false;
+    // VK_*_swapchain_maintenance1 is enabled and vkGetPhysicalDeviceSurfaceCapabilities2KHR is loaded.
+    bool maintenance1_ = false;
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
@@ -676,6 +814,12 @@ private:
     VkCommandBuffer blit_cmd_ = VK_NULL_HANDLE;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkPresentModeKHR present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR last_present_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    // The modes the swapchain was created with (VkSwapchainPresentModesCreateInfoEXT), FIFO first; one when it cannot
+    // switch, and then every present uses present_mode_.
+    std::array<VkPresentModeKHR, 3> switchable_{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_FIFO_KHR,
+                                                VK_PRESENT_MODE_FIFO_KHR};
+    std::uint32_t switchable_count_ = 1;
     bool allow_tearing_ = false;
     VkExtent2D surface_extent_{0, 0};
     VkExtent2D extent_{0, 0};

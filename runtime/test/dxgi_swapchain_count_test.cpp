@@ -6,11 +6,16 @@
 // always below it, one stable resource per index. The shim must not expose images the driver added above
 // minImageCount, and must hide a caps.minImageCount above the request. When the native count differs, the
 // exposed buffers form an offscreen ring; each present blits the current slot into the acquired native image.
+//
+// The same fake surface also checks the per-present mode (R5-5): with swapchain_maintenance1 a FIFO swapchain switches
+// to the mode Present's SyncInterval and DXGI_PRESENT_ALLOW_TEARING ask for, among the modes the fake surface lists and
+// reports compatible with FIFO, and Present(0, 0) never tears.
 #include "../shims/dxgi_swapchain.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <vector>
 
@@ -36,6 +41,14 @@ struct Fake {
     VkImage blit_dst = VK_NULL_HANDLE;
     unsigned presents = 0;
     unsigned created_offscreen = 0;
+    // Present modes: what the surface lists, which of them it reports compatible with FIFO, what the swapchain was
+    // created with and what each present asked for (MAX_ENUM: no VkSwapchainPresentModeInfoEXT).
+    std::vector<VkPresentModeKHR> listed_modes{VK_PRESENT_MODE_FIFO_KHR};
+    std::vector<VkPresentModeKHR> fifo_compatible;
+    VkPresentModeKHR create_mode = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    std::uint32_t create_switchable = 0;
+    VkPresentModeKHR presented_mode = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    VkResult present_result = VK_SUCCESS;
 };
 Fake g;
 
@@ -84,8 +97,41 @@ VKAPI_ATTR VkResult VKAPI_CALL surface_formats(VkPhysicalDevice, VkSurfaceKHR, s
 VKAPI_ATTR VkResult VKAPI_CALL surface_present_modes(VkPhysicalDevice, VkSurfaceKHR, std::uint32_t* count,
                                                      VkPresentModeKHR* modes) {
     if (!count) return VK_ERROR_INITIALIZATION_FAILED;
-    if (modes && *count) modes[0] = VK_PRESENT_MODE_FIFO_KHR;
-    *count = 1;
+    const auto n = static_cast<std::uint32_t>(g.listed_modes.size());
+    if (!modes) {
+        *count = n;
+        return VK_SUCCESS;
+    }
+    const std::uint32_t written = *count < n ? *count : n;
+    for (std::uint32_t i = 0; i < written; ++i) modes[i] = g.listed_modes[i];
+    *count = written;
+    return written < n ? VK_INCOMPLETE : VK_SUCCESS;
+}
+// The base capabilities in every mode; FIFO reports g.fifo_compatible, any other mode only itself.
+VKAPI_ATTR VkResult VKAPI_CALL surface_caps2(VkPhysicalDevice physical, const VkPhysicalDeviceSurfaceInfo2KHR* info,
+                                             VkSurfaceCapabilities2KHR* caps) {
+    if (!info || !caps) return VK_ERROR_INITIALIZATION_FAILED;
+    surface_caps(physical, info->surface, &caps->surfaceCapabilities);
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+    VkPresentModeKHR asked = VK_PRESENT_MODE_MAX_ENUM_KHR;
+    for (auto* in = static_cast<const VkBaseInStructure*>(info->pNext); in; in = in->pNext)
+        if (in->sType == VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_EXT)
+            asked = reinterpret_cast<const VkSurfacePresentModeEXT*>(in)->presentMode;
+    for (auto* out = static_cast<VkBaseOutStructure*>(caps->pNext); out; out = out->pNext) {
+        if (out->sType != VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT) continue;
+        auto* compat = reinterpret_cast<VkSurfacePresentModeCompatibilityEXT*>(out);
+        const std::vector<VkPresentModeKHR> modes =
+            asked == VK_PRESENT_MODE_FIFO_KHR ? g.fifo_compatible : std::vector<VkPresentModeKHR>{asked};
+        const auto n = static_cast<std::uint32_t>(modes.size());
+        if (compat->pPresentModes) {
+            const std::uint32_t written = compat->presentModeCount < n ? compat->presentModeCount : n;
+            for (std::uint32_t i = 0; i < written; ++i) compat->pPresentModes[i] = modes[i];
+            compat->presentModeCount = written;
+        } else {
+            compat->presentModeCount = n;
+        }
+    }
+#endif
     return VK_SUCCESS;
 }
 VKAPI_ATTR void VKAPI_CALL memory_properties(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties* props) {
@@ -100,6 +146,13 @@ VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice, const VkSwapchainCreat
                                                 const VkAllocationCallbacks*, VkSwapchainKHR* out) {
     if (!info || !out) return VK_ERROR_INITIALIZATION_FAILED;
     g.create_min_image_count = info->minImageCount;
+    g.create_mode = info->presentMode;
+    g.create_switchable = 0;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+    for (auto* in = static_cast<const VkBaseInStructure*>(info->pNext); in; in = in->pNext)
+        if (in->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT)
+            g.create_switchable = reinterpret_cast<const VkSwapchainPresentModesCreateInfoEXT*>(in)->presentModeCount;
+#endif
     *out = reinterpret_cast<VkSwapchainKHR>(kSwapchain);
     return VK_SUCCESS;
 }
@@ -123,8 +176,14 @@ VKAPI_ATTR VkResult VKAPI_CALL acquire_next_image(VkDevice, VkSwapchainKHR, std:
 VKAPI_ATTR VkResult VKAPI_CALL queue_present(VkQueue, const VkPresentInfoKHR* info) {
     if (!info || info->swapchainCount != 1 || !info->pImageIndices) return VK_ERROR_INITIALIZATION_FAILED;
     g.presented_image = info->pImageIndices[0];
+    g.presented_mode = VK_PRESENT_MODE_MAX_ENUM_KHR;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+    for (auto* in = static_cast<const VkBaseInStructure*>(info->pNext); in; in = in->pNext)
+        if (in->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT)
+            g.presented_mode = reinterpret_cast<const VkSwapchainPresentModeInfoEXT*>(in)->pPresentModes[0];
+#endif
     ++g.presents;
-    return VK_SUCCESS;
+    return g.present_result;
 }
 VKAPI_ATTR VkResult VKAPI_CALL create_fence(VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*,
                                             VkFence* out) {
@@ -198,6 +257,7 @@ const Entry kEntries[] = {
     {"vkGetPhysicalDeviceSurfaceCapabilitiesKHR", as_function(surface_caps)},
     {"vkGetPhysicalDeviceSurfaceFormatsKHR", as_function(surface_formats)},
     {"vkGetPhysicalDeviceSurfacePresentModesKHR", as_function(surface_present_modes)},
+    {"vkGetPhysicalDeviceSurfaceCapabilities2KHR", as_function(surface_caps2)},
     {"vkGetPhysicalDeviceMemoryProperties", as_function(memory_properties)},
     {"vkCreateSwapchainKHR", as_function(create_swapchain)},
     {"vkDestroySwapchainKHR", as_function(destroy_swapchain)},
@@ -326,6 +386,76 @@ int run_case(const char* label, std::uint32_t requested, std::uint32_t native, s
     return 0;
 }
 
+constexpr VkPresentModeKHR kFifo = VK_PRESENT_MODE_FIFO_KHR;
+constexpr VkPresentModeKHR kImmediate = VK_PRESENT_MODE_IMMEDIATE_KHR;
+constexpr VkPresentModeKHR kMailbox = VK_PRESENT_MODE_MAILBOX_KHR;
+
+struct ModeCase {
+    const char* label;
+    bool maintenance1;                            // the device has swapchain_maintenance1
+    std::vector<VkPresentModeKHR> listed;         // vkGetPhysicalDeviceSurfacePresentModesKHR
+    std::vector<VkPresentModeKHR> compatible;     // VkSurfacePresentModeCompatibilityEXT for FIFO
+    bool tearing_chain;                           // created with DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+    bool switches;                                // created with VkSwapchainPresentModesCreateInfoEXT
+    VkPresentModeKHR sync1, torn, sync0, sync4;   // Present(1,0), (0,ALLOW_TEARING), (0,0), (4,0)
+};
+
+// Creates the swapchain on the fake surface and checks the mode each Present is queued in.
+int run_mode_case(const ModeCase& c) {
+    g = Fake{};
+    g.listed_modes = c.listed;
+    g.fifo_compatible = c.compatible;
+    std::mutex mutex;
+    leonida::VulkanSwapchain swapchain(get_instance_proc, reinterpret_cast<VkInstance>(1),
+                                      reinterpret_cast<VkPhysicalDevice>(2), get_device_proc,
+                                      reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0, mutex,
+                                      c.maintenance1);
+    if (!swapchain.create(reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1)), 64, 64,
+                          VK_FORMAT_B8G8R8A8_UNORM, 2, c.tearing_chain))
+        return fail("VulkanSwapchain::create (present modes)");
+    if ((g.create_switchable > 1) != c.switches) {
+        std::fprintf(stderr, "FAIL: %s: created with %u switchable modes\n", c.label, g.create_switchable);
+        return 1;
+    }
+    if (c.switches && g.create_mode != kFifo) return fail("a switchable swapchain must be created in FIFO");
+    if (swapchain.last_present_mode() != VK_PRESENT_MODE_MAX_ENUM_KHR)
+        return fail("last_present_mode before a present");
+    struct Step {
+        std::uint32_t sync;
+        bool tear;
+        VkPresentModeKHR want;
+    };
+    const Step steps[] = {{1, false, c.sync1}, {0, true, c.torn}, {0, false, c.sync0}, {4, false, c.sync4}};
+    for (const Step& step : steps) {
+        if (step.tear && !c.tearing_chain) continue;  // Present rejects the flag on a plain swap chain
+        std::uint32_t index = 0;
+        if (!swapchain.acquire_next_image(index)) return fail("acquire (present modes)");
+        if (!swapchain.present(swapchain.current_back_buffer_index(), step.sync, step.tear))
+            return fail("present (present modes)");
+        // Only a switchable swapchain names the mode per present; otherwise the creation mode applies.
+        const VkPresentModeKHR queued = c.switches ? g.presented_mode : g.create_mode;
+        if (c.switches ? g.presented_mode == VK_PRESENT_MODE_MAX_ENUM_KHR
+                       : g.presented_mode != VK_PRESENT_MODE_MAX_ENUM_KHR)
+            return fail("VkSwapchainPresentModeInfoEXT chained iff the swapchain switches");
+        if (queued != step.want || swapchain.last_present_mode() != step.want) {
+            std::fprintf(stderr, "FAIL: %s: Present(%u, %s) queued mode %d (hook %d), expected %d\n", c.label,
+                         step.sync, step.tear ? "ALLOW_TEARING" : "0", queued, swapchain.last_present_mode(),
+                         step.want);
+            return 1;
+        }
+    }
+    // A present the driver refuses does not change the mode the hook reports (the last one, Present(4, 0), was FIFO
+    // on a switchable swapchain; this one asks for c.torn or c.sync0).
+    const VkPresentModeKHR before = swapchain.last_present_mode();
+    std::uint32_t index = 0;
+    if (!swapchain.acquire_next_image(index)) return fail("acquire (failed present)");
+    g.present_result = VK_ERROR_OUT_OF_DATE_KHR;
+    if (swapchain.present(swapchain.current_back_buffer_index(), 0, c.tearing_chain))
+        return fail("present should fail when vkQueuePresentKHR does");
+    if (swapchain.last_present_mode() != before) return fail("a failed present changed last_present_mode");
+    return 0;
+}
+
 struct Case {
     const char* label;
     std::uint32_t requested;
@@ -348,7 +478,37 @@ int main() {
     for (const Case& c : cases) {
         if (const int result = run_case(c.label, c.requested, c.native, c.minimum, c.offscreen)) return result;
     }
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+    const ModeCase mode_cases[] = {
+        // The fix: a plain swap chain never tears, so Present(0, 0) without MAILBOX stays FIFO, not IMMEDIATE.
+        {"plain, IMMEDIATE only", true, {kFifo, kImmediate}, {kFifo, kImmediate}, false, true,
+         kFifo, kFifo, kFifo, kFifo},
+        {"ALLOW_TEARING, IMMEDIATE only", true, {kFifo, kImmediate}, {kFifo, kImmediate}, true, true,
+         kFifo, kImmediate, kFifo, kFifo},
+        {"plain, MAILBOX and IMMEDIATE", true, {kImmediate, kMailbox, kFifo}, {kFifo, kMailbox, kImmediate}, false,
+         true, kFifo, kFifo, kMailbox, kFifo},
+        {"ALLOW_TEARING, MAILBOX and IMMEDIATE", true, {kImmediate, kMailbox, kFifo}, {kFifo, kMailbox, kImmediate},
+         true, true, kFifo, kImmediate, kMailbox, kFifo},
+        {"ALLOW_TEARING, MAILBOX only", true, {kFifo, kMailbox}, {kFifo, kMailbox}, true, true,
+         kFifo, kMailbox, kMailbox, kFifo},
+        // Cannot switch: listed but not compatible with FIFO, or no swapchain_maintenance1. Every present keeps the
+        // creation mode, the original behaviour (IMMEDIATE for an ALLOW_TEARING swap chain, FIFO for a plain one).
+        {"ALLOW_TEARING, nothing compatible with FIFO", true, {kFifo, kImmediate, kMailbox}, {kFifo}, true, false,
+         kImmediate, kImmediate, kImmediate, kImmediate},
+        {"plain, nothing compatible with FIFO", true, {kFifo, kImmediate, kMailbox}, {kFifo}, false, false,
+         kFifo, kFifo, kFifo, kFifo},
+        {"ALLOW_TEARING, no swapchain_maintenance1", false, {kFifo, kImmediate, kMailbox},
+         {kFifo, kImmediate, kMailbox}, true, false, kImmediate, kImmediate, kImmediate, kImmediate},
+    };
+    for (const ModeCase& c : mode_cases) {
+        if (const int result = run_mode_case(c)) return result;
+    }
+    std::printf("dxgi_swapchain_count_test: PASS (3 buffer-count cases: extra native images, min above request, "
+                "request above min; %u present-mode cases)\n",
+                static_cast<unsigned>(std::size(mode_cases)));
+#else
     std::printf("dxgi_swapchain_count_test: PASS (3 cases: extra native images, min above request, "
-                "request above min)\n");
+                "request above min; present-mode cases need the swapchain_maintenance1 headers)\n");
+#endif
     return 0;
 }

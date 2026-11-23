@@ -2916,6 +2916,23 @@ That import must be shimmed. The shim provides:
   `GetBuffer(i)` wraps each swapchain image as an `ID3D12Resource` so the game can create RTVs.
 - `Present` → `vkQueuePresentKHR`; `ResizeBuffers`/`ResizeTarget` recreate the swapchain; `SetFullscreenState`
   toggles borderless/fullscreen; `GetFrameStatistics` is a stub.
+- `Present(SyncInterval, Flags)` picks the frame's present mode (`VulkanSwapchain::present_mode_for`,
+  `runtime/shims/dxgi_swapchain.h`). As in flip-model DXGI, `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING` only permits tearing
+  and only the per-present `DXGI_PRESENT_ALLOW_TEARING` tears. An interval of 1-4 waits for the vblank (FIFO). An
+  interval of 0 with `DXGI_PRESENT_ALLOW_TEARING` tears (IMMEDIATE, else MAILBOX, else FIFO). An interval of 0 without
+  that flag does not wait but never tears (MAILBOX, else FIFO). With `VK_KHR/EXT_swapchain_maintenance1` the swapchain
+  is created in FIFO and also lists the IMMEDIATE and MAILBOX modes the surface reports compatible with FIFO. Each
+  present then names its mode in `VkSwapchainPresentModeInfoEXT`. When the swapchain cannot switch (no
+  swapchain_maintenance1, or no IMMEDIATE/MAILBOX mode compatible with FIFO), the original behaviour remains: every
+  present keeps the creation mode, IMMEDIATE (else MAILBOX) with the ALLOW_TEARING swapchain flag, FIFO without it, so
+  `Present(1, 0)` on an ALLOW_TEARING swap chain still tears there. An interval of 2-4 waits for one vblank, not 2-4.
+  `LEONIDA_PRESENT_NO_TEAR` applies only to the PresentX presenter, not to DXGI `Present`. `dxgi_swapchain_test`
+  checks the mode each present used on both kinds of swap chain, and prints `SKIP (part)` when the GPU's surface
+  cannot switch. `dxgi_swapchain_count_test` checks the same mapping on a fake surface (IMMEDIATE only, MAILBOX only,
+  both, nothing compatible with FIFO, no swapchain_maintenance1). On an RTX 5070 Ti (driver 32.0.16.2124) both swap
+  chains switch between FIFO, IMMEDIATE and MAILBOX, with 0 VUIDs under `LEONIDA_VK_VALIDATION=1`. Until this change,
+  an ALLOW_TEARING swap chain presented every frame IMMEDIATE, `Present(1, 0)` included, and a plain one presented
+  every frame FIFO.
 - `DXGI_PRESENT_TEST`/`DO_NOT_WAIT` map to a no-op/`VK_NOT_READY` path.
 
 **What exists.** The DXGI shim's `Present` (`runtime/shims/dxgi_com.cpp`) has its own surface, swapchain and

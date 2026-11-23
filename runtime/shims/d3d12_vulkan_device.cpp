@@ -9224,7 +9224,7 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
     const auto gdpa = reinterpret_cast<PFN_vkGetDeviceProcAddr>(i.get_instance_proc(i.instance, "vkGetDeviceProcAddr"));
     if (!gdpa) return E_FAIL;
     return rt::dxgi::create_factory(d->context(), i.get_instance_proc, i.instance, i.physical, gdpa, i.queue,
-                                    i.queue_family, riid, out);
+                                    i.queue_family, i.presentation && i.swapchain_maintenance1, riid, out);
 }
 
 // Creates its own Vulkan instance and a Vulkan 1.3 device, or a 1.2 device with VK_KHR_dynamic_rendering and

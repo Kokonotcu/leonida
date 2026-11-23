@@ -23,6 +23,10 @@ namespace {
 // Native DXGI accepts up to 40 queued frames on a waitable swapchain.
 constexpr UINT max_waitable_frame_latency = 40;
 
+// Private IID that only this module's SwapChain answers, so the test hooks (last_present_mode,
+// switchable_present_modes) can find it behind an interface.
+constexpr GUID kIID_LeonidaSwapChain = {0x3f6b1c52, 0x8e0d, 0x4b7a, {0x9a, 0x61, 0x2d, 0x5e, 0x47, 0xc3, 0x18, 0xb9}};
+
 void stub(const char* method) {
     static std::mutex mutex;
     static std::set<std::string> seen;
@@ -208,11 +212,12 @@ class SwapChain final : public IDXGISwapChain3 {
 public:
     SwapChain(IDXGIFactory4* parent, IUnknown* device, leonida::VulkanContext& context,
               PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
-              PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family)
+              PFN_vkGetDeviceProcAddr gdpa, VkQueue queue, std::uint32_t queue_family, bool swapchain_maintenance1)
         : parent_(parent),
           device_(device),
           context_(context),
-          swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex()) {
+          swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex(),
+                     swapchain_maintenance1) {
         if (parent_) parent_->AddRef();
         if (device_) device_->AddRef();
     }
@@ -262,6 +267,11 @@ public:
             AddRef();
             return S_OK;
         }
+        if (riid == kIID_LeonidaSwapChain) {
+            *out = this;
+            AddRef();
+            return S_OK;
+        }
         return E_NOINTERFACE;
     }
 
@@ -306,9 +316,11 @@ public:
         if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
         // The native chain goes out of date on a window resize, minimise or restore; DXGI keeps presenting through
         // all three (host-measured: S_OK, also while minimised), so replace the native chain and present again.
-        bool shown = swapchain_.present(swapchain_.current_back_buffer_index());
+        // SyncInterval and DXGI_PRESENT_ALLOW_TEARING choose this frame's present mode (present_mode_for).
+        const bool tearing = (flags & DXGI_PRESENT_ALLOW_TEARING) != 0;
+        bool shown = swapchain_.present(swapchain_.current_back_buffer_index(), sync, tearing);
         if (!shown && swapchain_.stale() && swapchain_.recreate_native())
-            shown = swapchain_.present(swapchain_.current_back_buffer_index());
+            shown = swapchain_.present(swapchain_.current_back_buffer_index(), sync, tearing);
         if (shown) {
             ++present_count_;
             LARGE_INTEGER qpc{};
@@ -326,6 +338,9 @@ public:
         if (waitable_) ReleaseSemaphore(waitable_, 1, nullptr);
         return S_OK;
     }
+
+    VkPresentModeKHR last_present_mode() const { return swapchain_.last_present_mode(); }
+    std::vector<VkPresentModeKHR> switchable_present_modes() const { return swapchain_.switchable_present_modes(); }
 
     HRESULT STDMETHODCALLTYPE GetBuffer(UINT buffer, REFIID riid, void** surface) override {
         if (!surface) return E_POINTER;
@@ -1355,6 +1370,9 @@ public:
         : context_(context), gipa_(gipa), instance_(instance), physical_(physical), gdpa_(gdpa),
           queue_(queue), queue_family_(queue_family) {}
 
+    // The device has VK_*_swapchain_maintenance1: swap chains switch present modes per Present.
+    void set_swapchain_maintenance1(bool enabled) { swapchain_maintenance1_ = enabled; }
+
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
     ULONG STDMETHODCALLTYPE Release() override {
         const ULONG left = --refs_;
@@ -1511,7 +1529,8 @@ public:
         if (!valid_flip_buffer_count(desc->BufferCount)) return DXGI_ERROR_INVALID_CALL;
         const VkFormat vk_fmt = dxgi_to_vk_format(desc->Format);
         if (vk_fmt == VK_FORMAT_UNDEFINED) return DXGI_ERROR_INVALID_CALL;
-        auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_);
+        auto* sc = new SwapChain(this, device, context_, gipa_, instance_, physical_, gdpa_, queue_, queue_family_,
+                                 swapchain_maintenance1_);
         if (restrict_to_output) sc->set_restrict_to_output(restrict_to_output);
         if (!sc->init(hwnd, *desc, vk_fmt)) {
             sc->Release();
@@ -1687,6 +1706,7 @@ private:
     PFN_vkGetDeviceProcAddr gdpa_;
     VkQueue queue_;
     std::uint32_t queue_family_;
+    bool swapchain_maintenance1_ = false;
     HWND assoc_hwnd_ = nullptr;
     mutable std::once_flag tearing_once_;
     bool tearing_supported_ = false;
@@ -1701,13 +1721,39 @@ private:
 
 HRESULT create_factory(leonida::VulkanContext& context, PFN_vkGetInstanceProcAddr gipa, VkInstance instance,
                        VkPhysicalDevice physical, PFN_vkGetDeviceProcAddr gdpa, VkQueue queue,
-                       std::uint32_t queue_family, REFIID riid, void** out) {
+                       std::uint32_t queue_family, bool swapchain_maintenance1, REFIID riid, void** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     auto* factory = new Factory(context, gipa, instance, physical, gdpa, queue, queue_family);
+    factory->set_swapchain_maintenance1(swapchain_maintenance1);
     const HRESULT hr = factory->QueryInterface(riid, out);
     factory->Release();
     return hr;
+}
+
+namespace {
+// This module's SwapChain behind `unknown` (AddRef'd), or null.
+SwapChain* find_swap_chain(IUnknown* unknown) {
+    void* ours = nullptr;
+    if (!unknown || FAILED(unknown->QueryInterface(kIID_LeonidaSwapChain, &ours))) return nullptr;
+    return static_cast<SwapChain*>(ours);
+}
+}  // namespace
+
+VkPresentModeKHR last_present_mode(IUnknown* swapchain) {
+    SwapChain* chain = find_swap_chain(swapchain);
+    if (!chain) return VK_PRESENT_MODE_MAX_ENUM_KHR;
+    const VkPresentModeKHR mode = chain->last_present_mode();
+    chain->Release();
+    return mode;
+}
+
+std::vector<VkPresentModeKHR> switchable_present_modes(IUnknown* swapchain) {
+    SwapChain* chain = find_swap_chain(swapchain);
+    if (!chain) return {};
+    std::vector<VkPresentModeKHR> modes = chain->switchable_present_modes();
+    chain->Release();
+    return modes;
 }
 
 }  // namespace rt::dxgi

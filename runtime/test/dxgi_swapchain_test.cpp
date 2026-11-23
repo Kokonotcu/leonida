@@ -347,6 +347,29 @@ int main() {
 
     std::vector<const char*> inst_exts = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
     if (val_active) inst_exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    // The surface half of VK_*_swapchain_maintenance1, as the standalone device enables it: with it the swap chain can
+    // switch present modes per Present (SyncInterval / DXGI_PRESENT_ALLOW_TEARING).
+    const char* surface_m1 = nullptr;
+    {
+        const auto enum_inst_exts = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+            gipa(nullptr, "vkEnumerateInstanceExtensionProperties"));
+        std::uint32_t n = 0;
+        if (enum_inst_exts && enum_inst_exts(nullptr, &n, nullptr) == VK_SUCCESS) {
+            std::vector<VkExtensionProperties> available(n);
+            enum_inst_exts(nullptr, &n, available.data());
+            bool caps2 = false, khr = false, ext = false;
+            for (const auto& e : available) {
+                caps2 = caps2 || !std::strcmp(e.extensionName, "VK_KHR_get_surface_capabilities2");
+                khr = khr || !std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1");
+                ext = ext || !std::strcmp(e.extensionName, "VK_EXT_surface_maintenance1");
+            }
+            if (caps2 && (khr || ext)) {
+                surface_m1 = khr ? "VK_KHR_surface_maintenance1" : "VK_EXT_surface_maintenance1";
+                inst_exts.push_back("VK_KHR_get_surface_capabilities2");
+                inst_exts.push_back(surface_m1);
+            }
+        }
+    }
 
     VkDebugUtilsMessengerCreateInfoEXT dbg{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
     dbg.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
@@ -449,12 +472,42 @@ int main() {
     qci.queueCount = 1;
     qci.pQueuePriorities = &prio;
 
-    const char* dev_ext = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    std::vector<const char*> dev_exts = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT swapchain_m1{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
+    bool swapchain_m1_enabled = false;
+    if (surface_m1) {
+        const auto enum_dev_exts = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+            gipa(instance, "vkEnumerateDeviceExtensionProperties"));
+        const auto get_features2 =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(gipa(instance, "vkGetPhysicalDeviceFeatures2"));
+        // The device extension that goes with the instance's surface extension (KHR with KHR, EXT with EXT).
+        const char* wanted = !std::strcmp(surface_m1, "VK_KHR_surface_maintenance1") ? "VK_KHR_swapchain_maintenance1"
+                                                                                      : "VK_EXT_swapchain_maintenance1";
+        std::uint32_t n = 0;
+        bool listed = false;
+        if (enum_dev_exts && enum_dev_exts(physical, nullptr, &n, nullptr) == VK_SUCCESS) {
+            std::vector<VkExtensionProperties> available(n);
+            enum_dev_exts(physical, nullptr, &n, available.data());
+            for (const auto& e : available) listed = listed || !std::strcmp(e.extensionName, wanted);
+        }
+        if (listed && get_features2) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &swapchain_m1};
+            get_features2(physical, &query);
+            if (swapchain_m1.swapchainMaintenance1 == VK_TRUE) {
+                swapchain_m1.pNext = nullptr;
+                f13.pNext = &swapchain_m1;
+                dev_exts.push_back(wanted);
+                swapchain_m1_enabled = true;
+            }
+        }
+    }
+    std::printf("swapchain_maintenance1: %s\n", swapchain_m1_enabled ? "enabled" : "not available");
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &f12};
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
-    dci.ppEnabledExtensionNames = &dev_ext;
+    dci.enabledExtensionCount = static_cast<std::uint32_t>(dev_exts.size());
+    dci.ppEnabledExtensionNames = dev_exts.data();
 
     VkDevice vk_dev = VK_NULL_HANDLE;
     if (create_dev(physical, &dci, nullptr, &vk_dev) != VK_SUCCESS) return fail("vkCreateDevice");
@@ -471,6 +524,8 @@ int main() {
     info.queue = vk_queue;
     info.queue_family = family;
     info.separate_depth_stencil_layouts = true;
+    info.presentation = true;
+    info.swapchain_maintenance1 = swapchain_m1_enabled;
 
     ID3D12Device* dev = nullptr;
     if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&dev))) || !dev) return fail("create_vulkan_device");
@@ -1712,6 +1767,113 @@ int main() {
         CloseHandle(waitable);
         wsc->Release();
         DestroyWindow(hwnd3);
+    }
+
+    // Present's SyncInterval and DXGI_PRESENT_ALLOW_TEARING choose the Vulkan present mode of that frame (R5-5). As in
+    // flip-model DXGI, the swap chain flag ALLOW_TEARING only permits tearing: an interval of 1-4 waits for the vblank
+    // (FIFO), 0 with DXGI_PRESENT_ALLOW_TEARING tears (IMMEDIATE, else MAILBOX, else FIFO), and 0 without it does not
+    // wait but never tears (MAILBOX, else FIFO). Switching per present needs VK_*_swapchain_maintenance1 and an
+    // IMMEDIATE or MAILBOX mode the surface reports compatible with FIFO (rt::dxgi::switchable_present_modes); a swap
+    // chain that cannot switch keeps its creation mode for every present. dxgi_swapchain_count_test covers the surfaces
+    // this GPU does not have.
+    {
+        if (rt::dxgi::last_present_mode(factory) != VK_PRESENT_MODE_MAX_ENUM_KHR ||
+            rt::dxgi::last_present_mode(nullptr) != VK_PRESENT_MODE_MAX_ENUM_KHR ||
+            !rt::dxgi::switchable_present_modes(factory).empty())
+            return fail("the present-mode hooks should not answer for something that is not a swap chain");
+        const auto make_chain = [&](HWND window, UINT flags) -> IDXGISwapChain3* {
+            DXGI_SWAP_CHAIN_DESC1 d = scd;
+            d.Flags = flags;
+            IDXGISwapChain1* c1 = nullptr;
+            IDXGISwapChain3* c3 = nullptr;
+            if (FAILED(factory->CreateSwapChainForHwnd(queue, window, &d, nullptr, nullptr, &c1)) || !c1)
+                return nullptr;
+            c1->QueryInterface(IID_PPV_ARGS(&c3));
+            c1->Release();
+            return c3;
+        };
+        const auto mode_after = [](IDXGISwapChain3* chain, UINT sync, UINT flags) {
+            if (FAILED(chain->Present(sync, flags))) return VK_PRESENT_MODE_MAX_ENUM_KHR;
+            return rt::dxgi::last_present_mode(chain);
+        };
+        const auto has = [](const std::vector<VkPresentModeKHR>& modes, VkPresentModeKHR m) {
+            for (const VkPresentModeKHR x : modes)
+                if (x == m) return true;
+            return false;
+        };
+        const auto print_modes = [](const char* label, const std::vector<VkPresentModeKHR>& modes) {
+            std::printf("%s swap chain modes:", label);
+            for (const VkPresentModeKHR m : modes) std::printf(" %d", m);
+            std::printf(" (FIFO %d, IMMEDIATE %d, MAILBOX %d)\n", VK_PRESENT_MODE_FIFO_KHR,
+                        VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR);
+        };
+        HWND hwnd4 = create_test_window(128, 96);
+        if (!hwnd4) return fail("CreateWindowExW (present modes)");
+
+        IDXGISwapChain3* tear_sc = make_chain(hwnd4, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+        if (!tear_sc) return fail("CreateSwapChainForHwnd (ALLOW_TEARING, present modes)");
+        if (rt::dxgi::last_present_mode(tear_sc) != VK_PRESENT_MODE_MAX_ENUM_KHR)
+            return fail("last_present_mode before the first Present should be MAX_ENUM");
+        if (FAILED(tear_sc->Present(1, DXGI_PRESENT_TEST)) ||
+            rt::dxgi::last_present_mode(tear_sc) != VK_PRESENT_MODE_MAX_ENUM_KHR)
+            return fail("Present(DXGI_PRESENT_TEST) must not present");
+        const std::vector<VkPresentModeKHR> tear_modes = rt::dxgi::switchable_present_modes(tear_sc);
+        const VkPresentModeKHR tear_sync1 = mode_after(tear_sc, 1, 0);
+        const VkPresentModeKHR tear_torn = mode_after(tear_sc, 0, DXGI_PRESENT_ALLOW_TEARING);
+        const VkPresentModeKHR tear_sync0 = mode_after(tear_sc, 0, 0);
+        const VkPresentModeKHR tear_sync4 = mode_after(tear_sc, 4, 0);
+        print_modes("ALLOW_TEARING", tear_modes);
+        std::printf("ALLOW_TEARING swap chain: Present(1,0) mode %d, Present(0,ALLOW_TEARING) %d, Present(0,0) %d, "
+                    "Present(4,0) %d\n",
+                    tear_sync1, tear_torn, tear_sync0, tear_sync4);
+        tear_sc->Release();
+
+        HWND hwnd5 = create_test_window(128, 96);
+        if (!hwnd5) return fail("CreateWindowExW (present modes, plain)");
+        IDXGISwapChain3* plain_sc = make_chain(hwnd5, 0);
+        if (!plain_sc) return fail("CreateSwapChainForHwnd (plain, present modes)");
+        const std::vector<VkPresentModeKHR> plain_modes = rt::dxgi::switchable_present_modes(plain_sc);
+        const VkPresentModeKHR plain_sync1 = mode_after(plain_sc, 1, 0);
+        const VkPresentModeKHR plain_sync0 = mode_after(plain_sc, 0, 0);
+        const VkPresentModeKHR plain_sync2 = mode_after(plain_sc, 2, 0);
+        print_modes("plain", plain_modes);
+        std::printf("plain swap chain: Present(1,0) mode %d, Present(0,0) %d, Present(2,0) %d\n", plain_sync1,
+                    plain_sync0, plain_sync2);
+        plain_sc->Release();
+        DestroyWindow(hwnd5);
+        DestroyWindow(hwnd4);
+
+        const bool tear_switches = tear_modes.size() > 1;
+        const bool plain_switches = plain_modes.size() > 1;
+        if (!swapchain_m1_enabled && (tear_switches || plain_switches))
+            return fail("without swapchain_maintenance1 no swap chain should switch present modes");
+        // A plain swap chain never tears and an interval of 1-4 always waits, switchable or not.
+        if (plain_sync1 != VK_PRESENT_MODE_FIFO_KHR || plain_sync2 != VK_PRESENT_MODE_FIFO_KHR)
+            return fail("Present(1 or 2, 0) on a plain swap chain should be FIFO");
+        if (plain_sync0 != (has(plain_modes, VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR
+                                                                         : VK_PRESENT_MODE_FIFO_KHR))
+            return fail("Present(0, 0) on a plain swap chain should be MAILBOX when it can switch to it, else FIFO");
+        if (tear_switches) {
+            if (tear_modes[0] != VK_PRESENT_MODE_FIFO_KHR)
+                return fail("a switchable swap chain should list FIFO first");
+            if (tear_sync1 != VK_PRESENT_MODE_FIFO_KHR || tear_sync4 != VK_PRESENT_MODE_FIFO_KHR)
+                return fail("Present(1 or 4, 0) on an ALLOW_TEARING swap chain must wait for the vblank (FIFO)");
+            VkPresentModeKHR want_torn = VK_PRESENT_MODE_FIFO_KHR;
+            if (has(tear_modes, VK_PRESENT_MODE_IMMEDIATE_KHR)) want_torn = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            else if (has(tear_modes, VK_PRESENT_MODE_MAILBOX_KHR)) want_torn = VK_PRESENT_MODE_MAILBOX_KHR;
+            if (tear_torn != want_torn)
+                return fail("Present(0, ALLOW_TEARING) should be IMMEDIATE, else MAILBOX, of the swap chain's modes");
+            if (tear_sync0 != (has(tear_modes, VK_PRESENT_MODE_MAILBOX_KHR) ? VK_PRESENT_MODE_MAILBOX_KHR
+                                                                           : VK_PRESENT_MODE_FIFO_KHR))
+                return fail("Present(0, 0) on an ALLOW_TEARING swap chain should be MAILBOX, else FIFO (no tearing)");
+        } else if (tear_modes.size() != 1 || tear_sync1 != tear_modes[0] || tear_torn != tear_modes[0] ||
+                   tear_sync0 != tear_modes[0] || tear_sync4 != tear_modes[0]) {
+            return fail("a swap chain that cannot switch should present every frame in its creation mode");
+        }
+        if (!tear_switches || !plain_switches)
+            std::printf("SKIP (part): per-present switching needs swapchain_maintenance1 and an IMMEDIATE or MAILBOX "
+                        "mode compatible with FIFO (ALLOW_TEARING chain %s, plain chain %s)\n",
+                        tear_switches ? "switches" : "cannot switch", plain_switches ? "switches" : "cannot switch");
     }
 
     // CreateSwapChainForCoreWindow & Occlusion status registration
