@@ -1191,15 +1191,24 @@ bool STDMETHODCALLTYPE pkg_uninstall_package(void*, const char*) { return false;
 // XPackageChunkAvailability: Ready 0, Pending 1, Installable 2, Unavailable 3.
 char g_package_monitor;
 constexpr uint32_t kChunkReady = 0;
-const char kInstallChunksIdentity = 0, kMountWithUiIdentity = 0;
+const char kInstallChunksIdentity = 0, kMountWithUiIdentity = 1;  // different values, so a linker cannot fold them
+// "Installed" means what slot 23's XPackageMount means by it: the process's own package, or a content package in
+// LEONIDA_CONTENT_PACKAGES. Anything else is ERROR_NOT_FOUND here as it is there.
+HRESULT package_installed(const char* id) {
+    if (!id) return E_INVALIDARG;
+    char path[MAX_PATH];
+    const HRESULT hr = resolve_package_path(id, path, sizeof(path));
+    return hr == E_ACCESSDENIED ? S_OK : hr;  // E_ACCESSDENIED is the game's own id: installed, just not mountable
+}
 
 // HRESULT XPackageCreateInstallationMonitor(const char* packageIdentifier, uint32_t selectorCount,
 //     XPackageChunkSelector* selectors, uint32_t minimumUpdateIntervalMs, XTaskQueueHandle queue,
 //     XPackageInstallationMonitorHandle* installationMonitor)
 HRESULT STDMETHODCALLTYPE pkg_create_monitor(void*, const char* id, uint32_t, void*, uint32_t, XTaskQueueHandle,
                                              void** monitor) {
-    if (!id) return E_INVALIDARG;
     if (!monitor) return E_POINTER;
+    *monitor = nullptr;
+    if (const HRESULT hr = package_installed(id); FAILED(hr)) return hr;
     *monitor = &g_package_monitor;
     return S_OK;
 }
@@ -1216,28 +1225,29 @@ HRESULT STDMETHODCALLTYPE pkg_register_progress(void*, void*, void*, void* callb
 // HRESULT XPackageFindChunkAvailability(const char* packageIdentifier, uint32_t selectorCount,
 //     XPackageChunkSelector* selectors, XPackageChunkAvailability* availability)
 HRESULT STDMETHODCALLTYPE pkg_find_chunk_availability(void*, const char* id, uint32_t, void*, uint32_t* availability) {
-    if (!id) return E_INVALIDARG;
     if (!availability) return E_POINTER;
+    if (const HRESULT hr = package_installed(id); FAILED(hr)) return hr;
     *availability = kChunkReady;
     return S_OK;
 }
 // HRESULT XPackageChangeChunkInstallOrder(const char* packageIdentifier, uint32_t selectorCount,
 //     XPackageChunkSelector* selectors): nothing is queued, so there is no order to change.
 HRESULT STDMETHODCALLTYPE pkg_change_chunk_order(void*, const char* id, uint32_t, void*) {
-    return id ? S_OK : E_INVALIDARG;
+    return package_installed(id);
 }
 // HRESULT XPackageEstimateDownloadSize(const char* packageIdentifier, uint32_t selectorCount,
 //     XPackageChunkSelector* selectors, uint64_t* downloadSize, bool* shouldPresentUserConfirmation)
 HRESULT STDMETHODCALLTYPE pkg_estimate_download(void*, const char* id, uint32_t, void*, uint64_t* size, bool* confirm) {
-    if (!id) return E_INVALIDARG;
     if (!size || !confirm) return E_POINTER;
+    if (const HRESULT hr = package_installed(id); FAILED(hr)) return hr;
     *size = 0;
     *confirm = false;
     return S_OK;
 }
 // HRESULT XPackageUninstallChunks(const char* packageIdentifier, uint32_t selectorCount,
 //     XPackageChunkSelector* selectors): refused. The game folder is read only and nothing is removed, so the
-// chunks stay Ready; the one caller does not test the result. The same answer as slot 34 (not uninstalled).
+// chunks stay Ready; the one call site (counted with tools/gdk_runtime_calls.py) does not test the result. The same
+// answer as slot 34 (not uninstalled).
 HRESULT STDMETHODCALLTYPE pkg_uninstall_chunks(void*, const char*, uint32_t, void*) { return E_ACCESSDENIED; }
 
 // The answer of slots 16 and 37 rides in the async context as one u64 (the monitor or the mount handle).
@@ -1262,8 +1272,8 @@ HRESULT CALLBACK package_value_provider(XAsyncOp op, const XAsyncProviderData* d
 // completes at once with the installed package's monitor.
 HRESULT STDMETHODCALLTYPE pkg_install_chunks_async(void*, const char* id, uint32_t, void*, uint32_t, bool,
                                                    XAsyncBlock* async) {
-    if (!id) return E_INVALIDARG;
     if (!async) return E_POINTER;
+    if (const HRESULT hr = package_installed(id); FAILED(hr)) return hr;
     return XAsyncBegin(async, &g_package_monitor, &kInstallChunksIdentity, "XPackageInstallChunksAsync",
                        package_value_provider);
 }
@@ -1274,8 +1284,9 @@ HRESULT STDMETHODCALLTYPE pkg_install_chunks_result(void*, XAsyncBlock* async, v
 // HRESULT XPackageMountWithUiAsync(const char* packageIdentifier, XAsyncBlock* asyncBlock) /
 // XPackageMountWithUiResult(XAsyncBlock*, XPackageMountHandle*): no UI to show offline, so this is slot 23's
 // XPackageMount, done before the call returns. A refused mount (ERROR_NOT_FOUND, E_ACCESSDENIED for the game itself)
-// is returned by the Async call itself, which its one caller tests; whether the GDK fails there or in the result is
-// not known.
+// is returned by the Async call itself, which its one call site (tools/gdk_runtime_calls.py) tests; whether the GDK
+// fails there or in the result is not known. A mount whose result is never collected (a cancel before the work runs,
+// or no slot 38 call) stays in the mount table: one small entry, not closed by the async cleanup.
 HRESULT STDMETHODCALLTYPE pkg_mount_with_ui_async(void*, const char* id, XAsyncBlock* async) {
     if (!async) return E_POINTER;
     XPackageMountHandle mount{};
