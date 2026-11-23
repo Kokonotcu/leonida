@@ -401,9 +401,10 @@ trio (23-25). What the slots must answer is still **not measured**; that is the 
   an update past 16 MB (`GS_MAX_BLOB_SIZE`) is `E_GS_UPDATE_TOO_BIG`.
 - **Names:** container names follow `XGameSaveCreateContainer`'s documented rule (`E_GS_INVALID_CONTAINER_NAME`
   otherwise).
-- **Reads:** `XGameSaveReadBlobData` fills the title's buffer with the `XGameSaveBlob` array, then each blob's bytes
-  and name, which the array points into; a buffer too small is `E_GS_PROVIDED_BUFFER_TOO_SMALL`, a missing blob
-  `E_GS_BLOB_NOT_FOUND`. The async read's result size (`XAsyncGetResultSize`) is the buffer it needs.
+- **Reads:** `XGameSaveReadBlobData` fills the title's buffer with the `XGameSaveBlob` array, then every blob's bytes,
+  then every name, unpadded, which the array points into: the size `XGameSaveEnumerateBlobInfo`'s sample computes
+  (`sizeof(XGameSaveBlob)` + size + name length + 1 per blob). A buffer too small is
+  `E_GS_PROVIDED_BUFFER_TOO_SMALL`, a missing blob `E_GS_BLOB_NOT_FOUND`. The async read's result size (`XAsyncGetResultSize`) is the buffer it needs.
 - **ASSUMPTION:** a fixed 1 GiB quota, blob names of at most 256 bytes, `blobNames = nullptr` reads every blob,
   and `XGameSaveGetContainerInfo` of a missing container returns `S_OK` without a callback. `syncOnDemand` is
   ignored: nothing syncs offline.

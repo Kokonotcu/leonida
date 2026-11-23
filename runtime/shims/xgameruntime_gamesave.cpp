@@ -317,35 +317,36 @@ void enumerate_containers(const fs::path& user_dir, std::string_view prefix, voi
 // ---- Reading blobs into the title's buffer ----
 //
 // The buffer is laid out as the GDK samples read it: an array of XGameSaveBlob, one per blob, whose info.name and
-// data point further into the same buffer (each blob's bytes 8-aligned, then its name).
+// data point further into the same buffer (every blob's bytes, then every name, unpadded: the size
+// XGameSaveEnumerateBlobInfo's sample computes, sizeof(XGameSaveBlob) + size + name length + 1 per blob).
 
 struct BlobRead {
     std::string name;
     std::vector<uint8_t> data;
 };
 
-size_t align8(size_t n) { return (n + 7) & ~size_t{7}; }
-
 size_t packed_size(const std::vector<BlobRead>& blobs) {
-    size_t n = align8(blobs.size() * sizeof(XGameSaveBlob));
-    for (const BlobRead& b : blobs) n += align8(b.data.size()) + align8(b.name.size() + 1);
+    size_t n = blobs.size() * sizeof(XGameSaveBlob);
+    for (const BlobRead& b : blobs) n += b.data.size() + b.name.size() + 1;
     return n;
 }
 
 void pack(const std::vector<BlobRead>& blobs, void* buffer) {
     auto* base = static_cast<uint8_t*>(buffer);
     auto* entries = static_cast<XGameSaveBlob*>(buffer);
-    size_t at = align8(blobs.size() * sizeof(XGameSaveBlob));
+    size_t at = blobs.size() * sizeof(XGameSaveBlob);
     for (size_t i = 0; i < blobs.size(); ++i) {
         uint8_t* data = base + at;
         if (!blobs[i].data.empty()) std::memcpy(data, blobs[i].data.data(), blobs[i].data.size());
-        at += align8(blobs[i].data.size());
-        char* name = reinterpret_cast<char*>(base + at);
-        std::memcpy(name, blobs[i].name.c_str(), blobs[i].name.size() + 1);
-        at += align8(blobs[i].name.size() + 1);
-        entries[i].info.name = name;
+        at += blobs[i].data.size();
         entries[i].info.size = static_cast<uint32_t>(blobs[i].data.size());
         entries[i].data = data;
+    }
+    for (size_t i = 0; i < blobs.size(); ++i) {
+        char* name = reinterpret_cast<char*>(base + at);
+        std::memcpy(name, blobs[i].name.c_str(), blobs[i].name.size() + 1);
+        at += blobs[i].name.size() + 1;
+        entries[i].info.name = name;
     }
 }
 

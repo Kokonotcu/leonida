@@ -117,6 +117,19 @@ bool CALLBACK on_blob(const BlobInfo* info, void* context) {
     return true;
 }
 
+struct Sizing {
+    const char* const* names;
+    size_t count;
+    size_t size;
+};
+bool CALLBACK size_blobs(const BlobInfo* info, void* context) {
+    auto* sizing = static_cast<Sizing*>(context);
+    for (size_t i = 0; i < sizing->count; ++i)
+        if (std::strcmp(info->name, sizing->names[i]) == 0)
+            sizing->size += std::strlen(info->name) + 1 + info->size + sizeof(Blob);
+    return true;
+}
+
 }  // namespace
 
 int main() {
@@ -227,6 +240,23 @@ int main() {
               std::strcmp(out[1].info.name, "profile/main") == 0 &&
               std::memcmp(out[1].data, profile.data(), profile.size()) == 0,
           "ReadBlobData returns both blobs, byte for byte, pointing into the buffer");
+    Sizing sizing{names, 2, 0};
+    at<EnumBlobs>(save, 18)(save, container, &sizing, size_blobs);
+    std::vector<uint8_t> exact(sizing.size + 8, 0xEE);
+    auto* eout = reinterpret_cast<Blob*>(exact.data());
+    count = 2;
+    check(at<Read>(save, 20)(save, container, names, &count, sizing.size - 1, eout) == E_GS_PROVIDED_BUFFER_TOO_SMALL,
+          "one byte less than the documented size is too small");
+    count = 2;
+    const HRESULT exact_hr = at<Read>(save, 20)(save, container, names, &count, sizing.size, eout);
+    bool untouched = true;
+    for (size_t i = sizing.size; i < exact.size(); ++i) untouched = untouched && exact[i] == 0xEE;
+    check(exact_hr == S_OK && count == 2 &&
+              std::strcmp(eout[0].info.name, "story") == 0 && eout[0].info.size == story.size() &&
+              std::memcmp(eout[0].data, story.data(), story.size()) == 0 &&
+              std::strcmp(eout[1].info.name, "profile/main") == 0 && eout[1].info.size == profile.size() &&
+              std::memcmp(eout[1].data, profile.data(), profile.size()) == 0 && untouched,
+          "ReadBlobData fits the size XGameSaveEnumerateBlobInfo's sample computes, and writes nothing past it");
     const char* absent[] = {"nope"};
     count = 1;
     check(at<Read>(save, 20)(save, container, absent, &count, buffer.size() * 8, out) == E_GS_BLOB_NOT_FOUND,
@@ -239,8 +269,8 @@ int main() {
     check(at<ReadAsync>(save, 21)(save, container, names, 1, &async) == S_OK && finished(&async),
           "ReadBlobDataAsync runs");
     size_t needed = 0;
-    check(XAsyncGetResultSize(&async, &needed) == S_OK && needed > story.size(),
-          "its result size is what the buffer needs (XAsyncGetResultSize)");
+    check(XAsyncGetResultSize(&async, &needed) == S_OK && needed == sizeof(Blob) + story.size() + sizeof("story"),
+          "its result size is what the buffer needs (XAsyncGetResultSize), as the docs size it");
     std::vector<uint64_t> abuf((needed + 7) / 8);
     uint32_t acount = 0;
     auto* aout = reinterpret_cast<Blob*>(abuf.data());
