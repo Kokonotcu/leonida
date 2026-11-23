@@ -5829,8 +5829,12 @@ int main() {
             UINT total_size = 0, param_count = 0;
             EXPECT(device5->EnumerateMetaCommandParameters(unknown_command, D3D12_META_COMMAND_PARAMETER_STAGE_CREATION,
                                                            &total_size, &param_count, nullptr) == E_INVALIDARG);
+            // Device slot 61 of the Xbox-ABI proxy is the console's CreateSamplerX (d3d12_xs_device.cpp), not the PC
+            // CreateMetaCommand, so the layer's own device answers this one.
+            Ref<ID3D12Device5> inner5;
+            EXPECT(SUCCEEDED(inner->QueryInterface(IID_PPV_ARGS(&inner5.p))));
             void* meta = reinterpret_cast<void*>(1);
-            EXPECT(device5->CreateMetaCommand(unknown_command, 0, nullptr, 0, IID_ID3D12MetaCommand, &meta) ==
+            EXPECT(inner5->CreateMetaCommand(unknown_command, 0, nullptr, 0, IID_ID3D12MetaCommand, &meta) ==
                        E_INVALIDARG &&
                    meta == nullptr);
             D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER identifier{};
