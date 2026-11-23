@@ -833,8 +833,11 @@ void test_ga_tls_existing_thread(const fs::path& exe) {
     {
         rt::Loader loader(exe.parent_path());
         rt::Module& m = loader.load(exe);
-        check(m.tls_index != 0, "the /GA fixture gets a module TLS index other than the process EXE's 0");
-        check(m.tls_ga_slot != rt::kNoTlsIndex, "load() rewrites the /GA fixture's index-0 TLS reads");
+        // Either mechanism serves its index-0 reads: the first mapped EXE takes slot 0 itself (the host's TLS moves to
+        // the helper index, also on threads that already run), or it gets another index and its reads are rewritten.
+        check((m.tls_index == 0 && m.tls_ga_slot == rt::kNoTlsIndex) ||
+                  (m.tls_index != 0 && m.tls_ga_slot != rt::kNoTlsIndex),
+              "the /GA fixture's index-0 TLS reads reach its own block (slot 0, or rewritten to a TlsAlloc slot)");
         get = find_export<int(__cdecl*)()>(m, "ga_tls_get");
         set = find_export<void(__cdecl*)(int)>(m, "ga_tls_set");
         check(get() == 7, "the loading thread reads the /GA fixture's template value 7");
@@ -856,8 +859,11 @@ void test_ga_tls_existing_thread(const fs::path& exe) {
         SetEvent(second.go);
         WaitForSingleObject(second.done, INFINITE);
         check(seen_second == 7, "the same thread reads the template again after a second load()");
+        // It ends while the fixture is still mapped: its detach must give its slots back (the host's own block to
+        // slot 0) before Windows frees them, and host code in its exit path must still find its own TLS.
+        early.join();
+        check(get() == 7, "the loading thread's block is untouched by the other thread's exit");
     }
-    early.join();
     for (HANDLE h : {first.go, first.done, second.go, second.done, started}) CloseHandle(h);
 }
 

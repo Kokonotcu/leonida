@@ -415,6 +415,10 @@ struct ExistingThreadBlock {
     void* block = nullptr;
     void** ga_cell = nullptr;  // that thread's TEB->TlsSlots[tls_ga_slot]: inline in the TEB, so it never moves
     void* ga_view = nullptr;   // the /GA view that cell points at (Module::tls_ga_slot)
+    // Slot 0 handed to a console EXE (host_owns_slot_zero): the thread's own host block (`saved`), moved to
+    // g_host_tls.index where the host's code now looks for it, and what that slot held before.
+    void* host_moved = nullptr;
+    void* host_replaced = nullptr;
 };
 
 // Immortal, like the thread events that use them. `ended` holds the ids of threads whose DLL_THREAD_DETACH has run:
@@ -803,7 +807,12 @@ void restore_tls_cell(void** cell, void* view) noexcept {
 
 // Takes a block out of its slot and frees it. The existing-threads lock is held; b.vector is null when the thread
 // is gone.
-void remove_existing_block(const ExistingThreadBlock& b) {
+// `restore_host`: also give the helper index its old block back (host_moved). The thread's own detach passes false and
+// does that last (on_host_thread_event), because the host's code that runs after this on that thread still reads its
+// thread_locals there.
+void remove_existing_block(const ExistingThreadBlock& b, bool restore_host = true) {
+    if (restore_host && b.vector && b.host_moved && g_host_tls.index < kMaxModuleTlsSlots)
+        restore_thread_slot(b.vector, g_host_tls.index, b.host_moved, b.host_replaced);
     if (b.vector && b.index < kMaxModuleTlsSlots) restore_thread_slot(b.vector, b.index, b.block, b.saved);
     if (b.ga_view) {
         if (b.ga_cell) restore_tls_cell(b.ga_cell, b.ga_view);
@@ -921,8 +930,31 @@ void install_on_existing_threads(Module& m) {
                                      m.name.c_str());
                 }
             }
-            state.blocks.push_back(
-                {c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block, ga_cell, ga_view});
+            // Slot 0 went to a console EXE: the host's code reads its TLS at g_host_tls.index from now on (the
+            // _tls_index switch in load()), and on this thread that slot still holds another image's block (the TLS
+            // host DLL's). The thread's own host block, which the EXE's block just replaced, moves there, so host code
+            // already running on this thread (a pool worker that later runs the title's callbacks) keeps its state
+            // instead of writing over another image's TLS.
+            void* host_moved = nullptr;
+            void* host_replaced = nullptr;
+            if (m.tls_index == 0 && saved && g_host_tls.index != TLS_OUT_OF_INDEXES &&
+                g_host_tls.index < kMaxModuleTlsSlots) {
+                void** now = nullptr;
+                void* previous = nullptr;
+                if (read_thread_slot(vector, g_host_tls.index, now, previous) && now &&
+                    write_thread_slot(now, g_host_tls.index, saved)) {
+                    host_moved = saved;
+                    host_replaced = previous;
+                } else {
+                    static std::atomic<bool> logged_host{false};
+                    if (!logged_host.exchange(true))
+                        std::fprintf(stderr, "[rt] loader: %s: a running thread's own TLS could not move to index %lu; "
+                                             "host code on it reads another image's thread-local data\n",
+                                     m.name.c_str(), static_cast<unsigned long>(g_host_tls.index));
+                }
+            }
+            state.blocks.push_back({c.id, m.tls_slot, &m, m.tls_generation, m.tls_index, vector, saved, block, ga_cell,
+                                    ga_view, host_moved, host_replaced});
         }
     }
 }
@@ -967,7 +999,15 @@ void forget_ended_thread_id() {
 // DLL_THREAD_DETACH, before this thread's own records are released: the blocks load() gave it come out, newest first,
 // after the module's TLS callbacks have seen the event (Windows sends DLL_THREAD_DETACH to a DLL for a thread that
 // was running before it was loaded, too).
-void release_existing_blocks_of_this_thread() {
+// A helper-index slot this thread's detach gives back last (ExistingThreadBlock::host_moved).
+struct PendingHostRestore {
+    void*** vector = nullptr;
+    void* moved = nullptr;
+    void* replaced = nullptr;
+};
+
+PendingHostRestore release_existing_blocks_of_this_thread() {
+    PendingHostRestore pending;
     const DWORD self = GetCurrentThreadId();
     std::vector<ExistingThreadBlock> mine;
     {
@@ -991,13 +1031,15 @@ void release_existing_blocks_of_this_thread() {
     for (auto it = state.blocks.end(); it != state.blocks.begin();) {
         --it;
         if (it->thread != self) continue;
-        remove_existing_block(*it);
+        if (it->host_moved) pending = {it->vector, it->host_moved, it->host_replaced};
+        remove_existing_block(*it, /*restore_host=*/false);
         it = state.blocks.erase(it);
     }
     // Bounded: an id matters only until its thread has left the process, moments after this event, so the oldest
     // can go. (An id also leaves the list when a new thread gets it.)
     if (state.ended.size() >= kMaxEndedThreads) state.ended.erase(state.ended.begin(), state.ended.begin() + kMaxEndedThreads / 2);
     state.ended.push_back(self);
+    return pending;
 }
 
 // Runs in gta6rt_tls_host.dll's DllMain for each thread the process starts or ends once the helper is loaded, under
@@ -1036,8 +1078,9 @@ void __cdecl on_host_thread_event(DWORD reason) {
     } else if (reason == DLL_THREAD_DETACH) {
         // The blocks load() gave this thread while it was already running come out first (they can sit on top of
         // an older module's block in the same slot).
+        PendingHostRestore pending_host;
         try {
-            release_existing_blocks_of_this_thread();
+            pending_host = release_existing_blocks_of_this_thread();
         } catch (const std::exception& e) {
             std::fprintf(stderr, "[rt] loader: thread detach: %s\n", e.what());
         }
@@ -1058,8 +1101,12 @@ void __cdecl on_host_thread_event(DWORD reason) {
                 release_thread_slot(i);  // installed by a module whose Loader is gone (or nothing to do)
             }
         }
-        // Last: put the helper's own block back before the OS frees this thread's TLS array.
+        // Last: put the helper's own block back before the OS frees this thread's TLS array. A thread that was already
+        // running at load() had its own host block moved to the helper index; slot 0 has it back by now, so the helper
+        // index gets the helper's block again (no gta6rt code with a thread_local runs after this).
         uninstall_host_tls();
+        if (pending_host.vector && g_host_tls.index < kMaxModuleTlsSlots)
+            restore_thread_slot(pending_host.vector, g_host_tls.index, pending_host.moved, pending_host.replaced);
     }
 }
 
