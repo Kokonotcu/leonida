@@ -304,13 +304,25 @@ public:
             (sync != 0 || !(flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)))
             return DXGI_ERROR_INVALID_CALL;
         if (flags & DXGI_PRESENT_TEST) return S_OK;  // only asks whether a present would succeed
-        const std::uint32_t cur = swapchain_.current_back_buffer_index();
-        if (!swapchain_.present(cur)) return E_FAIL;
-        ++present_count_;
-        LARGE_INTEGER qpc{};
-        if (QueryPerformanceCounter(&qpc)) last_present_qpc_.store(qpc.QuadPart, std::memory_order_relaxed);
+        // The native chain goes out of date on a window resize, minimise or restore; DXGI keeps presenting through
+        // all three (host-measured: S_OK, also while minimised), so replace the native chain and present again.
+        bool shown = swapchain_.present(swapchain_.current_back_buffer_index());
+        if (!shown && swapchain_.stale() && swapchain_.recreate_native())
+            shown = swapchain_.present(swapchain_.current_back_buffer_index());
+        if (shown) {
+            ++present_count_;
+            LARGE_INTEGER qpc{};
+            if (QueryPerformanceCounter(&qpc)) last_present_qpc_.store(qpc.QuadPart, std::memory_order_relaxed);
+        } else if (!swapchain_.stale()) {
+            return E_FAIL;  // a real failure (device lost, a submit that did not go through)
+        }
+        // The frame is skipped when the surface has no usable size (minimised for longer than the acquire timeout)
+        // or when the app's back buffers are the native images and cannot be replaced under it: S_OK, as DXGI
+        // reports for a window it cannot show, and the next ResizeBuffers rebuilds everything.
         std::uint32_t next = 0;
-        if (!swapchain_.acquire_next_image(next)) return E_FAIL;
+        const bool acquired = swapchain_.acquire_next_image(next, 1'000'000'000);  // 1 s: a lost vblank, not a hang
+        if (!acquired && !swapchain_.stale()) return E_FAIL;
+        // A skipped frame still frees the app's frame-latency slot, or a wait-then-present loop would stop for good.
         if (waitable_) ReleaseSemaphore(waitable_, 1, nullptr);
         return S_OK;
     }
@@ -380,7 +392,10 @@ public:
         flags_ = next_flags;
         register_buffers();
         std::uint32_t next = 0;
-        return swapchain_.acquire_next_image(next) ? S_OK : E_FAIL;
+        // A minimised window leaves the chain stale but the resize itself succeeded (host-measured): the next
+        // present rebuilds it. Any other failed acquire is a real error.
+        if (swapchain_.acquire_next_image(next, 1'000'000'000)) return S_OK;
+        return swapchain_.stale() ? S_OK : E_FAIL;
     }
 
     HRESULT STDMETHODCALLTYPE ResizeTarget(const DXGI_MODE_DESC* mode) override {

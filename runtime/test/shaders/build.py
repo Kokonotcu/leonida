@@ -13,8 +13,9 @@ FSSM program (the magic, zeros up to OFFSET, then the words): it is published as
 SHA-256 goes into the index as fssm_sha256, which is what the layer looks a PSO's shader up by (the translator
 hashes <work>/fssm/<name>.fssm for the game's programs, and compute shaders here already). A test builds the shader container from that file. The words
 are also what a shader reads through s_getpc_b64 (the code base) at that offset.
-The stage comes from the name's prefix. Mesh shaders (ms_) also need a DXBC container with their PSV0, which this
-doesn't make; geometry shaders (gs_) get gs_tri's signatures (gs_container).
+The stage comes from the name's prefix. Mesh shaders (ms_) also need a DXBC container with their PSV0: a mesh shader
+whose header has "; psv0: THREADS MAX_VERTICES MAX_PRIMITIVES" gets one (triangles; ms_container), the others are not
+built (scripts/run_gpu_tests.py makes theirs). Geometry shaders (gs_) get gs_tri's signatures (gs_container).
 The comment at the top of each .asm says which test program to run on the result and what it should print.
 With LEONIDA_FMA=khr (or glsl, or exact), the fused multiply-adds are translated with --fma khr (OpFmaKHR, which needs
 VK_KHR_shader_fma; the test programs enable it when the device has it, else they exit 77), --fma glsl, or --fma exact
@@ -89,6 +90,18 @@ def asm_mattr(path):
 CLIP_CASES = {"vs_clip": 1, "vs_clip_param4": 4, "vs_clip_undeclared": 1}
 
 
+def asm_psv0(path):
+    """(threads, max vertices, max primitives) of a mesh shader's "psv0" header comment, or None."""
+    for ln in Path(path).read_text(encoding="utf-8").splitlines():
+        s = ln.strip()
+        if s and not s.startswith(";"):
+            break
+        m = re.match(r";\s*psv0:\s*(\d+)\s+(\d+)\s+(\d+)\s*$", s)
+        if m:
+            return tuple(int(v) for v in m.groups())
+    return None
+
+
 def asm_fssm_fields(path):
     """(offset, words) of the "fssm-at" and "fssm-data" header comments, (None, []) without them."""
     at, words = None, []
@@ -147,6 +160,18 @@ def gs_container():
             + b"ISG1" + chunk + b"OSG1" + chunk)
 
 
+def ms_container(threads, max_vertices, max_primitives):
+    # One PSV0 chunk, as scripts/run_gpu_tests.py's make_ms_psv0 lays it out: the mesh stage (13), triangles (2), the
+    # output counts and NumThreads (threads x 1 x 1), no group-shared bytes.
+    psv = bytearray(48)
+    struct.pack_into("<HH", psv, 12, max_vertices, max_primitives)
+    psv[24], psv[27] = 13, 2
+    struct.pack_into("<III", psv, 36, threads, 1, 1)
+    payload = struct.pack("<I", len(psv)) + bytes(psv)
+    return (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 36 + 8 + len(payload), 1, 36)
+            + b"PSV0" + struct.pack("<I", len(payload)) + payload)
+
+
 def translate_tests(work, names):
     disasm, fssm, spirv = (work / d for d in ("disasm", "fssm", "spirv"))
     disasm.mkdir()
@@ -184,6 +209,11 @@ def translate_tests(work, names):
             (work / (n + ".dxbc")).write_bytes(clip_container())
         elif n.startswith("gs_"):
             (work / (n + ".dxbc")).write_bytes(gs_container())
+        elif n.startswith("ms_"):
+            psv0 = asm_psv0(asm_path)
+            if psv0 is None:   # main() skips these; a direct caller gets a clear error, not a TypeError
+                raise ValueError(f"{n}: a mesh shader needs a '; psv0: threads vertices primitives' header")
+            (work / (n + ".dxbc")).write_bytes(ms_container(*psv0))
         else:
             (work / (n + ".dxbc")).write_bytes(bytes(32))  # chunk count 0
     cmd = [sys.executable, "-I", TRANSLATOR, disasm, "--out", spirv]
@@ -220,9 +250,9 @@ def main():
     unknown = sorted(set(names) - set(available) - {"ps_mullit"})
     if unknown:
         sys.exit("Unknown test shaders: " + ", ".join(unknown))
-    skipped = [n for n in names if n.startswith("ms_")]
+    skipped = [n for n in names if n.startswith("ms_") and not asm_psv0(os.path.join(HERE, n + ".asm"))]
     if skipped:
-        print("not built (need a DXBC container with signatures):", ", ".join(skipped))
+        print("not built (mesh shaders without a \"psv0:\" header):", ", ".join(skipped))
     names = [n for n in names if n not in skipped]
     # A computed I/J pair needs PerVertexKHR inputs, which both fallbacks take away: the translator refuses it there,
     # and check.py and run_gpu_tests.py report it as SKIP. Leave it out instead of losing the whole batch.

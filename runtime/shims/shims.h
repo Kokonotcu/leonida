@@ -2,6 +2,7 @@
 // Add a DLL by writing a shims/<dll>.cpp with a SHIM_TABLE and listing it in CMakeLists.txt.
 #pragma once
 #include <cstdint>
+#include <filesystem>
 #include <string>
 
 namespace rt::shims {
@@ -65,6 +66,11 @@ struct BundledModuleOps {
     void* (*load_bundled)(void* ctx, const std::string& dll_lower, uint32_t flags, bool& handled);
     void* (*get_proc)(void* ctx, void* module, const std::string& sym, bool& owns_handle);
     bool (*owns_handle)(void* ctx, void* module);
+    // The handle of the first image the loader mapped (the exe), for GetModuleHandle(nullptr). Null if none.
+    void* (*main_module)(void* ctx);
+    // The path a mapped module was loaded from, for GetModuleFileName: `module` nullptr asks for the main image,
+    // a handle asks for that module; null when the handle is not the loader's (or it has no main image).
+    const std::filesystem::path* (*module_path)(void* ctx, void* module);
     // The same two lookups by the module's native (wide) basename, for names the ANSI code page cannot spell
     // (library_loader's W entries use them when a name has a character outside ASCII). Either may be null.
     void* (*find_loaded_w)(void* ctx, const std::wstring& basename);
@@ -79,6 +85,21 @@ void* find_loaded_bundled_module_w(const std::wstring& basename);
 void* load_bundled_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
 bool owns_bundled_module_handle(void* module);
+void* bundled_main_module();
+const std::filesystem::path* bundled_module_path(void* module);
+
+// Title-exported __XMemAllocationHooks__ (GDK XMEM_ALLOCATION_HOOKS): the console runtime routes internal
+// allocations (including D3D12 descriptor heaps) through these callbacks when the mapped image exports the struct.
+// Registered by Loader after relocations and removed in Loader::~Loader.
+using XMemAllocHookFn = void*(__stdcall*)(size_t size, uint64_t attributes);
+using XMemFreeHookFn = void(__stdcall*)(void* ptr, uint64_t attributes);
+struct XMemAllocationHooks {
+    XMemAllocHookFn alloc;
+    XMemFreeHookFn free;
+};
+void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks);
+void remove_xmem_allocation_hooks(const void* owner);
+const XMemAllocationHooks* xmem_allocation_hooks();
 
 // Test seam: called at the top of every unimplemented-import call with the address of rt_unimplemented's return
 // address slot (so a test can check stack alignment) and from inside the call (so it can walk the stack).

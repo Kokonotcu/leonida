@@ -103,6 +103,17 @@ struct VulkanDeviceInfo {
     // samplerAnisotropy, samplerMirrorClampToEdge and samplerFilterMinmax enabled; without them such samplers are
     // approximated.
     bool sampler_anisotropy = false;
+    // multiDrawIndirect is enabled: ExecuteIndirect hands all its commands to one vkCmdDraw*Indirect. Without it the
+    // layer issues one call per command (a drawCount above 1 is invalid without the feature).
+    bool multi_draw_indirect = false;
+    // drawIndirectCount (Vulkan 1.2) is enabled: ExecuteIndirect with a count buffer. Without it such a call is
+    // unsupported.
+    bool draw_indirect_count = false;
+    // drawIndirectFirstInstance is enabled: indirect records may have a StartInstanceLocation other than 0. Without
+    // it such a record is invalid Vulkan (the layer cannot see inside the GPU buffer, so it only says so once).
+    bool draw_indirect_first_instance = false;
+    // VkPhysicalDeviceLimits::maxDrawIndirectCount (a call takes at most this many records); 0 means unknown, no cap.
+    std::uint32_t max_draw_indirect_count = 0;
     bool sampler_mirror_clamp_to_edge = false;
     bool sampler_filter_minmax = false;
     // VK_KHR_calibrated_timestamps or VK_EXT_calibrated_timestamps is enabled on `device` (QueueClock).
@@ -157,6 +168,11 @@ struct VulkanDeviceInfo {
     // The instance enabled VK_EXT_debug_utils: SetMarker/BeginEvent/EndEvent become debug labels. Otherwise they
     // do nothing.
     bool debug_utils = false;
+    // LEONIDA_DRED=1 enabled device-lost diagnostics (vulkan_breadcrumbs.h): VK_AMD_buffer_marker for the
+    // breadcrumbs, and VK_EXT_device_fault with its deviceFault feature for the fault addresses, each when the GPU
+    // has it.
+    bool buffer_marker = false;
+    bool device_fault = false;
     // Vulkan 1.2 bufferDeviceAddress is enabled: buffers and shader-visible heaps then live in the GPU address
     // arena and have console VAs (docs section 3.3), and GetGPUVirtualAddress returns those addresses; ray tracing
     // needs it too. Without it, GetGPUVirtualAddress returns 0 and pipelines cannot be created.
@@ -193,8 +209,10 @@ struct VulkanDeviceInfo {
 // the device and every object it created. Wrap it in rt::d3d12_xs::create_device_proxy for the Xbox ABI.
 HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out);
 
-// The same, on a Vulkan instance and device of its own (destroyed with the D3D12 device). Picks the first discrete
-// GPU with the features above. LEONIDA_VK_VALIDATION=1 enables VK_LAYER_KHRONOS_validation.
+// The same, on a Vulkan device of its own (destroyed with the D3D12 device), made on the process's one Vulkan
+// instance: the first call creates it and it is kept until the process ends, so hooks that cached its handles stay
+// valid (#5144). Picks the first discrete GPU with the features above. LEONIDA_VK_VALIDATION=1 (read by the first
+// call) enables VK_LAYER_KHRONOS_validation.
 //
 // The queue test settings (LEONIDA_VK_MAX_QUEUES_PER_FAMILY, LEONIDA_VK_GRAPHICS_FAMILY_ONLY; docs/testing.md) give
 // the device fewer Vulkan queues than the GPU has, so the tests run the path where D3D12 queues share one. Only the
@@ -281,6 +299,17 @@ struct BindlessRoom {
     std::uint32_t samplers = 0;
 };
 BindlessRoom bindless_room(ID3D12Device* device);
+// The device's VkPipelineCache: how many Vulkan pipelines were created through it (graphics, compute and the draw-time
+// variants of a graphics PSO), how many of those the cache answered (VkPipelineCreationFeedback's application-cache
+// hit bit), and the size of its data. `available` is false without Vulkan 1.3 feedback or without the cache; then the
+// counts stay 0. For tests.
+struct PipelineCacheStats {
+    bool available = false;
+    std::uint32_t created = 0;
+    std::uint32_t hits = 0;
+    std::size_t bytes = 0;
+};
+PipelineCacheStats pipeline_cache_stats(ID3D12Device* device);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be

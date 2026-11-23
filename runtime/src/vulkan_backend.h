@@ -16,6 +16,7 @@
 #include "retire_tickets.h"
 #include "statistics_sum_spirv.h"
 #include "vulkan13_features.h"
+#include "vulkan_breadcrumbs.h"
 #include "vulkan_depth24.h"
 #include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_scratch.h"
@@ -97,8 +98,10 @@ struct VulkanDeviceFunctions {
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
+    X(vkCmdDrawMeshTasksIndirectEXT) X(vkCmdDrawMeshTasksIndirectCountEXT)                                    \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
-    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
+    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)                                                              \
+    X(vkCmdWriteBufferMarkerAMD) X(vkGetDeviceFaultInfoEXT) X(vkGetPipelineCacheData) /* optional: device-lost diagnostics (LEONIDA_DRED) */
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -914,6 +917,8 @@ struct TileRange {
 #endif
 class VulkanContext {
 public:
+    static constexpr std::uint64_t kRetireWaitSliceNs = 100'000'000;
+
     // conditional_rendering: VK_EXT_conditional_rendering is enabled on `device` (SetPredication).
     // ray_tracing: VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled on `device`.
     // xdxr: acceleration-structure builds write XDXR BVH4 records (xdxr_build.h) instead; needs bufferDeviceAddress.
@@ -967,6 +972,8 @@ public:
         replay_.set_blend_constants = vk.vkCmdSetBlendConstants;
         replay_.draw = vk.vkCmdDraw;
         replay_.draw_mesh_tasks = vk.vkCmdDrawMeshTasksEXT;  // null unless VK_EXT_mesh_shader is enabled
+        replay_.draw_mesh_tasks_indirect = vk.vkCmdDrawMeshTasksIndirectEXT;
+        replay_.draw_mesh_tasks_indirect_count = vk.vkCmdDrawMeshTasksIndirectCountEXT;
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
             const auto it = graphics_pipelines_.find(id);
@@ -1077,6 +1084,10 @@ public:
     ~VulkanContext() {
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
+        if (vk.vkDestroySemaphore) {
+            for (const auto& [sem, state] : progress_waits_)
+                if (state.destroy_when_done) vk.vkDestroySemaphore(device_, sem, nullptr);
+        }
         for (const auto& [key, framebuffer] : resolve_framebuffers_)
             vk.vkDestroyFramebuffer(device_, framebuffer, nullptr);
         for (const auto& [key, pass] : resolve_passes_) vk.vkDestroyRenderPass(device_, pass, nullptr);
@@ -1234,6 +1245,16 @@ public:
 
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
+    // The indirect-draw features enabled on the device (VulkanDeviceInfo::multi_draw_indirect / draw_indirect_count).
+    void set_indirect_features(bool multi_draw, bool draw_count, std::uint32_t max_draw_count = UINT32_MAX) {
+        replay_.multi_draw_indirect = multi_draw;
+        replay_.max_draw_indirect_count = max_draw_count;
+        if (!draw_count) {
+            replay_.draw_indirect_count = replay_.draw_indexed_indirect_count = nullptr;
+            replay_.draw_mesh_tasks_indirect_count = nullptr;
+        }
+    }
+
     void set_heap_base(std::uint64_t heap_base) {
         std::unique_lock lock(resource_mutex_);
         replay_.heap_base = heap_base;
@@ -1276,6 +1297,60 @@ public:
         occlusion_resolve_memory_ = memory;
     }
 
+    // Device-lost diagnostics (vulkan_breadcrumbs.h): per-list breadcrumbs from now on; call before any queue uses
+    // the context. The caller decides (LEONIDA_DRED) and says which extensions are enabled: a device function of an
+    // extension that is not enabled must not be called, even when the loader returned one. True with GPU
+    // breadcrumbs (VK_AMD_buffer_marker); false when the ring keeps only what the CPU knows, because the marker
+    // extension is not enabled or no host-visible memory fits.
+    // `per_op` (BUILD-1655): a progress marker after every D3D12 operation; false keeps the two around each list
+    // (for measuring what the per-op markers cost).
+    bool configure_breadcrumbs(const VkPhysicalDeviceMemoryProperties& memory, bool buffer_marker_enabled,
+                               bool device_fault_enabled, bool per_op = true) {
+        device_fault_enabled_ = device_fault_enabled;
+        BreadcrumbFunctions fn;
+        fn.create_buffer = vk.vkCreateBuffer;
+        fn.destroy_buffer = vk.vkDestroyBuffer;
+        fn.requirements = vk.vkGetBufferMemoryRequirements;
+        fn.allocate = vk.vkAllocateMemory;
+        fn.free = vk.vkFreeMemory;
+        fn.bind = vk.vkBindBufferMemory;
+        fn.map = vk.vkMapMemory;
+        fn.unmap = vk.vkUnmapMemory;
+        fn.write_marker = buffer_marker_enabled ? vk.vkCmdWriteBufferMarkerAMD : nullptr;
+        auto ring = std::make_unique<BreadcrumbRing>();
+        const bool gpu = fn.write_marker && ring->initialize(device_, memory, fn, per_op);
+        if (!gpu) {
+            ring = std::make_unique<BreadcrumbRing>();  // frees whatever a failed initialize() made
+            ring->initialize_cpu_only();
+        }
+        breadcrumbs_ = std::move(ring);
+        return gpu;
+    }
+    // Where the device-lost report goes (stderr); for tests.
+    void set_report_output(std::FILE* out) { report_out_ = out ? out : stderr; }
+    BreadcrumbRing* breadcrumbs() const { return breadcrumbs_.get(); }
+
+    // VK_EXT_device_fault after a loss: the faulting addresses and the vendor's description. False when the
+    // extension is not enabled, a query fails, or the driver has nothing to say. Vendor binary data is not asked for.
+    bool device_fault(std::vector<VkDeviceFaultAddressInfoEXT>& addresses, std::string& description) const {
+        addresses.clear();
+        description.clear();
+        if (!device_fault_enabled_ || !vk.vkGetDeviceFaultInfoEXT) return false;
+        VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+        if (vk.vkGetDeviceFaultInfoEXT(device_, &counts, nullptr) != VK_SUCCESS) return false;
+        addresses.resize(counts.addressInfoCount);
+        std::vector<VkDeviceFaultVendorInfoEXT> vendor(counts.vendorInfoCount);
+        counts.vendorBinarySize = 0;  // no vendor dump
+        VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+        info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+        info.pVendorInfos = vendor.empty() ? nullptr : vendor.data();
+        const VkResult result = vk.vkGetDeviceFaultInfoEXT(device_, &counts, &info);
+        if (result != VK_SUCCESS && result != VK_INCOMPLETE) return false;
+        addresses.resize(counts.addressInfoCount);
+        description.assign(info.description, strnlen(info.description, VK_MAX_DESCRIPTION_SIZE));
+        return !addresses.empty() || !description.empty();  // else the driver has nothing to say
+    }
+
     // For tests and traces.
     VkImageLayout layout(ResourceId id, std::uint32_t subresource) {
         std::lock_guard lock(tracker_mutex_);
@@ -1285,6 +1360,23 @@ public:
     bool has_resource(ResourceId id) {
         std::shared_lock lock(resource_mutex_);
         return resources_.find(id) != resources_.end();
+    }
+
+    // The registered buffer whose VA range holds `va`, preferring one that holds [va, va + bytes) as buffer_at does: its
+    // ID, first VA and size in bytes. False when none does, or when `acquire(id)` returns false. `acquire` runs with
+    // the registry locked, so the resource cannot finish being removed under it: it takes the caller's reference
+    // (Resource's destructor removes its entry first, which waits for this lock). Used where a console call names a
+    // buffer by VA only (Xbox device slot 70).
+    template<class Acquire>
+    bool buffer_resource_at(std::uint64_t va, std::uint64_t bytes, ResourceId& id, std::uint64_t& start,
+                            std::uint64_t& size, Acquire&& acquire) {
+        std::shared_lock lock(resource_mutex_);
+        BufferVaIndex<ResourceId>::Hit hit{};
+        if (!buffer_vas_.find(va, hit, bytes) || !acquire(hit.id)) return false;
+        id = hit.id;
+        start = hit.start;
+        size = hit.size;
+        return true;
     }
 
     bool ray_tracing_supported() const { return ray_tracing_ && vk.vkCmdBuildAccelerationStructuresKHR != nullptr; }
@@ -1434,24 +1526,63 @@ public:
     // Waits (not for the device: for the queues' timelines) until every submission up to `ticket` is done, then
     // returns the completed ticket. For a caller whose list of retired objects has grown past what it will hold.
     std::uint64_t wait_retire_ticket(std::uint64_t ticket) {
-        std::vector<std::pair<VkSemaphore, std::uint64_t>> pending;
+        std::vector<VkSemaphore> semaphores;
+        std::vector<std::uint64_t> values;
         {
             std::lock_guard lock(submit_mutex_);
             if (is_device_lost()) return 0;
-            pending = retire_tickets_.pending_through(ticket);
-        }
-        if (!pending.empty()) {
-            std::vector<VkSemaphore> semaphores;
-            std::vector<std::uint64_t> values;
+            const auto pending = retire_tickets_.pending_through(ticket);
             for (const auto& [semaphore, value] : pending) {
-                semaphores.push_back(semaphore);
-                values.push_back(value);
+                std::size_t idx = 0;
+                for (; idx < semaphores.size(); ++idx)
+                    if (semaphores[idx] == semaphore) break;
+                if (idx == semaphores.size()) {
+                    semaphores.push_back(semaphore);
+                    values.push_back(value);
+                } else if (value > values[idx]) {
+                    values[idx] = value;
+                }
             }
+            for (VkSemaphore sem : semaphores) ++progress_waits_[sem].waiters;
+        }
+        if (!semaphores.empty()) {
+            struct WaiterGuard {
+                VulkanContext& ctx;
+                const std::vector<VkSemaphore>& sems;
+                ~WaiterGuard() {
+                    std::vector<VkSemaphore> to_destroy;
+                    {
+                        std::lock_guard lock(ctx.submit_mutex_);
+                        for (VkSemaphore sem : sems) {
+                            const auto it = ctx.progress_waits_.find(sem);
+                            if (it == ctx.progress_waits_.end()) continue;
+                            if (--it->second.waiters == 0) {
+                                if (it->second.destroy_when_done) to_destroy.push_back(sem);
+                                ctx.progress_waits_.erase(it);
+                            }
+                        }
+                    }
+                    if (ctx.vk.vkDestroySemaphore) {
+                        for (VkSemaphore sem : to_destroy) ctx.vk.vkDestroySemaphore(ctx.device_, sem, nullptr);
+                    }
+                }
+            } guard{*this, semaphores};
+
             VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
             wait.semaphoreCount = std::uint32_t(semaphores.size());
             wait.pSemaphores = semaphores.data();
             wait.pValues = values.data();
-            vk.vkWaitSemaphores(device_, &wait, UINT64_MAX);  // outside submit_mutex_: a signal may need it
+            for (;;) {  // outside submit_mutex_: a signal may need it; bounded slice wakes on device loss
+                if (is_device_lost()) return 0;
+                const VkResult res = vk.vkWaitSemaphores(device_, &wait, kRetireWaitSliceNs);
+                if (res == VK_SUCCESS) break;
+                if (res == VK_TIMEOUT) continue;
+                if (res == VK_ERROR_DEVICE_LOST) {
+                    mark_device_lost();
+                    return 0;
+                }
+                break;
+            }
         }
         return completed_retire_ticket();
     }
@@ -1462,12 +1593,23 @@ public:
     void note_bindless_upload() { bindless_upload_pending_ = true; }
 
     std::uint64_t completed_retire_ticket() {
-        std::lock_guard lock(submit_mutex_);
-        if (is_device_lost()) return 0;
-        return retire_tickets_.completed([this](VkSemaphore semaphore, std::uint64_t value) {
-            std::uint64_t done = 0;
-            return vk.vkGetSemaphoreCounterValue(device_, semaphore, &done) == VK_SUCCESS && done >= value;
-        });
+        bool lost = false;
+        std::uint64_t ticket = 0;
+        {
+            std::lock_guard lock(submit_mutex_);
+            if (is_device_lost()) return 0;
+            ticket = retire_tickets_.completed([this, &lost](VkSemaphore semaphore, std::uint64_t value) {
+                std::uint64_t done = 0;
+                const VkResult result = vk.vkGetSemaphoreCounterValue(device_, semaphore, &done);
+                if (result == VK_ERROR_DEVICE_LOST) lost = true;
+                return result == VK_SUCCESS && done >= value;
+            });
+        }
+        // Outside submit_mutex_, as in submit(): notifying the fence dispatcher can run callbacks that submit.
+        // A DEVICE_LOST seen here is the first Vulkan operation to discover it; it must not be mistaken for
+        // "this ticket has not completed".
+        if (lost) mark_device_lost();
+        return lost ? 0 : ticket;
     }
 
     void drain_deleted_resources(std::uint64_t current_ticket) {
@@ -1497,8 +1639,36 @@ public:
             } catch (...) {
             }
         }
+        report_device_lost();
     }
-    bool is_device_lost() const noexcept { return device_lost_.load(std::memory_order_acquire); }
+    // The fence waiter sets device_lost_ itself, so the first caller that sees the loss prints the report.
+    bool is_device_lost() const noexcept {
+        if (!device_lost_.load(std::memory_order_acquire)) return false;
+        report_device_lost();
+        return true;
+    }
+
+    // Once, when the diagnostics are configured (LEONIDA_DRED): the breadcrumbs and VK_EXT_device_fault.
+    void report_device_lost() const noexcept {
+        if (!breadcrumbs_ || lost_reported_.exchange(true, std::memory_order_acq_rel)) return;
+        std::FILE* const out = report_out_;
+        try {
+            breadcrumbs_->report(out);
+            std::vector<VkDeviceFaultAddressInfoEXT> addresses;
+            std::string description;
+            if (!device_fault(addresses, description)) {
+                std::fprintf(out, "[rt] d3d12 DRED: no device fault information (VK_EXT_device_fault)\n");
+                return;
+            }
+            std::fprintf(out, "[rt] d3d12 DRED: device fault: %s\n", description.c_str());
+            for (const auto& a : addresses)
+                std::fprintf(out, "[rt] d3d12 DRED:   address %#llx (precision %#llx, type %d)\n",
+                             static_cast<unsigned long long>(a.reportedAddress),
+                             static_cast<unsigned long long>(a.addressPrecision), static_cast<int>(a.addressType));
+        } catch (...) {
+            std::fprintf(out, "[rt] d3d12 DRED: the report failed (out of memory)\n");
+        }
+    }
 
     void set_signal_event_fn(FenceWaitDispatcher::SignalEventFn fn) {
         if (fence_dispatcher_) fence_dispatcher_->set_signal_event_fn(fn);
@@ -1632,11 +1802,33 @@ private:
     bool ray_tracing_ = false;
     std::unique_ptr<XdxrBuilder> xdxr_;   // set: acceleration structures are XDXR BVH4 records
     std::atomic<bool> device_lost_{false};
+    std::unique_ptr<BreadcrumbRing> breadcrumbs_;  // device-lost diagnostics, when configured
+    mutable std::atomic<bool> lost_reported_{false};
+    bool device_fault_enabled_ = false;
+    std::FILE* report_out_ = stderr;
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
     alignas(64) std::mutex submit_mutex_;
     RetireTickets<VkSemaphore> retire_tickets_;
+    struct ProgressWaitState {
+        std::size_t waiters = 0;
+        bool destroy_when_done = false;
+    };
+    void destroy_or_defer_progress_semaphore(VkSemaphore semaphore) {
+        if (!semaphore) return;
+        bool destroy_now = true;
+        {
+            std::lock_guard lock(submit_mutex_);
+            const auto it = progress_waits_.find(semaphore);
+            if (it != progress_waits_.end() && it->second.waiters > 0) {
+                it->second.destroy_when_done = true;
+                destroy_now = false;
+            }
+        }
+        if (destroy_now && vk.vkDestroySemaphore) vk.vkDestroySemaphore(device_, semaphore, nullptr);
+    }
+    std::unordered_map<VkSemaphore, ProgressWaitState> progress_waits_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
@@ -1814,9 +2006,13 @@ public:
 
     ~VulkanQueue() {
         auto& vk = context_.vk;
+        // LEONIDA_DRED: a queue that never names itself (the device's staging queue) may later live at this
+        // address; it must not report this queue's debug name.
+        if (BreadcrumbRing* ring = context_.breadcrumbs_.get()) ring->label_queue(this, {});
         context_.holds().detach(this);  // no thread releases into this queue from here on
         report_held_at_teardown();
         context_.holds().pump_ready();  // presents queued behind what was just dropped can run
+        bool lost = false;
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
@@ -1824,9 +2020,10 @@ public:
             if (idle_result == VK_SUCCESS) {
                 if (progress_) context_.retire_queue_idle_locked(progress_);
             } else {
-                context_.mark_device_lost();
+                lost = true;
             }
         }
+        if (lost) context_.mark_device_lost();
         if (progress_) {
             std::lock_guard lock(context_.tracker_mutex_);
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
@@ -1839,7 +2036,7 @@ public:
             if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
-        if (progress_) vk.vkDestroySemaphore(context_.device(), progress_, nullptr);
+        if (progress_) context_.destroy_or_defer_progress_semaphore(progress_);
         destroy_khr_stages(khr_stage_pool_);
         for (auto& slot : buffers_) {
             destroy_khr_stages(slot.khr_instances);
@@ -1954,6 +2151,9 @@ public:
                 op.lists.reserve(lists.size());
                 for (const CommandList* list : lists) op.lists.push_back(*list);
                 if (pin) op.pins.push_back(pin());
+                op.origins.assign(lists.begin(), lists.end());
+                if (const BreadcrumbRing* ring = context_.breadcrumbs_.get())
+                    for (const CommandList* list : lists) op.names.push_back(ring->names_of(list, this));
                 hold(std::move(op));
                 held = true;
             }
@@ -2152,7 +2352,11 @@ private:
         return ReplayResult::success;
     }
 
-    ReplayResult execute_now(std::span<const CommandList* const> lists) {
+    // For a held batch (LEONIDA_DRED): `identity`, the application's lists its copies stand for (their addresses
+    // are the list ids), and `held_names`, their debug names when the batch was held.
+    ReplayResult execute_now(std::span<const CommandList* const> lists,
+                             std::span<const CommandList* const> identity = {},
+                             std::span<const BreadcrumbRing::Names> held_names = {}) {
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
@@ -2478,9 +2682,23 @@ private:
         bool wrote_readback = false;
         VkPipelineStageFlags2 readback_stages = 0;
         std::uint32_t open_labels = 0;  // events may span the lists of one ExecuteCommandLists
+        BreadcrumbRing* const breadcrumbs = context_.breadcrumbs_.get();  // LEONIDA_DRED only
+        std::vector<BreadcrumbRing::Mark> marks;
         for (std::size_t i = 0; i < lists.size(); ++i) {
             const auto& list = prepared[i];
-            emit(list, command_buffer, replay, &next_tracker, &open_labels);
+            if (breadcrumbs) {
+                marks.push_back(breadcrumbs->mark(*lists[i], this, i < identity.size() ? identity[i] : lists[i],
+                                                  i < held_names.size() ? &held_names[i] : nullptr));
+                breadcrumbs->record_begin(command_buffer, marks.back());
+            }
+            OpMarkers op_markers;
+            if (breadcrumbs && breadcrumbs->op_markers_for(marks.back())) {
+                const BreadcrumbRing::Mark& m = marks.back();
+                op_markers = {breadcrumbs->op_marker_function(), breadcrumbs->marker_buffer(),
+                              breadcrumbs->progress_offset(m), m.first_op, m.positions.data(), m.positions.size()};
+            }
+            emit(list, command_buffer, replay, &next_tracker, &open_labels, op_markers.write ? &op_markers : nullptr);
+            if (breadcrumbs) breadcrumbs->record_end(command_buffer, marks.back());
             wrote_readback |= list.wrote_readback;
             readback_stages |= list.readback_src_stages;
         }
@@ -2547,6 +2765,7 @@ private:
             waits_.pop_back();
             wait_values_.pop_back();
         }
+        if (breadcrumbs) breadcrumbs->submitted(std::move(marks), submitted);  // "submitted" is CPU knowledge only
         if (submitted) {
             context_.tracker_ = std::move(next_tracker);
             slot->predicate = std::move(batch);
@@ -2600,6 +2819,8 @@ private:
         std::vector<VkSemaphore> waits;
         std::vector<std::uint64_t> wait_values;
         std::vector<CommandList> lists;  // batch: copies, so the application may Reset its lists after the call
+        std::vector<const CommandList*> origins;  // batch: the lists as passed, as LEONIDA_DRED's list ids only
+        std::vector<BreadcrumbRing::Names> names;  // batch, LEONIDA_DRED: the debug names when it was held
         VkSemaphore fence = VK_NULL_HANDLE;  // signal
         std::uint64_t value = 0;
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;  // marker
@@ -2681,7 +2902,7 @@ private:
             for (const CommandList& list : op.lists) lists.push_back(&list);
             // The pipeline states and root signatures of the lists are in op.pins (see execute()): they live until
             // the batch has been recorded and then, with the fences, until its submission has completed (below).
-            const ReplayResult result = execute_now(lists);
+            const ReplayResult result = execute_now(lists, op.origins, op.names);
             if (result != ReplayResult::success) {
                 int none = static_cast<int>(ReplayResult::success);
                 held_failure_.compare_exchange_strong(none, static_cast<int>(result));

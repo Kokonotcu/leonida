@@ -1,0 +1,10 @@
+LIBRARY ext-ms-win-rtcore-ntuser-window-l1-1-0
+EXPORTS
+    RegisterClassExW
+    CreateWindowExW
+    DefWindowProcW
+    ShowWindow
+    UnregisterClassA
+    UnregisterClassW
+    GetClassInfoExA
+    GetClassInfoExW

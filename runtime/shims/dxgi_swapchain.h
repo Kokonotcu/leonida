@@ -167,14 +167,31 @@ public:
         allow_tearing_ = allow_tearing;
         const VkFormat fmt = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : format_;
         const std::uint32_t count = buffer_count ? buffer_count : exposed_count_;
-        return rebuild(width, height, fmt, count ? count : 2u);
+        if (!rebuild(width, height, fmt, count ? count : 2u)) {
+            // A minimised window has no client area. DXGI still completes ResizeBuffers there (host-measured:
+            // S_OK, buffers at the requested size); there is no surface to build a native chain on, so keep the
+            // current one and let the next present replace it once the window is back.
+            if (!no_surface_extent_) return false;
+            stale_ = true;
+            presentable_ = false;
+        }
+        return true;
     }
 
+    // A present or acquire that came back VK_ERROR_OUT_OF_DATE_KHR / VK_SUBOPTIMAL_KHR (the window was resized,
+    // minimised or restored) sets stale(): the native swapchain no longer matches the surface. recreate_native()
+    // replaces only the native chain under the app's back buffers; ResizeBuffers also clears it.
+    bool stale() const { return stale_; }
+    // Whether a native image is acquired and may be presented. present() clears it; a failed present leaves the
+    // image unpresentable, so the same image is never handed to the engine twice.
+    bool presentable() const { return presentable_; }
     bool acquire_next_image(std::uint32_t& out_index, std::uint64_t timeout_ns = UINT64_MAX) {
+        presentable_ = false;
         if (!swapchain_ || !acquire_fence_) return false;
         if (fn_.reset_fences(device_, 1, &acquire_fence_) != VK_SUCCESS) return false;
         const VkResult r = fn_.acquire_next_image(device_, swapchain_, timeout_ns, VK_NULL_HANDLE, acquire_fence_,
                                                   &out_index);
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || r == VK_TIMEOUT) stale_ = true;
         if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) return false;
         if (fn_.wait_for_fences(device_, 1, &acquire_fence_, VK_TRUE, timeout_ns) != VK_SUCCESS) return false;
         acquired_index_ = out_index;
@@ -197,11 +214,13 @@ public:
                 return false;
             image_initialized_[out_index] = true;
         }
+        presentable_ = true;
         return true;
     }
 
     bool present(std::uint32_t back_buffer_index) {
-        if (!swapchain_ || back_buffer_index >= exposed_count_ || acquired_index_ >= images_.size()) return false;
+        if (!swapchain_ || !presentable_ || back_buffer_index >= exposed_count_ || acquired_index_ >= images_.size())
+            return false;
         std::uint32_t image_index = back_buffer_index;
         if (is_offscreen()) {
             if (!blit_to_swapchain(back_buffer_index)) return false;
@@ -213,8 +232,54 @@ public:
         pi.pImageIndices = &image_index;
         std::lock_guard lock(submit_mutex_);
         const VkResult r = fn_.queue_present(queue_, &pi);
+        presentable_ = false;  // handed to the engine (or abandoned): never present this image again
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) stale_ = true;
         return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
     }
+
+    // The native swapchain is out of date (a window resize, minimise or restore). With the offscreen ring the app's
+    // back buffers are ours, so only the native chain is replaced and an image is acquired from it; the app's
+    // GetBuffer resources stay valid, as DXGI's do across a window resize. False when the app's back buffers are
+    // the native images (nothing can be replaced without invalidating them) or the surface has no usable extent.
+    bool recreate_native() {
+        if (!loaded_ || !surface_ || !swapchain_ || !is_offscreen() || images_.empty()) return false;
+        VkSurfaceCapabilitiesKHR caps{};
+        if (fn_.surface_caps(physical_, surface_, &caps) != VK_SUCCESS) return false;
+        const VkExtent2D ext = surface_extent_now(caps, extent_.width, extent_.height);
+        if (ext.width == 0 || ext.height == 0) return false;  // still no window to present to
+        if (ext.width == failed_extent_.width && ext.height == failed_extent_.height)
+            return false;  // the same size failed already: wait for the window to change again
+        std::uint32_t count = std::max(exposed_count_, caps.minImageCount);
+        if (caps.maxImageCount > 0) count = std::min(count, caps.maxImageCount);
+        VkSwapchainCreateInfoKHR ci = native_info_;
+        ci.surface = surface_;
+        ci.minImageCount = count;
+        ci.imageExtent = ext;
+        ci.oldSwapchain = swapchain_;
+        VkSwapchainKHR next = VK_NULL_HANDLE;
+        if (fn_.create_swapchain(device_, &ci, nullptr, &next) != VK_SUCCESS) {
+            failed_extent_ = ext;
+            return false;
+        }
+        failed_extent_ = {};
+        {
+            std::lock_guard lock(submit_mutex_);
+            fn_.device_wait_idle(device_);  // the presentation engine may still hold the old chain's images
+            fn_.destroy_swapchain(device_, swapchain_, nullptr);
+            swapchain_ = next;
+        }
+        std::uint32_t img_count = 0;
+        if (fn_.get_images(device_, swapchain_, &img_count, nullptr) != VK_SUCCESS || img_count == 0) return false;
+        images_.resize(img_count);
+        if (fn_.get_images(device_, swapchain_, &img_count, images_.data()) != VK_SUCCESS) return false;
+        images_.resize(img_count);
+        image_initialized_.assign(img_count, false);
+        surface_extent_ = ext;
+        stale_ = false;
+        std::uint32_t acquired = 0;
+        return acquire_next_image(acquired, 1'000'000'000);
+    }
+
 
     // DXGI exposes exactly the BufferCount the app asked for (GetDesc/GetDesc1 and GetCurrentBackBufferIndex
     // stay inside it). When Vulkan supplies a different number of native images the extra ones are hidden
@@ -246,6 +311,21 @@ public:
     }
 
 private:
+    // The size the native swapchain must have now: caps.currentExtent when the driver fixes it, else the requested
+    // window size inside the surface's bounds. A window with no client area (minimised, or created 0x0) leaves the
+    // driver's bounds at zero (measured on NVIDIA); that is {0,0} and the caller refuses to create the chain, as
+    // the host's DXGI refuses a swapchain on a 0x0 window (E_ACCESSDENIED).
+    VkExtent2D surface_extent_now(const VkSurfaceCapabilitiesKHR& caps, std::uint32_t width,
+                                  std::uint32_t height) const {
+        if (caps.currentExtent.width != UINT32_MAX && caps.currentExtent.width > 0 && caps.currentExtent.height > 0)
+            return caps.currentExtent;
+        if (caps.maxImageExtent.width == 0 || caps.maxImageExtent.height == 0) return {};
+        VkExtent2D ext{};
+        ext.width = std::clamp(width, caps.minImageExtent.width, caps.maxImageExtent.width);
+        ext.height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);
+        return ext;
+    }
+
     bool transition_image_layout(VkImage img, VkImageLayout old_layout, VkImageLayout new_layout) {
         if (!blit_cmd_ || !blit_fence_ || !img) return false;
         std::lock_guard lock(submit_mutex_);
@@ -296,6 +376,8 @@ private:
         }
         images_.clear();
         exposed_count_ = 0;
+        stale_ = false;
+        presentable_ = false;
     }
 
     bool create_offscreen_backbuffers(std::uint32_t count) {
@@ -476,6 +558,7 @@ private:
     }
 
     bool rebuild(std::uint32_t width, std::uint32_t height, VkFormat preferred_format, std::uint32_t buffer_count) {
+        no_surface_extent_ = false;
         VkSurfaceCapabilitiesKHR caps{};
         if (fn_.surface_caps(physical_, surface_, &caps) != VK_SUCCESS) return false;
 
@@ -493,12 +576,10 @@ private:
             }
         }
 
-        VkExtent2D ext{};
-        if (caps.currentExtent.width != UINT32_MAX && caps.currentExtent.width > 0 && caps.currentExtent.height > 0) {
-            ext = caps.currentExtent;
-        } else {
-            ext.width = std::clamp(width, caps.minImageExtent.width, caps.maxImageExtent.width);
-            ext.height = std::clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height);
+        VkExtent2D ext = surface_extent_now(caps, width, height);
+        if (ext.width == 0 || ext.height == 0) {  // no client area yet: creating would be invalid
+            no_surface_extent_ = true;
+            return false;
         }
 
         std::uint32_t count = std::max(buffer_count, caps.minImageCount);
@@ -541,6 +622,8 @@ private:
 
         VkSwapchainKHR next = VK_NULL_HANDLE;
         if (fn_.create_swapchain(device_, &ci, nullptr, &next) != VK_SUCCESS) return false;
+        native_info_ = ci;  // what recreate_native() repeats, with a new extent and minImageCount
+        native_info_.oldSwapchain = VK_NULL_HANDLE;
         if (swapchain_) fn_.destroy_swapchain(device_, swapchain_, nullptr);
         destroy_offscreen();
         swapchain_ = next;
@@ -548,6 +631,9 @@ private:
         format_ = (preferred_format != VK_FORMAT_UNDEFINED) ? preferred_format : chosen.format;
         surface_extent_ = ext;
         extent_ = (width > 0 && height > 0) ? VkExtent2D{width, height} : ext;
+        stale_ = false;
+        presentable_ = false;
+        failed_extent_ = {};
 
         std::uint32_t img_count = 0;
         fn_.get_images(device_, swapchain_, &img_count, nullptr);
@@ -601,6 +687,14 @@ private:
     std::uint32_t current_index_ = 0;
     std::uint32_t acquired_index_ = 0;
     std::uint32_t next_back_buffer_ = 0;
+    // The last present/acquire came back out of date; a native image is acquired and may be presented; the
+    // creation parameters recreate_native() repeats (minus the extent, count and old swapchain); the extent a
+    // failed recreate_native() already tried, so a window that stays unusable is not retried every present.
+    bool stale_ = false;
+    bool presentable_ = false;
+    bool no_surface_extent_ = false;  // the last rebuild found a surface with no usable size (minimised)
+    VkSwapchainCreateInfoKHR native_info_{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    VkExtent2D failed_extent_{0, 0};
 };
 
 }  // namespace leonida

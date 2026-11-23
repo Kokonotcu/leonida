@@ -2,9 +2,10 @@
 //
 // GDK code does not always import the console runtime. The package's libHttpClient.GDK.dll and XCurl.dll have no
 // import entry for xgameruntime.dll at all: their statically linked xgameruntime.lib thunks hold the wide string
-// "xgameruntime.dll" and the names InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl and
-// UninitializeApiImpl, and look them up at run time (docs/runtime_imports.md, "Run-time loaded modules"). Bound to the
-// host, that LoadLibraryW would load the PC's Gaming Services runtime or fail, and never reach the offline shims.
+// "xgameruntime.dll" and the names InitializeApiImpl, InitializeApiImplEx, InitializeApiImplEx2, QueryApiImpl,
+// UninitializeApiImpl and XErrorReport, and look them up at run time (docs/runtime_imports.md, "Run-time loaded
+// modules"). Bound to the host, that LoadLibraryW would load the PC's Gaming Services runtime or fail, and never reach
+// the offline shims.
 //
 // So for a module the shim registry owns (rt::shims::owns_dll: xgameruntime.dll, d3d12_xs.dll, xmem.dll, ...), these
 // return a pseudo-handle, and GetProcAddress on it resolves names (and "#ordinal") through rt::shims::find. A name the
@@ -14,8 +15,11 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstring>
 #include <deque>
+#include <filesystem>
 #include <map>
+#include <malloc.h>
 #include <mutex>
 #include <set>
 #include <string>
@@ -91,20 +95,18 @@ std::string module_name(std::string path) {
     return path;
 }
 
-std::string host_module_name(HMODULE module) {
-    std::lock_guard lock(loader_mutex());
-    static auto* names = new std::map<HMODULE, std::string>;
-    if (auto it = names->find(module); it != names->end()) return it->second;
+bool crt_heap_ok() { return HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr) != FALSE; }
 
+std::string host_module_name(HMODULE module) {
+    // No lazy static map: GetProcAddress on a host module is reached during the title's CRT
+    // initialisation, and a first-use magic static there depends on TLS/epoch state that is not
+    // dependable yet (it was observed reading a null map pointer). The lookup is not hot enough to
+    // be worth that risk.
     std::vector<wchar_t> path(MAX_PATH);
     for (;;) {
         const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
         if (!length) return {};
-        if (length < path.size()) {
-            const std::string name = module_name(narrow(path.data()));
-            names->emplace(module, name);
-            return name;
-        }
+        if (length < path.size()) return module_name(narrow(path.data()));
         if (path.size() == 32768) return {};
         path.resize(path.size() > 16384 ? 32768 : path.size() * 2);
     }
@@ -202,34 +204,106 @@ HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
 // GetModuleHandle answers for an owned module as if it were loaded (the GDK may probe before it loads), and for any
 // bundled package module already mapped by the native loader.
 HMODULE WINAPI get_module_handle_a(LPCSTR name) {
-    if (name) {
-        if (HMODULE h = owned_handle(name)) return h;
-        const std::string dll = module_name(name);
-        if (!dll.empty())
-            if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
+    if (!name) {
+        if (void* h = bundled_main_module()) return reinterpret_cast<HMODULE>(h);
+        return GetModuleHandleA(name);
     }
+    if (HMODULE h = owned_handle(name)) return h;
+    const std::string dll = module_name(name);
+    if (!dll.empty())
+        if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
     return GetModuleHandleA(name);
 }
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
-    if (name) {
-        if (ascii_basename(name)) {
-            const std::string path = narrow(name);
-            if (HMODULE h = owned_handle(path)) return h;
-            const std::string dll = module_name(path);
-            if (!dll.empty())
-                if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
-        } else {
-            // Outside ASCII: by the wide basename (narrow() would turn it into '?'), as for load_library_w.
-            const std::wstring dll = module_name_w(name);
-            if (!dll.empty())
-                if (void* h = find_loaded_bundled_module_w(dll)) return reinterpret_cast<HMODULE>(h);
-        }
+    if (getenv("LEONIDA_HEAP_PROBE")) {
+        std::fprintf(stderr, "[rt] heap-probe: GetModuleHandleW entry tid=%lu\n", GetCurrentThreadId());
+        std::fflush(stderr);
+        const BOOL ok = HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr);
+        std::fprintf(stderr, "[rt] heap-probe: GetModuleHandleW entry ok=%d\n", ok);
+        std::fflush(stderr);
+    }
+    if (!name) {
+        // The process's own image: the mapped exe, not gta6rt.
+        if (void* h = bundled_main_module()) return reinterpret_cast<HMODULE>(h);
+        return GetModuleHandleW(name);
+    }
+    if (ascii_basename(name)) {
+        const std::string path = narrow(name);
+        if (HMODULE h = owned_handle(path)) return h;
+        const std::string dll = module_name(path);
+        if (!dll.empty())
+            if (void* h = find_loaded_bundled_module(dll)) return reinterpret_cast<HMODULE>(h);
+    } else {
+        // Outside ASCII: by the wide basename (narrow() would turn it into '?'), as for load_library_w.
+        const std::wstring dll = module_name_w(name);
+        if (!dll.empty())
+            if (void* h = find_loaded_bundled_module_w(dll)) return reinterpret_cast<HMODULE>(h);
     }
     return GetModuleHandleW(name);
 }
 
+// The Win32 spelling of a stored module path: backslashes throughout, and a unix-absolute path (a leading "/", only
+// possible under Wine) becomes Z:\..., the drive Wine maps at the filesystem root. A relative stored path is made
+// absolute through the host first, so the result is always drive-qualified.
+std::wstring windows_form(const std::filesystem::path& p) {
+    std::wstring s = p.native();
+    for (auto& c : s)
+        if (c == L'/') c = L'\\';
+    if (s.size() >= 2 && s[1] != L':' && s[0] == L'\\' && s[1] != L'\\') s.insert(0, L"Z:");
+    if (s.size() < 2 || s[1] != L':') {
+        std::error_code ec;
+        s = std::filesystem::absolute(s, ec).native();
+        for (auto& c : s)
+            if (c == L'/') c = L'\\';
+        if (s.size() >= 2 && s[1] != L':' && s[0] == L'\\' && s[1] != L'\\') s.insert(0, L"Z:");
+    }
+    return s;
+}
+
+// GetModuleFileName answers for the mapped images: nullptr is the process's own image (the exe the loader mapped,
+// not gta6rt.exe) and a bundled module's handle names that module. Host modules fall through.
+DWORD WINAPI get_module_file_name_w(HMODULE module, LPWSTR buffer, DWORD size) {
+    const std::filesystem::path* p = bundled_module_path(module);
+    if (!p) return GetModuleFileNameW(module, buffer, size);
+    if (!buffer || !size) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    const std::wstring s = windows_form(*p);
+    if (s.size() >= size) {
+        std::wmemcpy(buffer, s.c_str(), size - 1);
+        buffer[size - 1] = 0;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return size;
+    }
+    std::wmemcpy(buffer, s.c_str(), s.size() + 1);
+    return static_cast<DWORD>(s.size());
+}
+
+DWORD WINAPI get_module_file_name_a(HMODULE module, LPSTR buffer, DWORD size) {
+    const std::filesystem::path* p = bundled_module_path(module);
+    if (!p) return GetModuleFileNameA(module, buffer, size);
+    if (!buffer || !size) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    const std::string s = narrow(windows_form(*p).c_str());
+    if (s.size() >= size) {
+        std::memcpy(buffer, s.c_str(), size - 1);
+        buffer[size - 1] = 0;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return size;
+    }
+    std::memcpy(buffer, s.c_str(), s.size() + 1);
+    return static_cast<DWORD>(s.size());
+}
+
 FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
+    const bool heap_probe = getenv("LEONIDA_HEAP_PROBE") != nullptr;
+    if (heap_probe)
+        std::fprintf(stderr, "[rt] heap-probe: GetProcAddress entry tid=%lu module=%p ok=%d\n",
+                     GetCurrentThreadId(), module, crt_heap_ok());
     if (const Pseudo* p = pseudo(module)) {
         if (!name) {
             SetLastError(ERROR_PROC_NOT_FOUND);
@@ -259,8 +333,10 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
     }
 
     const std::string what = IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
+    if (heap_probe) std::fprintf(stderr, "[rt] heap-probe: after name ok=%d name=%s\n", crt_heap_ok(), what.c_str());
     bool owns_handle = false;
     void* fn = get_bundled_proc_address(module, what, owns_handle);
+    if (heap_probe) std::fprintf(stderr, "[rt] heap-probe: after bundled ok=%d owns=%d\n", crt_heap_ok(), owns_handle);
     if (owns_handle) {
         if (fn) return reinterpret_cast<FARPROC>(fn);
         SetLastError(ERROR_PROC_NOT_FOUND);
@@ -300,6 +376,8 @@ BOOL WINAPI disable_thread_calls(HMODULE module) {
     {dll, "LoadLibraryExW", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_ex_w)},                   \
     {dll, "GetModuleHandleA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_a)},               \
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
+    {dll, "GetModuleFileNameA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_a)},          \
+    {dll, "GetModuleFileNameW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_w)},          \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \
     {dll, "FreeLibrary", reinterpret_cast<void*>(&rt::shims::library_loader::free_library)},                           \
     {dll, "DisableThreadLibraryCalls", reinterpret_cast<void*>(&rt::shims::library_loader::disable_thread_calls)}

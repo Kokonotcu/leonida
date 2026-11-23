@@ -3,7 +3,9 @@
 // SHA-256 of its FSSM program, writing eight words through the V# in s[4:7] (four root constants in the console compute layout), read back:
 //   w64 native    cs_w64x_readlane translated natively: v_readlane across both halves of a wave64. Exact only in a
 //                 64-wide subgroup, so the PSO must ask for 64 (and full subgroups) on a device that can give it.
-//                 On a device that cannot (NVIDIA: 32 only) the PSO reports it, and the result is not judged.
+//                 On a device that cannot (NVIDIA: 32 only) the PSO is refused with E_NOTIMPL and a log line: it
+//                 would read lanes 32-63 that are not there. The same refusal is checked on every GPU by telling
+//                 the layer the device has 32-wide subgroups only.
 //   w64 emulated  the same shader translated with --wave64-emulate: exact on any size, the PSO asks for nothing.
 //   w32 native    cs_wqm_w32, a wave32 shader with whole-quad mode on lane masks; the PSO asks for 32 where the
 //                 device's default or range would otherwise change it.
@@ -149,6 +151,7 @@ constexpr Shader w32_native{"w32 native (cs_wqm_w32)", "w32_native", {12, 1, 4, 
 
 struct Result {
     int failure = 0;      // a line number, 0 when the case ran
+    HRESULT pso = S_OK;   // what CreateComputePipelineState returned; on failure nothing else was run
     Words words{};
     std::vector<leonida::SubgroupRequest> requests;
 };
@@ -206,8 +209,12 @@ Result run(vktest::Device& d, const std::filesystem::path& library, const leonid
     pso_desc.CS = {container.data(), container.size()};
     const IID pso_iid = __uuidof(ID3D12PipelineState);
     Ref<ID3D12PipelineState> pso;
-    CASE_EXPECT(SUCCEEDED(reinterpret_cast<XboxComputePipelineFn>(slot(device.p, 62))(
-        device.p, &pso_desc, 0, 0, &pso_iid, reinterpret_cast<void**>(&pso.p))));
+    result.pso = reinterpret_cast<XboxComputePipelineFn>(slot(device.p, 62))(
+        device.p, &pso_desc, 0, 0, &pso_iid, reinterpret_cast<void**>(&pso.p));
+    if (FAILED(result.pso)) {  // refused: the caller judges the HRESULT
+        CASE_EXPECT(!pso.p);
+        return result;
+    }
     const auto* requests = rt::d3d12::pipeline_subgroup_requests(pso.p);
     CASE_EXPECT(requests && requests->size() == 1);
     result.requests = *requests;
@@ -279,9 +286,8 @@ std::string words_text(const Words& w) {
 }
 
 // What the decision function says about the shader's own index entry on this device.
-leonida::SubgroupRequest expected_request(const Shader& shader, const leonida::SubgroupSizeCaps& caps) {
+leonida::SubgroupRequest expected_request(const std::filesystem::path& dir, const leonida::SubgroupSizeCaps& caps) {
     leonida::ShaderLibrary index;
-    const auto dir = std::filesystem::path(LEONIDA_TEST_SUBGROUP_SHADERS) / shader.folder / "spirv";
     if (!index.load(dir.string())) return {};
     const auto* entry = index.find("cs", leonida::sha256_hex(fixture_fssm()));
     return entry ? leonida::decide_subgroup_size(*entry, caps) : leonida::SubgroupRequest{};
@@ -541,9 +547,23 @@ int main() {
 
     unsigned judged = 0;
     for (const Shader* shader : {&w64_native, &w64_emulated, &w32_native}) {
-        const leonida::SubgroupRequest want = expected_request(*shader, caps);
+        const leonida::SubgroupRequest want = expected_request(shader_dir(*shader), caps);
         const Result result = run(d, shader_dir(*shader), caps);
         EXPECT(!result.failure);
+        if (shader == &w64_native && want.outcome == leonida::SubgroupOutcome::unavailable) {
+            // This GPU cannot give a wave64 compute shader 64 lanes: the PSO is refused (one log line, above). The
+            // build for this GPU uses --wave64-emulate, which the next case checks.
+            std::printf("%s: PSO %s (0x%08x) on a device with no 64-wide compute subgroup (sizes %u..%u)\n",
+                        shader->label, FAILED(result.pso) ? "refused" : "BUILT", unsigned(result.pso), caps.min_size,
+                        caps.max_size);
+            EXPECT(result.pso == E_NOTIMPL);
+            const Result control = run(d, shader_dir(*shader), off);
+            EXPECT(!control.failure && control.pso == S_OK);
+            std::printf("  control, nothing requested: %s (%s)\n", control.words == shader->expected ? "exact" : "differs",
+                        words_text(control.words).c_str());
+            continue;
+        }
+        EXPECT(result.pso == S_OK);
         EXPECT(result.requests.size() == 1);
         const leonida::SubgroupRequest& got = result.requests[0];
         // The PSO asked for what the decision function says.
@@ -554,17 +574,10 @@ int main() {
         std::printf("%s: outcome %d, required size %u, full subgroups %s; result %s (%s)\n", shader->label,
                     int(got.outcome), got.size, got.flags ? "yes" : "no", exact ? "exact" : "DIFFERS",
                     words_text(result.words).c_str());
-        if (shader == &w64_native && got.outcome == leonida::SubgroupOutcome::unavailable) {
-            // This GPU cannot give a wave64 compute shader 64 lanes. The layer said so (a log line, above); the
-            // build for this GPU should have used --wave64-emulate, which the next case checks.
-            std::printf("  this device has no 64-wide compute subgroup (sizes %u..%u): native wave64 not judged\n",
-                        caps.min_size, caps.max_size);
-        } else {
-            if (!exact) std::fprintf(stderr, "%s: wanted %s\n", shader->label, words_text(shader->expected).c_str());
-            EXPECT(exact);
-            ++judged;
-        }
-        if (shader == &w64_native && got.outcome != leonida::SubgroupOutcome::unavailable) {
+        if (!exact) std::fprintf(stderr, "%s: wanted %s\n", shader->label, words_text(shader->expected).c_str());
+        EXPECT(exact);
+        ++judged;
+        if (shader == &w64_native) {
             EXPECT(got.outcome != leonida::SubgroupOutcome::unknown_device);
             EXPECT(got.outcome == leonida::SubgroupOutcome::required || got.outcome == leonida::SubgroupOutcome::device_fixed ||
                    got.outcome == leonida::SubgroupOutcome::device_default);
@@ -584,6 +597,17 @@ int main() {
                         words_text(control.words).c_str());
         }
     }
+    // The refusal on any GPU: told that the device has 32-wide subgroups only, the layer refuses the native wave64
+    // PSO before it makes any Vulkan object.
+    {
+        leonida::SubgroupSizeCaps only32 = caps;
+        only32.min_size = only32.max_size = only32.default_size = 32;
+        const Result native = run(d, shader_dir(w64_native), only32);
+        EXPECT(!native.failure);
+        EXPECT(native.pso == E_NOTIMPL);
+        std::printf("told the device has 32-wide subgroups only: the native wave64 PSO is refused\n");
+    }
+
     // --- The driver's choice, observed: probe shaders that store gl_SubgroupSize ------------------------------------
     const auto exact_outcome = [](leonida::SubgroupOutcome o) {
         return o == leonida::SubgroupOutcome::required || o == leonida::SubgroupOutcome::device_fixed;
@@ -591,17 +615,27 @@ int main() {
     for (const Mode* mode : {&mode_w64, &mode_w32, &mode_emulated}) {
         const auto library = compute_probe_library(*mode);
         const Result r = run(d, library, caps);
-        EXPECT(!r.failure && r.requests.size() == 1);
-        const leonida::SubgroupRequest& req = r.requests[0];
-        const std::uint32_t seen = r.words[0];
-        std::printf("compute probe, %s: outcome %d (asked %u), the driver ran it %u-wide\n", mode->label,
-                    int(req.outcome), req.size, seen);
-        if (exact_outcome(req.outcome)) EXPECT(seen == req.wanted);  // the size the PSO asked for is the size it got
+        EXPECT(!r.failure);
+        // The native wave64 probe is refused where 64 cannot be had, as the shader above; nothing else is.
+        const bool refused = mode == &mode_w64 &&
+                             expected_request(library, caps).outcome == leonida::SubgroupOutcome::unavailable;
+        EXPECT(r.pso == (refused ? E_NOTIMPL : S_OK));
+        if (refused) {
+            std::printf("compute probe, %s: PSO refused\n", mode->label);
+        } else {
+            EXPECT(r.requests.size() == 1);
+            const leonida::SubgroupRequest& req = r.requests[0];
+            const std::uint32_t seen = r.words[0];
+            std::printf("compute probe, %s: outcome %d (asked %u), the driver ran it %u-wide\n", mode->label,
+                        int(req.outcome), req.size, seen);
+            if (exact_outcome(req.outcome)) EXPECT(seen == req.wanted);  // the size the PSO asked for is the size it got
+        }
         const Result control = run(d, library, off);
         EXPECT(!control.failure);
         std::printf("  control, nothing requested: %u-wide (device default %u)\n", control.words[0], caps.default_size);
         // The request matters: a wave32 shader on a device whose default is not 32 runs at the default without it.
-        if (mode == &mode_w32 && req.outcome == leonida::SubgroupOutcome::required && caps.default_size != 32)
+        if (mode == &mode_w32 && SUCCEEDED(r.pso) && r.requests[0].outcome == leonida::SubgroupOutcome::required &&
+            caps.default_size != 32)
             EXPECT(control.words[0] != 32);
         std::filesystem::remove_all(library);
     }

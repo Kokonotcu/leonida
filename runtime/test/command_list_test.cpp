@@ -98,6 +98,18 @@ int main() {
     CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, l::common, 9, all, 0x2}));
     CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, l::common, 9,
                                        {0, 1, 0, 0, 0, 1}, 0}));  // zero layers
+    CHECK(!list.transition({24, 0, s::common, s::common}));
+    CHECK(!list.transition({24, 0, s::common, s::render_target | s::copy_dest}));
+    CHECK(!list.transition({24, 0, s::common, s::copy_dest | s::copy_source}));
+    CHECK(!list.transition({24, 0, 0x80000000u, s::copy_dest}));
+    CHECK(!list.barrier(GlobalBarrier{y::none, y::all, a::common, a::common}));
+    CHECK(!list.barrier(GlobalBarrier{y::all, y::none, a::common, a::common}));
+    CHECK(!list.barrier(GlobalBarrier{y::all, y::all, a::no_access | a::render_target, a::common}));
+    CHECK(!list.barrier(GlobalBarrier{y::copy, y::all, a::render_target, a::common}));
+    CHECK(!list.barrier(GlobalBarrier{0x04000000u, y::all, a::common, a::common}));
+    CHECK(!list.barrier(GlobalBarrier{y::all, y::all, 0x04000000u, a::common}));
+    CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, 999u, l::common, 9, all, 0}));
+    CHECK(!list.barrier(TextureBarrier{y::all, y::all, a::common, a::common, l::common, 999u, 9, all, 0}));
     CHECK(list.close());
     CHECK(list.commands().size() == 4);
     CHECK(std::get<GlobalBarrier>(list.commands()[1]).sync_before == y::split);

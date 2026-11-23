@@ -764,6 +764,17 @@ Queues and fences are wrapped the same way.
   object implements but the proxy does not model is logged once and refused.
 - **The refused tail.** A slot past the public chain, up to the end of the proxy's own table (128 queue and
   64 fence slots, every one a thunk), logs its first four argument words once and returns `E_NOTIMPL`.
+- **Fence slot 12.** The one served slot past the fence chain. The retail executable calls it as
+  `(value, descriptor, flags)` and reads the return as a pointer to the fence's 64-bit completed value: it
+  compares that value with `~0` (device removed) and subtracts the value it waits for. The proxy returns a
+  per-fence mirror. Completion events refresh it immediately. A 10 ms wait timeout also refreshes it if the
+  fence rewinds below the pending event's threshold. Slot 12 and the CPU `Signal` (10) refresh it synchronously.
+  The descriptor's second word is a code pointer, which is not called.
+- **Command lists.** Device slot 73 (`CreateCommandListX`), asked for the console list IID, returns a list proxy.
+  Its PC chain (80 slots) is forwarded in order; console slots 131 and 132 are no-op `S_OK`
+  (presentation/clear-adjacent setup). Console slot 139 is the retail title's `Reset(allocator, pso)`, measured
+  between `Close` and recording: it forwards to PC `Reset` (slot 10) with the allocator and pipeline state proxies
+  unwrapped. `xs_proxy_mock_test` checks the `Close`-then-139 order and the unwrap.
 - **The guard region.** Each table sits at the end of the first page of a 64 KiB reservation, and the rest
   of that reservation is never committed. A slot past the table therefore faults on the vtable read itself,
   inside the reservation, and a vectored handler logs the slot before the fault goes on. A vtable read that
@@ -781,7 +792,11 @@ Command allocators get the same kind of proxy: device slot 9 (`CreateCommandAllo
 
 - **What is forwarded.** The public chain, 9 slots: the base chain and `Reset` at 8. A slot past it, up to the
   end of a 64-slot table, is logged and refused, and a read past the table faults in its own guard region.
-  The console allocator's extra methods cannot be measured from the package (D3D-360). No shipped module creates,
+  **Slot 9** is the retail title's allocator-pool path: it is logged with its first arguments and answers `S_OK`
+  without forwarding (the console method's shape is unmeasured, D3D-360). The one observed poison is repaired: when
+  the first word names writable memory that holds all ones (the value the title then reads through), it is set to
+  null, the COM convention for "no object"; no other caller memory is written.
+  The console allocator's other extra methods cannot be measured from the package (D3D-360). No shipped module creates,
   receives or calls an allocator (§3.5). The package has no `d3d12_xs.dll` either, and no export of the three
   D3D12 clients takes an allocator. `dumpbin /exports` (MSVC 19.52) lists the BVH builder's 12 exports, which take
   an `ID3D12Device11` or a command list (`docs/d3d12_xs_surface.md`), and the FSR loader's and upscaler's
@@ -811,7 +826,10 @@ Vulkan device does not share fences (the test prints "not checked" there). Each 
 process and is compared with the real object's HRESULT. The test also includes a console-style client: it makes a heap through slot 14 (handle in
 RAX) and buffers through slot 76 (layout word 0x1). It then copies through the queue proxy, finishes through
 the fence proxy, reads the data back, and makes residency calls that carry the heap, queue and fence proxies.
-`device_proxy_test` gets its queue and fence through the registered `D3D12XboxCreateDevice` shim.
+`device_proxy_test` gets its queue and fence through the registered `D3D12XboxCreateDevice` shim. It also checks device
+slot 13, `CheckFeatureSupport`: a `D3D12_OPTIONS` request larger than the PC's 0x3C bytes (the console's is 0x40) is
+answered from the PC runtime's structure with the extra bytes zeroed, a smaller size and any other feature stay
+refused (see [d3d12_vulkan.md](d3d12_vulkan.md) section 4.1).
 
 The package-gated `bvh_builder_test` and `fsr_dispatch_test` stay at `SKIP (no package)` without
 `LEONIDA_GAME_DIR`, and they would not cover these paths if they ran. Neither creates a queue or a fence:

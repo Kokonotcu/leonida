@@ -131,12 +131,12 @@ the de-duplicated 1–22. It maps each question to the event to look for; it doe
 | 3 | Root signature → `s0..s31` | `CreateRootSignature`, `SetGraphicsRootSignature`, then the shader's user-SGPR reads; mask `0x03000000` on a copy |
 | 4 | Descriptor bytes and heap increments | first `CreateShaderResourceView`/`CreateSampler` and the first draw; dump the heap bytes and compare with the T#/S# parser |
 | 5 | VA range and arena capacity | `GetGPUVirtualAddress` and every descriptor base; high-water mark |
-| 6 | DXGI, `PresentX`, or both | first present/queue call; `PresentX` is a queue method past the public chain, so an unknown slot is the expected first finding |
+| 6 | DXGI, `PresentX`, or both | first present/queue call; `PresentX` is a queue method past the public chain, and the public HLE reports queue slots 30 and 32, so set `LEONIDA_PRESENTX_SLOT=30` (or `LEONIDA_CAPTURE`) before the first run and look for the routed line |
 | 7 | Standard AS build vs `XboxBvhBuilder` | first `BuildRaytracingAccelerationStructure`/`Copy...` vs slot-62 PSOs; see [embedded_shaders.md](embedded_shaders.md) |
 | 8 | XDXR desc layouts | measured in [xdxr.md](xdxr.md); the live signal is a non-empty stream desc at slot 62 |
 | 9 | Tiled textures / DCC | slot 76, `CopyTextureRegion`, resource descs; a `0x101` layout or tiled address |
 | 10 | Binning, DCC, VRS, wave MMA, stream output | shader-side answered by `tools/feature_scan.py`; the trace adds PSO/stream subobjects |
-| 11 | `CheckFeatureSupport` answers | the call's `ok`/`failed` and the `[rt]` feature-id line; the answer itself is not logged yet |
+| 11 | `CheckFeatureSupport` answers | the call's `ok`/`failed` and the `[rt]` feature-id line; the answer itself is not logged yet. A `D3D12_OPTIONS` call with more than the PC's 60 bytes logs its size (`[rt] d3d12: ... asked for more bytes ...; size N`), and gets the PC answer with the extra bytes zeroed |
 | 12 | Async compute / copy queues | queue creation and cross-queue fences |
 | 13 | 144-byte push constants | device creation `[rt]` line; `push_constants_need_fallback` when the device reports fewer |
 | 14 | Two code-base stages in one PSO | PSO creation log; the index metadata (`uses_code_base`) |

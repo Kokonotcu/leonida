@@ -156,6 +156,21 @@ and file list in its README) with the licence file. `runtime/shims/xgameruntime.
 `xgameruntime.dll` imports. The HTTP and WebSocket stack is not included. Unlike the projects above, this is code
 use under a compatible licence, so the MIT notice must stay with the files.
 
+## sammwyy/xvalkyrie
+
+<https://github.com/sammwyy/xvalkyrie>
+
+A C++ translation layer for Xbox One and Xbox Series software on Windows. Its research notes record what a GDK
+title imports and how the title's half of the Gaming Runtime reaches the console, read from the public kits'
+static libraries and from running a retail Xbox One GDK title.
+
+**Licence:** GPL-3.0, compatible with GPL-3.0-or-later; the SCARAB rule applies: facts first, our own
+implementation, and the pull request names the file a fact came from.
+
+**What we use it for:** leads to check on this package. So far one: `XSystemGetDeviceType` is linked into the title
+and reads the console mode from the registry ([runtime_imports.md](runtime_imports.md#the-device-type-is-read-from-the-registry)).
+The value table in this repository was read from the package's own `XCurl.dll`, not from xvalkyrie.
+
 ## AMD machine-readable GPU ISA specification
 
 <https://gpuopen.com/machine-readable-isa> (reader: <https://github.com/GPUOpen-Tools/isa_spec_manager>)

@@ -62,6 +62,8 @@ std::atomic<int> g_runtime_refs{0};
 // (no caller in the shipped DLLs to measure), and the classes of the other xgameruntime_*.cpp files through their
 // query functions; for any other class QueryApiImpl logs the class and interface id and refuses it, so the first boot
 // with the executable lists the interfaces to implement next.
+//
+// The thunks look up a sixth name, XErrorReport (served below GetApiVersionImpl), and refuse the runtime without it.
 
 struct ApiImplOptions {    // InitializeApiImplEx2's fourth argument
     uint32_t unknown;      // documented as always 1
@@ -647,6 +649,13 @@ HRESULT WINAPI GetApiVersionImpl(uint64_t* first, uint64_t* second) {
     return S_OK;
 }
 
+// XErrorReport, the sixth name xgameruntime.lib's thunks GetProcAddress in xgameruntime.dll: in both package DLLs its
+// string sits in the same block as the five entry points above, and when the lookup fails the thunks give up before
+// they call an initializer (libHttpClient.GDK.dll's initialisation then returns 0x89240101,
+// E_GAMERUNTIME_DLL_NOT_FOUND, and XCurl.dll's fails too). The arguments are IXErrorImpl slot 3's without `this`, and
+// the slot's function serves it, so a report reaches the callback XErrorSetCallback set either way.
+HRESULT WINAPI XErrorReport(HRESULT hr, const char* message) { return error_report(nullptr, hr, message); }
+
 // HRESULT XGameRuntimeInitialize(). Reference counted, as in the GDK: each call needs an XGameRuntimeUninitialize.
 HRESULT __stdcall XGameRuntimeInitialize() {
     if (g_runtime_refs.fetch_add(1) == 0) std::fprintf(stderr, "[rt] xgameruntime: initialized (offline)\n");
@@ -679,6 +688,86 @@ uint32_t __stdcall XSystemGetDeviceType() {
     }
     return static_cast<uint32_t>(XSystemDeviceType::XboxScarlettAnaconda);
 }
+
+// ---- The console mode in the registry ----
+//
+// The export above is not what a title calls. xgameruntime.lib links XSystemGetDeviceType into the title, and that
+// copy asks the registry (the package's XCurl.dll and libHttpClient.GDK.dll both carry it): it opens
+// HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM, reads the DWORD "ConsoleMode" and turns it into the
+// device type; when the key or the value is missing its answer is PC. Bound to the host those calls find no such
+// key, so the title was told it runs on a PC. sammwyy/xvalkyrie answers the same key and reports a retail title that
+// crashes on the PC value (facts only; docs/runtime_imports.md, "The device type is read from the registry").
+//
+// So that one key is answered here, from the device type the export reports, and every other registry call goes to
+// the host unchanged. With LEONIDA_DEVICE_TYPE=1 the key is left to the host, which is how a PC answers.
+constexpr wchar_t kOemKey[] = L"software\\microsoft\\windows nt\\currentversion\\oem";
+constexpr wchar_t kConsoleModeValue[] = L"ConsoleMode";
+const char g_oem_key_tag = 0;  // its address is the handle of the answered key; never a real registry handle
+
+HKEY oem_key_handle() { return reinterpret_cast<HKEY>(const_cast<char*>(&g_oem_key_tag)); }
+
+// The ConsoleMode value for the reported device type. False for a PC, which has no such key.
+bool console_mode(DWORD& mode) {
+    switch (static_cast<XSystemDeviceType>(XSystemGetDeviceType())) {
+        case XSystemDeviceType::Pc: return false;
+        case XSystemDeviceType::XboxOne: mode = 0x10; return true;
+        case XSystemDeviceType::XboxOneS: mode = 0x40; return true;
+        case XSystemDeviceType::XboxOneX: mode = 0x50; return true;
+        case XSystemDeviceType::XboxOneXDevkit: mode = 0x58; return true;
+        case XSystemDeviceType::XboxScarlettLockhart: mode = 0x60; return true;
+        case XSystemDeviceType::XboxScarlettAnaconda: mode = 0x64; return true;
+        case XSystemDeviceType::XboxScarlettDevkit: mode = 0x68; return true;
+        case XSystemDeviceType::Unknown: break;
+    }
+    mode = 0;  // a value the title's table does not know: it answers Unknown
+    return true;
+}
+
+bool is_oem_key(HKEY root, LPCWSTR path, DWORD& mode) {
+    if (root != HKEY_LOCAL_MACHINE || !path) return false;
+    while (*path == L'\\') ++path;
+    size_t length = std::wcslen(path);
+    while (length > 0 && path[length - 1] == L'\\') --length;
+    if (length != std::size(kOemKey) - 1 || _wcsnicmp(path, kOemKey, length) != 0) return false;
+    return console_mode(mode);
+}
+
+LSTATUS WINAPI reg_open_key_w(HKEY root, LPCWSTR path, PHKEY key) {
+    DWORD mode = 0;
+    if (key && is_oem_key(root, path, mode)) {
+        *key = oem_key_handle();
+        return ERROR_SUCCESS;
+    }
+    return ::RegOpenKeyW(root, path, key);
+}
+
+LSTATUS WINAPI reg_open_key_ex_w(HKEY root, LPCWSTR path, DWORD options, REGSAM access, PHKEY key) {
+    DWORD mode = 0;
+    if (key && is_oem_key(root, path, mode)) {
+        *key = oem_key_handle();
+        return ERROR_SUCCESS;
+    }
+    return ::RegOpenKeyExW(root, path, options, access, key);
+}
+
+LSTATUS WINAPI reg_query_value_ex_w(HKEY key, LPCWSTR name, LPDWORD reserved, LPDWORD type, LPBYTE data, LPDWORD size) {
+    if (key != oem_key_handle()) return ::RegQueryValueExW(key, name, reserved, type, data, size);
+    DWORD mode = 0;
+    if (!name || _wcsicmp(name, kConsoleModeValue) != 0 || !console_mode(mode)) return ERROR_FILE_NOT_FOUND;
+    if (type) *type = REG_DWORD;
+    if (data) {
+        if (!size) return ERROR_INVALID_PARAMETER;
+        if (*size < sizeof(mode)) {
+            *size = sizeof(mode);
+            return ERROR_MORE_DATA;
+        }
+        std::memcpy(data, &mode, sizeof(mode));
+    }
+    if (size) *size = sizeof(mode);
+    return ERROR_SUCCESS;
+}
+
+LSTATUS WINAPI reg_close_key(HKEY key) { return key == oem_key_handle() ? ERROR_SUCCESS : ::RegCloseKey(key); }
 
 // HRESULT XSystemGetConsoleId(size_t consoleIdSize, char* consoleId, size_t* consoleIdUsed).
 // XSystemConsoleIdBytes is 39 (including the terminator). An offline PC has no console id, so this returns a
@@ -1314,8 +1403,21 @@ RuntimeObject* const* measured_objects() {
 }
 
 #define XGR(name) {"xgameruntime.dll", #name, reinterpret_cast<void*>(&name)}
+// The registry calls behind the title's own XSystemGetDeviceType, under the names the package's DLLs import them by:
+// XCurl.dll through the two API sets, libHttpClient.GDK.dll through advapi32.dll.
+#define CONSOLE_MODE_REGISTRY(dll)                                          \
+    {dll, "RegOpenKeyW", reinterpret_cast<void*>(&reg_open_key_w)},         \
+    {dll, "RegOpenKeyExW", reinterpret_cast<void*>(&reg_open_key_ex_w)},    \
+    {dll, "RegQueryValueExW", reinterpret_cast<void*>(&reg_query_value_ex_w)}, \
+    {dll, "RegCloseKey", reinterpret_cast<void*>(&reg_close_key)}
 
 }  // namespace
+
+SHIM_TABLE(console_mode_registry,
+    CONSOLE_MODE_REGISTRY("advapi32.dll"),
+    CONSOLE_MODE_REGISTRY("api-ms-win-core-registry-l1-1-0.dll"),
+    CONSOLE_MODE_REGISTRY("api-ms-win-core-registry-l2-1-0.dll"),
+);
 
 SHIM_TABLE(xgameruntime,
     // what xgameruntime.lib's thunks GetProcAddress (library_loader.cpp serves the LoadLibrary before it)
@@ -1324,6 +1426,7 @@ SHIM_TABLE(xgameruntime,
     XGR(InitializeApiImplEx2),
     XGR(UninitializeApiImpl),
     XGR(QueryApiImpl),
+    XGR(XErrorReport),  // looked up with the five above; without it the thunks refuse the runtime
     // the same runtime through gameplatformservices.dll, which XCurl.dll loads from System32 (GetApiVersionImpl above)
     {"gameplatformservices.dll", "QueryApiImpl", reinterpret_cast<void*>(&QueryApiImpl)},
     {"gameplatformservices.dll", "GetApiVersionImpl", reinterpret_cast<void*>(&GetApiVersionImpl)},

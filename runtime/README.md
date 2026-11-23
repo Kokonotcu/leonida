@@ -113,6 +113,16 @@ basename when it has a character outside ASCII (`Loader::find_loaded_module_w`, 
 module names compare case-insensitively with the system's own table (`CompareStringOrdinal`), as Windows
 compares them; a narrow name outside ASCII compares the same way through the ANSI code page.
 
+The game's code is built for the console's AMD Zen 2 and uses a few of its instructions without asking CPUID: SSE4a
+`insertq`/`extrq`, `clzero` and `monitorx`/`mwaitx` (no Intel CPU has them) and `clwb` (Intel since Ice Lake)
+([docs/cpu_features.md](../docs/cpu_features.md)). A host without one raises `#UD` there, so `gta6rt` installs a
+vectored handler before any image code runs (`src/cpu_emulation.h`): it recognises those encodings at the faulting
+address, does the same work on the thread's context and continues after the instruction. It prints one `[rt] cpu:`
+line at startup naming what the host lacks, and one the first time each instruction is emulated. On a host that has
+them the CPU runs them and the handler never sees them. Each emulated instruction costs an exception round trip, so a
+hot loop of them is slow; patching such a site in place is a later step. `cpu_emulation_test` runs every form for
+real: natively on a Zen host, through the handler on an Intel one.
+
 `module_names` checks native and mapped renamed DLLs, distinct Unicode identities, basename cache
 reuse, existing ACP aliases, the wide and case-insensitive lookups, export execution, and path errors. On native Windows with Python available,
 `run_module_names` compares original renamed EXEs through native execution and `--dry-run`, `--init`,
@@ -164,7 +174,7 @@ Current limits, by design:
   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
   address. `XMemAllocDefault`/`XMemFreeDefault` share that heap. `XMemVirtualAlloc` accepts the attribute word,
-  drops the console's `PAGE_GRAPHICS_*` protection bits, commits 2 MiB guest pages 2 MiB-aligned,
+  drops the console's `PAGE_GRAPHICS_*` and write-combine protection bits, commits 2 MiB guest pages 2 MiB-aligned,
   and passes `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` through. Physical pages
   (`XMemAllocatePhysicalPages`, `XMemFreePhysicalPages`, `XMemMapPhysicalPages`, `XMemMapPhysicalPagesScatter`) are
   64 KiB pages of pagefile-backed sections, mapped one view per page into the placeholder that a reserve-only
@@ -184,6 +194,16 @@ Current limits, by design:
   compute pipeline states, draws, dispatches and `ExecuteIndirect`; see `docs/d3d12_vulkan.md` for what is
   missing.
 
+- The window API — `RegisterClassExA/W`, `CreateWindowExA/W`, `DefWindowProcA/W`, `ShowWindow`,
+  `UnregisterClassA/W` and `GetClassInfoExA/W` under the two `ext-ms-win-rtcore-ntuser-window-*` names the
+  executable imports and `user32.dll`. A class or window created with the mapped image's `GetModuleHandle(nullptr)`
+  result is registered against gta6rt's own instance, which user32 knows; the game's `WNDPROC` is left as is.
+- `dstorage_xs.dll` / `xcrdapi.dll` / `dstorage.dll` — `DStorageGetFactory`: the console DirectStorage API
+  (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`). Files open through the `GAME:` mapping and the
+  overlay; each queue reads file or memory ranges into memory in order on its own worker thread, inflating zlib
+  requests (RFC 1950, `src/shader_library.h`'s inflater), and reports through status arrays, `ID3D12Fence` signals
+  and events. BCPack, swizzle and physical-page requests are not done yet.
+  See [docs/directstorage.md](../docs/directstorage.md) for the ABI evidence and what is unverified.
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
   (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback
   and trigger haptics where SDL opens the pad as a haptic device, and on a DualSense adaptive-trigger effects and the
@@ -360,6 +380,7 @@ from the ANSI code page.
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
 | `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault` and `XMemVirtualAlloc` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (not for the frees), `caller` (module+RVA) |
+| `xmem_virtual_alloc` | the first `XMemVirtualAlloc` for each distinct (type, attributes, protect) | `api`, `type`, `attributes`, `protect`, `size`, `caller` |
 | `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
 | `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |

@@ -115,6 +115,8 @@ int main() {
         CHECK(r.outcome == SubgroupOutcome::emulated && r.size == 0 && r.flags == 0);
         r = decide_subgroup_size(entry("ms", true, {128, 1, 1}, true), caps);
         CHECK(r.outcome == SubgroupOutcome::emulated && r.size == 0 && r.flags == 0);
+        // Where 64 can be had, no native wave64 pipeline is refused.
+        CHECK(!subgroup_refused(decide_subgroup_size(entry("cs", true), caps)));
     }
 
     // --- NVIDIA-like: 32 only ----------------------------------------------------------------------------------
@@ -132,6 +134,12 @@ int main() {
         }
         const auto emulated = decide_subgroup_size(entry("cs", true, {64, 1, 1}, true), caps);
         CHECK(emulated.outcome == SubgroupOutcome::emulated && emulated.size == 0);
+        // A native wave64 compute pipeline is refused (the emulated build is exact); graphics stages, which have no
+        // emulation, and wave32 or emulated shaders are not.
+        CHECK(subgroup_refused(decide_subgroup_size(entry("cs", true), caps)));
+        for (const char* stage : {"ps", "vs", "gs"}) CHECK(!subgroup_refused(decide_subgroup_size(entry(stage, true), caps)));
+        CHECK(!subgroup_refused(decide_subgroup_size(entry("cs", false), caps)));
+        CHECK(!subgroup_refused(emulated));
     }
 
     // --- An old RADV: COMPUTE only ----------------------------------------------------------------------------------

@@ -288,8 +288,12 @@ measurement in `d3d12_vulkan.md`, because its page could not be found.
 Not every console module is reached through an import table. `libHttpClient.GDK.dll` and `XCurl.dll` both use the
 GDK runtime, but `dumpbin /imports` shows **no import of `xgameruntime.dll`** in either. Both carry the wide string
 `xgameruntime.dll` and the ASCII names `InitializeApiImpl`, `InitializeApiImplEx`, `InitializeApiImplEx2`,
-`QueryApiImpl` and `UninitializeApiImpl`, next to a statically linked `XGameRuntimeInitialize`. So `xgameruntime.lib`'s
-thunks `LoadLibraryW` the runtime and `GetProcAddress` those five names at run time. xodus-gaming/xgameruntime-docs
+`QueryApiImpl`, `UninitializeApiImpl` and `XErrorReport` (one block of strings in each DLL), next to a statically
+linked `XGameRuntimeInitialize`. So `xgameruntime.lib`'s thunks `LoadLibraryW` the runtime and `GetProcAddress` those
+six names at run time. A runtime without `XErrorReport` is refused before any initializer is called: with only the
+five entry points served, the package's own libHttpClient `HCInitialize` returned `0x89240101`
+(`E_GAMERUNTIME_DLL_NOT_FOUND`) and XCurl's `curl_global_init` returned `CURLE_FAILED_INIT`, both called through
+`gta6rt --run` by a stand-in program that loads the two DLLs from the package. xodus-gaming/xgameruntime-docs
 (GPL-3.0) documents the same mechanism for PC GDK titles: `InitializeApiImplEx2` is what
 `XGameRuntimeInitialize[WithOptions]` calls, and `QueryApiImpl` hands out the runtime's COM classes, whose methods
 mostly correspond one to one to the `xgameruntime.lib` functions. The executable is very likely linked the same way.
@@ -315,7 +319,8 @@ the api-set binding `XCurl.dll` uses, and calls the classes `xgameruntime.cpp` s
 pointers to 64-bit locals (the result is not read), compares the pair with the one it saw last and keeps it. On the
 host that load would find a PC's Gaming Services runtime, which bypasses the offline classes, or nothing, in which
 case XCurl returns `0x87E00196`. The shims own `gameplatformservices.dll` too: its `QueryApiImpl` is the offline
-one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time.
+one, and `GetApiVersionImpl(uint64_t*, uint64_t*)` writes the same two values every time. `curl_global_init` also
+asks that module for `InitializeApiImpl`, which is not served; the call succeeds without it.
 
 ### Class layouts, measured
 
@@ -617,6 +622,26 @@ end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMem
 Each refused server is logged once (`[rt] winhttp: offline, refused <host>:<port>`), which records what a title
 tried to reach. `runtime/test/winhttp_offline_test.cpp` (ctest `winhttp_offline`) covers the synchronous and
 asynchronous paths with `.invalid` names; it opens no connection.
+
+## The device type is read from the registry
+
+`XSystemGetDeviceType` is not an import and not a runtime class method: `xgameruntime.lib` links it into the title,
+and that copy asks the registry. It opens `HKEY_LOCAL_MACHINE\Software\Microsoft\Windows NT\CurrentVersion\OEM`,
+reads the DWORD value `ConsoleMode`, and turns it into an `XSystemDeviceType`; when the key or the value is missing
+its answer is PC. The package's `XCurl.dll` and `libHttpClient.GDK.dll` both carry that function: the first imports
+`RegOpenKeyW`, `RegQueryValueExW` and `RegCloseKey` from `api-ms-win-core-registry-l1-1-0.dll` and `-l2-1-0.dll`, the
+second from `advapi32.dll`.
+
+Bound to the host those calls find no such key, so a title was told it runs on a PC whatever the shim's
+`XSystemGetDeviceType` export said.
+[sammwyy/xvalkyrie](https://github.com/sammwyy/xvalkyrie/blob/b883d2d85eb8c239c791f3a5f741b6d1b5762450/docs/research/gdk-titles.md)
+(GPL-3.0; facts only) describes the same read and reports a retail title that indexes a jump table with the result
+and crashes on the PC value.
+
+`runtime/shims/xgameruntime.cpp` therefore answers that one key under those three DLL names, with the `ConsoleMode`
+of the device type the export reports (Series X, or `LEONIDA_DEVICE_TYPE`), and passes every other registry call to
+the host. With `LEONIDA_DEVICE_TYPE=1` the key is left to the host, which is how a PC answers. `xgameruntime_test`
+runs the title's sequence against the registry functions the loader would bind.
 
 ## What this proves and what it does not
 

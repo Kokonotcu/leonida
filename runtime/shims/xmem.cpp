@@ -10,9 +10,10 @@
 // site shows the alignment/type fields, every block is 64-byte aligned (covers cache lines and SIMD) and a size of
 // zero is rounded up to one byte so the result is a stable, non-null pointer that XMemFree can release.
 //
-// The default allocators, the physical-page functions and XMemIsToolsMemAvailable follow argument shapes measured
-// locally at a title's call sites (each function says which). The page functions are built on the Windows placeholder
-// APIs (VirtualAlloc2, MapViewOfFile3), whose flags the title's own XMemVirtualAlloc calls already use.
+// The remaining exports (the default routines and their hooks, XMemMakeTag, XMemSetOption and the heap queries) follow
+// the public GDK XMem reference. The default allocators, the physical-page functions and XMemIsToolsMemAvailable follow
+// argument shapes measured locally at a title's call sites (each function says which). The page functions are built on
+// the Windows placeholder APIs (VirtualAlloc2, MapViewOfFile3), whose flags the title's own XMemVirtualAlloc calls use.
 #include <windows.h>
 #include <intrin.h>
 #include <malloc.h>
@@ -29,6 +30,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -40,6 +42,11 @@ namespace {
 
 constexpr size_t kAlign = 64;
 constexpr size_t kNoSize = static_cast<size_t>(-1);  // XMemFree has no size field
+
+constexpr const char* kApiAlloc = "XMemAlloc";
+constexpr const char* kApiFree = "XMemFree";
+constexpr const char* kApiAllocDefault = "XMemAllocDefault";
+constexpr const char* kApiFreeDefault = "XMemFreeDefault";
 
 std::string caller_field(const void* caller) {
     return ",\"caller\":" + rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller)));
@@ -66,28 +73,53 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
 
 void* allocate_block(size_t size) { return _aligned_malloc(size ? size : 1, kAlign); }
 
-void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
-    note_attributes("XMemAlloc", attributes, size, _ReturnAddress());
-    return allocate_block(size);
-}
-
-void __stdcall XMemFree(void* p, uint64_t attributes) {
-    note_attributes("XMemFree", attributes, kNoSize, _ReturnAddress());
-    _aligned_free(p);
-}
-
 // XMemAllocDefault / XMemFreeDefault: the GDK's own allocator behind XMemAlloc and XMemFree, which a title that hooks
 // XMemAlloc forwards to. The measured title reaches each through one wrapper that is a bare tail jump to the import,
 // so they take exactly XMemAlloc's and XMemFree's arguments. They share the heap: a block from either allocator may be
 // released by either free.
 void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
-    note_attributes("XMemAllocDefault", attributes, size, _ReturnAddress());
+    note_attributes(kApiAllocDefault, attributes, size, _ReturnAddress());
     return allocate_block(size);
 }
 
 void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
-    note_attributes("XMemFreeDefault", attributes, kNoSize, _ReturnAddress());
+    note_attributes(kApiFreeDefault, attributes, kNoSize, _ReturnAddress());
     _aligned_free(p);
+}
+
+// XMemSetAllocationHooks replaces the routines XMemAlloc and XMemFree call. Titles install them once at startup, before
+// allocating, so the pair is two atomics rather than a lock on every allocation. The free hook is published first: a
+// block that comes from a new alloc hook always meets its matching free hook.
+using AllocRoutine = void*(__stdcall*)(size_t, uint64_t);
+using FreeRoutine = void(__stdcall*)(void*, uint64_t);
+std::atomic<AllocRoutine> g_alloc_hook{nullptr};
+std::atomic<FreeRoutine> g_free_hook{nullptr};
+
+void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
+    note_attributes(kApiAlloc, attributes, size, _ReturnAddress());
+    const AllocRoutine hook = g_alloc_hook.load(std::memory_order_acquire);
+    // Allocate directly: calling XMemAllocDefault would log a second, misleading XMemAllocDefault event.
+    return hook ? hook(size, attributes) : allocate_block(size);
+}
+
+void __stdcall XMemFree(void* p, uint64_t attributes) {
+    note_attributes(kApiFree, attributes, kNoSize, _ReturnAddress());
+    const FreeRoutine hook = g_free_hook.load(std::memory_order_acquire);
+    if (hook)
+        hook(p, attributes);
+    else
+        _aligned_free(p);  // as above, without a second XMemFreeDefault event
+}
+
+// Both routines or neither: the GDK documents hooking only one of them as an error, and a lone hook would hand out
+// blocks the other side cannot release. Two nulls restore the defaults.
+void __stdcall XMemSetAllocationHooks(AllocRoutine alloc, FreeRoutine free_routine) {
+    if ((alloc == nullptr) != (free_routine == nullptr)) {
+        std::fprintf(stderr, "[rt] xmem: XMemSetAllocationHooks with only one routine ignored\n");
+        return;
+    }
+    g_free_hook.store(free_routine, std::memory_order_release);
+    g_alloc_hook.store(alloc, std::memory_order_release);
 }
 
 // BOOL XMemIsToolsMemAvailable(void). The measured title calls it from one helper, which six out-of-memory paths reach
@@ -181,19 +213,27 @@ struct PlaceholderApi {
     bool available() const { return virtual_alloc2 && map_view3 && unmap_view2; }
 };
 
-const PlaceholderApi& placeholder_api() {
-    static const PlaceholderApi api = [] {
-        PlaceholderApi resolved;
-        if (const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll")) {
-            resolved.virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelbase, "VirtualAlloc2"));
-            resolved.map_view3 = reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(kernelbase, "MapViewOfFile3"));
-            resolved.unmap_view2 =
-                reinterpret_cast<UnmapViewOfFile2Fn>(GetProcAddress(kernelbase, "UnmapViewOfFile2"));
-        }
-        return resolved;
-    }();
-    return api;
+PlaceholderApi resolve_placeholder_api() {
+    PlaceholderApi resolved;
+    // kernel32 forwards these, but a host may have kernelbase unloaded at the point the loader reaches the first
+    // shim call, so load it rather than assume.
+    HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+    if (!kernelbase) kernelbase = LoadLibraryW(L"kernelbase.dll");
+    if (kernelbase) {
+        resolved.virtual_alloc2 = reinterpret_cast<VirtualAlloc2Fn>(GetProcAddress(kernelbase, "VirtualAlloc2"));
+        resolved.map_view3 = reinterpret_cast<MapViewOfFile3Fn>(GetProcAddress(kernelbase, "MapViewOfFile3"));
+        resolved.unmap_view2 = reinterpret_cast<UnmapViewOfFile2Fn>(GetProcAddress(kernelbase, "UnmapViewOfFile2"));
+    }
+    return resolved;
 }
+
+// Namespace scope: this resolves during static initialisation, on the thread that starts the process. As a
+// function-local static it was first evaluated on the title's thread, the initialiser did not run there, every
+// member stayed null and available() answered no on a host that has VirtualAlloc2 -- so every console 64 KiB window
+// and every 2 MiB/4 MiB reservation took the plain-VirtualAlloc fallback instead of the placeholder path.
+const PlaceholderApi g_placeholder_api = resolve_placeholder_api();
+
+const PlaceholderApi& placeholder_api() { return g_placeholder_api; }
 
 // XMem allocation-type page bits select the guest page granularity and must not be forwarded as Win32 flags.
 constexpr DWORD kXmemLargePages = 0x20000000;  // 2 MiB pages
@@ -205,21 +245,27 @@ constexpr DWORD kXmemHostAllocationTypeMask = MEM_COMMIT | MEM_RESERVE | MEM_REP
                                               MEM_RESERVE_PLACEHOLDER | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH |
                                               MEM_RESET_UNDO;
 
+// The console's protection word adds the GPU's view of the memory to the CPU's: the PAGE_GRAPHICS_* bits of the
+// Windows SDK's winnt.h (PAGE_GRAPHICS_NOACCESS 0x800 .. PAGE_GRAPHICS_NOCACHE 0x40000). The measured title combines
+// them with PAGE_READWRITE or PAGE_NOACCESS, often with PAGE_WRITECOMBINE; the retail executable's XMemVirtualAlloc
+// passes 0x801 and 0x22004. The host refuses the graphics bits with ERROR_INVALID_PARAMETER, so they are dropped, and
+// so is PAGE_WRITECOMBINE: the D3D12 layer reads this memory on the CPU, which is uncached and very slow from
+// write-combined pages. A word with no CPU bits left (graphics-only memory) becomes PAGE_READWRITE for the same reason.
+constexpr DWORD kConsoleProtectBits = PAGE_WRITECOMBINE | PAGE_GRAPHICS_NOACCESS | PAGE_GRAPHICS_READONLY |
+                                      PAGE_GRAPHICS_READWRITE | PAGE_GRAPHICS_EXECUTE | PAGE_GRAPHICS_EXECUTE_READ |
+                                      PAGE_GRAPHICS_EXECUTE_READWRITE | PAGE_GRAPHICS_COHERENT |
+                                      PAGE_GRAPHICS_NOCACHE;
+
+DWORD host_protect(DWORD protect) {
+    const DWORD host = protect & ~kConsoleProtectBits;
+    return host ? host : PAGE_READWRITE;
+}
+
 bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
     const SIZE_T max = (std::numeric_limits<SIZE_T>::max)();
     if (alignment == 0 || (alignment & (alignment - 1)) != 0 || value > max - (alignment - 1)) return false;
     rounded = (value + alignment - 1) & ~(alignment - 1);
     return true;
-}
-
-// The console's PAGE_GRAPHICS_* protection bits (winnt.h: PAGE_GRAPHICS_NOACCESS 0x800 .. PAGE_GRAPHICS_NOCACHE
-// 0x40000). The host refuses them with ERROR_INVALID_PARAMETER, and the D3D12 layer reads guest memory through the
-// CPU mapping, so only the CPU protection is applied. The retail executable passes 0x801 and 0x22004.
-constexpr DWORD kPageGraphicsMask = 0x0007F800;
-
-DWORD host_protect(DWORD p) {
-    const DWORD cpu = p & ~kPageGraphicsMask;
-    return cpu ? cpu : PAGE_NOACCESS;
 }
 
 // Physical pages and the windows they are mapped into. One mutex covers both tables and every map and unmap.
@@ -313,15 +359,35 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
                                             PAGE_NOACCESS, parameter_count ? &parameter : nullptr, parameter_count);
 }
 
+// gta6rt --trace FILE: the first XMemVirtualAlloc for each distinct (type, attributes, protect) goes to the startup
+// trace as an "xmem_virtual_alloc" event with the size and the caller, so a run records the words the title passes.
+void note_virtual_alloc(DWORD type, uint64_t attributes, DWORD protect, SIZE_T size, const void* caller) {
+    if (!rt::startup_trace::enabled()) return;
+    static std::mutex mutex;
+    static std::set<std::tuple<DWORD, uint64_t, DWORD>> seen;
+    {
+        const std::lock_guard lock(mutex);
+        if (!seen.insert({type, attributes, protect}).second) return;
+    }
+    rt::startup_trace::event(
+        "xmem_virtual_alloc",
+        "\"api\":\"XMemVirtualAlloc\",\"type\":" + rt::startup_trace::quote(rt::startup_trace::hex(type)) +
+            ",\"attributes\":" + rt::startup_trace::quote(rt::startup_trace::hex(attributes)) +
+            ",\"protect\":" + rt::startup_trace::quote(rt::startup_trace::hex(protect)) +
+            ",\"size\":" + std::to_string(static_cast<uint64_t>(size)) + caller_field(caller));
+}
+
 // PVOID XMemVirtualAlloc(address, size, allocationType, attributes, protect). All 23 calls of the measured title pass a
 // nonzero attribute word; its bits are not decoded and nothing on the host depends on them, so it is accepted and only
-// recorded (xmem_attributes). Its types cover committed 2 MiB and 64 KiB pages, reserve-only 64 KiB windows for physical pages, one
+// recorded (xmem_attributes, and with the type and protection as xmem_virtual_alloc). Its types cover committed 2 MiB
+// and 64 KiB pages, reserve-only 64 KiB windows for physical pages, one
 // MEM_RESERVE_PLACEHOLDER reservation and five MEM_REPLACE_PLACEHOLDER windows carved out of it, each then filled with
 // XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
 // 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
 // VirtualAlloc2.
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+    note_virtual_alloc(allocation_type, attributes, protect, size, _ReturnAddress());
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -509,6 +575,11 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
     const uint64_t bytes = count * kPhysicalPageSize;  // below 2^37: count is below 2^21
     const HANDLE handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
                                              static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed)) {
+        std::fprintf(stderr, "[rt] xmem-probe: AllocatePhysicalPages count=%llu bytes=%llu handle=%p\n",
+                     static_cast<unsigned long long>(count), static_cast<unsigned long long>(bytes), handle);
+    }
     if (!handle) {
         *page_count = 0;
         return FALSE;
@@ -526,6 +597,11 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         g_pages[page] = PhysicalPage{section, i * kPhysicalPageSize};
         page_array[i] = page;
     }
+    static std::atomic<bool> done_logged{false};
+    if (!done_logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] xmem-probe: AllocatePhysicalPages done first=%llu last=%llu\n",
+                     static_cast<unsigned long long>(page_array[0]),
+                     static_cast<unsigned long long>(page_array[count - 1]));
     return TRUE;
 }
 
@@ -559,6 +635,10 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
 // Each page is its own view (MapViewOfFile3 into a 64 KiB placeholder), so any page can be remapped or unmapped later
 // without touching its neighbours. A failure part-way leaves the pages before it mapped.
 void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint64_t* page_array) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] xmem-probe: MapPhysicalPages address=%p count=%llu array=%p\n", address,
+                     static_cast<unsigned long long>(page_count), page_array);
     const uintptr_t start = reinterpret_cast<uintptr_t>(address);
     if (!aligned_page_address(start) || page_count > (std::numeric_limits<uintptr_t>::max)() / kPhysicalPageSize ||
         start > (std::numeric_limits<uintptr_t>::max)() - page_count * kPhysicalPageSize) {
@@ -692,6 +772,48 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
     return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
 }
 
+// XMemMakeTag packs a four-character code into the top 24 bits of an XMem flags word, six bits per character from the
+// documented alphabet (a-z, A-Z, 0-9 and '$'). ASSUMPTION: the console's order inside that alphabet is not public. The
+// tag only travels back into XMem calls, which ignore it here, so any stable packing is enough.
+uint64_t tag_code(uint32_t c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return 26 + (c - 'a');
+    if (c >= '0' && c <= '9') return 52 + (c - '0');
+    return c == '$' ? 62 : 63;
+}
+
+ULONGLONG __stdcall XMemMakeTag(uint32_t tag) {
+    uint64_t code = 0;
+    for (int i = 0; i < 4; ++i) code = (code << 6) | tag_code((tag >> (8 * i)) & 0xff);
+    return code << 40;
+}
+
+// The XMEM_OPTION settings all configure the console's heap manager (tag tree, page-size demotion, use-after-free
+// traps, file-mapping rules). There is no such manager behind XMemAllocDefault, so the call is recorded and ignored.
+// The argument is not read: the structure's layout is not public.
+void __stdcall XMemSetOption(uint64_t option) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] xmem: XMemSetOption(0x%llx) ignored: no console heap manager on the host\n",
+                     static_cast<unsigned long long>(option));
+}
+
+// The hooks fire when the console's memory manager services HeapAlloc, HeapReAlloc and HeapFree. Those calls go to the
+// host heap here, so the registration succeeds and the hooks never run.
+void __stdcall XMemSetWin32HeapTrackingHooks(void* alloc, void* realloc, void* free_routine) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] xmem: XMemSetWin32HeapTrackingHooks(%p, %p, %p) accepted; the host heap never calls "
+                             "them\n", alloc, realloc, free_routine);
+}
+
+// NULL is the documented answer when the title partition has no heap. Returning the host process heap instead would
+// let a title free title-heap blocks into a heap it does not own.
+HANDLE __stdcall XMemGetTitleHeap() { return nullptr; }
+
+// Grows a console heap to its hysteresis size ahead of time. The defaults commit on demand: nothing to grow.
+BOOL __stdcall XMemPreallocateFreeSpace(DWORD /*memory_type*/, BOOL /*large_heap*/) { return TRUE; }
+
 }  // namespace
 
 #define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
@@ -717,10 +839,16 @@ SHIM_TABLE(xmem,
     {"xmem.dll", "XMemVirtualAlloc", reinterpret_cast<void*>(&XMemVirtualAlloc)},
     {"xmem.dll", "XMemGetWriteWatch", reinterpret_cast<void*>(&XMemGetWriteWatch)},
     {"xmem.dll", "XMemResetWriteWatch", reinterpret_cast<void*>(&XMemResetWriteWatch)},
-    {"xmem.dll", "XMemTransferMemory", reinterpret_cast<void*>(&XMemTransferMemory)},
     {"xmem.dll", "XMemAllocDefault", reinterpret_cast<void*>(&XMemAllocDefault)},
     {"xmem.dll", "XMemFreeDefault", reinterpret_cast<void*>(&XMemFreeDefault)},
+    {"xmem.dll", "XMemSetAllocationHooks", reinterpret_cast<void*>(&XMemSetAllocationHooks)},
+    {"xmem.dll", "XMemMakeTag", reinterpret_cast<void*>(&XMemMakeTag)},
+    {"xmem.dll", "XMemSetOption", reinterpret_cast<void*>(&XMemSetOption)},
+    {"xmem.dll", "XMemSetWin32HeapTrackingHooks", reinterpret_cast<void*>(&XMemSetWin32HeapTrackingHooks)},
     {"xmem.dll", "XMemIsToolsMemAvailable", reinterpret_cast<void*>(&XMemIsToolsMemAvailable)},
+    {"xmem.dll", "XMemGetTitleHeap", reinterpret_cast<void*>(&XMemGetTitleHeap)},
+    {"xmem.dll", "XMemPreallocateFreeSpace", reinterpret_cast<void*>(&XMemPreallocateFreeSpace)},
+    {"xmem.dll", "XMemTransferMemory", reinterpret_cast<void*>(&XMemTransferMemory)},
     {"xmem.dll", "XMemAllocatePhysicalPages", reinterpret_cast<void*>(&XMemAllocatePhysicalPages)},
     {"xmem.dll", "XMemFreePhysicalPages", reinterpret_cast<void*>(&XMemFreePhysicalPages)},
     {"xmem.dll", "XMemMapPhysicalPages", reinterpret_cast<void*>(&XMemMapPhysicalPages)},

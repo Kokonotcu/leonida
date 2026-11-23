@@ -142,6 +142,17 @@ inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const Subg
     return r;
 }
 
+// Whether a pipeline from this stage's module is refused instead of built: a native wave64 compute shader (one
+// translated without --wave64-emulate) on a device that cannot give it 64 lanes (NVIDIA: 32 only). Such a shader
+// reads lanes 32-63 of a 32-wide subgroup and gives wrong results, and compute has an exact translation for any
+// size, --wave64-emulate, which make_game.py --wave64-emulate auto picks for such a GPU (#94). Vertex, geometry and
+// pixel shaders have no emulation; they run at the device's size and are only reported. Mesh shaders have one too,
+// but no mesh PSO exists yet to refuse.
+inline bool subgroup_refused(const SubgroupRequest& request) {
+    return request.outcome == SubgroupOutcome::unavailable && request.wanted == 64 &&
+           request.stage == VK_SHADER_STAGE_COMPUTE_BIT;
+}
+
 // Puts a request into a stage create-info. `storage` holds the chained structure and must outlive the
 // vkCreate*Pipelines call. Chains in front of whatever pNext already holds.
 inline void apply_subgroup_request(const SubgroupRequest& request,

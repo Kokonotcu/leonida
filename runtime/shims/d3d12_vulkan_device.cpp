@@ -12,10 +12,14 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "d3d12_console_feature.h"
+#include "d3d12_object_tags.h"
+#include "d3d12_dred.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "../src/arena_size.h"
+#include "../src/synthetic_va.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
 #include "../src/uav_clear.h"
@@ -200,14 +204,18 @@ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_ca
 }
 
 // A shader whose subgroup size cannot be had runs at the device's: inexact if it crosses the halves of a wave64 (or,
-// for a wave32 shader on a 64-wide default, reads lanes that are not its own). Logged once per stage with the first
-// shader's name, then again at 10, 100, 1000... of that stage so a whole corpus stays readable.
+// for a wave32 shader on a 64-wide default, reads lanes that are not its own). A native wave64 compute shader
+// is refused instead (leonida::subgroup_refused): one line says so and names the build that fixes it.
+// Logged once per stage with the first shader's name, then again at 10, 100, 1000... of that stage so a whole corpus
+// stays readable; refused and built shaders are counted apart, so the first refusal is always logged.
 void report_subgroup_unavailable(const leonida::ShaderEntry& entry, const leonida::SubgroupRequest& request,
                                  const leonida::SubgroupSizeCaps& caps) {
     static std::mutex mutex;
-    static std::map<std::string, std::pair<std::set<std::string>, unsigned>> seen;  // stage -> names, next report
+    // (stage, refused) -> names, next report
+    static std::map<std::pair<std::string, bool>, std::pair<std::set<std::string>, unsigned>> seen;
     std::lock_guard lock(mutex);
-    auto& [names, next_report] = seen[entry.stage];
+    const bool refused = leonida::subgroup_refused(request);
+    auto& [names, next_report] = seen[{entry.stage, refused}];
     if (!names.insert(entry.name).second) return;
     if (names.size() == 1) next_report = 10;
     else if (names.size() != next_report) return;
@@ -215,6 +223,15 @@ void report_subgroup_unavailable(const leonida::ShaderEntry& entry, const leonid
     const bool emulable = entry.stage == "cs" || entry.stage == "ms";
     const std::string so_far =
         names.size() > 1 ? " (shaders of this stage so far: " + std::to_string(names.size()) + ")" : "";
+    if (refused) {
+        std::fprintf(stderr,
+                     "[rt] d3d12: %s (%s) is a native wave64 shader and this device has no 64-wide subgroup for the "
+                     "stage (device sizes %u..%u, default %u): pipeline refused, it would give wrong results; "
+                     "translate with --wave64-emulate (make_game.py --wave64-emulate auto does)%s\n",
+                     entry.name.c_str(), entry.stage.c_str(), caps.min_size, caps.max_size, caps.default_size,
+                     so_far.c_str());
+        return;
+    }
     std::fprintf(stderr,
                  "[rt] d3d12: %s (%s) is a %u-wide shader but this device cannot require that subgroup size for the "
                  "stage (device sizes %u..%u, default %u, subgroupSizeControl %s); it runs at the device's size and "
@@ -323,6 +340,9 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     case DXGI_FORMAT_R8G8_SINT: return {VK_FORMAT_R8G8_SINT, color};
     case DXGI_FORMAT_R16_FLOAT: return {VK_FORMAT_R16_SFLOAT, color};
     case DXGI_FORMAT_R8_UNORM: return {VK_FORMAT_R8_UNORM, color};
+    // Alpha-only A8: the single channel holds the alpha value, so R8_UNORM is the same 8-bit storage; a shader
+    // view that reads alpha expects the component in R. Format 65 in the retail title's render targets.
+    case DXGI_FORMAT_A8_UNORM: return {VK_FORMAT_R8_UNORM, color};
     case DXGI_FORMAT_R8_TYPELESS: return {VK_FORMAT_R8_UNORM, color, true};
     case DXGI_FORMAT_R8_SNORM: return {VK_FORMAT_R8_SNORM, color};
     case DXGI_FORMAT_R8_UINT: return {VK_FORMAT_R8_UINT, color};
@@ -768,6 +788,43 @@ struct DeviceState {
         }
     }
 
+    // One VkPipelineCache for every pipeline the device creates (docs/d3d12_vulkan.md section 3.6): a PSO created a
+    // second time from the same shaders and state is satisfied from it. `pipeline_cache()` (above) makes it on first
+    // use. With Vulkan 1.3 every creation also asks for VkPipelineCreationFeedback, which is how the layer counts the
+    // creations the cache answered.
+    bool vulkan_1_3 = false;  // the physical device's apiVersion allows VkPipelineCreationFeedback without an extension
+    std::atomic<std::uint32_t> pipelines_created{0};
+    std::atomic<std::uint32_t> pipeline_cache_hits{0};
+
+    // The size of the cache's data in bytes, 0 without a cache.
+    std::size_t pipeline_cache_bytes() {
+        const VkPipelineCache cache = pipeline_cache();
+        std::size_t bytes = 0;
+        if (cache && context->vk.vkGetPipelineCacheData &&
+            context->vk.vkGetPipelineCacheData(info.device, cache, &bytes, nullptr) != VK_SUCCESS)
+            bytes = 0;
+        return bytes;
+    }
+
+    // `create(cache, info)` runs vkCreate*Pipelines with the device's cache and `create_info` (a graphics or compute
+    // create-info, taken by value so the feedback struct can be chained in front of its pNext).
+    template<class Info, class Create>
+    VkResult create_pipeline(Create create, Info create_info) {
+        VkPipelineCreationFeedback total{};
+        VkPipelineCreationFeedbackCreateInfo feedback{VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
+        feedback.pPipelineCreationFeedback = &total;
+        if (vulkan_1_3) {
+            feedback.pNext = create_info.pNext;
+            create_info.pNext = &feedback;
+        }
+        const VkResult result = create(pipeline_cache(), create_info);
+        if (result == VK_SUCCESS && vulkan_1_3 && (total.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT)) {
+            ++pipelines_created;
+            if (total.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) ++pipeline_cache_hits;
+        }
+        return result;
+    }
+
     // The translator's output, loaded on first use.
     std::mutex library_mutex;
     bool library_tried = false;
@@ -949,10 +1006,12 @@ struct DeviceState {
     // The format a texture description is created with, D24S8 and R9G9B9E5 UAV fallbacks included.
     Format texture_format(const D3D12_RESOURCE_DESC& desc) const {
         if (!xr_bias_compatible(desc)) return {};
+        // Native D3D12 refuses an A8 render target; the console title renders into A8 (the 4K alpha/UI target).
+        // The image is R8_UNORM, which is render-target capable, and the A8 view swizzles alpha out of R, so the
+        // console path allows the render-target flag. Depth/stencil and UAV stay refused as on the host.
         if (desc.Format == DXGI_FORMAT_A8_UNORM &&
             (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
-             (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
+             (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
             return {};
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             if ((desc.SampleDesc.Count != 1 && (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
@@ -1065,6 +1124,8 @@ struct DeviceState {
     // section 3.3) stays below, and 256 bytes apart (the T# keeps addresses in 256-byte units). Nothing
     // dereferences it.
     std::atomic<std::uint64_t> next_image_address{std::uint64_t(1) << 32};
+    // VAs of buffers on a device with no GPU address arena (src/synthetic_va.h).
+    leonida::SyntheticVa synthetic_va;
 
     // 0 float, 1 unsigned integer, 2 signed integer: which of the three storage-image arrays a view belongs in.
     static int numeric_class(VkFormat format) {
@@ -1481,21 +1542,50 @@ const char* heap_properties_refusal(const D3D12_HEAP_PROPERTIES& heap, bool uma)
     return nullptr;
 }
 
-// Why the host would refuse this CreateHeap description, or null if these checks pass (D3D-238). A probe on an
-// RX 5700 and WARP refuses an alignment other than 0, 64 KiB and 4 MiB, the heap properties above (a type of 0, a
-// custom heap without a CPU page property), and a heap that denies buffers and both kinds of texture. ALLOW_DISPLAY
-// (CreateCommittedResource on a default heap only, per the D3D12_HEAP_FLAGS documentation) is refused too, confirmed
-// on an RTX 4070 SUPER and a UHD 770 host by @CowBoYdu76. Those hosts accept HARDWARE_PROTECTED, so it is not refused.
+// Why the host would refuse this CreateHeap description, or null if these checks pass (D3D-238). Measured on an
+// RTX 5090, RX 5700, RTX 4070 SUPER, UHD 770 and WARP: refuses zero size, alignment other than 0 / 64 KiB / 4 MiB,
+// invalid heap properties (MEMORY_POOL_L1 on a UMA adapter among them), unknown D3D12_HEAP_FLAGS bits, ALLOW_DISPLAY
+// (CreateCommittedResource on a default heap only, per the D3D12_HEAP_FLAGS documentation), single-bit or all-three
+// DENY combinations (only ALLOW_ALL or ALLOW_ONLY_* are valid), SHARED on CPU-accessible heaps, SHARED_CROSS_ADAPTER
+// without SHARED or with DENY flags or on L1, ALLOW_WRITE_WATCH on non-CPU-accessible heaps, and
+// ALLOW_SHADER_ATOMICS on UPLOAD/READBACK heaps. HARDWARE_PROTECTED is accepted on Win11 hosts, so not refused.
 const char* heap_desc_refusal(const D3D12_HEAP_DESC& desc, bool uma) {
     if (!desc.SizeInBytes) return "zero size";
     if (desc.Alignment && desc.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT &&
         desc.Alignment != D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT)
         return "alignment (0, 64 KiB or 4 MiB)";
     if (const char* why = heap_properties_refusal(desc.Properties, uma)) return why;
+    const UINT flags = UINT(desc.Flags);
+    constexpr UINT known_flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_ALLOW_DISPLAY |
+                                 D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+                                 D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_HARDWARE_PROTECTED |
+                                 D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH | D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS |
+                                 D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT | D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
+    if (flags & ~known_flags) return "unknown heap flags";
+    if (flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY) return "ALLOW_DISPLAY (committed resources only)";
     constexpr UINT deny_all = D3D12_HEAP_FLAG_DENY_BUFFERS | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
                               D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
-    if ((UINT(desc.Flags) & deny_all) == deny_all) return "heap flags denying every resource kind";
-    if (UINT(desc.Flags) & D3D12_HEAP_FLAG_ALLOW_DISPLAY) return "ALLOW_DISPLAY (committed resources only)";
+    const UINT deny = flags & deny_all;
+    if (deny != D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES && deny != D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS &&
+        deny != D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES && deny != D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES)
+        return "heap DENY flags (must allow all or allow only one resource kind)";
+    const bool cpu_accessible =
+        desc.Properties.Type == D3D12_HEAP_TYPE_UPLOAD || desc.Properties.Type == D3D12_HEAP_TYPE_READBACK ||
+        (desc.Properties.Type == D3D12_HEAP_TYPE_CUSTOM &&
+         desc.Properties.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE);
+    if ((flags & D3D12_HEAP_FLAG_SHARED) && cpu_accessible) return "SHARED on a CPU-accessible heap";
+    if (flags & D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER) {
+        if (!(flags & D3D12_HEAP_FLAG_SHARED)) return "SHARED_CROSS_ADAPTER without SHARED";
+        if (deny != D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES) return "SHARED_CROSS_ADAPTER with DENY flags";
+        if (desc.Properties.Type == D3D12_HEAP_TYPE_CUSTOM &&
+            desc.Properties.MemoryPoolPreference == D3D12_MEMORY_POOL_L1)
+            return "SHARED_CROSS_ADAPTER on L1 memory pool";
+    }
+    if ((flags & D3D12_HEAP_FLAG_ALLOW_WRITE_WATCH) && !cpu_accessible)
+        return "ALLOW_WRITE_WATCH on a non-CPU-accessible heap";
+    if ((flags & D3D12_HEAP_FLAG_ALLOW_SHADER_ATOMICS) &&
+        (desc.Properties.Type == D3D12_HEAP_TYPE_UPLOAD || desc.Properties.Type == D3D12_HEAP_TYPE_READBACK))
+        return "ALLOW_SHADER_ATOMICS on upload or readback heap";
     return nullptr;
 }
 
@@ -1708,10 +1798,12 @@ private:
 };
 
 class Resource final
-    : public Child<Resource, ID3D12ResourceStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource> {
+    : public Child<Resource, ID3D12Resource1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource,
+                   ID3D12Resource1> {
 public:
-    // {9b3e5f12-7c48-4d0e-a6b1-2f8d4c7e9a35}
-    static constexpr GUID kTag{0x9b3e5f12, 0x7c48, 0x4d0e, {0xa6, 0xb1, 0x2f, 0x8d, 0x4c, 0x7e, 0x9a, 0x35}};
+    // {9b3e5f12-7c48-4d0e-a6b1-2f8d4c7e9a35}, shared with presentx_capture.cpp so the capture guard and this object
+    // cannot drift.
+    static constexpr GUID kTag = kLeonidaResourceTag;
 
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
              D3D12_HEAP_FLAGS heap_flags)
@@ -1857,6 +1949,12 @@ public:
             bda.buffer = buffer_;
             buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
             gpu_va_ = buffer_va_;
+        }
+        if (!addressable) {
+            // No arena: the VA is always a synthetic one, never the raw device address, which can be above the 48 bits
+            // a V# keeps and is aligned only as the driver likes. Left at 0 it would send a title's root descriptors
+            // and V#s to address 0, in every heap and state.
+            if (!device_.synthetic_va.allocate(desc_.Width, va_)) return E_OUTOFMEMORY;
         }
         if (device_.info.ray_tracing && initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
             vk.vkCreateAccelerationStructureKHR && vk.vkGetAccelerationStructureDeviceAddressKHR) {
@@ -2015,8 +2113,12 @@ public:
             info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             create.format_list.viewFormatCount = std::uint32_t(view_formats_.size());
             create.format_list.pViewFormats = view_formats_.data();
-            create.format_list.pNext = info.pNext;
-            info.pNext = &create.format_list;
+            // The R9G9B9E5 emulation already chained format_list (TextureCreateInfo): relinking it would point it
+            // at itself, and a looped pNext chain hangs whatever walks it.
+            if (info.pNext != &create.format_list) {
+                create.format_list.pNext = info.pNext;
+                info.pNext = &create.format_list;
+            }
         }
         const std::uint32_t samples = info.samples;
         // Textures the CPU reads and writes (WriteToSubresource/ReadFromSubresource) copy on the host when they can.
@@ -2118,6 +2220,12 @@ public:
     // structure reports its real device address (instance descriptors and builds hand it to the driver); other
     // buffers report their console VA into the GPU address arena.
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
+
+    // ID3D12Resource1: as for a heap, no resource belongs to a protected session (DXGI_ERROR_NOT_FOUND, null out).
+    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return DXGI_ERROR_NOT_FOUND;
+    }
 
     //
     // The node masks read back as the one node of a single adapter (0 becomes 1), and the heap flags as the runtime
@@ -2583,7 +2691,8 @@ bool equal_semantic(const std::string& a, const char* b) {
 // name any 64 KiB-aligned offset in it. Textures placed in it still get their own VkDeviceMemory; the offset is only
 // their key, which keeps optimal-tiling images out of the arena's memory type.
 class Heap final
-    : public Child<Heap, ID3D12HeapStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Heap> {
+    : public Child<Heap, ID3D12Heap1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Heap,
+                   ID3D12Heap1> {
 public:
     // {5d20c7a4-8e13-4b6d-9f27-3a1c94e0b7d8}
     static constexpr GUID kTag{0x5d20c7a4, 0x8e13, 0x4b6d, {0x9f, 0x27, 0x3a, 0x1c, 0x94, 0xe0, 0xb7, 0xd8}};
@@ -2612,6 +2721,13 @@ public:
         desc.Properties.CreationNodeMask = 1;
         desc.Properties.VisibleNodeMask = 1;
         return desc;
+    }
+
+    // ID3D12Heap1: the layer has no protected resource sessions, so no heap belongs to one. The host runtime and
+    // WARP answer DXGI_ERROR_NOT_FOUND with a null interface for an unprotected heap, whatever the IID asked for.
+    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return DXGI_ERROR_NOT_FOUND;
     }
 
     bool reserved() const { return bool(allocation_); }
@@ -3371,7 +3487,9 @@ public:
         // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
         // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
         // stages[] is {vs, gs, ps} since geometry shaders joined graphics PSOs (#2109): the PS is stages[2], and with a
-        // GS the PS reads the GS's outputs, not the VS's, so the VS/PS halves link only applies without one.
+        // GS the PS reads the GS's outputs, not the VS's, so the VS/PS halves link only applies without one. Hull and
+        // domain shaders and stream output are refused above, so here the PS is the only reader of the VS's outputs,
+        // which lets the link demote raw VS outputs the PS does not read when it needs their locations.
         Stage& vs_stage = stages[0];
         Stage& gs_stage = stages[1];
         Stage& ps_stage = stages[2];
@@ -3802,6 +3920,13 @@ public:
                          entry->name.c_str());
             return E_NOTIMPL;
         }
+        // A native wave64 shader on a device without 64-wide compute subgroups would read lanes that are not there:
+        // refused before any Vulkan object is made (src/subgroup_size.h, subgroup_refused).
+        if (const leonida::SubgroupRequest request = leonida::decide_subgroup_size(*entry, device_.info.subgroup);
+            leonida::subgroup_refused(request)) {
+            report_subgroup_unavailable(*entry, request, device_.info.subgroup);
+            return E_NOTIMPL;
+        }
         if (entry->binding_count) register_literal_samplers(device_, *entry);
         // SHADER-309: a module over the device's maxComputeSharedMemorySize is invalid usage that spirv-val accepts
         // and RADV dies on (#1721); some drivers report 32768. Refuse it here instead of creating the pipeline.
@@ -3852,8 +3977,11 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (vk.vkCreateComputePipelines(dev, device_.pipeline_cache(), 1, &pipeline_info, nullptr, &pipeline_.pipeline) !=
-            VK_SUCCESS)
+        if (device_.create_pipeline(
+                [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
+                    return vk.vkCreateComputePipelines(dev, cache, 1, &create, nullptr, &pipeline_.pipeline);
+                },
+                pipeline_info) != VK_SUCCESS)
             return E_FAIL;
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
@@ -3969,8 +4097,12 @@ private:
         info.pDynamicState = &dynamic;
         info.layout = graphics_.layout;
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
-                                                          &info, nullptr, &pipeline) != VK_SUCCESS)
+        if (device_.create_pipeline(
+                [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& create) {
+                    return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &create,
+                                                                         nullptr, &pipeline);
+                },
+                info) != VK_SUCCESS)
             return VK_NULL_HANDLE;
         return pipeline;
     }
@@ -4782,12 +4914,11 @@ private:
     bool registered_ = false;            // added to the context, so removed from it on destruction
 };
 
-// The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
+// The Vulkan device create_vulkan_device_standalone made, destroyed with the D3D12 device. The instance belongs to
+// the process and is never destroyed (create_vulkan_device_standalone).
 struct OwnedRuntime {
     PFN_vkDestroyDevice destroy_device = nullptr;
-    PFN_vkDestroyInstance destroy_instance = nullptr;
     VkDevice device = VK_NULL_HANDLE;
-    VkInstance instance = VK_NULL_HANDLE;
 };
 
 class Device final
@@ -4829,6 +4960,11 @@ public:
             return;
         state_.r9g9b9e5_uav_emulated = state_.probe_r9g9b9e5_uav_emulation();
         memory_properties(info.physical, &state_.memory);
+        {
+            VkPhysicalDeviceProperties physical_properties{};
+            device_properties(info.physical, &physical_properties);
+            state_.vulkan_1_3 = physical_properties.apiVersion >= VK_API_VERSION_1_3;
+        }
         {
             char text[4] = {};
             size_t length = 0;
@@ -4904,6 +5040,13 @@ public:
                     return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
                 });
         }
+        state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count,
+                                              info.max_draw_indirect_count ? info.max_draw_indirect_count : UINT32_MAX);
+        if (!info.draw_indirect_first_instance)
+            std::fprintf(stderr, "[rt] d3d12: drawIndirectFirstInstance is not enabled: ExecuteIndirect records with "
+                                 "a StartInstanceLocation other than 0 are invalid\n");
+        dred_.attach(static_cast<ID3D12Device*>(this), state_.context.get(), &removed_, &state_.arena.address,
+                     dred_requested());
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         if (info.conditional_rendering) {
@@ -4990,6 +5133,12 @@ public:
             if (family.queueFlags & VK_QUEUE_COMPUTE_BIT)
                 state_.context->set_occlusion_resolve_memory(state_.memory);
         }
+        if ((dred_requested() || info.buffer_marker) &&
+            !state_.context->configure_breadcrumbs(state_.memory, info.buffer_marker, info.device_fault,
+                                                   dred_level() >= 2))
+            std::fprintf(stderr, "[rt] d3d12 DRED: no GPU breadcrumbs (%s); a device-lost report lists the submitted "
+                                 "command lists with their GPU progress UNKNOWN\n",
+                         info.buffer_marker ? "no host-visible memory for them" : "no VK_AMD_buffer_marker");
 
         if (info.debug_utils) {
             leonida::DebugLabelFunctions labels;
@@ -5265,7 +5414,6 @@ public:
             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
         state_.context.reset();
         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
-        if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
     }
 
     bool ok() const { return state_.context && state_.context->loaded(); }
@@ -5278,10 +5426,27 @@ public:
     leonida::VulkanContext& context() { return *state_.context; }
     const leonida::BindlessSet* bindless() const { return state_.bindless.get(); }
     const DeviceState& state() const { return state_; }
+    DeviceState& mutable_state() { return state_; }
     IUnknown* holder() { return identity(); }
     bool bind_sampler(const leonida::gfx10::SamplerWords& words) { return state_.bind_sampler(words); }
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
+
+    // The buffer resource holding console VA `va`, with a reference added for the caller, or null when no resource this
+    // layer made holds it. `start` and `size` are the resource's first VA and byte size.
+    // Only this layer's own buffers have a VA in the registry (the swapchain's are images, a copy's staging binding has
+    // no VA), so an ID found by VA is the ID3D12Resource pointer of a Resource (resource_id).
+    ID3D12Resource* add_ref_buffer_at(std::uint64_t va, std::uint64_t bytes, std::uint64_t& start, std::uint64_t& size) {
+        leonida::ResourceId id = 0;
+        ID3D12Resource* found = nullptr;
+        const bool ok = state_.context->buffer_resource_at(va, bytes, id, start, size, [&](leonida::ResourceId candidate) {
+            auto* resource = static_cast<Resource*>(reinterpret_cast<ID3D12Resource*>(candidate));
+            if (!resource->try_add_ref()) return false;
+            found = resource;
+            return true;
+        });
+        return ok ? found : nullptr;
+    }
 
     UINT STDMETHODCALLTYPE GetNodeCount() override { return 1; }
 
@@ -5428,6 +5593,16 @@ public:
 
     // STUB
     void STDMETHODCALLTYPE RemoveDevice() override { removed_.store(true, std::memory_order_release); }
+
+    // ID3D12DeviceRemovedExtendedData/1/2 are a tear-off with the device's identity (d3d12_dred.h).
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (out && dred_.attached() && DeviceRemovedData::answers(riid)) {
+            *out = static_cast<ID3D12DeviceRemovedExtendedData2*>(&dred_);
+            AddRef();
+            return S_OK;
+        }
+        return Object::QueryInterface(riid, out);
+    }
 
     HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* desc, REFIID riid,
                                                  void** out) override {
@@ -5593,6 +5768,15 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
+            // Replayed as vkCmdDrawMeshTasksIndirect(Count)EXT; without VK_EXT_mesh_shader there is no mesh PSO to
+            // run it with (the device reports MeshShaderTier NOT_SUPPORTED then).
+            if (!state_.info.mesh_shader || !state_.context->vk.vkCmdDrawMeshTasksIndirectEXT) return E_NOTIMPL;
+            // Root arguments or views before it would need the per-record expansion the draw kinds lack too
+            // (section 4.7); refuse rather than read the group counts from the record's first bytes.
+            if (desc->NumArgumentDescs != 1) return E_NOTIMPL;
+            kind = leonida::IndirectKind::dispatch_mesh;
+            break;
         default: return E_NOTIMPL;
         }
         return create_command_signature(kind, desc->ByteStride, riid, out, identity());
@@ -5733,6 +5917,13 @@ public:
             ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
              (desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV || desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV))) {
             log_once("CreateDescriptorHeap refused (flags or node mask), type", desc->Type);
+            return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        // A shader-visible heap with zero descriptors has no host answer: the runtime passes it to the driver,
+        // and WARP removes the device (DXGI_ERROR_DRIVER_INTERNAL_ERROR) while the RTX 3060 driver faults (D3D-434).
+        // Refuse it rather than ask the GPU address arena for an empty range (which it refuses as "full").
+        if ((desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && !desc->NumDescriptors) {
+            log_once("CreateDescriptorHeap refused (shader-visible, 0 descriptors), type", desc->Type);
             return d3d12_trace::result(method, E_INVALIDARG);
         }
         auto* heap = new DescriptorHeap(state_, *desc);
@@ -6117,7 +6308,11 @@ public:
     void STDMETHODCALLTYPE CopyDescriptors(UINT destination_ranges, const D3D12_CPU_DESCRIPTOR_HANDLE* destinations,
                                            const UINT* destination_sizes, UINT source_ranges,
                                            const D3D12_CPU_DESCRIPTOR_HANDLE* sources, const UINT* source_sizes,
-                                           D3D12_DESCRIPTOR_HEAP_TYPE) override {
+                                           D3D12_DESCRIPTOR_HEAP_TYPE type) override {
+        if (UINT(type) >= UINT(D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES)) {
+            log_once("CopyDescriptors ignored invalid descriptor heap type", int(type));
+            return;
+        }
         if (!destinations || !sources) return;
         UINT d = 0, s = 0, d_at = 0, s_at = 0;  // the range on each side, and the position in it
         while (d < destination_ranges && s < source_ranges) {
@@ -6137,8 +6332,12 @@ public:
 
     void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT count, D3D12_CPU_DESCRIPTOR_HANDLE destination,
                                                  D3D12_CPU_DESCRIPTOR_HANDLE source,
-                                                 D3D12_DESCRIPTOR_HEAP_TYPE) override {
-        if (!destination.ptr || !source.ptr) return;
+                                                 D3D12_DESCRIPTOR_HEAP_TYPE type) override {
+        if (UINT(type) >= UINT(D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES)) {
+            log_once("CopyDescriptorsSimple ignored invalid descriptor heap type", int(type));
+            return;
+        }
+        if (!count || !destination.ptr || !source.ptr) return;
         std::memmove(reinterpret_cast<void*>(destination.ptr), reinterpret_cast<const void*>(source.ptr),
                      std::size_t(count) * kDescriptorSize);
     }
@@ -6795,6 +6994,7 @@ public:
                      int(desc->SizeInBytes / 1024));
             return E_NOTIMPL;
         }
+        if (!out) return S_FALSE;
         auto* heap = new Heap(state_, *desc);
         heap->attach_device(identity());
         if (!heap->reserved()) {
@@ -6802,11 +7002,17 @@ public:
             heap->Release();
             return E_OUTOFMEMORY;
         }
-        if (!out) {
-            heap->Release();
-            return S_FALSE;
-        }
         return hand_out(heap, riid, out);
+    }
+
+    // Device4: CreateHeap with an optional protected session. The layer reports no protected-session support, so a
+    // session is refused as the committed-resource variants refuse one; without a session it is CreateHeap itself
+    // (the host runtime and WARP answer the same HRESULTs for the same arguments).
+    HRESULT STDMETHODCALLTYPE CreateHeap1(const D3D12_HEAP_DESC* desc, ID3D12ProtectedResourceSession* session,
+                                          REFIID riid, void** out) override {
+        if (out) *out = nullptr;
+        if (session) return refuse_protected_session("CreateHeap1");
+        return CreateHeap(desc, riid, out);
     }
 
     HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* heap_interface, UINT64 heap_offset,
@@ -7148,9 +7354,11 @@ public:
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS: {
-            if (size != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)) return d3d12_trace::result(method, E_INVALIDARG);
-            auto* opts = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS*>(data);
-            *opts = {};
+            // The console asks with a larger structure (0x40 against the PC's 0x3C): the PC fields, then zeros for
+            // the console's extra bytes. Smaller than the PC structure is E_INVALIDARG, as on the host.
+            if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)) return d3d12_trace::result(method, E_INVALIDARG);
+            D3D12_FEATURE_DATA_D3D12_OPTIONS answer{};
+            auto* opts = &answer;
             // Answer what the layer will actually honour, not what the GPU offers: docs/d3d12_vulkan.md 4.1 says a
             // false "supported" is worse than a false "unsupported" at boot, and the PSO paths refuse these same
             // features when they are missing (logic ops, per the mapping vkd3d-proton's
@@ -7177,6 +7385,10 @@ public:
             opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation =
                 state_.info.shader_output_layer && state_.info.shader_output_viewport_index;
             opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
+            rt::d3d12::store_with_console_tail(data, size, &answer, sizeof(answer));
+            if (rt::d3d12::is_console_sized_feature_request(feature, size))
+                log_once("CheckFeatureSupport(D3D12_OPTIONS) asked for more bytes than the PC structure has (60), "
+                         "extra bytes zeroed; size", int(size));
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS1: {
@@ -8321,6 +8533,7 @@ private:
     std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
     std::atomic<bool> removed_{false};
+    DeviceRemovedData dred_;
     OwnedRuntime owned_;
     IUnknown* outer_ = nullptr;  // the Xbox-ABI proxy, which owns a reference to this device
 };
@@ -8356,7 +8569,16 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
     // for IDXGIDevice1: the device's outer identity is the proxy itself either way.
     if (void* proxy = rt::d3d12_xs::device_proxy_primary(outer)) outer = static_cast<IUnknown*>(proxy);
     d->set_outer(outer);
-    // Second job, for an outer that is the Xbox-ABI proxy: its IDXGIDevice1::GetAdapter (d3d12_xs_device.h) hands
+    // Another job for an outer that is the Xbox-ABI proxy: its device slot 70 names a buffer by console VA only, and
+    // this finds the layer's resource for it.
+    if (rt::d3d12_xs::is_device_proxy(outer))
+        rt::d3d12_xs::set_device_resource_provider(
+            outer, [](ID3D12Device* real, std::uint64_t va, std::uint64_t bytes, std::uint64_t* start,
+                      std::uint64_t* size) -> ID3D12Resource* {
+                Device* device = Device::from<Device>(real);
+                return device ? device->add_ref_buffer_at(va, bytes, *start, *size) : nullptr;
+            });
+    // And for the same outer: its IDXGIDevice1::GetAdapter (d3d12_xs_device.h) hands
     // out this layer's adapter, the one create_dxgi_factory enumerates, so a title on the Vulkan device never gets
     // a host DXGI object from it.
     if (!rt::d3d12_xs::is_device_proxy(outer)) return;
@@ -8583,6 +8805,20 @@ BindlessRoom bindless_room(ID3D12Device* device) {
     return {set->free_images(leonida::ImageDimension::dim_2d), set->free_samplers()};
 }
 
+PipelineCacheStats pipeline_cache_stats(ID3D12Device* device) {
+    PipelineCacheStats stats{};
+    if (!device) return stats;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    Device* d = Device::from<Device>(real ? real : device);
+    if (!d) return stats;
+    DeviceState& state = d->mutable_state();
+    stats.available = state.vulkan_1_3 && state.pipeline_cache() != VK_NULL_HANDLE;
+    stats.created = state.pipelines_created;
+    stats.hits = state.pipeline_cache_hits;
+    stats.bytes = state.pipeline_cache_bytes();
+    return stats;
+}
+
 WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
     : device_(device), presenter_(std::move(presenter)) {
     device_->AddRef();
@@ -8791,116 +9027,149 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         std::fprintf(stderr, "[rt] d3d12: vulkan-1.dll not found\n");
         return E_FAIL;
     }
-    const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance"));
-    const auto enum_inst_exts = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
-        get(nullptr, "vkEnumerateInstanceExtensionProperties"));
-    std::vector<const char*> inst_exts;
-    bool surface_maintenance1_khr = false, surface_maintenance1_ext = false;  // enabled on the instance
-    bool swapchain_colorspace_enabled = false;  // VK_EXT_swapchain_colorspace on the instance
-    if (enum_inst_exts) {
-        std::uint32_t ext_cnt = 0;
-        enum_inst_exts(nullptr, &ext_cnt, nullptr);
-        std::vector<VkExtensionProperties> available(ext_cnt);
-        enum_inst_exts(nullptr, &ext_cnt, available.data());
-        bool has_surface = false, has_win32 = false, has_caps2 = false;
-        for (const auto& e : available) {
-            if (!std::strcmp(e.extensionName, VK_KHR_SURFACE_EXTENSION_NAME)) has_surface = true;
-            if (!std::strcmp(e.extensionName, VK_KHR_WIN32_SURFACE_EXTENSION_NAME)) has_win32 = true;
-            if (!std::strcmp(e.extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) has_caps2 = true;
-            if (!std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1")) surface_maintenance1_khr = true;
-            if (!std::strcmp(e.extensionName, "VK_EXT_surface_maintenance1")) surface_maintenance1_ext = true;
-        }
-        if (has_surface && has_win32) {
-            inst_exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
-            inst_exts.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
-            // Lists the HDR10 (ST.2084) surface formats, which a PresentX plane in HDR10 can use (xbox_present.h); without it
-            // the surface only offers sRGB-nonlinear ones.
-            for (const auto& e : available)
-                if (!std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
-                    inst_exts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
-                    swapchain_colorspace_enabled = true;
-                    break;
+    // One VkInstance for the process, made by the first call and kept until the process ends. Every device made here
+    // is created on it and destroyed with its D3D12 device (#5144, RT-398). Code outside the runtime caches the first
+    // instance's handles: RivaTuner Statistics Server's injected RTSSHooks64.dll calls
+    // vkGetPhysicalDeviceMemoryProperties on the first instance's VkPhysicalDevice from its vkQueuePresentKHR hook, and
+    // the loader ends the process when that instance was destroyed (a device released and another created). The
+    // instance settings, LEONIDA_VK_VALIDATION included, are those of the first call; the GPU is still picked per
+    // device (LEONIDA_VK_DEVICE).
+    struct ProcessInstance {
+        VkInstance instance = VK_NULL_HANDLE;
+        bool surface_maintenance1_khr = false, surface_maintenance1_ext = false;
+        bool swapchain_colorspace_enabled = false, instance_has_surface = false, has_debug_utils = false;
+    };
+    static std::mutex process_instance_mutex;
+    static ProcessInstance process_instance;
+    ProcessInstance shared;
+    {
+        const std::lock_guard<std::mutex> lock(process_instance_mutex);
+        if (!process_instance.instance) {
+            const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance"));
+            const auto enum_inst_exts = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                get(nullptr, "vkEnumerateInstanceExtensionProperties"));
+            std::vector<const char*> inst_exts;
+            bool surface_maintenance1_khr = false, surface_maintenance1_ext = false;  // enabled on the instance
+            bool swapchain_colorspace_enabled = false;  // VK_EXT_swapchain_colorspace on the instance
+            if (enum_inst_exts) {
+                std::uint32_t ext_cnt = 0;
+                enum_inst_exts(nullptr, &ext_cnt, nullptr);
+                std::vector<VkExtensionProperties> available(ext_cnt);
+                enum_inst_exts(nullptr, &ext_cnt, available.data());
+                bool has_surface = false, has_win32 = false, has_caps2 = false;
+                for (const auto& e : available) {
+                    if (!std::strcmp(e.extensionName, VK_KHR_SURFACE_EXTENSION_NAME)) has_surface = true;
+                    if (!std::strcmp(e.extensionName, VK_KHR_WIN32_SURFACE_EXTENSION_NAME)) has_win32 = true;
+                    if (!std::strcmp(e.extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) has_caps2 = true;
+                    if (!std::strcmp(e.extensionName, "VK_KHR_surface_maintenance1")) surface_maintenance1_khr = true;
+                    if (!std::strcmp(e.extensionName, "VK_EXT_surface_maintenance1")) surface_maintenance1_ext = true;
                 }
-            // The surface half of VK_*_swapchain_maintenance1 (the present modes a swapchain can switch between).
-            if (has_caps2 && (surface_maintenance1_khr || surface_maintenance1_ext)) {
-                inst_exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
-                if (surface_maintenance1_khr) inst_exts.push_back("VK_KHR_surface_maintenance1");
-                if (surface_maintenance1_ext) inst_exts.push_back("VK_EXT_surface_maintenance1");
-            } else {
-                surface_maintenance1_khr = surface_maintenance1_ext = false;
+                if (has_surface && has_win32) {
+                    inst_exts.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+                    inst_exts.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+                    // Lists the HDR10 (ST.2084) surface formats, which a PresentX plane in HDR10 can use (xbox_present.h); without it
+                    // the surface only offers sRGB-nonlinear ones.
+                    for (const auto& e : available)
+                        if (!std::strcmp(e.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+                            inst_exts.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+                            swapchain_colorspace_enabled = true;
+                            break;
+                        }
+                    // The surface half of VK_*_swapchain_maintenance1 (the present modes a swapchain can switch between).
+                    if (has_caps2 && (surface_maintenance1_khr || surface_maintenance1_ext)) {
+                        inst_exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+                        if (surface_maintenance1_khr) inst_exts.push_back("VK_KHR_surface_maintenance1");
+                        if (surface_maintenance1_ext) inst_exts.push_back("VK_EXT_surface_maintenance1");
+                    } else {
+                        surface_maintenance1_khr = surface_maintenance1_ext = false;
+                    }
+                } else {
+                    surface_maintenance1_khr = surface_maintenance1_ext = false;
+                }
             }
-        } else {
-            surface_maintenance1_khr = surface_maintenance1_ext = false;
+            VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+            app.pApplicationName = "gta6rt";
+            app.apiVersion = VK_API_VERSION_1_3;
+            VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+            instance_info.pApplicationInfo = &app;
+            const char* layer = "VK_LAYER_KHRONOS_validation";
+            const VkValidationFeatureEnableEXT sync_validation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
+            VkValidationFeaturesEXT validation_features{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
+            validation_features.enabledValidationFeatureCount = 1;
+            validation_features.pEnabledValidationFeatures = &sync_validation;
+            char validation[8] = {};
+            size_t length = 0;
+            if (getenv_s(&length, validation, "LEONIDA_VK_VALIDATION") == 0 && length > 1 && validation[0] != '0') {
+                // Ask for the layer only when the loader lists it, and say so when it does not: an instance that
+                // cannot be made because of a missing layer left the caller with "Vulkan unavailable" and no hint that
+                // validation was the cause. Wine does not list the Linux loader's layers to the program and refuses
+                // an explicit request for one, so there only VK_INSTANCE_LAYERS (which Wine keeps out of the
+                // program's environment) loads it.
+                bool layer_listed = false;
+                if (const auto enumerate_layers = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
+                        get(nullptr, "vkEnumerateInstanceLayerProperties"))) {
+                    std::uint32_t layer_count = 0;
+                    enumerate_layers(&layer_count, nullptr);
+                    std::vector<VkLayerProperties> layers(layer_count);
+                    if (layer_count && enumerate_layers(&layer_count, layers.data()) >= VK_SUCCESS)
+                        for (std::uint32_t i = 0; i < layer_count; ++i)
+                            layer_listed = layer_listed || std::strcmp(layers[i].layerName, layer) == 0;
+                }
+                if (layer_listed) {
+                    instance_info.pNext = &validation_features;
+                    instance_info.enabledLayerCount = 1;
+                    instance_info.ppEnabledLayerNames = &layer;
+                } else {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: LEONIDA_VK_VALIDATION is set but %s is not listed by the Vulkan loader "
+                                 "(install the Vulkan SDK; under Wine set VK_INSTANCE_LAYERS=%s instead)\n",
+                                 layer, layer);
+                    return E_FAIL;  // nothing kept: a later call tries again
+                }
+            }
+            // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
+            const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+            bool has_debug_utils = false;
+            if (const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                    get(nullptr, "vkEnumerateInstanceExtensionProperties"))) {
+                std::uint32_t extension_count = 0;
+                enumerate(nullptr, &extension_count, nullptr);
+                std::vector<VkExtensionProperties> extensions(extension_count);
+                enumerate(nullptr, &extension_count, extensions.data());
+                for (const auto& e : extensions) has_debug_utils = has_debug_utils || std::strcmp(e.extensionName, debug_utils) == 0;
+            }
+            // One list: the surface extensions above (for DXGI presentation) and debug utils both go on the instance.
+            const bool instance_has_surface = !inst_exts.empty();
+            if (has_debug_utils) inst_exts.push_back(debug_utils);
+            instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
+            instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
+            ProcessInstance made;
+            if (create_instance(&instance_info, nullptr, &made.instance) != VK_SUCCESS) {
+                std::fprintf(stderr, "[rt] d3d12: vkCreateInstance (Vulkan 1.3) failed\n");
+                return E_FAIL;  // nothing kept: a later call tries again
+            }
+            made.surface_maintenance1_khr = surface_maintenance1_khr;
+            made.surface_maintenance1_ext = surface_maintenance1_ext;
+            made.swapchain_colorspace_enabled = swapchain_colorspace_enabled;
+            made.instance_has_surface = instance_has_surface;
+            made.has_debug_utils = has_debug_utils;
+            process_instance = made;
         }
+        shared = process_instance;
     }
-    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.pApplicationName = "gta6rt";
-    app.apiVersion = VK_API_VERSION_1_3;
-    VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-    instance_info.pApplicationInfo = &app;
-    const char* layer = "VK_LAYER_KHRONOS_validation";
-    const VkValidationFeatureEnableEXT sync_validation = VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT;
-    VkValidationFeaturesEXT validation_features{VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT};
-    validation_features.enabledValidationFeatureCount = 1;
-    validation_features.pEnabledValidationFeatures = &sync_validation;
-    char validation[8] = {};
-    size_t length = 0;
-    if (getenv_s(&length, validation, "LEONIDA_VK_VALIDATION") == 0 && length > 1 && validation[0] != '0') {
-        // Ask for the layer only when the loader lists it, and say so when it does not: an instance that cannot be
-        // made because of a missing layer left the caller with "Vulkan unavailable" and no hint that validation was
-        // the cause. Wine does not list the Linux loader's layers to the program and refuses an explicit request for
-        // one, so there only VK_INSTANCE_LAYERS (which Wine keeps out of the program's environment) loads it.
-        bool layer_listed = false;
-        if (const auto enumerate_layers = reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
-                get(nullptr, "vkEnumerateInstanceLayerProperties"))) {
-            std::uint32_t layer_count = 0;
-            enumerate_layers(&layer_count, nullptr);
-            std::vector<VkLayerProperties> layers(layer_count);
-            if (layer_count && enumerate_layers(&layer_count, layers.data()) >= VK_SUCCESS)
-                for (std::uint32_t i = 0; i < layer_count; ++i)
-                    layer_listed = layer_listed || std::strcmp(layers[i].layerName, layer) == 0;
-        }
-        if (layer_listed) {
-            instance_info.pNext = &validation_features;
-            instance_info.enabledLayerCount = 1;
-            instance_info.ppEnabledLayerNames = &layer;
-        } else {
-            std::fprintf(stderr,
-                         "[rt] d3d12: LEONIDA_VK_VALIDATION is set but %s is not listed by the Vulkan loader "
-                         "(install the Vulkan SDK; under Wine set VK_INSTANCE_LAYERS=%s instead)\n",
-                         layer, layer);
-            return E_FAIL;
-        }
-    }
-    // VK_EXT_debug_utils when the loader has it, for the game's debug markers (PIX events) in RenderDoc and the like.
-    const char* debug_utils = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
-    bool has_debug_utils = false;
-    if (const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
-            get(nullptr, "vkEnumerateInstanceExtensionProperties"))) {
-        std::uint32_t extension_count = 0;
-        enumerate(nullptr, &extension_count, nullptr);
-        std::vector<VkExtensionProperties> extensions(extension_count);
-        enumerate(nullptr, &extension_count, extensions.data());
-        for (const auto& e : extensions) has_debug_utils = has_debug_utils || std::strcmp(e.extensionName, debug_utils) == 0;
-    }
-    // One list: the surface extensions above (for DXGI presentation) and debug utils both go on the instance.
-    const bool instance_has_surface = !inst_exts.empty();
-    if (has_debug_utils) inst_exts.push_back(debug_utils);
-    instance_info.enabledExtensionCount = static_cast<std::uint32_t>(inst_exts.size());
-    instance_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
+    const VkInstance instance = shared.instance;
+    const bool surface_maintenance1_khr = shared.surface_maintenance1_khr;
+    const bool surface_maintenance1_ext = shared.surface_maintenance1_ext;
+    const bool swapchain_colorspace_enabled = shared.swapchain_colorspace_enabled;
+    const bool instance_has_surface = shared.instance_has_surface;
+    const bool has_debug_utils = shared.has_debug_utils;
     OwnedRuntime owned{};
-    if (create_instance(&instance_info, nullptr, &owned.instance) != VK_SUCCESS) {
-        std::fprintf(stderr, "[rt] d3d12: vkCreateInstance (Vulkan 1.3) failed\n");
-        return E_FAIL;
-    }
-    owned.destroy_instance = reinterpret_cast<PFN_vkDestroyInstance>(get(owned.instance, "vkDestroyInstance"));
     const auto fail = [&](const char* why) {
         std::fprintf(stderr, "[rt] d3d12: %s\n", why);
-        owned.destroy_instance(owned.instance, nullptr);
         return E_FAIL;
     };
 
-#define LEONIDA_INSTANCE(name) const auto name = reinterpret_cast<PFN_##name>(get(owned.instance, #name))
+#define LEONIDA_INSTANCE(name) const auto name = reinterpret_cast<PFN_##name>(get(instance, #name))
     LEONIDA_INSTANCE(vkEnumeratePhysicalDevices);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceProperties);
     LEONIDA_INSTANCE(vkGetPhysicalDeviceQueueFamilyProperties);
@@ -8911,12 +9180,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     LEONIDA_INSTANCE(vkGetDeviceProcAddr);
 #undef LEONIDA_INSTANCE
     std::uint32_t count = 0;
-    vkEnumeratePhysicalDevices(owned.instance, &count, nullptr);
+    vkEnumeratePhysicalDevices(instance, &count, nullptr);
     std::vector<VkPhysicalDevice> physicals(count);
-    vkEnumeratePhysicalDevices(owned.instance, &count, physicals.data());
+    vkEnumeratePhysicalDevices(instance, &count, physicals.data());
     VulkanDeviceInfo info{};
     info.get_instance_proc = get;
-    info.instance = owned.instance;
+    info.instance = instance;
     info.separate_depth_stencil_layouts = true;
     info.debug_utils = has_debug_utils;
     VkPhysicalDeviceProperties chosen{};
@@ -9084,6 +9353,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                     chosen12.descriptorBindingStorageBufferUpdateAfterBind;
     info.bindless_partially_bound = info.bindless && chosen12.descriptorBindingPartiallyBound;
     info.sampler_anisotropy = chosen_features.samplerAnisotropy;
+    // ExecuteIndirect: several commands per call, and a count buffer.
+    info.multi_draw_indirect = chosen_features.multiDrawIndirect == VK_TRUE;
+    info.draw_indirect_count = chosen12.drawIndirectCount == VK_TRUE;
+    enable12.drawIndirectCount = info.draw_indirect_count;
+    info.draw_indirect_first_instance = chosen_features.drawIndirectFirstInstance == VK_TRUE;
+    info.max_draw_indirect_count = chosen.limits.maxDrawIndirectCount;
     info.sampler_mirror_clamp_to_edge = chosen12.samplerMirrorClampToEdge;
     info.sampler_filter_minmax = chosen12.samplerFilterMinmax;
     enable12.runtimeDescriptorArray = info.bindless;
@@ -9159,6 +9434,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (!chosen_features.shaderInt64)
         std::fprintf(stderr, "[rt] d3d12: the GPU has no shaderInt64; translated shaders (all declare Int64) will not load\n");
     enable.samplerAnisotropy = info.sampler_anisotropy;
+    enable.multiDrawIndirect = info.multi_draw_indirect;
+    enable.drawIndirectFirstInstance = chosen_features.drawIndirectFirstInstance;  // StartInstanceLocation in ExecuteIndirect
     enable.occlusionQueryPrecise = chosen_features.occlusionQueryPrecise;  // exact D3D12 occlusion counts
     enable.pipelineStatisticsQuery = chosen_features.pipelineStatisticsQuery;
     info.occlusion_query_precise = chosen_features.occlusionQueryPrecise == VK_TRUE;
@@ -9398,6 +9675,33 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                      "[rt] d3d12: no VK_EXT_custom_border_color; custom sampler border colours fall back to transparent black\n");
     }
 
+    // LEONIDA_DRED=1: device-lost diagnostics (vulkan_breadcrumbs.h), off by default.
+#if defined(VK_EXT_device_fault)
+    VkPhysicalDeviceFaultFeaturesEXT fault_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+#endif
+    if (dred_requested()) {
+        const auto device_has = [&](const char* name) {
+            return std::any_of(extensions.begin(), extensions.end(),
+                               [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+        };
+        info.buffer_marker = device_has(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+#if defined(VK_EXT_device_fault)
+        if (device_has(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &fault_features};
+            vkGetPhysicalDeviceFeatures2(info.physical, &query);
+            info.device_fault = fault_features.deviceFault == VK_TRUE;
+            if (info.device_fault) {
+                fault_features.deviceFaultVendorBinary = VK_FALSE;  // the report reads no vendor dump
+                fault_features.pNext = *v13.next();  // since #1706
+                *v13.next() = &fault_features;
+            }
+        }
+#endif
+        std::fprintf(stderr, "[rt] d3d12 DRED: breadcrumbs %s, device fault %s\n",
+                     info.buffer_marker ? "on" : "off (no VK_AMD_buffer_marker)",
+                     info.device_fault ? "on" : "off (no VK_EXT_device_fault)");
+    }
+
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, &enable12};
     device_info.queueCreateInfoCount = std::uint32_t(queue_infos.size());
     device_info.pQueueCreateInfos = queue_infos.data();
@@ -9425,6 +9729,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    if (info.buffer_marker) device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+#if defined(VK_EXT_device_fault)
+    if (info.device_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+#endif
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);

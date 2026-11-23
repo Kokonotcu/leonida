@@ -6,8 +6,8 @@
 // size at +8, and XMemVirtualQuery's MEMORY_BASIC_INFORMATION prefix inside a zeroed 64-byte output.
 // XMemTransferMemory follows the call shape in Microsoft's public samples: TRUE for any direction and size, with
 // nothing committed, and one trace event per distinct (type, size). XMemVirtualAlloc accepts attribute words and console
-// graphics protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical pages keep their
-// contents across unmap and remap, alias when mapped twice, and scatter-map per address.
+// graphics and write-combine protection bits and commits 2 MiB guest pages; the placeholder flags pass through; physical
+// pages keep their contents across unmap and remap, alias when mapped twice, and scatter-map per address.
 #include <windows.h>
 #include <psapi.h>
 
@@ -32,6 +32,12 @@ using XMemGetWorkingSetStatisticsFn = BOOL(__stdcall*)(uint32_t, void*);
 using XMemVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, ULONGLONG, DWORD);
 using XMemGetWriteWatchFn = UINT(WINAPI*)(DWORD, void*, SIZE_T, void**, ULONG_PTR*, ULONG*);
 using XMemResetWriteWatchFn = UINT(WINAPI*)(void*, SIZE_T);
+using XMemSetAllocationHooksFn = void(__stdcall*)(XMemAllocFn, XMemFreeFn);
+using XMemMakeTagFn = ULONGLONG(__stdcall*)(uint32_t);
+using BoolFn = BOOL(__stdcall*)();
+using TitleHeapFn = HANDLE(__stdcall*)();
+using PreallocateFn = BOOL(__stdcall*)(DWORD, BOOL);
+using SetOptionFn = void(__stdcall*)(uint64_t);
 // BOOL XMemTransferMemory(XMEM_TRANSFER_TYPE, SIZE_T): the shape Microsoft's public NetRumble and NativeAOT-Xbox
 // samples call (see runtime/shims/xmem.cpp).
 using XMemTransferMemoryFn = BOOL(WINAPI*)(uint32_t, SIZE_T);
@@ -245,17 +251,30 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
     }
 
     // The attribute word is accepted (every measured call passes a nonzero one) and the protection loses its graphics
-    // bits, in the 64 KiB page mode as well.
+    // and write-combine bits, in the 64 KiB page mode as well.
     void* const attributed = virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT | kXmem64kPages, 0x181,
-                                           PAGE_READWRITE | PAGE_GRAPHICS_READWRITE);
+                                           PAGE_READWRITE | PAGE_WRITECOMBINE | PAGE_GRAPHICS_READWRITE);
     check(attributed != nullptr, "XMemVirtualAlloc accepts a nonzero attribute word and console protection bits");
     if (attributed) {
         MEMORY_BASIC_INFORMATION info{};
         VirtualQuery(attributed, &info, sizeof(info));
         check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
-              "the region is committed PAGE_READWRITE (graphics bits dropped)");
+              "the region is committed PAGE_READWRITE (graphics and write-combine bits dropped)");
         static_cast<volatile uint8_t*>(attributed)[0] = 0x42;
         check(VirtualFree(attributed, 0, MEM_RELEASE), "release the attributed region");
+    }
+
+    // Graphics-only protection (no CPU bits left once the graphics bits go) is committed read-write: the D3D12 layer
+    // reads that memory on the CPU.
+    void* const graphics_only =
+        virtual_alloc(nullptr, kPage64k, MEM_RESERVE | MEM_COMMIT, 0x181, PAGE_GRAPHICS_READWRITE);
+    check(graphics_only != nullptr, "XMemVirtualAlloc accepts a graphics-only protection");
+    if (graphics_only) {
+        MEMORY_BASIC_INFORMATION info{};
+        VirtualQuery(graphics_only, &info, sizeof(info));
+        check(info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE,
+              "a graphics-only protection commits PAGE_READWRITE");
+        check(VirtualFree(graphics_only, 0, MEM_RELEASE), "release the graphics-only region");
     }
 
     // The retail executable's GPU pools: the attribute word is recorded, and the PAGE_GRAPHICS_* bits are dropped.
@@ -517,7 +536,10 @@ void test_attribute_trace(XMemAllocFn alloc, XMemFreeFn free_mem, XMemVirtualAll
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x5e50000\"") == 1, "XMemFree 0x5e50000 is recorded once");
     check(count("\"api\":\"XMemFree\",\"attributes\":\"0x77\"") == 1, "XMemFree 0x77 is recorded");
     check(count("\"attributes\":\"0x1111\"") == 0, "nothing was recorded while the trace was off");
-    check(count("\"caller\":\"") == 6, "every event names its caller");
+    check(count("\"kind\":\"xmem_virtual_alloc\"") == 1, "one xmem_virtual_alloc event for the one XMemVirtualAlloc");
+    check(count("\"type\":\"0x3000\",\"attributes\":\"0x183\",\"protect\":\"0x4\",\"size\":65536") == 1,
+          "the xmem_virtual_alloc event carries the type, the attribute word and the protection");
+    check(count("\"caller\":\"") == 7, "every event names its caller");
     DeleteFileW(path.c_str());
 }
 
@@ -639,6 +661,62 @@ void test_title_virtual_alloc() {
     }
 }
 
+// A hooked pair receives every XMemAlloc/XMemFree; one routine alone is refused; two nulls restore the defaults.
+int g_hook_allocs = 0;
+int g_hook_frees = 0;
+
+void* __stdcall counting_alloc(size_t size, uint64_t attributes) {
+    ++g_hook_allocs;
+    const auto fallback = reinterpret_cast<XMemAllocFn>(rt::shims::find("xmem.dll", "XMemAllocDefault"));
+    return fallback(size, attributes);
+}
+
+void __stdcall counting_free(void* p, uint64_t attributes) {
+    ++g_hook_frees;
+    const auto fallback = reinterpret_cast<XMemFreeFn>(rt::shims::find("xmem.dll", "XMemFreeDefault"));
+    fallback(p, attributes);
+}
+
+void test_allocation_hooks(XMemAllocFn alloc, XMemFreeFn free_mem) {
+    const auto set_hooks =
+        reinterpret_cast<XMemSetAllocationHooksFn>(rt::shims::find("xmem.dll", "XMemSetAllocationHooks"));
+    check(set_hooks != nullptr, "registry exposes xmem.dll!XMemSetAllocationHooks");
+    if (!set_hooks) return;
+
+    set_hooks(&counting_alloc, nullptr);
+    free_mem(alloc(32, 0), 0);
+    check(g_hook_allocs == 0 && g_hook_frees == 0, "a lone alloc hook is refused");
+
+    set_hooks(&counting_alloc, &counting_free);
+    void* const p = alloc(32, 0);
+    check(aligned_64(p), "the hooked XMemAlloc returns the default routine's 64-byte aligned block");
+    free_mem(p, 0);
+    check(g_hook_allocs == 1 && g_hook_frees == 1, "XMemAlloc and XMemFree go through the installed hooks");
+
+    set_hooks(nullptr, nullptr);
+    free_mem(alloc(32, 0), 0);
+    check(g_hook_allocs == 1 && g_hook_frees == 1, "two null routines restore the defaults");
+}
+
+void test_documented_queries() {
+    const auto make_tag = reinterpret_cast<XMemMakeTagFn>(rt::shims::find("xmem.dll", "XMemMakeTag"));
+    const auto tools = reinterpret_cast<BoolFn>(rt::shims::find("xmem.dll", "XMemIsToolsMemAvailable"));
+    const auto title_heap = reinterpret_cast<TitleHeapFn>(rt::shims::find("xmem.dll", "XMemGetTitleHeap"));
+    const auto preallocate =
+        reinterpret_cast<PreallocateFn>(rt::shims::find("xmem.dll", "XMemPreallocateFreeSpace"));
+    const auto set_option = reinterpret_cast<SetOptionFn>(rt::shims::find("xmem.dll", "XMemSetOption"));
+    check(make_tag && tools && title_heap && preallocate && set_option, "registry exposes the documented queries");
+    if (!make_tag || !tools || !title_heap || !preallocate || !set_option) return;
+
+    const uint64_t tag = make_tag('A' | 'b' << 8 | '0' << 16 | '$' << 24);
+    check(tag != 0 && (tag & ((uint64_t{1} << 40) - 1)) == 0, "XMemMakeTag fills only the top 24 bits");
+    check(tag != make_tag('A' | 'b' << 8 | '1' << 16 | '$' << 24), "XMemMakeTag tells different codes apart");
+    check(!tools(), "XMemIsToolsMemAvailable is FALSE outside a profiling dev kit");
+    check(title_heap() == nullptr, "XMemGetTitleHeap reports no title-partition heap");
+    check(preallocate(0, FALSE) == TRUE, "XMemPreallocateFreeSpace succeeds");
+    set_option(1);  // must return without reading the argument: 1 is not a readable address
+}
+
 void print_result() {
     if (g_failures == 0) {
         std::printf("xmem_test: OK (%d checks)\n", g_checks);
@@ -713,6 +791,8 @@ int main() {
     }
 
     test_title_virtual_alloc();
+    test_allocation_hooks(alloc, free_mem);
+    test_documented_queries();
 
     if (alloc_default && free_default) test_default_alloc(alloc, free_mem, alloc_default, free_default);
     if (tools_mem) check(tools_mem() == FALSE, "XMemIsToolsMemAvailable returns FALSE (no devkit tools memory)");

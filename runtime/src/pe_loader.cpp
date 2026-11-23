@@ -171,12 +171,27 @@ std::array<std::atomic<Module*>, kMaxMappedTlsModules> g_tls_slot_owners{};
 std::array<std::atomic<uint64_t>, kMaxMappedTlsModules> g_tls_slot_generations{};
 std::atomic<uint64_t> g_next_tls_generation{1};
 std::vector<TlsCloneRecord> g_tls_clones;
+bool g_tls_event_hooked = false;
+
+void set_host_thread_event_hook(HMODULE module, void(__cdecl* fn)(DWORD)) {
+    if (!module) return;
+    using SetThreadEvent = void(__cdecl*)(void(__cdecl*)(DWORD));
+    if (auto set = reinterpret_cast<SetThreadEvent>(GetProcAddress(module, "gta6rt_tls_host_set_thread_event"))) {
+        set(fn);
+        g_tls_event_hooked = (fn != nullptr);
+    }
+}
 
 // Frees every TLS helper clone this process loaded and deletes its files. load() registers the wrapper with atexit;
 // the --run path in main() must also call this directly before ExitProcess, which skips the atexit table. Call it
 // only when no mapped code can run again: it unmaps the helper images.
 void cleanup_tls_clones_internal() {
+    std::lock_guard alloc_lock(g_tls_alloc_mutex);
+    if (g_tls_hosts[0].module && g_tls_event_hooked) set_host_thread_event_hook(g_tls_hosts[0].module, nullptr);
     for (const auto& rec : g_tls_clones) {
+        for (size_t i = 1; i < kMaxMappedTlsModules; ++i) {
+            if (g_tls_hosts[i].module == rec.module) g_tls_hosts[i] = {};
+        }
         if (rec.module) FreeLibrary(rec.module);
         if (!rec.path.empty()) DeleteFileW(rec.path.c_str());
     }
@@ -261,9 +276,7 @@ TlsHostModule load_tls_host_image(const std::filesystem::path& path, bool hook_t
     host.index = *reinterpret_cast<DWORD*>(tls->AddressOfIndex);
     if (hook_thread_events) {
         // Only the primary helper reports thread attach/detach events; on_host_thread_event iterates all active slots.
-        using SetThreadEvent = void(__cdecl*)(void(__cdecl*)(DWORD));
-        if (auto set = reinterpret_cast<SetThreadEvent>(GetProcAddress(host.module, "gta6rt_tls_host_set_thread_event")))
-            set(&on_host_thread_event);
+        set_host_thread_event_hook(host.module, &on_host_thread_event);
     }
     return host;
 }
@@ -271,6 +284,8 @@ TlsHostModule load_tls_host_image(const std::filesystem::path& path, bool hook_t
 // Must be called with g_tls_alloc_mutex held and WITHOUT g_tls_lock held (LoadLibraryExW takes the Windows loader lock).
 TlsHostModule ensure_tls_host(size_t slot) {
     if (slot >= kMaxMappedTlsModules) return {};
+    if (g_tls_hosts[0].module && !g_tls_event_hooked)
+        set_host_thread_event_hook(g_tls_hosts[0].module, &on_host_thread_event);
     if (g_tls_hosts[slot].index != TLS_OUT_OF_INDEXES) return g_tls_hosts[slot];
 
     const std::filesystem::path primary = tls_host_base_path();
@@ -470,6 +485,73 @@ void uninstall_thread_block(Module& m) {
         m.tls_saved_block = nullptr;
     }
     release_thread_slot(slot);
+}
+
+// The retail console main EXE does not load _tls_index: its CRT reads gs:[58h][0] directly (the console's main-module
+// assumption), while the loader was giving it the helper's index (8 here). Its thread-attach TLS callback therefore
+// wrote a 0x1480-byte block into the host EXE's 0x2c0-byte block at slot 0 and overran the process heap. Move the
+// host's own TLS to the primary helper's index and leave slot 0 for that main image. The helper is CRT-free, so its
+// module slot has no other user; the saved block goes back before the OS frees the thread's TLS array.
+extern "C" unsigned long _tls_index;
+
+struct HostTlsState {
+    DWORD index = TLS_OUT_OF_INDEXES;
+    const uint8_t* raw = nullptr;
+    uint32_t raw_size = 0;
+    uint32_t zero_fill = 0;
+    uint32_t total = 0;
+    DWORD saved_slot = TLS_OUT_OF_INDEXES;
+};
+HostTlsState g_host_tls;
+
+bool module_is_dll(const Module& m) {
+    const auto* nt = at<IMAGE_NT_HEADERS64>(m.base, reinterpret_cast<IMAGE_DOS_HEADER*>(m.base)->e_lfanew);
+    return (nt->FileHeader.Characteristics & IMAGE_FILE_DLL) != 0;
+}
+
+void init_host_tls(DWORD index) {
+    if (g_host_tls.index != TLS_OUT_OF_INDEXES) return;
+    auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr));
+    auto* nt = at<IMAGE_NT_HEADERS64>(base, reinterpret_cast<IMAGE_DOS_HEADER*>(base)->e_lfanew);
+    const auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!dir.Size) throw std::runtime_error("gta6rt: the host image has no TLS directory");
+    auto* tls = at<IMAGE_TLS_DIRECTORY64>(base, dir.VirtualAddress);
+    const uint64_t raw = tls->EndAddressOfRawData - tls->StartAddressOfRawData;
+    const uint64_t total = raw + tls->SizeOfZeroFill;
+    if (total > 0xFFFFFFFFull) throw std::runtime_error("gta6rt: the host TLS block is too large");
+    g_host_tls.raw = reinterpret_cast<const uint8_t*>(tls->StartAddressOfRawData);
+    g_host_tls.raw_size = static_cast<uint32_t>(raw);
+    g_host_tls.zero_fill = tls->SizeOfZeroFill;
+    g_host_tls.total = static_cast<uint32_t>(total);
+    g_host_tls.index = index;
+    g_host_tls.saved_slot = TlsAlloc();
+    if (g_host_tls.saved_slot == TLS_OUT_OF_INDEXES) throw std::runtime_error("gta6rt: TlsAlloc failed");
+}
+
+void install_host_tls() {
+    if (g_host_tls.index == TLS_OUT_OF_INDEXES) return;
+    void** slots = module_tls_slots();
+    if (!slots || g_host_tls.index >= kMaxModuleTlsSlots)
+        throw std::runtime_error("gta6rt: cannot install the host TLS block in this thread");
+    void* block = VirtualAlloc(nullptr, g_host_tls.total, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!block) throw std::runtime_error("gta6rt: host TLS block allocation failed");
+    if (g_host_tls.raw_size) std::memcpy(block, g_host_tls.raw, g_host_tls.raw_size);
+    if (g_host_tls.zero_fill)
+        std::memset(static_cast<uint8_t*>(block) + g_host_tls.raw_size, 0, g_host_tls.zero_fill);
+    void* saved = slots[g_host_tls.index];
+    slots[g_host_tls.index] = block;
+    TlsSetValue(g_host_tls.saved_slot, saved);
+}
+
+void uninstall_host_tls() {
+    if (g_host_tls.index == TLS_OUT_OF_INDEXES) return;
+    void** slots = module_tls_slots();
+    void* saved = TlsGetValue(g_host_tls.saved_slot);
+    if (!slots || !saved) return;  // not installed on this thread
+    void* block = slots[g_host_tls.index];
+    if (block && block != saved) VirtualFree(block, 0, MEM_RELEASE);
+    slots[g_host_tls.index] = saved;
+    TlsSetValue(g_host_tls.saved_slot, nullptr);
 }
 
 // `trace`: record each callback in the startup trace. Only the Loader's own calls (process attach and detach) pass
@@ -766,6 +848,13 @@ void __cdecl on_host_thread_event(DWORD reason) {
     // The try/catch is per slot: a throw from one module's install or callbacks must not take the thread events
     // away from the other slots. Nothing may leave DllMain.
     if (reason == DLL_THREAD_ATTACH) {
+        // gta6rt's TLS now lives at the primary helper's index, so install its block before any gta6rt code on this
+        // thread touches a thread_local (the event runs before the thread start routine).
+        try {
+            install_host_tls();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[rt] loader: host TLS attach: %s\n", e.what());
+        }
         try {
             forget_ended_thread_id();
         } catch (const std::exception& e) {
@@ -808,6 +897,8 @@ void __cdecl on_host_thread_event(DWORD reason) {
                 release_thread_slot(i);  // installed by a module whose Loader is gone (or nothing to do)
             }
         }
+        // Last: put the helper's own block back before the OS frees this thread's TLS array.
+        uninstall_host_tls();
     }
 }
 
@@ -916,6 +1007,14 @@ bool bundled_owns_handle(void* ctx, void* module) {
     return static_cast<Loader*>(ctx)->owns_module_handle(module);
 }
 
+void* bundled_main_module(void* ctx) {
+    return static_cast<Loader*>(ctx)->main_module();
+}
+
+const std::filesystem::path* bundled_module_path(void* ctx, void* module) {
+    return static_cast<Loader*>(ctx)->module_path_for(module);
+}
+
 void* bundled_find_loaded_w(void* ctx, const std::wstring& basename) {
     return static_cast<Loader*>(ctx)->find_loaded_module_w(basename);
 }
@@ -929,6 +1028,8 @@ const shims::BundledModuleOps kBundledOps{
     &bundled_load,
     &bundled_get_proc,
     &bundled_owns_handle,
+    &bundled_main_module,
+    &bundled_module_path,
     &bundled_find_loaded_w,
     &bundled_load_w,
 };
@@ -969,6 +1070,7 @@ Loader::~Loader() {
             entry(m.base, DLL_PROCESS_DETACH, nullptr);  // explicit unload; the return value is ignored
         }
     }
+    shims::remove_xmem_allocation_hooks(this);
     shims::remove_bundled_loader(this);
     shims::remove_module_lookup(this);
     for (auto* m : order_) {
@@ -990,6 +1092,11 @@ Loader::~Loader() {
         if (m->tls_block) VirtualFree(m->tls_block, 0, MEM_RELEASE);
         if (m->base) VirtualFree(m->base, 0, MEM_RELEASE);
         delete m;
+    }
+    // The mapped EXE gave slot 0 back above; return the host to its original index on this thread too.
+    if (g_host_tls.index != TLS_OUT_OF_INDEXES && TlsGetValue(g_host_tls.saved_slot)) {
+        _tls_index = 0;
+        uninstall_host_tls();
     }
 }
 
@@ -1182,6 +1289,19 @@ bool Loader::owns_module_handle(void* module_handle) const {
     return false;
 }
 
+void* Loader::main_module() const {
+    std::lock_guard lock(mutex_);
+    return order_.empty() ? nullptr : static_cast<void*>(order_.front()->base);
+}
+
+const std::filesystem::path* Loader::module_path_for(void* module_handle) const {
+    std::lock_guard lock(mutex_);
+    if (!module_handle) return order_.empty() ? nullptr : &order_.front()->path;
+    for (Module* m : order_)
+        if (m->base == module_handle) return &m->path;
+    return nullptr;
+}
+
 // x64 has no frame-pointer chain to fall back on: without its .pdata registered, an exception raised in (or passing
 // through) a mapped image can't be dispatched past that frame, and the process dies. Images the system loader maps
 // are found through its own module list; ours are VirtualAlloc'd, so they are registered as dynamic function tables.
@@ -1292,40 +1412,35 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
     m->preferred_base = oh.ImageBase;
     m->size = oh.SizeOfImage;
     m->entry_rva = oh.AddressOfEntryPoint;
-    by_name_[module_key(path)] = m;
-    order_.push_back(m);
+    try {
+        // Inside the range gta6rt reserved for this image before the process started (base_reservation.h), else as usual.
+        m->base = static_cast<uint8_t*>(base_reservation::commit_reserved(oh.ImageBase, oh.SizeOfImage));
+        if (!m->base)
+            m->base = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage,
+                                                         MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (!m->base) {
+            const auto relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+            if (!relocs.Size)
+                throw std::runtime_error(m->name + ": preferred base is taken and the image has no relocations");
+            m->base =
+                static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+            if (!m->base) throw std::runtime_error(m->name + ": VirtualAlloc failed");
+        }
 
-    // Inside the range gta6rt reserved for this image before the process started (base_reservation.h), else as usual.
-    m->base = static_cast<uint8_t*>(base_reservation::commit_reserved(oh.ImageBase, oh.SizeOfImage));
-    if (!m->base)
-        m->base = static_cast<uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(oh.ImageBase), oh.SizeOfImage,
-                                                     MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    if (!m->base) {
-        const auto relocs = directory(nt, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-        if (!relocs.Size)
-            throw std::runtime_error(m->name + ": preferred base is taken and the image has no relocations");
-        m->base = static_cast<uint8_t*>(VirtualAlloc(nullptr, oh.SizeOfImage, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        if (!m->base) throw std::runtime_error(m->name + ": VirtualAlloc failed");
-    }
-    {
-        // From here an address inside the image names it. The memory stays until ~Loader, which unregisters the
-        // lookup first.
-        std::unique_lock lock(ranges_mutex_);
-        ranges_.push_back({reinterpret_cast<uint64_t>(m->base), m->size, m->name});
-    }
-
-    std::memcpy(m->base, file.data(), oh.SizeOfHeaders);
-    auto* sec = IMAGE_FIRST_SECTION(nt);
-    for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
-        if (sec->VirtualAddress < oh.SizeOfHeaders)
-            throw std::runtime_error(m->name + ": section " + std::to_string(i) + " overlaps the headers");
-        uint32_t n = std::min(sec->SizeOfRawData, sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData);
-        if (!n) continue;
-        if (sec->PointerToRawData > file.size() || n > file.size() - sec->PointerToRawData)
-            throw std::runtime_error(m->name + ": section " + std::to_string(i) + " reads past the end of the file");
-        require_range(m->name, sec->VirtualAddress, n, m->size, "a section's data");
-        std::memcpy(m->base + sec->VirtualAddress, file.data() + sec->PointerToRawData, n);
-    }
+        std::memcpy(m->base, file.data(), oh.SizeOfHeaders);
+        auto* sec = IMAGE_FIRST_SECTION(nt);
+        for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
+            if (sec->VirtualAddress < oh.SizeOfHeaders)
+                throw std::runtime_error(m->name + ": section " + std::to_string(i) + " overlaps the headers");
+            uint32_t n =
+                std::min(sec->SizeOfRawData, sec->Misc.VirtualSize ? sec->Misc.VirtualSize : sec->SizeOfRawData);
+            if (!n) continue;
+            if (sec->PointerToRawData > file.size() || n > file.size() - sec->PointerToRawData)
+                throw std::runtime_error(m->name + ": section " + std::to_string(i) +
+                                         " reads past the end of the file");
+            require_range(m->name, sec->VirtualAddress, n, m->size, "a section's data");
+            std::memcpy(m->base + sec->VirtualAddress, file.data() + sec->PointerToRawData, n);
+        }
 
     int64_t delta = reinterpret_cast<int64_t>(m->base) - static_cast<int64_t>(oh.ImageBase);
     if (delta) {
@@ -1369,11 +1484,50 @@ Module& Loader::map_image(const std::filesystem::path& path, const std::string& 
             block = reinterpret_cast<IMAGE_BASE_RELOCATION*>(reinterpret_cast<uint8_t*>(block) + block->SizeOfBlock);
         }
     }
-    // The TLS directory and the exception directory hold virtual addresses, so both are read after relocation. TLS is
-    // installed here, before bind_imports can return control to the caller and before any image code can run.
-    initialize_tls(*m);
-    parse_exports(*m);
-    return *m;
+        // Both tables hold virtual addresses, so read them after relocation. Export validation cannot allocate TLS,
+        // and is therefore done first: until it succeeds the module has no state outside this function to roll back.
+        parse_exports(*m);
+
+        // A title that intercepts its own descriptor-heap backing exports the callback struct. Register it before
+        // initialize_tls/DllMain can run image code, and remove it if publishing the module fails (the loader
+        // destructor also removes it on normal teardown).
+        if (auto it = m->exports.find("__XMemAllocationHooks__"); it != m->exports.end()) {
+            const auto offset = static_cast<uint64_t>(static_cast<uint8_t*>(it->second) - m->base);
+            if (offset <= m->size && m->size - offset >= sizeof(shims::XMemAllocationHooks)) {
+                shims::add_xmem_allocation_hooks(this,
+                                                 static_cast<const shims::XMemAllocationHooks*>(it->second));
+            }
+        }
+
+        // Prepare every allocation needed to publish the module before installing TLS. Once initialize_tls succeeds,
+        // committing the already-prepared pointer and range cannot throw.
+        const auto key = module_key(path);
+        MappedRange range{reinterpret_cast<uint64_t>(m->base), m->size, m->name};
+        order_.reserve(order_.size() + 1);
+        {
+            std::unique_lock lock(ranges_mutex_);
+            ranges_.reserve(ranges_.size() + 1);
+        }
+        by_name_[key] = m;
+        try {
+            // Installed before bind_imports can return control to the caller and before any image code can run.
+            initialize_tls(*m);
+        } catch (...) {
+            by_name_.erase(key);
+            throw;
+        }
+        order_.push_back(m);
+        {
+            std::unique_lock lock(ranges_mutex_);
+            ranges_.push_back(std::move(range));
+        }
+        return *m;
+    } catch (...) {
+        shims::remove_xmem_allocation_hooks(this);
+        if (m->base) VirtualFree(m->base, 0, MEM_RELEASE);
+        delete m;
+        throw;
+    }
 }
 
 // Static TLS for the thread that calls load(). The PE TLS directory only carries the template (Start..End) and the
@@ -1406,8 +1560,12 @@ void Loader::initialize_tls(Module& m) {
 
     if (!module_tls_slots()) throw std::runtime_error(m.name + ": this thread has no TLS array");
 
+    // A console main EXE reads its TLS through gs:[58h][0] directly. Leave slot 0 to it and move gta6rt's own TLS to
+    // the primary helper's index; every other mapped image keeps a helper/clone index.
+    const bool host_owns_slot_zero = by_name_.size() == 1 && !module_is_dll(m);
     size_t slot = kMaxMappedTlsModules;
     DWORD index = TLS_OUT_OF_INDEXES;
+    DWORD host_index = TLS_OUT_OF_INDEXES;
     {
         std::lock_guard alloc_lock(g_tls_alloc_mutex);
         for (size_t i = 0; i < kMaxMappedTlsModules; ++i) {
@@ -1422,10 +1580,19 @@ void Loader::initialize_tls(Module& m) {
 
         // Load/clone gta6rt_tls_host.dll OUTSIDE ExclusiveTlsLock so LoadLibraryExW cannot deadlock with
         // on_host_thread_event (which runs under the Windows loader lock and takes SharedTlsLock).
-        index = ensure_tls_host(slot).index;
-        if (index == TLS_OUT_OF_INDEXES)
-            throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
-        if (index >= kMaxModuleTlsSlots) throw std::runtime_error(m.name + ": reserved TLS index is out of range");
+        if (host_owns_slot_zero) {
+            host_index = ensure_tls_host(0).index;
+            if (host_index == TLS_OUT_OF_INDEXES)
+                throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
+            if (host_index >= kMaxModuleTlsSlots)
+                throw std::runtime_error(m.name + ": reserved TLS index is out of range");
+            index = 0;
+        } else {
+            index = ensure_tls_host(slot).index;
+            if (index == TLS_OUT_OF_INDEXES)
+                throw std::runtime_error(m.name + ": gta6rt_tls_host.dll is missing or has no module TLS index");
+            if (index >= kMaxModuleTlsSlots) throw std::runtime_error(m.name + ": reserved TLS index is out of range");
+        }
 
         // The fields are complete before a thread event can see the owner.
         ExclusiveTlsLock lock;
@@ -1441,6 +1608,12 @@ void Loader::initialize_tls(Module& m) {
         m.tls_raw_size = static_cast<uint32_t>(raw);
         m.tls_zero_fill = tls->SizeOfZeroFill;
         m.tls_block_size = static_cast<uint32_t>(total);
+        if (host_owns_slot_zero) {
+            // The host keeps its thread_locals (including g_thread_tls_slots) at the helper index from here on.
+            init_host_tls(host_index);
+            install_host_tls();
+            _tls_index = host_index;
+        }
         // The index lives in a writable section and protect_sections() has not run yet, so the write needs no
         // VirtualProtect dance.
         if (index_rva) *reinterpret_cast<uint32_t*>(m.base + index_rva) = index;
@@ -1509,6 +1682,19 @@ void Loader::parse_exports(Module& m) {
     }
 }
 
+// The file-name rule LoadLibrary applies to a bare module name, the same normalisation library_loader.cpp's
+// module_name() uses: lower-case, a trailing '.' dropped, ".dll" added when there is no extension. Without it an
+// import naming "GameInput" or "gameinput.dll." misses the shim and owns_dll lookups while LoadLibraryExA still
+// binds the real System32 module.
+std::string dll_key(std::string name) {
+    const size_t slash = name.find_last_of("\\/");
+    if (slash != std::string::npos) name.erase(0, slash + 1);
+    name = lower(name);
+    if (!name.empty() && name.back() == '.') name.pop_back();
+    else if (name.find('.') == std::string::npos) name += ".dll";
+    return name;
+}
+
 // Follows a forwarder string to the module and export it names. Bundled modules are searched first, with or without
 // the extension, because a forwarder may point at another mapped module; system DLLs go through LoadLibraryEx, whose
 // own GetProcAddress already follows its forwarders. Errors are "not found": the caller decides what to bind.
@@ -1520,8 +1706,7 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
 
     // A forwarder can name a module the loader shims. Shims take precedence over a bundled or host copy, exactly as
     // they do for a direct import in resolve(); without this, a forwarded xmem or d3d12_xs call becomes a failure thunk.
-    std::string shim_key = lower(module);
-    if (shim_key.size() < 4 || shim_key.compare(shim_key.size() - 4, 4, ".dll") != 0) shim_key += ".dll";
+    std::string shim_key = dll_key(module);
     if (void* p = shims::find(shim_key, symbol)) {
         binding = Binding::Shim;
         return p;
@@ -1553,18 +1738,24 @@ void* Loader::resolve_forwarder(const std::string& spec, Binding& binding, int d
         return nullptr;  // the bundled module exists and does not export it; don't look for a host namesake
     }
 
-    HMODULE h = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!h) return nullptr;
-    if (prefer_host_copy(shim_key)) redirect_pc_to_file_header(h);
-    FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(static_cast<WORD>(ordinal)) : symbol.c_str());
-    if (!p) return nullptr;
-    if (prefer_host_copy(shim_key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
-    binding = Binding::Host;
-    return reinterpret_cast<void*>(p);
+    // A module the shims own (xgameruntime.dll, gameinput.dll, d3d12_xs.dll, xmem.dll) never binds to a host
+    // namesake: xgameruntime.dll and gameinput.dll exist on the PC too, and a call into the real Gaming Services
+    // runtime would bypass the offline shims the same way a direct host load would (owns_dll, registry.cpp).
+    if (!shims::owns_dll(shim_key)) {
+        HMODULE h = LoadLibraryExA(module.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (!h) return nullptr;
+        if (prefer_host_copy(shim_key)) redirect_pc_to_file_header(h);
+        FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(static_cast<WORD>(ordinal)) : symbol.c_str());
+        if (!p) return nullptr;
+        if (prefer_host_copy(shim_key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
+        binding = Binding::Host;
+        return reinterpret_cast<void*>(p);
+    }
+    return nullptr;
 }
 
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {
-    std::string key = lower(dll);
+    std::string key = dll_key(dll);
     std::string sym = by_ordinal ? "#" + std::to_string(ordinal) : name;
 
     if (void* p = shims::find(key, sym)) {
@@ -1588,13 +1779,18 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         }
     }
     // Host Windows: system DLLs and API sets. LOAD_LIBRARY_SEARCH_SYSTEM32 keeps the game folder out of the search.
-    if (HMODULE h = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
-        if (prefer_host_copy(key)) redirect_pc_to_file_header(h);  // before any mapped code can throw through it
-        FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str());
-        if (p) {
-            if (prefer_host_copy(key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
-            m.imports.push_back({dll, sym, Binding::Host});
-            return reinterpret_cast<void*>(p);
+    // A shim-owned module is skipped: xgameruntime.dll and gameinput.dll have real PC namesakes in System32, and an
+    // unregistered import must end unimplemented, exactly as GetProcAddress on the pseudo-handle returns NULL
+    // (library_loader.cpp). Binding it to Gaming Services would also leave the process online-capable.
+    if (!shims::owns_dll(key)) {
+        if (HMODULE h = LoadLibraryExA(dll.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+            if (prefer_host_copy(key)) redirect_pc_to_file_header(h);  // before any mapped code can throw through it
+            FARPROC p = GetProcAddress(h, by_ordinal ? MAKEINTRESOURCEA(ordinal) : name.c_str());
+            if (p) {
+                if (prefer_host_copy(key)) redirect_pc_to_file_header_at(reinterpret_cast<const void*>(p));
+                m.imports.push_back({dll, sym, Binding::Host});
+                return reinterpret_cast<void*>(p);
+            }
         }
     }
     m.imports.push_back({dll, sym, Binding::Unimplemented});

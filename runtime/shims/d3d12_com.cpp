@@ -2,6 +2,7 @@
 
 #include "d3d12_stubs.h"  // generated
 #include "d3d12_com_object.h"
+#include "d3d12_dred.h"
 #include "d3d12_fence_waiter.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
@@ -495,7 +496,9 @@ public:
 
     void STDMETHODCALLTYPE ResourceBarrier(UINT count, const D3D12_RESOURCE_BARRIER* barriers) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::ResourceBarrier");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || list_.closed()) return check(false);
+        if (count == 0) return;
+        if (!barriers) return check(false);
         for (UINT i = 0; i < count; ++i) {
             const auto& b = barriers[i];
             switch (b.Type) {
@@ -520,24 +523,39 @@ public:
 
     void STDMETHODCALLTYPE Barrier(UINT32 groups, const D3D12_BARRIER_GROUP* group) override {
         d3d12_trace::record("ID3D12GraphicsCommandList7::Barrier");
-        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE || list_.closed()) return check(false);
+        if (groups == 0) return;
+        if (!group) return check(false);
         for (UINT32 g = 0; g < groups; ++g) {
-            for (UINT32 i = 0; i < group[g].NumBarriers; ++i) {
-                switch (group[g].Type) {
-                case D3D12_BARRIER_TYPE_GLOBAL: {
-                    const auto& b = group[g].pGlobalBarriers[i];
+            const auto& grp = group[g];
+            switch (grp.Type) {
+            case D3D12_BARRIER_TYPE_GLOBAL:
+                if (grp.NumBarriers == 0) break;
+                if (!grp.pGlobalBarriers) return check(false);
+                for (UINT32 i = 0; i < grp.NumBarriers; ++i) {
+                    const auto& b = grp.pGlobalBarriers[i];
                     check(list_.barrier(leonida::GlobalBarrier{u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore),
                                                                u(b.AccessAfter)}));
-                    break;
                 }
-                case D3D12_BARRIER_TYPE_BUFFER: {
-                    const auto& b = group[g].pBufferBarriers[i];
+                break;
+            case D3D12_BARRIER_TYPE_BUFFER:
+                if (grp.NumBarriers == 0) break;
+                if (!grp.pBufferBarriers) return check(false);
+                for (UINT32 i = 0; i < grp.NumBarriers; ++i) {
+                    const auto& b = grp.pBufferBarriers[i];
+                    if (b.Offset != 0) {
+                        check(false);
+                        continue;
+                    }
                     check(list_.barrier(leonida::BufferBarrier{u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore),
                                                                u(b.AccessAfter), resource_id(b.pResource)}));
-                    break;
                 }
-                case D3D12_BARRIER_TYPE_TEXTURE: {
-                    const auto& b = group[g].pTextureBarriers[i];
+                break;
+            case D3D12_BARRIER_TYPE_TEXTURE:
+                if (grp.NumBarriers == 0) break;
+                if (!grp.pTextureBarriers) return check(false);
+                for (UINT32 i = 0; i < grp.NumBarriers; ++i) {
+                    const auto& b = grp.pTextureBarriers[i];
                     const auto& r = b.Subresources;
                     check(list_.barrier(leonida::TextureBarrier{
                         u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore), u(b.AccessAfter), u(b.LayoutBefore),
@@ -545,11 +563,10 @@ public:
                         {r.IndexOrFirstMipLevel, r.NumMipLevels, r.FirstArraySlice, r.NumArraySlices, r.FirstPlane,
                          r.NumPlanes},
                         u(b.Flags)}));
-                    break;
                 }
-                default:
-                    check(false);
-                }
+                break;
+            default:
+                check(false);
             }
         }
     }
@@ -847,6 +864,17 @@ public:
                 return check(false);
         }
         leonida::ExecuteIndirect cmd{};
+        // A draw takes the list's graphics state, as DrawInstanced does; with nothing to rasterize it is dropped. A
+        // list with no pipeline, root signature or topology yet records the bare call (it closes, as on the PC
+        // runtime; it is not a call replay can run).
+        // A DISPATCH_MESH signature takes the state DispatchMesh does: no topology, vertex or index buffers.
+        const bool mesh = kind == leonida::IndirectKind::dispatch_mesh;
+        if (kind != leonida::IndirectKind::dispatch && max_command_count && graphics_pipeline_ && graphics_.layout &&
+            (topology_ || mesh)) {
+            if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+            cmd.state = std::make_shared<const leonida::Draw>(
+                mesh ? make_mesh_draw(0, 0, 0) : make_draw(kind == leonida::IndirectKind::draw_indexed, 0, 0, 0, 0, 0));
+        }
         cmd.kind = kind;
         cmd.stride = stride;
         cmd.max_count = max_command_count;
@@ -1404,6 +1432,13 @@ private:
         return draw_views_;
     }
 
+    // A mesh draw needs a graphics pipeline and a graphics root signature; it has no topology or vertex input.
+    void record_mesh_draw(UINT x, UINT y, UINT z) {
+        if (!graphics_pipeline_ || !graphics_.layout) return check(false);
+        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+        check(list_.draw(make_mesh_draw(x, y, z)));
+    }
+
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
@@ -1411,10 +1446,24 @@ private:
         // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
         // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
         if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_,
-                           scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
-                           first, base_vertex, first_instance};
-        check(list_.draw(std::move(draw)));
+        check(list_.draw(make_draw(indexed, count, instances, first, base_vertex, first_instance)));
+    }
+
+    // The list's graphics state as a mesh draw: no vertex input or input assembly; the group counts go in
+    // count/instances/first.
+    leonida::Draw make_mesh_draw(UINT x, UINT y, UINT z) {
+        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_, scissor_,
+                           blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
+        draw.mesh = true;
+        return draw;
+    }
+
+    // The list's graphics state as a draw (see record_draw for what has to be set).
+    leonida::Draw make_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex,
+                            UINT first_instance) {
+        return {graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_, scissor_,
+                blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first, base_vertex,
+                first_instance};
     }
 };
 
@@ -1630,6 +1679,11 @@ public:
             }
             recorded.push_back(&list->commands());
             graphics.push_back(list);
+        }
+        if (auto* ring = context_.breadcrumbs()) {  // LEONIDA_DRED: the SetName names as they are now, copied
+            ring->label_queue(&queue_, dred_debug_name(this));
+            for (UINT i = 0; i < count; ++i)
+                ring->label_list(recorded[i], dred_debug_name(GraphicsCommandList::from(lists[i])));
         }
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");

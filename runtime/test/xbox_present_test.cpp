@@ -334,8 +334,10 @@ int main() {
         EXPECT(presenter->enable_capture());
 
         leonida::ManualFrameClock clock;
-        auto owner = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), &clock);
+        auto device_tokens = rt::d3d12_xs::device_frame_tokens(device.p);
+        auto owner = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), &clock, device_tokens);
         rt::d3d12::XboxPresentation& xbox = *owner;
+        EXPECT(xbox.pacer().token_source() == device_tokens);
 
         D3D12_COMMAND_QUEUE_DESC queue_desc{};
         Ref<ID3D12CommandQueue> queue;
@@ -593,6 +595,27 @@ int main() {
         EXPECT(grab(frame));
         EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
         EXPECT(xbox.presents() == presented_before + 3);
+
+        // A token from device slot 80 (WaitFrameEventX) is one the pacer accepts: the device and the pacer share the
+        // device's token source, so a title that waits through the device and presents through XboxPresentation does
+        // not see every PresentX refused. A token that was never issued is still refused.
+        {
+            using WaitFrameEventFn = HRESULT(WINAPI*)(void*, UINT, UINT, void*, UINT, std::uint64_t*);
+            void** device_vtable = *reinterpret_cast<void***>(device.p);
+            std::uint64_t device_token = 0;
+            EXPECT(reinterpret_cast<WaitFrameEventFn>(device_vtable[80])(
+                       device.p, rt::d3d12::xbox_frame_event_origin, 0, nullptr, 0, &device_token) == S_OK);
+            EXPECT(device_token != 0 && device_token == xbox.pacer().tokens_issued());
+            plane = plane_of(rgba, device_token + 1);
+            EXPECT(xbox.PresentX(1, &plane, nullptr) == E_INVALIDARG);
+            EXPECT(xbox.presents() == presented_before + 3);
+            plane = plane_of(rgba, device_token);
+            EXPECT(xbox.PresentX(1, &plane, nullptr) == S_OK);
+            EXPECT(xbox.presents() == presented_before + 4);
+            EXPECT(grab(frame));
+            EXPECT(region_is(frame, 0, 0, width, height, {51, 153, 230}));
+            std::printf("a token from device slot 80 (WaitFrameEventX) presents: ok\n");
+        }
 
         // Sources the GPU cannot blit are refused with DXGI_ERROR_UNSUPPORTED and present nothing: multisampled,
         // integer and block-compressed. The last frame stays on screen and the token is still usable afterwards.

@@ -47,6 +47,12 @@ inline float depth24_to_float(std::uint32_t d) {
 // back gives the quantisation D3D makes.
 inline float depth24_clear_value(float value) { return depth24_to_float(depth24_quantize(value)); }
 
+// A D32 depth clear value as D3D12 writes it: a denormal clears to 0, as on WARP; Vulkan writes it into a D32 image as
+// it is. (D16 is quantised by the replay, D24 by depth24_clear_value.)
+inline float depth_clear_value(float value) {
+    return std::fpclassify(value) == FP_SUBNORMAL ? 0.0f : value;
+}
+
 // One copy between a footprint (words of 24-bit depth) and the D32 aspect of a texture, as the compute pass sees it.
 // The pass converts between the application's buffer and a tight scratch buffer of floats; a copy command moves the
 // scratch to or from the image. vulkan_depth24.h fills the scratch and descriptor fields in `prepare`.

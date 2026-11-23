@@ -190,6 +190,55 @@ struct TempDir {
     TempDir& operator=(const TempDir&) = delete;
 };
 
+// A title linked against the console runtime's import library gets its interface ids as data imports of
+// d3d12_xs.dll: the import address table slot holds the address of a GUID. tiny_iid.dll imports three that way and
+// returns the address each resolved to. The registry has to answer with the GUID itself; an import nobody serves is
+// bound to the "unimplemented" thunk, whose first 16 bytes of code the title would then read as its IID.
+void test_d3d12_xs_iid_data(const fs::path& iid_dll) {
+    std::printf("\n-- GUID data imports of d3d12_xs.dll: %s --\n", iid_dll.string().c_str());
+    rt::Loader loader(iid_dll.parent_path());
+    rt::Module& m = loader.load(iid_dll);
+
+    // The values a title expects: ID3D12Device's from the Windows SDK headers (d3d12.h), DXGI_DEBUG_ALL's from
+    // dxgidebug.h, and the console DMA command list's from docs/d3d12_xs_surface.md section 4.
+    static const GUID kDevice = {0x189819f1, 0x1db6, 0x4b57, {0xbe, 0x54, 0x18, 0x21, 0x33, 0x9b, 0x85, 0xf7}};
+    static const GUID kDebugAll = {0xe48ae283, 0xda80, 0x490b, {0x87, 0xe6, 0x43, 0xe9, 0xa9, 0xcf, 0xda, 0x08}};
+    static const GUID kDmaList = {0x30bc77b9, 0x8379, 0x4b25, {0x95, 0xde, 0xb8, 0x58, 0x8c, 0x42, 0x27, 0x5d}};
+    struct Case {
+        const char* import_name;
+        const char* getter;
+        const GUID* expected;
+        const char* bound;
+        const char* value;
+    };
+    const Case cases[] = {
+        {"IID_ID3D12Device", "tiny_iid_device", &kDevice,
+         "d3d12_xs.dll!IID_ID3D12Device is bound by the shim registry (Binding::Shim)",
+         "and the title reads ID3D12Device's interface id through it"},
+        {"DXGI_DEBUG_ALL", "tiny_iid_debug_all", &kDebugAll,
+         "d3d12_xs.dll!DXGI_DEBUG_ALL is bound by the shim registry (Binding::Shim)",
+         "and the title reads DXGI_DEBUG_ALL through it"},
+        {"IID_ID3D12ConsDmaCommandList", "tiny_iid_dma_list", &kDmaList,
+         "d3d12_xs.dll!IID_ID3D12ConsDmaCommandList is bound by the shim registry (Binding::Shim)",
+         "and the title reads the console DMA command list's interface id through it"},
+    };
+    for (const Case& c : cases) {
+        rt::Binding binding = rt::Binding::Unimplemented;
+        const int matches = count_imports(m, "d3d12_xs.dll", c.import_name, &binding);
+        check(matches == 1 && binding == rt::Binding::Shim, c.bound);
+        std::printf("     d3d12_xs.dll!%s -> %s\n", c.import_name, matches == 1 ? binding_name(binding) : "missing");
+
+        const auto it = m.exports.find(c.getter);
+        bool same = false;
+        if (it != m.exports.end()) {
+            using Getter = const GUID*(__cdecl*)();
+            const GUID* const got = reinterpret_cast<Getter>(it->second)();
+            same = got != nullptr && std::memcmp(got, c.expected, sizeof(GUID)) == 0;
+        }
+        check(same, c.value);
+    }
+}
+
 void test_fixture_dll(const fs::path& dll) {
     std::printf("\n-- fixture DLL: %s --\n", dll.string().c_str());
     const ImageInfo info = read_image_info(dll);
@@ -693,8 +742,8 @@ void print_result() {
 
 int main(int argc, char** argv) {
     std::printf("pe_loader_test: rt::Loader against locally built fixtures (default run needs no game files)\n");
-    if (argc != 3) {
-        std::fprintf(stderr, "usage: pe_loader_test <tiny_dll.dll> <tiny_exe.exe>\n");
+    if (argc != 3 && argc != 4) {
+        std::fprintf(stderr, "usage: pe_loader_test <tiny_dll.dll> <tiny_exe.exe> [tiny_iid.dll]\n");
         return 2;
     }
     const fs::path dll = argv[1];
@@ -714,6 +763,11 @@ int main(int argc, char** argv) {
         test_forced_relocation(dll);
         test_rejections(dll, temp.path);
         test_unwind(dll);
+        if (argc == 4) {
+            const fs::path iid_dll = argv[3];
+            check(fs::exists(iid_dll), "GUID-import fixture DLL exists");
+            if (fs::exists(iid_dll)) test_d3d12_xs_iid_data(iid_dll);
+        }
         test_inherited_reservation();
         test_optional_package();
         test_optional_package_unwind();

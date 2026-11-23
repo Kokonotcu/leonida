@@ -272,6 +272,40 @@ void test_section_bounds() {
     }
 }
 
+void test_failed_map_can_be_retried() {
+    const char* what = "a failed map releases its range and preferred base for a corrected retry";
+    auto valid = make_image();
+    auto bad = valid;
+    IMAGE_FIRST_SECTION(nt_of(bad))->PointerToRawData = 0x3F0;  // 0x3F0 + 0x200 > file size
+    const auto path = write_image_as(bad, "map_retry.dll");
+    const uint64_t preferred = nt_of(valid)->OptionalHeader.ImageBase;
+
+    rt::Loader loader(g_dir);
+    try {
+        loader.load(path);
+        return failed(what, "the malformed first image loaded");
+    } catch (const std::exception&) {
+    }
+
+    std::string module;
+    uint32_t rva = 0;
+    const bool retained_range = loader.find_address(preferred, module, rva);
+    const size_t retained_modules = loader.modules().size();
+    write_image_as(valid, "map_retry.dll");
+    try {
+        rt::Module& retried = loader.load(path);
+        if (retained_modules)
+            return failed(what, "the failed image remained in modules()");
+        if (retained_range)
+            return failed(what, "find_address found the failed image's range");
+        if (reinterpret_cast<uint64_t>(retried.base) != preferred)
+            return failed(what, "the corrected image did not reclaim its preferred base");
+        pass(what);
+    } catch (const std::exception& e) {
+        failed(what, std::string("the corrected retry failed: ") + e.what());
+    }
+}
+
 void test_truncation() {
     // Every length of a valid image: no length below the full one may load, and none may crash.
     auto full = make_image();
@@ -469,6 +503,61 @@ void test_imports() {
         dir.VirtualAddress = 0x1000;
         dir.Size = sizeof(IMAGE_IMPORT_DESCRIPTOR);
         expect_rejects("an import thunk table that runs past the image", img);
+    }
+    for (const char* dll : {"TestShim", "testshim.dll."}) {
+        // LoadLibrary's file-name rule keys these the same as testshim.dll; without that normalisation the
+        // shim lookup misses while a real host namesake would still bind.
+        const std::string what = std::string("an import naming ") + dll + " resolves to testshim.dll's shim";
+        auto importer = write_image_as(make_import_image(dll, "F"), "importer_key.exe");
+        try {
+            rt::Loader loader(g_dir);
+            rt::Module& m = loader.load(importer);
+            if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Shim)
+                return failed(what.c_str(), "the import did not bind as a shim");
+            if (*reinterpret_cast<void**>(m.base + 0x1180) != reinterpret_cast<void*>(&test_shim_function))
+                return failed(what.c_str(), "the address table does not hold the shim function");
+            pass(what.c_str());
+        } catch (const std::exception& e) {
+            failed(what.c_str(), e.what());
+        }
+    }
+    // The bundled-module ops back GetModuleHandle(nullptr) and GetModuleFileName for mapped images (the shim
+    // bodies live in library_loader.cpp, which this target does not link): a null handle asks for the first
+    // image load() mapped, a module's own handle for the path it was loaded from.
+    try {
+        rt::Loader loader(g_dir);
+        rt::Module& m = loader.load(
+            write_image_as(make_import_image("testshim.dll", "F"), "importer_identity.exe"));
+        if (rt::shims::bundled_main_module() != m.base)
+            return failed("GetModuleHandle(nullptr) answers the first image load() mapped",
+                          "it answered a different module");
+        const std::filesystem::path* main_path = rt::shims::bundled_module_path(nullptr);
+        const std::filesystem::path* own_path = rt::shims::bundled_module_path(m.base);
+        if (!main_path || *main_path != m.path)
+            return failed("GetModuleFileName(nullptr) names the main image's load path", "it did not");
+        if (!own_path || *own_path != m.path)
+            return failed("GetModuleFileName(module) names the module's own load path", "it did not");
+        pass("GetModuleHandle(nullptr)/GetModuleFileName answer for mapped images through the bundled ops");
+    } catch (const std::exception& e) {
+        failed("the bundled-module ops answer module identity for mapped images", e.what());
+    }
+    // A shim-owned module's unregistered imports never reach a host namesake. version.dll is claimed in the
+    // test table, so GetFileVersionInfoSizeA — a real System32 export the table does not carry — must end
+    // unimplemented instead of binding the host copy (Kam471's probe on #5731, made a check).
+    static const rt::shims::Entry owned_entries[] = {
+        {"version.dll", "LeonidaSentinel", reinterpret_cast<void*>(&test_shim_function)},
+    };
+    static const rt::shims::Table owned_table(owned_entries, 1);
+    try {
+        rt::Loader loader(g_dir);
+        rt::Module& m = loader.load(write_image_as(
+            make_import_image("version.dll", "GetFileVersionInfoSizeA"), "importer_skip.exe"));
+        if (m.imports.size() != 1 || m.imports[0].binding != rt::Binding::Unimplemented)
+            return failed("an unregistered import of a shim-owned module does not host-bind",
+                          m.imports.empty() ? "no import record" : "it bound the host copy");
+        pass("an unregistered import of a shim-owned module ends unimplemented, not host");
+    } catch (const std::exception& e) {
+        failed("an unregistered import of a shim-owned module does not host-bind", e.what());
     }
 }
 
@@ -1333,6 +1422,7 @@ int main() {
         test_entry_bounds();
         test_header_bounds();
         test_section_bounds();
+        test_failed_map_can_be_retried();
         test_truncation();
         test_relocations();
         test_exports();

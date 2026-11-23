@@ -118,6 +118,59 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL fake_get_device_proc(VkDevice, const ch
     return nullptr;
 }
 
+struct EnumHook {
+    std::vector<const char*> extensions;
+    std::vector<const char*> append_after_incomplete;
+    VkResult count_result = VK_SUCCESS;
+    VkResult fill_result = VK_SUCCESS;
+    bool use_count_override = false;
+    std::uint32_t count_override = 0;
+    int incomplete_attempts = 0;
+    bool use_shrink_to = false;
+    std::uint32_t shrink_to = 0;
+    bool unterminated_slot0 = false;
+    int calls = 0;
+};
+
+EnumHook* g_enum_hook = nullptr;
+
+VKAPI_ATTR VkResult VKAPI_CALL hook_enumerate_extensions(
+    VkPhysicalDevice, const char*, std::uint32_t* count, VkExtensionProperties* properties) {
+    ++g_enum_hook->calls;
+    if (!properties) {
+        *count = g_enum_hook->use_count_override
+                     ? g_enum_hook->count_override
+                     : static_cast<std::uint32_t>(g_enum_hook->extensions.size());
+        return g_enum_hook->count_result;
+    }
+    const std::uint32_t n = static_cast<std::uint32_t>(g_enum_hook->extensions.size());
+    const std::uint32_t write = *count < n ? *count : n;
+    for (std::uint32_t i = 0; i < write; ++i) {
+        std::memset(&properties[i], 0, sizeof(properties[i]));
+        if (i == 0 && g_enum_hook->unterminated_slot0) {
+            std::memset(properties[i].extensionName, 'A', VK_MAX_EXTENSION_NAME_SIZE);
+        } else {
+            const std::size_t len =
+                std::min<std::size_t>(std::strlen(g_enum_hook->extensions[i]), VK_MAX_EXTENSION_NAME_SIZE - 1);
+            std::memcpy(properties[i].extensionName, g_enum_hook->extensions[i], len);
+        }
+    }
+    *count = write;
+    if (g_enum_hook->fill_result != VK_SUCCESS) return g_enum_hook->fill_result;
+    if (g_enum_hook->incomplete_attempts > 0) {
+        --g_enum_hook->incomplete_attempts;
+        if (!g_enum_hook->append_after_incomplete.empty()) {
+            g_enum_hook->extensions.insert(g_enum_hook->extensions.end(),
+                                           g_enum_hook->append_after_incomplete.begin(),
+                                           g_enum_hook->append_after_incomplete.end());
+            g_enum_hook->append_after_incomplete.clear();
+        }
+        return VK_INCOMPLETE;
+    }
+    if (g_enum_hook->use_shrink_to) *count = std::min(write, g_enum_hook->shrink_to);
+    return VK_SUCCESS;
+}
+
 }  // namespace
 
 int main() {
@@ -419,6 +472,171 @@ int main() {
         lookup.ext_name = nullptr;
         EXPECT(device_proc_or_khr(fake_get_device_proc, VK_NULL_HANDLE, "vkCmdBeginRendering") == nullptr);
         EXPECT(lookup.queries.size() == 3);
+    }
+
+    // Non-zero Vulkan API variants (e.g. Vulkan SC variant 1) must be rejected without touching features2.
+    {
+        FakeDevice dev;
+        dev.dynamic_rendering = VK_TRUE;
+        dev.synchronization2 = VK_TRUE;
+        dev.subgroup_size_control = VK_TRUE;
+        dev.compute_full_subgroups = VK_TRUE;
+        g_device = &dev;
+
+        Vulkan13Features v13;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_3, fake_get_features2, nullptr);
+        EXPECT(v13.core && v13.usable() && v13.subgroup_size_control && v13.compute_full_subgroups);
+
+        dev.features2_calls = 0;
+        dev.enum_calls = 0;
+        v13.query(VK_NULL_HANDLE, VK_MAKE_API_VERSION(1, 1, 0, 0), fake_get_features2, fake_enumerate_extensions);
+        EXPECT(!v13.core && !v13.usable() && !v13.extended_dynamic_state);
+        EXPECT(!v13.subgroup_size_control && !v13.compute_full_subgroups);
+        EXPECT(dev.features2_calls == 0 && dev.enum_calls == 0);
+
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_3, fake_get_features2, nullptr);
+        dev.features2_calls = 0;
+        v13.query(VK_NULL_HANDLE, VK_MAKE_API_VERSION(1, 1, 3, 0), fake_get_features2, fake_enumerate_extensions);
+        EXPECT(!v13.core && !v13.usable() && !v13.extended_dynamic_state);
+        EXPECT(!v13.subgroup_size_control && !v13.compute_full_subgroups);
+        EXPECT(dev.features2_calls == 0 && dev.enum_calls == 0);
+    }
+
+    // Vulkan 1.2 extension enumeration: errors, zero count, VK_INCOMPLETE growth/bound, shrunk count, unterminated.
+    {
+        FakeDevice dev;
+        dev.dynamic_rendering = VK_TRUE;
+        dev.synchronization2 = VK_TRUE;
+        g_device = &dev;
+
+        // Error on count query must stop immediately without querying features2.
+        EnumHook hook;
+        hook.extensions = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+        hook.count_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        hook.use_count_override = true;
+        hook.count_override = 2;
+        g_enum_hook = &hook;
+        Vulkan13Features v13;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, hook_enumerate_extensions);
+        EXPECT(!v13.usable() && hook.calls == 1 && dev.features2_calls == 0);
+
+        // Error on fill call must still reject even if properties received valid extension names.
+        hook.count_result = VK_SUCCESS;
+        hook.use_count_override = false;
+        hook.fill_result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        hook.calls = 0;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, hook_enumerate_extensions);
+        EXPECT(!v13.usable() && hook.calls == 2 && dev.features2_calls == 0);
+
+        // Zero extensions stops after a single count call.
+        EnumHook empty_hook;
+        g_enum_hook = &empty_hook;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, hook_enumerate_extensions);
+        EXPECT(!v13.usable() && empty_hook.calls == 1 && dev.features2_calls == 0);
+
+        // VK_INCOMPLETE retries and sees newly added extensions.
+        EnumHook grow_hook;
+        grow_hook.extensions = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME};
+        grow_hook.append_after_incomplete = {VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+        grow_hook.incomplete_attempts = 1;
+        g_enum_hook = &grow_hook;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, hook_enumerate_extensions);
+        EXPECT(!v13.core && v13.usable() && grow_hook.calls == 4 && dev.features2_calls == 1);
+
+        // Persistent VK_INCOMPLETE terminates cleanly after a bounded retry count.
+        EnumHook stuck_hook;
+        stuck_hook.extensions = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+        stuck_hook.incomplete_attempts = 100;
+        g_enum_hook = &stuck_hook;
+        dev.features2_calls = 0;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, hook_enumerate_extensions);
+        EXPECT(!v13.usable() && stuck_hook.calls == 16 && dev.features2_calls == 0);
+
+        // Shrunk *count on VK_SUCCESS ignores trailing stale elements.
+        EnumHook shrink_hook;
+        shrink_hook.extensions = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+        shrink_hook.use_shrink_to = true;
+        shrink_hook.shrink_to = 1;
+        g_enum_hook = &shrink_hook;
+        dev.features2_calls = 0;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, hook_enumerate_extensions);
+        EXPECT(!v13.usable() && dev.features2_calls == 0);
+
+        // Non-NUL-terminated extensionName in slot 0 is compared safely without overread.
+        EnumHook unterminated_hook;
+        unterminated_hook.extensions = {"placeholder", VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
+                                        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+        unterminated_hook.unterminated_slot0 = true;
+        g_enum_hook = &unterminated_hook;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, hook_enumerate_extensions);
+        EXPECT(!v13.core && v13.usable());
+    }
+
+    // enable(), next(), and add_extensions() reflect usability and reset structs on reuse.
+    {
+        // Unusable core 1.3 keeps missing feature bits false.
+        FakeDevice dev;
+        dev.dynamic_rendering = VK_TRUE;
+        dev.synchronization2 = VK_FALSE;
+        g_device = &dev;
+        Vulkan13Features v13;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_3, fake_get_features2, nullptr);
+        EXPECT(v13.core && !v13.usable());
+        VkBaseOutStructure tail{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, nullptr};
+        const auto* enable13 = static_cast<const VkPhysicalDeviceVulkan13Features*>(v13.enable(&tail));
+        EXPECT(enable13->dynamicRendering == VK_TRUE && enable13->synchronization2 == VK_FALSE);
+
+        // Default-constructed instance enables nothing and adds no KHR extensions.
+        Vulkan13Features empty_v13;
+        const auto* er = static_cast<const VkPhysicalDeviceDynamicRenderingFeaturesKHR*>(empty_v13.enable(&tail));
+        const auto* es = static_cast<const VkPhysicalDeviceSynchronization2FeaturesKHR*>(er->pNext);
+        EXPECT(er->dynamicRendering == VK_FALSE && es->synchronization2 == VK_FALSE);
+        std::vector<const char*> exts;
+        empty_v13.add_extensions(exts);
+        EXPECT(exts.empty());
+
+        // Partial 1.2 device does not force dynamicRendering=VK_TRUE or add extensions.
+        dev.extensions = {VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME};
+        dev.dynamic_rendering = VK_FALSE;
+        dev.synchronization2 = VK_TRUE;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(!v13.usable());
+        const auto* pr = static_cast<const VkPhysicalDeviceDynamicRenderingFeaturesKHR*>(v13.enable(&tail));
+        const auto* ps = static_cast<const VkPhysicalDeviceSynchronization2FeaturesKHR*>(pr->pNext);
+        EXPECT(pr->dynamicRendering == VK_FALSE && ps->synchronization2 == VK_TRUE);
+        v13.add_extensions(exts);
+        EXPECT(exts.empty());
+
+        // Reusing an instance when extended_dynamic_state changes from true to false drops EDS links cleanly.
+        dev.extensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
+        dev.extensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+        dev.dynamic_rendering = VK_TRUE;
+        dev.eds = VK_TRUE;
+        dev.eds2 = VK_TRUE;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(v13.extended_dynamic_state);
+        EXPECT(chain_types(v13.enable(&tail)).size() == 5);
+
+        dev.eds2 = VK_FALSE;
+        v13.query(VK_NULL_HANDLE, VK_API_VERSION_1_2, fake_get_features2, fake_enumerate_extensions);
+        EXPECT(!v13.extended_dynamic_state);
+        const auto types = chain_types(v13.enable(&tail));
+        EXPECT(types.size() == 3);
+        EXPECT(types[0] == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR);
+        EXPECT(types[1] == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR);
+        EXPECT(types[2] == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2);
+        EXPECT(*v13.next() == &tail);
+    }
+
+    // device_proc_or_khr ignores null callback/name or empty name without probing the callback.
+    {
+        ProcLookup lookup;
+        g_proc = &lookup;
+        lookup.core_name = "vkCmdPipelineBarrier2";
+        EXPECT(device_proc_or_khr(fake_get_device_proc, VK_NULL_HANDLE, "") == nullptr);
+        EXPECT(device_proc_or_khr(nullptr, VK_NULL_HANDLE, "vkCmdPipelineBarrier2") == nullptr);
+        EXPECT(device_proc_or_khr(fake_get_device_proc, VK_NULL_HANDLE, nullptr) == nullptr);
+        EXPECT(lookup.queries.empty());
     }
 
     std::printf("vulkan13_features: all checks passed\n");

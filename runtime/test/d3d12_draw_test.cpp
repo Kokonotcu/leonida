@@ -124,6 +124,7 @@ int main() {
         info.shader_dir = library.string();
         // Of the PSO features only logicOp is passed on, so the other feature refusals below still apply.
         info.features.logicOp = d.enabled.logicOp;
+        info.occlusion_query_precise = d.occlusion_query_precise;
         info.vertex_attribute_divisor = d.vertex_attribute_divisor;
         ID3D12Device* inner = nullptr;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
@@ -1007,6 +1008,63 @@ int main() {
             }
             std::printf("castable RTVs: %u draws stored in the view's channel order and encoding\n",
                         unsigned(std::size(casts)));
+        }
+
+        // D3D12's implicit viewport scissor applies with or without a bound render target.
+        if (d.occlusion_query_precise) {
+            struct ViewCase { D3D12_VIEWPORT viewport; D3D12_RECT scissor; UINT64 samples; };
+            const ViewCase cases[] = {
+                {{0, 0, 2, 2, 0, 1}, scissor, 4},
+                {{0, 0, 1.75f, 1.75f, 0, 1}, scissor, 1},
+                {{0.25f, 0.25f, 2.5f, 1.5f, 0, 1}, scissor, 2},
+                {{0, 0, 0.75f, 0.75f, 0, 1}, scissor, 0},
+                {{-4, -4, 1, 1, 0, 1}, scissor, 0},
+                {{0.25f, 0.25f, 1.875f, 1.875f, 0, 1}, scissor, 4},  // floor the sum, not the width
+                {{0, 0, 4, 4, 0, 1}, {1, 1, 3, 2}, 2},              // the explicit scissor still applies
+            };
+            constexpr UINT case_count = UINT(std::size(cases));
+            const D3D12_QUERY_HEAP_DESC query_desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION, 2 * case_count, 0};
+            Ref<ID3D12QueryHeap> queries;
+            EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&queries.p))));
+            auto no_targets = fullscreen_desc;
+            no_targets.NumRenderTargets = 0;
+            no_targets.RTVFormats[0] = DXGI_FORMAT_UNKNOWN;
+            Ref<ID3D12PipelineState> occlusion_pso;
+            EXPECT(SUCCEEDED(device->CreateGraphicsPipelineState(&no_targets, IID_PPV_ARGS(&occlusion_pso.p))));
+            Ref<ID3D12Resource> color;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &rt_desc,
+                             D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&color.p))));
+            device->CreateRenderTargetView(color.p, nullptr, rtv);
+            EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+            list->SetGraphicsRootSignature(root.p);
+            list->SetGraphicsRootConstantBufferView(1, upload_va + 512);
+            list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            for (UINT targets = 0; targets <= 1; ++targets) {
+                list->SetPipelineState(targets ? fullscreen.p : occlusion_pso.p);
+                list->OMSetRenderTargets(targets, targets ? &rtv : nullptr, FALSE, nullptr);
+                for (UINT i = 0; i < case_count; ++i) {
+                    const UINT query = targets * case_count + i;
+                    list->RSSetViewports(1, &cases[i].viewport);
+                    list->RSSetScissorRects(1, &cases[i].scissor);
+                    list->BeginQuery(queries.p, D3D12_QUERY_TYPE_OCCLUSION, query);
+                    list->DrawInstanced(3, 1, 0, 0);
+                    list->EndQuery(queries.p, D3D12_QUERY_TYPE_OCCLUSION, query);
+                }
+            }
+            list->ResolveQueryData(queries.p, D3D12_QUERY_TYPE_OCCLUSION, 0, query_desc.Count, readback.p, 0);
+            EXPECT(SUCCEEDED(list->Close()));
+            queue->ExecuteCommandLists(1, lists);
+            EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+            EXPECT(SUCCEEDED(queue->Signal(fence.p, 100)) && SUCCEEDED(fence->SetEventOnCompletion(100, nullptr)));
+            std::array<UINT64, 2 * case_count> samples{};
+            std::memcpy(samples.data(), mapped, sizeof(samples));
+            unsigned mismatches = 0;
+            for (UINT i = 0; i < case_count; ++i) {
+                std::printf("viewport %u: %llu samples without RTV, %llu with RTV (expected %llu)\n",
+                            i, samples[i], samples[case_count + i], cases[i].samples);
+                mismatches += samples[i] != cases[i].samples || samples[case_count + i] != cases[i].samples;
+            }
+            EXPECT(mismatches == 0);
         }
 
         // A draw without a topology is invalid; Close reports it.

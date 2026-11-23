@@ -92,6 +92,20 @@ def make_ms_psv0(threads_x: int, maxv: int, maxp: int, topology: int = 2, group_
     return struct.pack("<I", len(r)) + bytes(r)
 
 
+def asm_psv0(asm_path: str):
+    """(threads, max vertices, max primitives) of a mesh shader's "; psv0: T V P" header comment (as
+    runtime/test/shaders/build.py reads it), or None."""
+    with open(asm_path, encoding="utf-8") as source:
+        for ln in source:
+            s = ln.strip()
+            if s and not s.startswith(";"):
+                break
+            m = re.match(r";\s*psv0:\s*(\d+)\s+(\d+)\s+(\d+)\s*$", s)
+            if m:
+                return tuple(int(v) for v in m.groups())
+    return None
+
+
 def assemble_to_s(llvm_mc: str, asm_path: str, s_path: str, name: str) -> None:
     """Assemble raw RDNA2 .asm with llvm-mc -show-encoding into .s format for rdna2spirv.py."""
     with open(asm_path, encoding="utf-8") as source:
@@ -656,6 +670,9 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
                  "ps_m3_post": "d3d12_m3_frame_test", "ps_m3_query": "d3d12_m3_frame_test",
                  "cs_m4_fill": "d3d12_m4_compute_test", "cs_m4_indirect": "d3d12_m4_compute_test",
                  "cs_buf_typed": "d3d12_buffer_uav_test", "cs_buf_counter": "d3d12_buffer_uav_test",
+                 "vs_m5": "d3d12_m5_world_test", "ps_m5_inst": "d3d12_m5_world_test",
+                 "ps_m5_flat": "d3d12_m5_world_test", "ps_m5_tex": "d3d12_m5_world_test",
+                 "ms_m5": "d3d12_m5_mesh_test", "ps_m5_mesh": "d3d12_m5_mesh_test",
                  "ps_live_width": "w64_graphics.py"}
 
 
@@ -865,6 +882,9 @@ def run_suite(a, work: str) -> int:
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
         elif name == "ms_v5_workgroup":
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(32, 3, 1, group_shared=128))])
+        elif name.startswith("ms_") and asm_psv0(os.path.join(SHADER_DIR, fname)):
+            # A layer-test mesh shader (ms_m5): its PSV0 from the "psv0:" header, as build.py makes it.
+            dxbc = make_dxbc([(b"PSV0", make_ms_psv0(*asm_psv0(os.path.join(SHADER_DIR, fname))))])
         elif name == "ms_clip":
             dxbc = make_dxbc([
                 (b"PSV0", make_ms_psv0(128, 64, 64, 2)),

@@ -1,7 +1,7 @@
 // End-to-end Vulkan GPU test for per-pipeline `--f16-interp-fallback` linking (SHADER-378).
 //
-// Exercises two graphics PSOs through ID3D12Device::CreateGraphicsPipelineState on a real Vulkan 1.3 GPU, without
-// needing glslangValidator, llvm-mc or game files (both SPIR-V 1.5 modules are built directly in memory):
+// Exercises three graphics PSOs through ID3D12Device::CreateGraphicsPipelineState on a real Vulkan 1.3 GPU, without
+// needing glslangValidator, llvm-mc or game files (every SPIR-V 1.5 module is built directly in memory):
 //   1. A 16-param VS (param0..param15, static f16_halves only for param0..param6) writes packed f16 pairs into
 //      param7: .x = packHalf2x16(0.25, 0.75) = 0x3A003400, .y = packHalf2x16(0.5, 1.0) = 0x3C003800.
 //      PS #1 reads raw attr0..attr14 plus attr7's decoded f16 halves at Locations 20 & 21 (which collide with VS's
@@ -10,6 +10,10 @@
 //   2. PS #2 reads raw attr0..attr13 plus attr7's decoded f16 halves at Locations 14 & 15 (colliding with VS's raw
 //      param14 & param15). `link_f16_halves` relocates BOTH PS and VS halves to Locations 28 & 29 and renders the
 //      exact same RGBA (64, 191, 128, 255).
+//   3. PS #3 reads raw attr0..attr13 plus the decoded halves of attr0..attr7 at their fixed slots (28 - 2n, 29 - 2n):
+//      30 inputs, attr7's at 14 & 15. Reserving VS's raw param14 & param15 would leave 14 locations for 16 halves, but
+//      PS #3 does not read them: `link_f16_halves` demotes them to Private, synthesizes param7's halves at 14 & 15
+//      and the GPU renders the same RGBA (64, 191, 128, 255).
 // Skips (77) when no usable Vulkan 1.3 device is present. No game data.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
@@ -124,17 +128,20 @@ std::vector<std::uint32_t> make_16param_vs() {
 }
 
 // Fragment shader reading `num_raw` raw inputs (Location 0..num_raw-1) plus decoded halves of param7 at
-// `lo_loc` and `hi_loc`, writing vec4(lo.x, hi.x, lo.y, hi.y) to MRT 0.
-std::vector<std::uint32_t> make_f16_ps(std::uint32_t num_raw, std::uint32_t lo_loc, std::uint32_t hi_loc) {
+// `lo_loc` and `hi_loc`, writing vec4(lo.x, hi.x, lo.y, hi.y) to MRT 0. `other_half_locs` declares more decoded-half
+// inputs (other params' halves) that it does not read.
+std::vector<std::uint32_t> make_f16_ps(std::uint32_t num_raw, std::uint32_t lo_loc, std::uint32_t hi_loc,
+                                       const std::vector<std::uint32_t>& other_half_locs = {}) {
     // 1=%void, 2=%fn, 3=%float, 4=%v4float, 5=%ptr_in_v4, 6=%ptr_out_v4, 7=%out0, 8=%in_lo, 9=%in_hi,
     // 10=%main, 11=%entry, 12=%vlo, 13=%vhi, 14=%lox, 15=%hix, 16=%loy, 17=%hiy, 18=%rgba,
-    // 19.. = raw inputs 0..num_raw-1
-    const std::uint32_t bound = 19 + num_raw;
+    // 19.. = raw inputs 0..num_raw-1, then the inputs at `other_half_locs`
+    const std::uint32_t num_inputs = num_raw + std::uint32_t(other_half_locs.size());
+    const std::uint32_t bound = 19 + num_inputs;
     std::vector<std::uint32_t> w = {kSpirvMagic, 0x00010500u, 0, bound, 0};
     put_inst(w, kOpCapability, {1});
     put_inst(w, kOpMemoryModel, {0, 1});
     std::vector<std::uint32_t> ep = {kExecModelFragment, 10, 0x6e69616du, 0x00000000u, 7, 8, 9};
-    for (std::uint32_t i = 0; i < num_raw; ++i) ep.push_back(19 + i);
+    for (std::uint32_t i = 0; i < num_inputs; ++i) ep.push_back(19 + i);
     put_inst_vec(w, kOpEntryPoint, ep);
     put_inst(w, kOpExecutionMode, {10, 7});  // OriginUpperLeft
 
@@ -142,6 +149,8 @@ std::vector<std::uint32_t> make_f16_ps(std::uint32_t num_raw, std::uint32_t lo_l
     put_inst(w, kOpDecorate, {8, kDecorationLocation, lo_loc});
     put_inst(w, kOpDecorate, {9, kDecorationLocation, hi_loc});
     for (std::uint32_t i = 0; i < num_raw; ++i) put_inst(w, kOpDecorate, {19 + i, kDecorationLocation, i});
+    for (std::uint32_t i = 0; i < other_half_locs.size(); ++i)
+        put_inst(w, kOpDecorate, {19 + num_raw + i, kDecorationLocation, other_half_locs[i]});
 
     put_inst(w, 19, {1});
     put_inst(w, 33, {2, 1});
@@ -153,7 +162,7 @@ std::vector<std::uint32_t> make_f16_ps(std::uint32_t num_raw, std::uint32_t lo_l
     put_inst(w, kOpVariable, {6, 7, kStorageOutput});
     put_inst(w, kOpVariable, {5, 8, kStorageInput});
     put_inst(w, kOpVariable, {5, 9, kStorageInput});
-    for (std::uint32_t i = 0; i < num_raw; ++i) put_inst(w, kOpVariable, {5, 19 + i, kStorageInput});
+    for (std::uint32_t i = 0; i < num_inputs; ++i) put_inst(w, kOpVariable, {5, 19 + i, kStorageInput});
 
     put_inst(w, kOpFunction, {1, 10, 0, 2});
     put_inst(w, 248, {11});
@@ -184,15 +193,20 @@ int main() {
     const auto vs_prog = fssm_program({0x56530378, 0xbf810000});
     const auto ps1_prog = fssm_program({0x50530378, 0x00000001});
     const auto ps2_prog = fssm_program({0x50530378, 0x00000002});
+    const auto ps3_prog = fssm_program({0x50530378, 0x00000003});
     const auto vs_c = shader_container(vs_prog);
     const auto ps1_c = shader_container(ps1_prog);
     const auto ps2_c = shader_container(ps2_prog);
+    const auto ps3_c = shader_container(ps3_prog);
 
     const auto lib_dir = std::filesystem::temp_directory_path() / "leonida_f16_halves_gpu_test";
     std::filesystem::create_directories(lib_dir);
     write_spv(lib_dir / "vs_16p.spv", make_16param_vs());
     write_spv(lib_dir / "ps_packed.spv", make_f16_ps(15, 20, 21));
     write_spv(lib_dir / "ps_reloc.spv", make_f16_ps(14, 14, 15));
+    std::vector<std::uint32_t> attr0_6_half_locs;  // attr0..attr6's halves at 28 - 2n, 29 - 2n: 16..29
+    for (std::uint32_t loc = 16; loc <= 29; ++loc) attr0_6_half_locs.push_back(loc);
+    write_spv(lib_dir / "ps_unread.spv", make_f16_ps(14, 14, 15, attr0_6_half_locs));
     {
         std::ofstream idx(lib_dir / "index.json", std::ios::binary | std::ios::trunc);
         idx << "{\"vs_16p\": {\"stage\": \"vs\", \"fssm_sha256\": \"" << leonida::sha256_hex(vs_prog)
@@ -204,7 +218,11 @@ int main() {
                "\"f16_halves\": {\"7\": [20, 21]}},\n"
                " \"ps_reloc\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps2_prog)
             << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], "
-               "\"f16_halves\": {\"7\": [14, 15]}}}";
+               "\"f16_halves\": {\"7\": [14, 15]}},\n"
+               " \"ps_unread\": {\"stage\": \"ps\", \"fssm_sha256\": \"" << leonida::sha256_hex(ps3_prog)
+            << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"outputs\": [0], "
+               "\"f16_halves\": {\"0\": [28, 29], \"1\": [26, 27], \"2\": [24, 25], \"3\": [22, 23], "
+               "\"4\": [20, 21], \"5\": [18, 19], \"6\": [16, 17], \"7\": [14, 15]}}}";
     }
 
     rt::d3d12::VulkanDeviceInfo info{};
@@ -363,5 +381,6 @@ int main() {
 
     EXPECT(run_case("ps_packed (synth param7 + demote static halves)", ps1_c));
     EXPECT(run_case("ps_reloc (relocate colliding PS + VS halves to 28,29)", ps2_c));
+    EXPECT(run_case("ps_unread (demote unread raw param14/15, synth param7 at 14,15)", ps3_c));
     return 0;
 }

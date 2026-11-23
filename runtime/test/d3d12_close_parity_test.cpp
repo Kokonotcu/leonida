@@ -168,9 +168,9 @@ std::vector<Case> cases() {
         {"empty list", true, match, [](Env&) { return true; }},
         {"ResourceBarrier(0, nullptr)", true, match, CALLS(e.list->ResourceBarrier(0, nullptr))},
         // Resource barriers
-        {"transition COMMON -> COMMON", false, looser,
+        {"transition COMMON -> COMMON", false, match,
          CALLS(const auto b = barrier(e.tex.p, common, common); e.list->ResourceBarrier(1, &b))},
-        {"transition COPY_DEST -> COPY_DEST", false, looser,
+        {"transition COPY_DEST -> COPY_DEST", false, match,
          CALLS(const auto a = barrier(e.tex.p, common, copy_dest);
                const auto b = barrier(e.tex.p, copy_dest, copy_dest);
                e.list->ResourceBarrier(1, &a); e.list->ResourceBarrier(1, &b))},
@@ -187,7 +187,7 @@ std::vector<Case> cases() {
          CALLS(const auto b = barrier(nullptr, common, copy_dest); e.list->ResourceBarrier(1, &b))},
         {"transition of subresource 99 of a 1-subresource texture", false, looser,
          CALLS(const auto b = barrier(e.tex.p, common, copy_dest, 99); e.list->ResourceBarrier(1, &b))},
-        {"transition to COPY_DEST | COPY_SOURCE (write and read)", false, looser,
+        {"transition to COPY_DEST | COPY_SOURCE (write and read)", false, match,
          CALLS(const auto b = barrier(e.tex.p, common, copy_dest | D3D12_RESOURCE_STATE_COPY_SOURCE);
                e.list->ResourceBarrier(1, &b))},
         {"UAV barrier of a null resource", true, match,

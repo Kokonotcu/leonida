@@ -17,6 +17,7 @@
 
 #ifdef LEONIDA_VULKAN_DEVICE
 #include "d3d12_com.h"
+#include "xbox_present.h"
 #endif
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
@@ -117,11 +118,104 @@ HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size,
     return fn(data, size, iid, out);
 }
 
+void* xmem_descriptor_heap_alloc(std::size_t byte_size, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    return (hooks && hooks->alloc) ? hooks->alloc(byte_size, attributes) : nullptr;
+}
+
+void xmem_descriptor_heap_free(void* ptr, std::uint64_t attributes) {
+    const rt::shims::XMemAllocationHooks* hooks = rt::shims::xmem_allocation_hooks();
+    if (hooks && hooks->free) hooks->free(ptr, attributes);
+}
+
+#ifdef LEONIDA_VULKAN_DEVICE
+// The retail title creates its own window before it creates the device: RegisterClassExA/CreateWindowExA with the
+// class "sgaWindowClass" (measured at game+0x2478440), then ShowWindow. The factory is asked for a presenter on the
+// first frame-event or PresentX call, after that. Prefer the measured class (checking the process so a same-named
+// window elsewhere is not taken) and fall back to the largest visible top-level window of this process, so a renamed
+// class still attaches to the title's window instead of silently presenting nowhere.
+struct WindowSearch {
+    DWORD pid = 0;
+    HWND window = nullptr;
+    LONG area = 0;
+};
+
+BOOL CALLBACK find_process_window(HWND window, LPARAM param) {
+    auto* search = reinterpret_cast<WindowSearch*>(param);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (pid != search->pid || !IsWindowVisible(window) || GetWindow(window, GW_OWNER)) return TRUE;
+    RECT client{};
+    if (!GetClientRect(window, &client)) return TRUE;
+    const LONG area = (client.right - client.left) * (client.bottom - client.top);
+    if (area > search->area) {
+        search->window = window;
+        search->area = area;
+    }
+    return TRUE;
+}
+
+HWND game_window() {
+    HWND measured = FindWindowA("sgaWindowClass", nullptr);
+    if (measured) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(measured, &pid);
+        if (pid == GetCurrentProcessId()) return measured;
+    }
+    WindowSearch search;
+    search.pid = GetCurrentProcessId();
+    EnumWindows(find_process_window, reinterpret_cast<LPARAM>(&search));
+    return search.window;
+}
+
+// Adapts XboxPresentation (xbox_present.h) to the proxy's sink: the proxy owns the window, the Vulkan swapchain and
+// the frame pacer behind it, exactly as the measured retail slots expect. The first successful attach is logged.
+class RetailPresentation final : public rt::d3d12_xs::XboxPresentationSink {
+public:
+    explicit RetailPresentation(std::unique_ptr<rt::d3d12::XboxPresentation> presentation)
+        : presentation_(std::move(presentation)) {}
+
+    HRESULT SetFrameIntervalX(std::uint64_t output, std::uint32_t interval_us, std::uint32_t latency,
+                              std::uint32_t flags) override {
+        return presentation_->SetFrameIntervalX(reinterpret_cast<IUnknown*>(static_cast<std::uintptr_t>(output)),
+                                                interval_us, latency, flags);
+    }
+    HRESULT ScheduleFrameEventX(std::uint32_t event, std::uint32_t offset_us, std::uint32_t flags) override {
+        return presentation_->ScheduleFrameEventX(event, offset_us, flags);
+    }
+    HRESULT WaitFrameEventX(std::uint32_t event, std::uint32_t timeout_ms, std::uint32_t flags,
+                            std::uint64_t* token) override {
+        return presentation_->WaitFrameEventX(event, timeout_ms, flags, token);
+    }
+    HRESULT PresentX(std::uint32_t plane_count, const rt::d3d12::XboxPresentPlaneParameters* planes,
+                     const rt::d3d12::XboxPresentParameters* params) override {
+        return presentation_->PresentX(plane_count, planes, params);
+    }
+
+private:
+    std::unique_ptr<rt::d3d12::XboxPresentation> presentation_;
+};
+
+rt::d3d12_xs::XboxPresentationSink* create_retail_presentation(ID3D12Device* real, void* device_proxy,
+                                                              std::uint64_t window_word) {
+    HWND window = window_word ? reinterpret_cast<HWND>(static_cast<std::uintptr_t>(window_word)) : game_window();
+    if (!window) return nullptr;
+    auto presenter = rt::d3d12::create_window_presenter(real, window);
+    if (!presenter) return nullptr;
+    std::fprintf(stderr, "[rt] d3d12_xs: PresentX attached to window %p (Vulkan swapchain + frame pace)\n",
+                 static_cast<void*>(window));
+    // The pacer shares the device's token source: a token from WaitFrameEventX (device slot 80) is one PresentX takes.
+    return new RetailPresentation(std::make_unique<rt::d3d12::XboxPresentation>(
+        std::move(presenter), nullptr, rt::d3d12_xs::device_frame_tokens(device_proxy)));
+}
+#endif  // LEONIDA_VULKAN_DEVICE
+
 // Measured shape: D3D12XboxCreateDevice(adapter, params, riid, out), where params is a 24-word block that is only
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead, so 12_0 is used as the
 // least restrictive floor; higher feature levels are still exposed by the created device.
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
+    rt::d3d12_xs::set_default_descriptor_heap_allocator(&xmem_descriptor_heap_alloc, &xmem_descriptor_heap_free);
     constexpr auto method = "D3D12XboxCreateDevice";
     using rt::d3d12_trace::result;
     if (!out) return result(method, E_POINTER);
@@ -179,6 +273,9 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
             return result(method, vhr);
         }
         rt::d3d12::set_device_outer(vulkan, static_cast<IUnknown*>(*out));
+        // The retail title's window already exists (it is created before the device). Let the first Xbox frame-event
+        // or PresentX slot attach a real Vulkan presenter, so present reaches the swapchain instead of being dropped.
+        rt::d3d12_xs::set_xbox_presentation_factory(&create_retail_presentation);
         if (!tracing)
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice -> proxy %p (Vulkan device %p)\n", *out,
                          static_cast<void*>(vulkan));
@@ -217,12 +314,40 @@ static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
 static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
 static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
 
-// Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
-// dword at +4 it sets (a count), and only checks the result for failure. The PC/Vulkan side owns virtual memory,
-// so the policy is accepted and ignored.
-HRESULT WINAPI configure_virtual_memory(void* /*desc*/) { return S_OK; }
+// The runtime's 93 GUID data exports (docs/d3d12_xs_surface.md section 2.2): 83 the Windows SDK also defines, with
+// the same bytes, and 10 console-only ones. A title linked against the console import library imports them as data,
+// so the import address table slot holds the address of the GUID itself; an import nobody serves is bound to the
+// unimplemented-import thunk, and the title would read that thunk's code as its interface id without ever calling
+// it. The values come from tools/d3d12_xs_surface.py, which checks the standard ones against the SDK headers.
+#define LEONIDA_D3D12_XS_GUID(name, d1, d2, d3, b0, b1, b2, b3, b4, b5, b6, b7) \
+    const GUID kExport_##name = {d1, d2, d3, {b0, b1, b2, b3, b4, b5, b6, b7}};
+#include "d3d12_xs_guids.inc"
+#undef LEONIDA_D3D12_XS_GUID
 
 }  // namespace
+
+// Served by name. The ordinals are not: 34 of the 93 are derived from an ordering rule, not read from the runtime.
+#define LEONIDA_D3D12_XS_GUID(name, ...) \
+    {"d3d12_xs.dll", #name, const_cast<void*>(static_cast<const void*>(&kExport_##name))},
+static const ::rt::shims::Entry d3d12_xs_guid_entries[] = {
+#include "d3d12_xs_guids.inc"
+};
+#undef LEONIDA_D3D12_XS_GUID
+static_assert(sizeof(d3d12_xs_guid_entries) / sizeof(d3d12_xs_guid_entries[0]) == 93, "the runtime exports 93 GUIDs");
+static ::rt::shims::Table d3d12_xs_guid_table(d3d12_xs_guid_entries,
+                                              sizeof(d3d12_xs_guid_entries) / sizeof(d3d12_xs_guid_entries[0]));
+
+// D3D12ConfigureVirtualMemoryX: a console virtual-memory configuration call. A PC has one memory pool and no
+// title/system partition, so there is nothing to configure; the arguments are ignored and S_OK is returned.
+// Measured call (RT-5, 1.0.2.1): the title calls it once at startup with one pointer to a zeroed 32-byte block whose
+// dword at +4 it sets (a count), and only checks the result for failure.
+HRESULT WINAPI D3D12ConfigureVirtualMemoryX(void* /*desc*/) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX ignored (PC has no title/system memory "
+                             "partition)\n");
+    return S_OK;
+}
 
 SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12SerializeVersionedRootSignature", reinterpret_cast<void*>(&serialize_root_signature)},
@@ -230,5 +355,5 @@ SHIM_TABLE(d3d12_xs,
     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
      reinterpret_cast<void*>(&create_root_signature_deserializer)},
     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
-    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&configure_virtual_memory)},
+    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&D3D12ConfigureVirtualMemoryX)},
 );

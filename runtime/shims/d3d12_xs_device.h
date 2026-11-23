@@ -1,23 +1,59 @@
 // Xbox-ABI proxy around a PC ID3D12Device.
 //
 // Measured Xbox device deviations used here (vtable indices, x64):
+//   slot 26   GetCustomHeapProperties, the PC slot, but the retail executable calls it with the buffer for the
+//             returned struct in RCX and the device in RDX (node mask in R8, heap type in R9; three calls with node
+//             mask 1 and types DEFAULT/UPLOAD/READBACK). A PC C++ method has the device in RCX and the buffer in RDX.
+//             The thunk takes the console form when RDX holds a device proxy and forwards the PC form otherwise.
+//             Slots 25 and 43 return structs too and are still forwarded in the PC form: the executable calls 25 the
+//             same way (#6982 and its own call site), with console resource descriptions the PC method cannot take as
+//             they are, and no call of 43 has been seen.
+//   slot 41   CreateCommandSignature at its PC position; a console argument of type 105 (a 12-byte dispatch, read
+//             from the retail title's call sites) is created as D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.
+//   slot 61   CreateSamplerX(desc, dest) -> PC CreateSampler (slot 22); the description's PC
+//             D3D12_SAMPLER_DESC prefix is passed. The PC slot 61 is CreateMetaCommand. Measured on the retail title's boot.
 //   slot 62   CreateComputePipelineState(desc, w2, w3, iid, out): two words (0 from XboxBvhBuilder, meaning unknown)
 //             before the IID. The PC slot 62 is CreateStateObject.
 //   slot 67   CreateComputePipelineState from native code (desc, iid, out): converts the Xbox native-code desc
 //             (+0x00 root signature, +0x28 code, +0x30 size) to D3D12_COMPUTE_PIPELINE_STATE_DESC and forwards
 //             to PC CreateComputePipelineState (slot 11). The PC slot 67 is CreateProtectedResourceSession1.
+//   slot 70   (texture words, view desc, destination handle), no return value: a shader-resource view from raw words
+//             and a GPU address, with no resource (retail boot chain stop 14). The PC slot 70 is CreatePlacedResource1.
+//             A measured shape (PR 7066, eugen1763): a raw buffer SRV. arg1 starts with a desktop D3D12_RESOURCE_DESC
+//             (buffer), arg2 with a desktop D3D12_SHADER_RESOURCE_VIEW_DESC (R32_TYPELESS, BUFFER, RAW) followed at
+//             once by a D3D12_GPU_VIRTUAL_ADDRESS, the console VA a slot-133 call registered. When the VA is inside a
+//             buffer the device's resource provider knows, the destination gets a raw view of it (PC
+//             CreateShaderResourceView with that resource). Any other shape, or an unknown VA, gets the PC null view
+//             (CreateShaderResourceView with no resource) and the call returns.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
 //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
 //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
 //   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
 //             initialState, riid, out). The type is the first word of the Xbox desc; there is no node-mask argument
 //             in the console call (public HLE; the PC six-argument form differs).
-//   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
-//             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
-//             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
+//   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. They answer through the registered
+//             XboxPresentationSink when there is one (the Vulkan retail path below); otherwise a per-device token
+//             source answers them before the PC vtable is indexed and WaitFrameEventX returns at once with a fresh
+//             non-zero token. The token source is shared with the sink's frame pacer, so a token from slot 80 is one
+//             PresentX accepts. Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the
+//             beyond-table refusal.
+//   slot 86   CreatePipelineState(desc, riid, out) -> PC ID3D12Device2::CreatePipelineState (PC slot 47).
+//   slot 101  CreateStateObject(desc, riid, out) -> PC ID3D12Device5::CreateStateObject (PC slot 62, displaced on
+//             Xbox by compute-PSO slot 62).
+//   slot 108  GetResourceAllocationInfo2(ret, this, visible_mask, count, descs, info1) -> PC
+//             ID3D12Device8::GetResourceAllocationInfo2 (PC slot 68), accepting the console C-ABI struct return
+//             (return buffer in RCX, device in RDX) as well as the PC C++ order, with Xbox layout words and flag bits
+//             normalized on a copy of the descriptors.
+//   slot 127  CreateCommittedResource3 with Xbox layout/flags -> the PC device's ID3D12Device10 method; the
+//             caller's heap, layout, clear value, session and castable formats are kept.
 // The slots 48/73/78/79/80 are the public HLE Freminet/ScarlettX's observation, not Microsoft documentation, and can
 // be moved with LEONIDA_XS_QUEUE_X_SLOT, LEONIDA_XS_LIST_X_SLOT, LEONIDA_XS_FRAME_INTERVAL_SLOT,
 // LEONIDA_XS_SCHEDULE_EVENT_SLOT and LEONIDA_XS_WAIT_EVENT_SLOT (3..127; anything else is logged once and ignored).
+//   slot 13   CheckFeatureSupport keeps the PC signature, but a D3D12_OPTIONS request with a structure larger than
+//             the PC's (0x40 against 0x3C, measured on a retail console title) is answered from the PC runtime's
+//             structure with the extra bytes zeroed; the PC runtime refuses that size. See d3d12_console_feature.h.
+//   slot 133  CreatePlacedResourceX(va, desc, state, clear, riid, out) -> PC CreateCommittedResource on a DEFAULT heap,
+//             with the Xbox flag bits dropped and an all-ones state as COMMON. Not backed by the memory at va.
 // The measured slots 9/10 (GetCPU/GPUDescriptorHandleForHeapStart) are ID3D12DescriptorHeap methods, not device
 // methods: the PC device's 9/10 are CreateCommandAllocator/CreateGraphicsPipelineState and are forwarded unchanged.
 // On the PC heap those getters use the hidden return pointer in RDX; the Xbox ABI returns the 8-byte handle in
@@ -36,20 +72,34 @@
 // Command queues and fences (device slots 8, 75, 36, and 32 for a shared fence) come back wrapped in queue and fence
 // proxies of the same kind: the public chain (19 queue slots, 11 or 12 fence slots in SDK 10.0.26100) is forwarded
 // in PC order, and a slot past it, up to the end of the proxy's table (128 queue, 64 fence slots), is logged with its
-// first four argument words and refused with E_NOTIMPL. A slot past the table faults on the vtable read inside a
-// reserved, never-committed region, and the fault is logged with the slot. That is where the console's queue methods
-// (PresentX, SuspendX, ResumeX) will show up; their slots are not known and are not guessed, and that the console
-// keeps the public slots is an assumption (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
+// first four argument words and refused with E_NOTIMPL. Fence slot 12 is the served exception: the retail executable
+// calls it as (value, descriptor, flags) and reads the return as a pointer to the fence's completed value, so the
+// proxy returns a live per-fence mirror (see the section in d3d12_xs_device.cpp). Queue slot 32 is PresentX in the
+// retail executable: it goes
+// to the real presenter when one is registered, else to the opt-in capture when LEONIDA_PRESENTX_SLOT/_CAPTURE names
+// it, else it is refused like any other tail slot (slot 30 can be named as the alternate). A slot past the table
+// faults on the vtable read inside a reserved, never-committed region, and the
+// fault is logged with the slot. That the console keeps the public slots is an assumption
+// (docs/d3d12_command_objects.md §5.2). Heap, queue and fence proxies are
 // unwrapped wherever a device or queue method hands them to the real runtime: queue Signal/Wait (14/15), device
 // CreateSharedHandle (31), MakeResident/Evict (34/35), SetEventOnMultipleFenceCompletion (45), SetResidencyPriority
-// (46) and EnqueueMakeResident (50). Command lists are not wrapped, so ExecuteCommandLists passes them through and a
-// heap proxy given to a list's SetDescriptorHeaps reaches the real list as it is. QueryInterface answers only the
+// (46) and EnqueueMakeResident (50). A command list created for the console command-list IID is wrapped: on it,
+// console slot 139 is the retail title's Reset(allocator, pso) and forwards to PC slot 10 with both proxies unwrapped.
+// A heap proxy given to a list's SetDescriptorHeaps reaches the real list as it is. QueryInterface answers only the
 // modelled interfaces; one the real object has but the proxy does not model is logged once and refused.
 #pragma once
 
 #include <d3d12.h>
 
+#include <cstddef>
+#include "xbox_present_types.h"
+
 #include <cstdint>
+#include <memory>
+
+namespace leonida {
+class FrameTokenSource;
+}
 
 namespace rt::d3d12_xs {
 
@@ -74,6 +124,15 @@ bool is_device_proxy(const void* device);
 using DxgiAdapterProvider = HRESULT (*)(ID3D12Device* real, REFIID riid, void** out);
 // `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither: nothing is set then.
 bool set_device_adapter_provider(void* device, DxgiAdapterProvider provider);
+// Finds the buffer resource that holds a console GPU virtual address, for device slot 70. `real` is the device behind
+// the proxy; `bytes` is how many bytes from `va` the caller wants, so a resource that holds all of them is preferred
+// over a shorter alias. Returns the resource with a reference added (the proxy releases it), or null when no resource holds
+// `va`; `start` and `size` are then unused, otherwise the resource's first VA and size in bytes.
+using ResourceByVaProvider = ID3D12Resource* (*)(ID3D12Device* real, std::uint64_t va, std::uint64_t bytes,
+                                                std::uint64_t* start, std::uint64_t* size);
+// `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither. Without a provider slot
+// 70 writes only the null view.
+bool set_device_resource_provider(void* device, ResourceByVaProvider provider);
 // The device proxy an IDXGIDevice pointer handed out by one belongs to, or null.
 void* device_proxy_from_dxgi_device(void* dxgi_device);
 // The device proxy itself, given the proxy or its DXGI pointer; null for anything else.
@@ -83,17 +142,72 @@ void* device_proxy_primary(void* device);
 bool is_heap_proxy(const void* heap);
 ID3D12DescriptorHeap* heap_proxy_real_heap(const void* heap);
 
+// Console D3D12 descriptor heaps allocate their backing through XMem (allocator ID 0x80 = eXALLOCAllocatorId_D3D in
+// bits 16..23, object type 4 in the low 14 bits). A title that intercepts this allocation via __XMemAllocationHooks__
+// returns its own virtual address and expects GetCPUDescriptorHandleForHeapStart() to return that address.
+inline constexpr std::uint64_t kXmemDescriptorHeapAttributes = (0x80ULL << 16) | 4ULL;
+using DescriptorHeapBackingAlloc = void* (*)(std::size_t byte_size, std::uint64_t attributes);
+using DescriptorHeapBackingFree = void (*)(void* ptr, std::uint64_t attributes);
+// Installs (or clears when both are null) the backing allocator consulted by CreateDescriptorHeap (slot 14).
+void set_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free);
+// Installs the default bridge (used by D3D12XboxCreateDevice) only when no explicit allocator has been set.
+void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, DescriptorHeapBackingFree free);
+// Translates a CPU descriptor handle from a title-backed descriptor heap to the underlying PC/Vulkan heap handle.
+// Returns `handle` unchanged when it does not fall inside any active custom-backed heap.
+D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE handle);
+
 // Number of PC vtable slots the proxy forwards (detected from the interfaces the PC device supports).
 unsigned device_proxy_slot_count(const void* device);
 
 // The PC device behind a proxy. Null when `device` is not a proxy.
 ID3D12Device* device_proxy_real_device(const void* device);
 
+// The device's frame-token counter, shared with the presentation pacer when one is attached: device slot 80
+// (WaitFrameEventX) hands out its tokens and PresentX checks them, so a title that waits through the device and
+// presents through its XboxPresentation never sees a token the pacer did not issue. Null for a non-proxy.
+std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* device);
+
+// The real presentation behind the retail title's Xbox slots. The device proxy does not link the Vulkan presenter
+// itself: whichever module owns the presentation (d3d12_xs.cpp on the Vulkan backend) registers a factory once, and
+// a device asks it for a sink the first time an Xbox presentation slot is called. The factory gets the layer's
+// ID3D12Device and the window supplied to set_device_presentation_window (or null: find the process's game window).
+// Without a factory, or when it returns null, the device keeps the token stand-in and the queue keeps the capture
+// route, so unit tests and a host-D3D12 run do not require a window.
+//
+// Measured calls from the retail executable (1.0.2.1):
+//   device slots 78/79/80  SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX (0x270/0x278/0x280).
+//   queue slot 32          PresentX(plane_count, planes, params) (0x100). The plane layout is the provisional
+//                          XboxPresentPlaneParameters above: the executable writes 0x48 bytes per plane, token at
+//                          +0, ResourceCount 1 at +8, ppResources at +0x10, source rect at +0x18, full-output
+//                          placement at +0x20 and the colour space at +0x28.
+class XboxPresentationSink {
+public:
+    virtual ~XboxPresentationSink() = default;
+    virtual HRESULT SetFrameIntervalX(std::uint64_t output, std::uint32_t interval_us, std::uint32_t latency,
+                                      std::uint32_t flags) = 0;
+    virtual HRESULT ScheduleFrameEventX(std::uint32_t event, std::uint32_t offset_us, std::uint32_t flags) = 0;
+    virtual HRESULT WaitFrameEventX(std::uint32_t event, std::uint32_t timeout_ms, std::uint32_t flags,
+                                    std::uint64_t* token) = 0;
+    virtual HRESULT PresentX(std::uint32_t plane_count, const rt::d3d12::XboxPresentPlaneParameters* planes,
+                             const rt::d3d12::XboxPresentParameters* params) = 0;
+};
+// The factory returns a sink owned by the device proxy (delete on device release), or null. `device_proxy` is the
+// Xbox-ABI device the sink belongs to, so a factory that also drives leonida::FramePacer can share the device's
+// frame-token source through device_frame_tokens instead of numbering tokens on its own.
+using XboxPresentationFactory = XboxPresentationSink* (*)(ID3D12Device* real, void* device_proxy,
+                                                          std::uint64_t window);
+// Process-wide; call before the first Xbox presentation slot. A null factory restores the stand-ins.
+void set_xbox_presentation_factory(XboxPresentationFactory factory);
+// Optional window for this device's factory (an HWND as std::uint64_t); null lets the factory discover it.
+void set_device_presentation_window(void* device, std::uint64_t window);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
-// proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
-// 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the
-// measured 9/10 handle conversion is on the heap proxy, and device slot 9 is CreateCommandAllocator, which the proxy
-// handles for the allocator proxy.
+// proxies), 9 (allocator proxies), 13 (console-sized D3D12_OPTIONS), 14 (descriptor heap proxy), 17-24 (CPU
+// descriptor handle translation), 25/26 (the console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped),
+// 32 and 36 (fence proxies), 41 (CreateCommandSignature with the console signature IID), 48/73 and 78/79/80 (the
+// Xbox slots above, at their configured indices), 56 (GetResourceAllocationInfo1), 62, 67, 70, 76, 86, 101, 108 and
+// 133. Slot 10 is intentionally false: the measured 9/10 handle conversion is on the heap proxy, and device slot 9 is
+// CreateCommandAllocator, which the proxy handles for the allocator proxy.
 bool device_slot_overridden(unsigned slot);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
@@ -123,8 +237,11 @@ bool command_object_tables_guarded();
 
 // Command allocator proxies (device slot 9): the public chain (9 slots: the base chain and Reset) is forwarded, a
 // slot past it up to the end of the table (64 slots) is logged and refused with E_NOTIMPL, and a read past the
-// table faults in a guard region, as for queues and fences. The console allocator's extra methods are not
-// measured and not guessed. Slot 9 wraps only an allocator that answers kLeonidaCommandAllocatorTag, Leonida's
+// table faults in a guard region, as for queues and fences. Slot 9 is the served exception (the retail title's
+// allocator-pool path): it logs its first calls and answers S_OK without forwarding, and if its first word is
+// writable memory holding all ones (the poison the title reads through) it sets that word to null. The console
+// allocator's other extra methods are not measured and not guessed. Slot 9 of the device wraps only an allocator
+// that answers kLeonidaCommandAllocatorTag, Leonida's
 // own Vulkan-layer allocator: its command lists resolve the proxy (CreateCommandList, Reset). A PC runtime
 // allocator goes back unchanged, because the PC runtime's lists would take a proxy for their own allocator; a
 // command-list proxy that unwraps at Reset is what lets the host backend wrap allocators too.

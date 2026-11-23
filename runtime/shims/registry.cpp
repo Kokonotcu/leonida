@@ -18,9 +18,19 @@
 namespace rt::shims {
 namespace {
 
+// Immortal and free of function-local static init guards (safe on guest threads when TLS slot 0 is owned by the
+// mapped executable or under Wine / static-CRT cross-builds, as in RT-488).
+INIT_ONCE g_table_once = INIT_ONCE_STATIC_INIT;
+std::map<std::string, void*>* g_table = nullptr;
+
+BOOL CALLBACK init_table(PINIT_ONCE, PVOID, PVOID*) {
+    g_table = new std::map<std::string, void*>;
+    return TRUE;
+}
+
 std::map<std::string, void*>& table() {
-    static std::map<std::string, void*> t;  // "dll!name"
-    return t;
+    InitOnceExecuteOnce(&g_table_once, init_table, nullptr, nullptr);
+    return *g_table;
 }
 
 std::string lower_ascii(std::string s) {
@@ -76,11 +86,16 @@ std::vector<Lookup> g_lookups;
 //                            left out on purpose.
 //  gameinput.dll             GameInputCreate: HRESULT (gaming/gdk/docs/reference/input/gameinput/functions/
 //                            gameinputcreate). The shim implements it (runtime/shims/gameinput.cpp); the class is
-//                            listed anyway for a build or import it misses.
+//                            listed anyway for a build or import it misses. "#1" is the same function by ordinal:
+//                            ordinal 1 is GameInputCreate in the console export inventory (docs/d3d12_vulkan.md §7).
 //  xaudio2_9.dll             XAudio2Create: HRESULT (learn.microsoft.com/windows/win32/api/xaudio2/
 //  xaudio2_9redist.dll       nf-xaudio2-xaudio2create). xaudio2_9.dll is the console name (docs/d3d12_vulkan.md §7).
+//                            "#1" is XAudio2Create by ordinal, ordinal 1 verified in the same inventory.
 //  dstorage.dll              DStorageGetFactory: HRESULT (learn.microsoft.com/windows/win32/api/dstorage/
-//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory). dstorage_xs.dll is the console name.
+//  dstorage_xs.dll           nf-dstorage-dstoragegetfactory, and the GDK's gaming/gdk/docs/reference/system/dstorage/
+//  xcrdapi.dll               functions/dstoragegetfactory). dstorage_xs.dll is the console name; xcrdapi.dll is a
+//                            console module the title may import it from (docs/directstorage.md). dstorage.cpp serves
+//                            it; the class is kept for a build without that shim.
 const char* const kNotHResult[] = {
     "XAsyncCancel", "XAsyncComplete",
     "XTaskQueueCloseHandle", "XTaskQueueDispatch", "XTaskQueueGetCurrentProcessTaskQueue",
@@ -108,10 +123,15 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
             name == "DXGIDeclareAdapterRemovalSupport")
             return ReturnClass::HResult;
     } else if (dll == "xaudio2_9.dll" || dll == "xaudio2_9redist.dll") {
-        if (name == "XAudio2Create") return ReturnClass::HResult;
+        if (name == "XAudio2Create" || name == "#1") return ReturnClass::HResult;
+        // Host xaudio2_9.dll ordinals 8-10 are XAudio2CreateV2_9 / XAudio2CreateWithVersionInfo /
+        // XAudio2CreateWithSharedContexts (measured on the System32 export table); the redist's ordinal
+        // table is not confirmed, so only the system copy gets them.
+        if (dll == "xaudio2_9.dll" && (name == "#8" || name == "#9" || name == "#10"))
+            return ReturnClass::HResult;
     } else if (dll == "gameinput.dll") {
-        if (name == "GameInputCreate") return ReturnClass::HResult;
-    } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll") {
+        if (name == "GameInputCreate" || name == "#1") return ReturnClass::HResult;
+    } else if (dll == "dstorage.dll" || dll == "dstorage_xs.dll" || dll == "xcrdapi.dll") {
         if (name == "DStorageGetFactory") return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
         if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;
@@ -234,7 +254,8 @@ constexpr size_t kThunkSize = 32;
 uint8_t* g_pool = nullptr;
 size_t g_pool_used = 0, g_pool_size = 0;
 std::mutex g_pool_mutex;
-void* g_stub = nullptr;  // under g_pool_mutex
+void* g_stub = nullptr;                              // under g_pool_mutex
+std::map<std::string, void*>* g_thunks = nullptr;    // under g_pool_mutex; immortal
 
 void* make_common_stub() {
     constexpr size_t kUnwindOffset = 0x80, kFunctionOffset = 0x90, kRegionSize = 0x1000;
@@ -382,33 +403,46 @@ struct BundledLoaderEntry {
     const BundledModuleOps* ops;
 };
 
-// Immortal: late mapped-DLL detach or atexit handlers may call GetProcAddress/FreeLibrary during process teardown.
-std::mutex& bundled_loader_mutex() {
-    static auto* m = new std::mutex;
-    return *m;
-}
+struct XMemHooksEntry {
+    const void* owner;
+    const XMemAllocationHooks* hooks;
+};
 
-std::vector<BundledLoaderEntry>& bundled_loaders() {
-    static auto* v = new std::vector<BundledLoaderEntry>;
-    return *v;
-}
+// Immortal and constant-initialized: late mapped-DLL detach, atexit handlers, or guest threads (with TLS slot 0
+// owned by the mapped executable) may call GetProcAddress/FreeLibrary without tripping a function-local static guard.
+SRWLOCK g_bundled_lock = SRWLOCK_INIT;
+std::vector<BundledLoaderEntry>* g_bundled_loaders = nullptr;
+// Same rule as the registry table: the title's thread first asks for these hooks inside D3D12XboxCreateDevice, after
+// the loader has moved the process TLS, so no function-local static may guard this list.
+SRWLOCK g_xmem_hooks_lock = SRWLOCK_INIT;
+std::vector<XMemHooksEntry>* g_xmem_hooks = nullptr;
+
+struct SrwLockGuard {
+    SRWLOCK* lock;
+    explicit SrwLockGuard(SRWLOCK& l) : lock(&l) { AcquireSRWLockExclusive(lock); }
+    ~SrwLockGuard() { ReleaseSRWLockExclusive(lock); }
+    SrwLockGuard(const SrwLockGuard&) = delete;
+    SrwLockGuard& operator=(const SrwLockGuard&) = delete;
+};
 
 std::vector<BundledLoaderEntry> snapshot_bundled_loaders() {
-    std::lock_guard lock(bundled_loader_mutex());
-    return bundled_loaders();
+    SrwLockGuard lock(g_bundled_lock);
+    return g_bundled_loaders ? *g_bundled_loaders : std::vector<BundledLoaderEntry>{};
 }
 
 }  // namespace
 
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops) {
     if (!ctx || !ops) return;
-    std::lock_guard lock(bundled_loader_mutex());
-    bundled_loaders().push_back({ctx, ops});
+    SrwLockGuard lock(g_bundled_lock);
+    if (!g_bundled_loaders) g_bundled_loaders = new std::vector<BundledLoaderEntry>;
+    g_bundled_loaders->push_back({ctx, ops});
 }
 
 void remove_bundled_loader(void* ctx) {
-    std::lock_guard lock(bundled_loader_mutex());
-    auto& list = bundled_loaders();
+    SrwLockGuard lock(g_bundled_lock);
+    if (!g_bundled_loaders) return;
+    auto& list = *g_bundled_loaders;
     for (auto it = list.begin(); it != list.end(); ++it)
         if (it->ctx == ctx) {
             list.erase(it);
@@ -417,7 +451,13 @@ void remove_bundled_loader(void* ctx) {
 }
 
 void* find_loaded_bundled_module(const std::string& dll_lower) {
-    for (const auto& entry : snapshot_bundled_loaders())
+    // No allocation: this is reached from GetModuleHandleW during a title's CRT startup (RT-5's
+    // api-ms-win-core-synch-l1-2-0.dll probe), before its heap is necessarily usable. The copy that
+    // snapshot_bundled_loaders() makes was the first allocation on that path and faulted there. The loader's
+    // find_loaded only reads its module map, so holding the lock across it is safe and stays allocation-free.
+    SrwLockGuard lock(g_bundled_lock);
+    if (!g_bundled_loaders) return nullptr;
+    for (const auto& entry : *g_bundled_loaders)
         if (void* h = entry.ops->find_loaded(entry.ctx, dll_lower)) return h;
     return nullptr;
 }
@@ -458,7 +498,11 @@ void* load_bundled_module_w(const std::wstring& basename, uint32_t flags, bool& 
 
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle) {
     owns_handle = false;
-    for (const auto& entry : snapshot_bundled_loaders()) {
+    // Same early-CRT path as find_loaded_bundled_module: GetProcAddress during the title's static
+    // initialisation reaches this before its heap is dependable, so no vector copy here either.
+    SrwLockGuard lock(g_bundled_lock);
+    if (!g_bundled_loaders) return nullptr;
+    for (const auto& entry : *g_bundled_loaders) {
         bool loader_owns = false;
         void* fn = entry.ops->get_proc(entry.ctx, module, sym, loader_owns);
         if (loader_owns) {
@@ -475,6 +519,45 @@ bool owns_bundled_module_handle(void* module) {
     return false;
 }
 
+void* bundled_main_module() {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->main_module)
+            if (void* h = entry.ops->main_module(entry.ctx)) return h;
+    return nullptr;
+}
+
+const std::filesystem::path* bundled_module_path(void* module) {
+    for (const auto& entry : snapshot_bundled_loaders())
+        if (entry.ops->module_path)
+            if (const std::filesystem::path* p = entry.ops->module_path(entry.ctx, module)) return p;
+    return nullptr;
+}
+
+void add_xmem_allocation_hooks(const void* owner, const XMemAllocationHooks* hooks) {
+    if (!owner || !hooks) return;
+    SrwLockGuard lock(g_xmem_hooks_lock);
+    if (!g_xmem_hooks) g_xmem_hooks = new std::vector<XMemHooksEntry>;
+    g_xmem_hooks->push_back({owner, hooks});
+}
+
+void remove_xmem_allocation_hooks(const void* owner) {
+    SrwLockGuard lock(g_xmem_hooks_lock);
+    if (!g_xmem_hooks) return;
+    auto& list = *g_xmem_hooks;
+    for (auto it = list.begin(); it != list.end();) {
+        if (it->owner == owner) {
+            it = list.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+const XMemAllocationHooks* xmem_allocation_hooks() {
+    SrwLockGuard lock(g_xmem_hooks_lock);
+    return (g_xmem_hooks && !g_xmem_hooks->empty()) ? g_xmem_hooks->back().hooks : nullptr;
+}
+
 Table::Table(const Entry* entries, size_t count) {
     for (size_t i = 0; i < count; ++i) table()[lower_ascii(entries[i].dll) + "!" + entries[i].name] = entries[i].fn;
 }
@@ -486,7 +569,7 @@ void* find(const std::string& dll_lower, const std::string& name) {
 
 bool owns_dll(const std::string& dll_lower) {
     static const char* const host[] = {"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
-                                       "vulkan-1.dll", "ntdll.dll", "user32.dll"};
+                                       "vulkan-1.dll", "ntdll.dll", "user32.dll", "advapi32.dll"};
     if (starts_with(dll_lower, "api-ms-") || starts_with(dll_lower, "ext-ms-")) return false;
     for (const char* h : host)
         if (dll_lower == h) return false;
@@ -497,10 +580,11 @@ bool owns_dll(const std::string& dll_lower) {
 
 void* make_unimplemented_thunk(const std::string& dll, const std::string& name) {
     std::lock_guard lock(g_pool_mutex);
-    static std::map<std::string, void*> s_thunks;
+    if (!g_thunks) g_thunks = new std::map<std::string, void*>;
+    auto& thunks = *g_thunks;
     const std::string key = lower_ascii(dll) + "!" + name;
-    auto it = s_thunks.find(key);
-    if (it != s_thunks.end()) return it->second;
+    auto it = thunks.find(key);
+    if (it != thunks.end()) return it->second;
 
     if (!g_stub) g_stub = make_common_stub();
     if (!g_stub) return nullptr;
@@ -524,7 +608,7 @@ void* make_unimplemented_thunk(const std::string& dll, const std::string& name) 
     std::memset(code + 22, 0xCC, kThunkSize - 22);
     std::memcpy(t, code, kThunkSize);
     FlushInstructionCache(GetCurrentProcess(), t, kThunkSize);
-    s_thunks.emplace(key, t);
+    thunks.emplace(key, t);
     return t;
 }
 

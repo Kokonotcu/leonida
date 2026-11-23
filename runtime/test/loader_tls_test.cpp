@@ -757,6 +757,49 @@ void test_purge_ownership_scoping(const fs::path& dll, const fs::path& temp) {
     fs::remove(live_file, ec);
 }
 
+void test_reuse_after_cleanup_tls_clones(const fs::path& dll, const fs::path& dir) {
+    std::printf("\n-- reuse multiple TLS modules after cleanup_tls_clones --\n");
+    const fs::path second = dir / "tiny_tls_after_cleanup.dll";
+    fs::copy_file(dll, second, fs::copy_options::overwrite_existing);
+
+    {
+        rt::Loader loader(dll.parent_path());
+        rt::Module& first = loader.load(dll);
+        rt::Module& mapped_second = loader.load(second);
+        loader.initialise();
+        check(first.tls_index != rt::kNoTlsIndex && mapped_second.tls_index != rt::kNoTlsIndex,
+              "fresh Loader after cleanup_tls_clones assigns TLS indices to both modules");
+        check(first.tls_index != mapped_second.tls_index,
+              "fresh Loader after cleanup_tls_clones assigns distinct TLS indices");
+        check(own_clone_files().size() == 1,
+              "ensure_tls_host reloads a fresh clone after cleanup_tls_clones reset g_tls_hosts");
+        // Verify on_host_thread_event was re-hooked on slot 0 by exercising a worker thread.
+        using ReadFn = int(__cdecl*)();
+        auto read_second = reinterpret_cast<ReadFn>(mapped_second.exports.at("tiny_tls_get"));
+        int worker_val = 0;
+        HANDLE thread = CreateThread(
+            nullptr, 0,
+            [](void* p) -> DWORD {
+                auto fn = reinterpret_cast<ReadFn>(p);
+                return static_cast<DWORD>(fn());
+            },
+            reinterpret_cast<void*>(read_second), 0, nullptr);
+        check(thread != nullptr, "worker thread created after cleanup_tls_clones");
+        if (thread) {
+            WaitForSingleObject(thread, INFINITE);
+            DWORD code = 0;
+            GetExitCodeThread(thread, &code);
+            worker_val = static_cast<int>(code);
+            CloseHandle(thread);
+        }
+        check(worker_val == 7, "worker thread sees initial TLS template after re-hooking");
+    }
+    rt::cleanup_tls_clones();
+    check(own_clone_files().empty(), "second cleanup_tls_clones deletes the reloaded clone file");
+    std::error_code ec;
+    fs::remove(second, ec);
+}
+
 void print_result() {
     if (g_failures == 0)
         std::printf("\nloader_tls_test: OK (%d checks)\n", g_checks);
@@ -798,6 +841,7 @@ int main(int argc, char** argv) {
         check(!own_clone_files().empty(), "TLS helper clone files exist before explicit cleanup");
         rt::cleanup_tls_clones();
         check(own_clone_files().empty(), "cleanup_tls_clones deletes every clone file of this process");
+        test_reuse_after_cleanup_tls_clones(tls_dll, temp.path);
     } catch (const std::exception& e) {
         ++g_checks;
         ++g_failures;

@@ -241,6 +241,10 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
         desc1(texture_desc(1024, 1024, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
     D3D12_RESOURCE_DESC1 tex_256x256 =
         desc1(texture_desc(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE));
+    // R9G9B9E5 with UAV access: on GPUs without E5B9G9R9 storage the layer stores it as R32_UINT with its own
+    // view-format list, which a castable list then extends (a looped pNext chain once hung the creation).
+    D3D12_RESOURCE_DESC1 e5_uav_tex =
+        desc1(texture_desc(8, 8, DXGI_FORMAT_R9G9B9E5_SHAREDEXP, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
     D3D12_RESOURCE_DESC base_1000x600_10m =
         texture_desc(1000, 600, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE, 10);
     D3D12_RESOURCE_DESC base_300x200_f16 =
@@ -264,6 +268,7 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
     const DXGI_FORMAT srgb_cast[] = {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB};
     const DXGI_FORMAT unknown_cast[] = {DXGI_FORMAT_UNKNOWN};
     const DXGI_FORMAT wide_cast[] = {DXGI_FORMAT_R16G16B16A16_FLOAT};
+    const DXGI_FORMAT e5_cast[] = {DXGI_FORMAT_R32_UINT};
 
     const auto v2 = [&](const D3D12_HEAP_PROPERTIES& heap, const D3D12_RESOURCE_DESC1& desc) {
         Ref<ID3D12Resource> r;
@@ -322,6 +327,8 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
     res_rt.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     D3D12_RESOURCE_DESC res_uav = res_tex;
     res_uav.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    D3D12_RESOURCE_DESC res_e5_uav = res_uav;
+    res_e5_uav.Format = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
     D3D12_RESOURCE_DESC res_ds_deny = texture_desc(
         64, 64, DXGI_FORMAT_D32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
     res_ds_deny.Layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE;
@@ -412,6 +419,9 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
          v3(default_heap, ds_deny_tex, D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE), E_INVALIDARG},
         {"CreateCommittedResource3, DS+DENY_SR in GENERIC_READ",
          v3(default_heap, ds_deny_tex, D3D12_BARRIER_LAYOUT_GENERIC_READ), S_OK},
+        {"CreateCommittedResource3, R9G9B9E5 UAV texture with a castable list",
+         v3(default_heap, e5_uav_tex, D3D12_BARRIER_LAYOUT_COMMON, 1, true, D3D12_HEAP_FLAG_NONE, nullptr, e5_cast),
+         S_OK},
         {"CreatePlacedResource2, buffer in COMMON",
          p2(upload_placed_heap.p, 0, buffer, D3D12_BARRIER_LAYOUT_COMMON), E_INVALIDARG},
         {"CreatePlacedResource2, buffer with Height=2",
@@ -444,6 +454,8 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
          p2(placed_heap.p, 0, texture, D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE), E_INVALIDARG},
         {"CreatePlacedResource2, DS+DENY_SR in DIRECT_QUEUE_SHADER_RESOURCE",
          p2(placed_heap.p, 0, ds_deny_tex, D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE), E_INVALIDARG},
+        {"CreatePlacedResource2, R9G9B9E5 UAV texture with a castable list",
+         p2(placed_heap.p, 0, e5_uav_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, e5_cast), S_OK},
         {"CreateReservedResource1, clear value on plain texture",
          r1(res_tex, D3D12_RESOURCE_STATE_COMMON, &cv_rt), E_INVALIDARG},
         {"CreateReservedResource2, buffer in COMMON",
@@ -478,6 +490,8 @@ std::vector<Edge> edge_answers(ID3D12Device10* device, ID3D12Device10* placed_de
          r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, srgb_cast), S_OK},
         {"CreateReservedResource2, castable count with null list",
          r2(res_tex, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 2, nullptr), S_OK},
+        {"CreateReservedResource2, R9G9B9E5 UAV texture with a castable list",
+         r2(res_e5_uav, D3D12_BARRIER_LAYOUT_COMMON, nullptr, 1, e5_cast), S_OK},
         {"CreateCommandQueue1, null description", null_queue, E_INVALIDARG},
         {"GetCopyableFootprints1, texture with a mip region", footprint(texture_region), S_FALSE},
         {"GetCopyableFootprints1, buffer with a mip region", footprint(buffer_region), S_OK},

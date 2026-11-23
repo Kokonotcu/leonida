@@ -32,7 +32,16 @@ extern "C" __declspec(dllexport) void gta6rt_tls_host_set_thread_event(ThreadEve
     InterlockedExchangePointer(&g_thread_event, reinterpret_cast<void*>(fn));
 }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD reason, LPVOID) {
+// This is the image's entry point, not DllMain behind the C runtime's _DllMainCRTStartup. On DLL_THREAD_ATTACH the
+// CRT wrapper does its own per-thread bookkeeping *after* this function returns, in the module TLS block. The loader
+// has replaced that block with the mapped image's block, so the wrapper would treat the image's __declspec(thread)
+// data as its _ptd and corrupt the process heap during thread attach/detach. This DLL uses no CRT state, so handle
+// the thread events directly (the entry point receives exactly DllMain's arguments).
+extern "C" BOOL WINAPI gta6rt_tls_host_entry(HINSTANCE, DWORD reason, LPVOID) {
+    // The OS loader reserves a module TLS index only for a DLL with a non-empty import directory; an image with none
+    // is initialised without one (so its TLS index storage stays 0, colliding with the host EXE's index). Keep a
+    // kernel32 import in the image even though this CRT-free entry needs no other import.
+    (void)GetCurrentProcessId();
     if (reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH) {
         void* fn = InterlockedCompareExchangePointer(&g_thread_event, nullptr, nullptr);
         if (fn) reinterpret_cast<ThreadEventFn>(fn)(reason);

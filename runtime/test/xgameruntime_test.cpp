@@ -266,8 +266,8 @@ void check_measured_classes(QueryFn query, XSystemAnalyticsInfo (*named_analytic
 }
 
 // xgameruntime.lib's thunks don't import the runtime: they LoadLibraryW(L"xgameruntime.dll") and GetProcAddress five
-// names (measured in the package's libHttpClient.GDK.dll and XCurl.dll). Drive that path through the loader shims,
-// bound by the api set XCurl.dll imports them from, as a mapped image would be.
+// entry points and XErrorReport (measured in the package's libHttpClient.GDK.dll and XCurl.dll). Drive that path
+// through the loader shims, bound by the api set XCurl.dll imports them from, as a mapped image would be.
 void check_run_time_load() {
     using LoadW = HMODULE(WINAPI*)(LPCWSTR);
     using LoadExA = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
@@ -294,12 +294,15 @@ void check_run_time_load() {
           "the same module for a bare name, a full path in any case, LoadLibraryExA and GetModuleHandleW");
 
     const char* entry_points[] = {"InitializeApiImpl", "InitializeApiImplEx", "InitializeApiImplEx2",
-                                  "UninitializeApiImpl", "QueryApiImpl"};
+                                  "UninitializeApiImpl", "QueryApiImpl", "XErrorReport"};
     bool all = true;
     for (const char* n : entry_points)
         all = all && get_proc(rt_mod, n) &&
               reinterpret_cast<void*>(get_proc(rt_mod, n)) == rt::shims::find("xgameruntime.dll", n);
-    check(all, "GetProcAddress serves the five entry points xgameruntime.lib looks up");
+    check(all, "GetProcAddress serves the six names xgameruntime.lib looks up (five entry points and XErrorReport)");
+    using ReportExport = HRESULT(WINAPI*)(HRESULT, const char*);
+    auto report_export = reinterpret_cast<ReportExport>(get_proc(rt_mod, "XErrorReport"));
+    check(report_export && report_export(E_FAIL, "export") == S_OK, "the XErrorReport export answers S_OK");
     SetLastError(0);
     check(get_proc(rt_mod, "NoSuchRuntimeFunction") == nullptr && GetLastError() == ERROR_PROC_NOT_FOUND,
           "an unserved name is NULL with ERROR_PROC_NOT_FOUND, as from a real module");
@@ -906,6 +909,135 @@ void check_run_time_load() {
     g_teardown_free_lib = free_lib;
 }
 
+// XSystemGetDeviceType is not an import of a title: xgameruntime.lib links it into the title, and it reads the
+// console mode from the registry. This stands in for that function: RegOpenKeyW on
+// HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM, then RegQueryValueExW for the DWORD "ConsoleMode" with
+// a 4-byte buffer, then RegCloseKey; a failure of either call is 1 (PC), and the value maps to the device type as
+// below. The registry functions passed in are the ones the loader would bind.
+using RegOpenKeyWFn = LSTATUS(WINAPI*)(HKEY, LPCWSTR, PHKEY);
+using RegOpenKeyExWFn = LSTATUS(WINAPI*)(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
+using RegQueryValueExWFn = LSTATUS(WINAPI*)(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+using RegCloseKeyFn = LSTATUS(WINAPI*)(HKEY);
+constexpr wchar_t kOemKey[] = L"Software\\Microsoft\\Windows NT\\CurrentVersion\\OEM";
+
+uint32_t title_device_type(RegOpenKeyWFn open, RegQueryValueExWFn query, RegCloseKeyFn close) {
+    HKEY key = nullptr;
+    if (open(HKEY_LOCAL_MACHINE, kOemKey, &key) != ERROR_SUCCESS) return 1;
+    DWORD mode = 0, size = 4;
+    const LSTATUS status = query(key, L"ConsoleMode", nullptr, nullptr, reinterpret_cast<LPBYTE>(&mode), &size);
+    close(key);
+    if (status != ERROR_SUCCESS) return 1;
+    switch (mode) {
+        case 0x10: case 0x20: case 0x21: case 0x30: case 0x31: return 2;
+        case 0x40: return 3;
+        case 0x50: return 4;
+        case 0x58: return 5;
+        case 0x60: return 6;
+        case 0x64: return 7;
+        case 0x68: return 8;
+        default: return 0;
+    }
+}
+
+void test_console_mode_registry() {
+    std::printf("\n-- the console mode a title reads from the registry --\n");
+    // The names the package's DLLs import the calls by: XCurl.dll through the two API sets, libHttpClient.GDK.dll
+    // through advapi32.dll.
+    const char* const dlls[] = {"advapi32.dll", "api-ms-win-core-registry-l1-1-0.dll",
+                                "api-ms-win-core-registry-l2-1-0.dll"};
+    std::printf("     bound to the host's registry, the title's function answers %u (1 is a PC)\n",
+                title_device_type(&::RegOpenKeyW, &::RegQueryValueExW, &::RegCloseKey));
+    bool registered = true;
+    for (const char* dll : dlls)
+        for (const char* name : {"RegOpenKeyW", "RegOpenKeyExW", "RegQueryValueExW", "RegCloseKey"})
+            if (!rt::shims::find(dll, name)) {
+                std::printf("     not registered: %s!%s\n", dll, name);
+                registered = false;
+            }
+    check(registered, "RegOpenKeyW, RegOpenKeyExW, RegQueryValueExW and RegCloseKey resolve under advapi32 and both API sets");
+    if (!registered) return;
+    check(!rt::shims::owns_dll("advapi32.dll"),
+          "advapi32.dll stays a host module: only these four of its functions are answered");
+
+    const auto open = reinterpret_cast<RegOpenKeyWFn>(rt::shims::find("api-ms-win-core-registry-l2-1-0.dll", "RegOpenKeyW"));
+    const auto open_ex =
+        reinterpret_cast<RegOpenKeyExWFn>(rt::shims::find("api-ms-win-core-registry-l1-1-0.dll", "RegOpenKeyExW"));
+    const auto query =
+        reinterpret_cast<RegQueryValueExWFn>(rt::shims::find("api-ms-win-core-registry-l1-1-0.dll", "RegQueryValueExW"));
+    const auto close = reinterpret_cast<RegCloseKeyFn>(rt::shims::find("api-ms-win-core-registry-l1-1-0.dll", "RegCloseKey"));
+
+    SetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", nullptr);
+    const uint32_t shim_type = get<DeviceTypeFn>("XSystemGetDeviceType")();
+    check(title_device_type(open, query, close) == 7 && shim_type == 7,
+          "the title's own XSystemGetDeviceType reads Series X (7), as the shim's export reports");
+
+    // LEONIDA_DEVICE_TYPE moves both answers together. 1 is a PC: the key is then the host's to answer, and a PC
+    // has none, so the title's function returns 1 by its own failure path.
+    bool follows = true;
+    for (uint32_t type = 2; type <= 8; ++type) {
+        char text[8];
+        std::snprintf(text, sizeof(text), "%u", type);
+        SetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", text);
+        const uint32_t got = title_device_type(open, query, close);
+        if (got != type || get<DeviceTypeFn>("XSystemGetDeviceType")() != type) {
+            std::printf("     LEONIDA_DEVICE_TYPE=%u: the title reads %u\n", type, got);
+            follows = false;
+        }
+    }
+    check(follows, "LEONIDA_DEVICE_TYPE 2..8 reaches the title's function through the registry answer");
+    SetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", "1");
+    HKEY host_key = nullptr;
+    const bool host_has_key = ::RegOpenKeyW(HKEY_LOCAL_MACHINE, kOemKey, &host_key) == ERROR_SUCCESS;
+    if (host_has_key) ::RegCloseKey(host_key);
+    check(host_has_key || title_device_type(open, query, close) == 1,
+          "LEONIDA_DEVICE_TYPE=1 leaves the key to the host, where the title's function finds none: PC (1)");
+    SetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", nullptr);
+
+    // The answered key behaves like a registry key for what a caller can ask of a DWORD value.
+    HKEY key = nullptr;
+    check(open_ex(HKEY_LOCAL_MACHINE, L"\\SOFTWARE\\microsoft\\windows nt\\currentversion\\oem\\", 0, KEY_READ, &key) ==
+                  ERROR_SUCCESS &&
+              key != nullptr,
+          "RegOpenKeyExW opens the key too, whatever the case and with separators around it");
+    DWORD type = 0, size = 0, mode = 0;
+    check(query(key, L"consolemode", nullptr, &type, nullptr, &size) == ERROR_SUCCESS && type == REG_DWORD && size == 4,
+          "a query without a buffer reports REG_DWORD and 4 bytes");
+    size = 2;
+    check(query(key, L"ConsoleMode", nullptr, nullptr, reinterpret_cast<LPBYTE>(&mode), &size) == ERROR_MORE_DATA &&
+              size == 4 && mode == 0,
+          "a buffer that is too small gets ERROR_MORE_DATA, the size needed, and no data");
+    size = 4;
+    check(query(key, L"ConsoleMode", nullptr, &type, reinterpret_cast<LPBYTE>(&mode), &size) == ERROR_SUCCESS &&
+              mode == 0x64 && size == 4,
+          "ConsoleMode is 0x64 for Series X");
+    size = 4;
+    check(query(key, L"SomethingElse", nullptr, nullptr, reinterpret_cast<LPBYTE>(&mode), &size) == ERROR_FILE_NOT_FOUND,
+          "the key holds no other value");
+    check(close(key) == ERROR_SUCCESS, "RegCloseKey closes the answered key");
+
+    // Every other key is the host's: the same answer through the shim as from the host directly.
+    constexpr wchar_t kHostKey[] = L"Software\\Microsoft\\Windows NT\\CurrentVersion";
+    HKEY through_shim = nullptr, direct = nullptr;
+    wchar_t a[128] = {}, b[128] = {};
+    DWORD a_size = sizeof(a), b_size = sizeof(b);
+    const bool opened = open(HKEY_LOCAL_MACHINE, kHostKey, &through_shim) == ERROR_SUCCESS &&
+                        ::RegOpenKeyW(HKEY_LOCAL_MACHINE, kHostKey, &direct) == ERROR_SUCCESS;
+    check(opened, "another key under HKLM opens through the shim as it does on the host");
+    if (opened) {
+        const LSTATUS sa = query(through_shim, L"CurrentBuild", nullptr, nullptr, reinterpret_cast<LPBYTE>(a), &a_size);
+        const LSTATUS sb = ::RegQueryValueExW(direct, L"CurrentBuild", nullptr, nullptr, reinterpret_cast<LPBYTE>(b), &b_size);
+        check(sa == sb && a_size == b_size && std::memcmp(a, b, sizeof(a)) == 0,
+              "and its values are the host's (CurrentBuild reads the same both ways)");
+        check(close(through_shim) == ERROR_SUCCESS, "RegCloseKey closes a host key");
+        ::RegCloseKey(direct);
+    }
+    HKEY missing = nullptr;
+    check(open(HKEY_LOCAL_MACHINE, L"Software\\Leonida\\NoSuchKey\\OEM", &missing) == ERROR_FILE_NOT_FOUND,
+          "a key that merely ends in OEM is not the console's");
+    check(open(HKEY_CURRENT_USER, kOemKey, &missing) != ERROR_SUCCESS || missing != key,
+          "the same path under another root is the host's");
+}
+
 }  // namespace
 
 int main() {
@@ -929,6 +1061,7 @@ int main() {
     check(init() == S_OK, "a second XGameRuntimeInitialize also returns S_OK (reference counted)");
 
     check(get<DeviceTypeFn>("XSystemGetDeviceType")() == 7, "XSystemGetDeviceType reports XboxScarlettAnaconda (7)");
+    test_console_mode_registry();
 
     auto console_id = get<ConsoleIdFn>("XSystemGetConsoleId");
     char id[64] = {};
