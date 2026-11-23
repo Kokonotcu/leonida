@@ -8,8 +8,9 @@
 //   - heap, queue and fence proxies are unwrapped where the real runtime receives them (Signal/Wait,
 //     SetEventOnMultipleFenceCompletion, MakeResident/Evict/SetResidencyPriority/EnqueueMakeResident,
 //     CreateSharedHandle), and OpenSharedHandle wraps a shared fence;
-//   - slots past the public chain are refused (E_NOTIMPL) up to the end of the table, and a slot past the table
-//     faults on the vtable read in the guard region and is counted;
+//   - slots past the public chain are refused (E_NOTIMPL) up to the end of the table, except fence slot 12 (the
+//     address of a live completed value, as the retail title reads it), and a slot past the table faults on the
+//     vtable read in the guard region and is counted;
 //   - calls from eight threads at once, and repeated device, queue and fence creation without leaks;
 //   - the child-process runner of the differential check itself: large output, hangs, crashes, failed starts.
 // No shaders, game data or Xbox DLLs. LEONIDA_VK_VALIDATION=1 runs the Vulkan device under
@@ -395,18 +396,36 @@ int check_slots(const Backend& b) {
             EXPECT(as_hr(call_slot(queue.p, slot)) == E_NOTIMPL);
             EXPECT(qhits(slot) == before + 1 && xs::queue_slot_first_call_seen(slot));
         }
+        // Fence slot 12, one past ID3D12Fence1, is the one served slot (d3d12_xs_device.h): it returns the address of
+        // a live copy of the fence's completed value, the same address on every call. Every other slot is refused.
+        constexpr unsigned kFenceCompletedValueSlot = 12;
+        const volatile std::uint64_t* completed = nullptr;
         for (unsigned slot = fence_slots; slot < xs::fence_proxy_table_size(); ++slot) {
             before = fhits(slot);
+            if (slot == kFenceCompletedValueSlot) {
+                const std::uint64_t address = call_slot(fence.p, slot);
+                EXPECT(address && address % 8 == 0);
+                completed = reinterpret_cast<const volatile std::uint64_t*>(address);
+                EXPECT(*completed == fence->GetCompletedValue() && *completed == 8);
+                EXPECT(call_slot(fence.p, slot) == address);
+                EXPECT(fhits(slot) == before + 2 && xs::fence_slot_first_call_seen(slot));
+                continue;
+            }
             EXPECT(as_hr(call_slot(fence.p, slot)) == E_NOTIMPL);
             EXPECT(fhits(slot) == before + 1 && xs::fence_slot_first_call_seen(slot));
         }
-        // The objects still work after refused calls.
+        // The objects still work after refused calls, and slot 12's address follows the fence.
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 10)));
         if (wait_for(label, fence.p, 10)) return 1;
+        EXPECT(completed && call_slot(fence.p, kFenceCompletedValueSlot) ==
+                                reinterpret_cast<std::uint64_t>(completed) && *completed == 10);
+        EXPECT(SUCCEEDED(fence->Signal(11)));  // a CPU Signal through the proxy refreshes the copy at once
+        EXPECT(*completed == 11);
         EXPECT(xs::command_object_proxy_ref_count(queue.p) == 1 && xs::command_object_proxy_ref_count(fence.p) == 1);
     }
     EXPECT(xs::device_proxy_ref_count(device) == device_refs);  // every queue and fence gave its reference back
-    std::printf("%s: every public queue and fence slot forwarded and counted; tail refused\n", label);
+    std::printf("%s: every public queue and fence slot forwarded and counted; fence slot 12 gives a live completed "
+                "value; tail refused\n", label);
     return 0;
 }
 

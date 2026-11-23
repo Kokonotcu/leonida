@@ -499,8 +499,10 @@ int main() {
                                                          sizeof(quality_levels))));
             EXPECT(quality_levels.NumQualityLevels == (count == 1 ? 1u : 0u));
         }
-        for (auto flag : {D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
-                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
+        // Depth/stencil and UAV A8 textures are refused, as on the PC runtime. A render-target A8 texture is made
+        // (an R8 image): the console title renders into A8, which the PC runtime refuses (d3d12_vulkan_device.cpp,
+        // texture_format).
+        for (auto flag : {D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
             auto desc = texture_desc;
             desc.Format = DXGI_FORMAT_A8_UNORM;
             desc.Flags = flag;
@@ -508,6 +510,21 @@ int main() {
                                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                           __uuidof(ID3D12Resource), nullptr)));
             EXPECT(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes == UINT64_MAX);
+        }
+        {
+            auto desc = texture_desc;
+            desc.Format = DXGI_FORMAT_A8_UNORM;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            Ref<ID3D12Resource> a8_target;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&a8_target.p))));
+            EXPECT(a8_target->GetDesc().Format == DXGI_FORMAT_A8_UNORM);
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != UINT64_MAX);
+            desc.SampleDesc.Count = 4;  // only the single-sampled 2D case is made
+            EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                          D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                          __uuidof(ID3D12Resource), nullptr)));
         }
         Ref<ID3D12Resource> byte_textures[2];
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT byte_placed[2]{}, a8_mip_placed{};

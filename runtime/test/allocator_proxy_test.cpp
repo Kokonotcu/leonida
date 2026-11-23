@@ -1,8 +1,9 @@
 // Xbox-ABI command allocator proxies (d3d12_xs_device.h, device slot 9) behind the device proxy, on the Vulkan-backed
 // device and on the host PC runtime (WARP, and the first hardware adapter when there is one):
 //   - Vulkan device: slot 9 wraps the allocator; the public chain (9 slots) is forwarded with the real allocator's
-//     answers, every slot past it up to the end of the table is refused (E_NOTIMPL), and a read past the table faults
-//     in the guard region and is counted;
+//     answers, slot 9 (the retail allocator-pool path) answers S_OK and nulls an all-ones first word, every other
+//     slot up to the end of the table is refused (E_NOTIMPL), and a read past the table faults in the guard region
+//     and is counted;
 //   - QueryInterface identity, GetDevice -> the device proxy, references and release orders;
 //   - a command list created on the proxy and Reset on it (the Vulkan layer resolves the proxy), recording a buffer
 //     copy that runs through the queue and fence proxies and is read back, twice, with the allocator Reset between;
@@ -58,11 +59,12 @@ using SlotFn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::
                                       std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                       std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
 
-// A call through slot `slot` with all words zero, the way a title calls a console method the PC interface lacks.
-HRESULT call_slot(void* object, unsigned slot) {
+// A call through slot `slot` with all words zero but the first, the way a title calls a console method the PC
+// interface lacks.
+HRESULT call_slot(void* object, unsigned slot, std::uint64_t first = 0) {
     void** vtable = *reinterpret_cast<void***>(object);
     return static_cast<HRESULT>(static_cast<std::uint32_t>(
-        reinterpret_cast<SlotFn>(vtable[slot])(object, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)));
+        reinterpret_cast<SlotFn>(vtable[slot])(object, first, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)));
 }
 
 ULONG_PTR g_fault_address = 0;
@@ -182,10 +184,24 @@ int check_proxy(const Backend& b, ID3D12CommandAllocator* allocator) {
     back->Release();
     EXPECT(SUCCEEDED(allocator->SetPrivateDataInterface(key, nullptr)));
 
-    // The refused tail: every slot past the public chain, up to the table end, is E_NOTIMPL and counted.
+    // Slot 9, one past the public chain, is the retail title's allocator-pool path (d3d12_xs_device.h): S_OK without
+    // forwarding (the real allocator has no slot 9), counted; an all-ones first word becomes null, any other word and
+    // a null pointer are left alone.
+    {
+        const std::uint64_t before = xs::allocator_slot_hits(9);
+        std::uint64_t poison = ~std::uint64_t{0};
+        EXPECT(call_slot(allocator, 9, reinterpret_cast<std::uint64_t>(&poison)) == S_OK && poison == 0);
+        std::uint64_t kept = 0x1234;
+        EXPECT(call_slot(allocator, 9, reinterpret_cast<std::uint64_t>(&kept)) == S_OK && kept == 0x1234);
+        EXPECT(call_slot(allocator, 9) == S_OK);
+        EXPECT(xs::allocator_slot_hits(9) == before + 3 && xs::allocator_slot_first_call_seen(9));
+        EXPECT(xs::command_object_proxy_ref_count(allocator) == 1);
+    }
+
+    // The refused tail: every other slot past the public chain, up to the table end, is E_NOTIMPL and counted.
     const unsigned table = xs::allocator_proxy_table_size();
     EXPECT(table == 64);
-    for (unsigned slot = 9; slot < table; ++slot) {
+    for (unsigned slot = 10; slot < table; ++slot) {
         const std::uint64_t before = xs::allocator_slot_hits(slot);
         EXPECT(call_slot(allocator, slot) == E_NOTIMPL);
         EXPECT(xs::allocator_slot_hits(slot) == before + 1 && xs::allocator_slot_first_call_seen(slot));
@@ -201,7 +217,8 @@ int check_proxy(const Backend& b, ID3D12CommandAllocator* allocator) {
         EXPECT(g_fault_address == reinterpret_cast<ULONG_PTR>(&vtable[slot]));
         EXPECT(xs::allocator_table_overruns() == before + 1);
     }
-    std::printf("%s: allocator proxy: 9 public slots forwarded, slots 9-%u refused, the guard region names a read "
+    std::printf("%s: allocator proxy: 9 public slots forwarded, pool slot 9 answered (poison word nulled), slots "
+                "10-%u refused, the guard region names a read "
                 "past the table; QueryInterface/GetDevice/private data keep the proxy identity\n", label, table - 1);
     return 0;
 }

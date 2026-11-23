@@ -309,7 +309,8 @@ int main() {
                                                          IID_PPV_ARGS(&readback.p))));
 
         // Buffers D3D12 refuses: no bytes, or a size that wraps when aligned. One the arena cannot hold, and a
-        // shader-visible heap it cannot hold (512 MiB of descriptors in the 256 MiB default), run out of memory.
+        // shader-visible heap it cannot hold (512 MiB of descriptors in the 256 MiB default), run out of memory on
+        // the layer's device.
         {
             Ref<ID3D12Resource> bad;
             for (const UINT64 width : {UINT64(0), ~UINT64(0) - 65535}) {
@@ -325,7 +326,18 @@ int main() {
             const D3D12_DESCRIPTOR_HEAP_DESC too_many{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1u << 24,
                                                       D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
             Ref<ID3D12DescriptorHeap> big_heap;
-            EXPECT(device->CreateDescriptorHeap(&too_many, IID_PPV_ARGS(&big_heap.p)) == E_OUTOFMEMORY && !big_heap.p);
+            EXPECT(inner->CreateDescriptorHeap(&too_many, IID_PPV_ARGS(&big_heap.p)) == E_OUTOFMEMORY && !big_heap.p);
+            // Through the Xbox-ABI proxy (device slot 14) a shader-visible view heap past the device's limit is made
+            // at the limit, as the retail title needs (d3d12_xs_device.cpp, proxy_create_descriptor_heap).
+            UINT view_heap_limit = D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2;
+            D3D12_FEATURE_DATA_D3D12_OPTIONS19 options19{};
+            if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS19, &options19, sizeof(options19))) &&
+                options19.MaxViewDescriptorHeapSize > view_heap_limit)
+                view_heap_limit = options19.MaxViewDescriptorHeapSize;
+            EXPECT(view_heap_limit < too_many.NumDescriptors);
+            EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&too_many, IID_PPV_ARGS(&big_heap.p))) && big_heap.p);
+            EXPECT(big_heap->GetDesc().NumDescriptors == view_heap_limit);
+            big_heap.reset();
         }
         D3D12_RESOURCE_DESC rt_desc{};
         rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
