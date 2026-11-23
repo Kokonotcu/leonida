@@ -3159,14 +3159,21 @@ public:
         return desc;
     }
 
-    // The heap's range in the GPU address arena, reserved when a buffer first needs it (a placed buffer, or buffer
+    // The heap's range in the GPU address arena is reserved when a buffer first needs it (a placed buffer, or buffer
     // tiles sharing the arena): textures never use it, and a D3D12 heap has no GPU VA of its own, so a heap that only
-    // ever holds textures costs no arena space. False when the arena can't take the heap.
-    bool reserve_arena() {
+    // ever holds textures costs no arena space.
+    enum class PlaceBuffer { ok, separate_tiles, arena_full };
+    // For a placed buffer: checks that the heap has no separate sparse-tile backing, reserves the range and marks the
+    // heap as holding a buffer, under one lock, so a refused placement reserves nothing and no tile mapping can
+    // install separate backing in between.
+    PlaceBuffer place_buffer() {
         std::lock_guard lock(backing_mutex_);
-        return reserve_arena_locked();
+        if (tile_allocation_) return PlaceBuffer::separate_tiles;
+        if (!reserve_arena_locked()) return PlaceBuffer::arena_full;
+        placed_buffer_ = true;
+        return PlaceBuffer::ok;
     }
-    VkDeviceSize offset() const { return allocation_->offset; }   // after reserve_arena()
+    VkDeviceSize offset() const { return allocation_->offset; }   // after place_buffer() returned ok
     UINT64 bytes() const { return desc_.SizeInBytes; }
     UINT64 alignment() const { return desc_.Alignment ? desc_.Alignment : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; }
     const D3D12_HEAP_PROPERTIES& properties() const { return desc_.Properties; }
@@ -3206,11 +3213,11 @@ public:
         return tile_allocation_;
     }
 
-    bool use_as_placed_resource(bool buffer) {
+    // For a placed texture: it cannot alias the separate sparse memory allocation of texture tiles.
+    bool place_texture() {
         std::lock_guard lock(backing_mutex_);
-        // A placed resource cannot alias the separate sparse memory allocation.
-        if (tile_allocation_ && (buffer || image_tiles_)) return false;
-        (buffer ? placed_buffer_ : placed_image_) = true;
+        if (tile_allocation_ && image_tiles_) return false;
+        placed_image_ = true;
         return true;
     }
 
@@ -7708,14 +7715,17 @@ public:
         }
         if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         const bool buffer = desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
-        if (buffer && !heap->reserve_arena()) {
-            log_once("GPU address arena full (raise LEONIDA_ARENA_MB); heap of a placed buffer, size in KiB:",
-                     int(heap->bytes() / 1024));
-            return d3d12_trace::result(method, E_OUTOFMEMORY);
-        }
-        if (buffer && !heap->use_as_placed_resource(true)) {
-            log_once("placed buffer refused: heap uses a separate allocation for sparse tiles", 1);
-            return d3d12_trace::result(method, E_NOTIMPL);
+        if (buffer) {
+            switch (heap->place_buffer()) {
+            case Heap::PlaceBuffer::ok: break;
+            case Heap::PlaceBuffer::separate_tiles:
+                log_once("placed buffer refused: heap uses a separate allocation for sparse tiles", 1);
+                return d3d12_trace::result(method, E_NOTIMPL);
+            case Heap::PlaceBuffer::arena_full:
+                log_once("GPU address arena full (raise LEONIDA_ARENA_MB); heap of a placed buffer, size in KiB:",
+                         int(heap->bytes() / 1024));
+                return d3d12_trace::result(method, E_OUTOFMEMORY);
+            }
         }
         // Only buffers are addressable, as in D3D12: a placed texture keeps a null VA and its own Vulkan image, which
         // create_texture makes for 1D, 2D and 3D alike (arrays and mips included), as for a committed texture.
@@ -7737,7 +7747,7 @@ public:
                 if (SUCCEEDED(hr)) resource->keep_castable_formats(castable_count, castable);
             }
         }
-        if (SUCCEEDED(hr) && !buffer && !heap->use_as_placed_resource(false)) {
+        if (SUCCEEDED(hr) && !buffer && !heap->place_texture()) {
             log_once("placed resource refused: heap uses a separate allocation for sparse tiles", 1);
             hr = E_NOTIMPL;
         }
