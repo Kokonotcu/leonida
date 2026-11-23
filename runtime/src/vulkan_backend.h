@@ -407,6 +407,12 @@ private:
 
 struct SparseResource;
 
+// An object that frees itself once the GPU is done with it (DeferredDeletionQueue::Kind::release): a range of a
+// suballocated memory block goes back to its block this way (vulkan_suballocator.h).
+struct DeferredRelease {
+    void (*release)(DeferredRelease* self) = nullptr;
+};
+
 // Zero-allocation O(1) Ring Buffer deferred deletion queue tied to the device timeline semaphore.
 class DeferredDeletionQueue {
 public:
@@ -419,6 +425,7 @@ public:
         device_memory,
         acceleration_structure,
         framebuffer,
+        release,  // handle: a DeferredRelease*
     };
 
     struct Item {
@@ -509,6 +516,10 @@ public:
                 break;
             case Kind::framebuffer:
                 vk.vkDestroyFramebuffer(device, reinterpret_cast<VkFramebuffer>(item.handle), nullptr);
+                break;
+            case Kind::release:
+                if (auto* release = reinterpret_cast<DeferredRelease*>(item.handle); release->release)
+                    release->release(release);
                 break;
             }
         }

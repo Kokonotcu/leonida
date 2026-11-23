@@ -519,6 +519,11 @@ if(BUILD_TESTING)
 
   add_executable(retire_tickets_test test/retire_tickets_test.cpp)
   add_test(NAME retire_tickets COMMAND retire_tickets_test)
+  # The D3D12 layer's resource memory suballocator (runtime/src/vulkan_suballocator.h): pure stdlib, no GPU.
+  add_executable(suballocator_test test/suballocator_test.cpp)
+  find_package(Threads REQUIRED)
+  target_link_libraries(suballocator_test PRIVATE Threads::Threads)
+  add_test(NAME suballocator COMMAND suballocator_test)
   # VulkanContext::buffer_at's VA index (runtime/src/buffer_va_index.h): pure stdlib, no Vulkan instance.
   add_executable(buffer_va_index_test test/buffer_va_index_test.cpp)
   add_test(NAME buffer_va_index COMMAND buffer_va_index_test)
@@ -2338,6 +2343,15 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_residency_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_residency COMMAND d3d12_residency_test)
     set_tests_properties(d3d12_residency PROPERTIES SKIP_RETURN_CODE 77)
+
+    # Committed resources' memory: vkAllocateMemory calls for 6000 textures and 2000 upload buffers, suballocated and
+    # with LEONIDA_SUBALLOCATE=0, held to maxMemoryAllocationCount.
+    add_executable(d3d12_suballocation_test test/d3d12_suballocation_test.cpp)
+    target_link_libraries(d3d12_suballocation_test PRIVATE gta6rt_d3d12_com)
+    target_compile_definitions(d3d12_suballocation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_suballocation_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_suballocation COMMAND d3d12_suballocation_test)
+    set_tests_properties(d3d12_suballocation PROPERTIES SKIP_RETURN_CODE 77)
 
     # ID3D12Resource::GetHeapProperties for committed, placed and reserved resources, compared with the host runtime.
     add_executable(d3d12_heap_properties_test test/d3d12_heap_properties_test.cpp)
