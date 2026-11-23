@@ -982,18 +982,28 @@ the destination buffer:
    word that holds it: D3D12 aligns an R16 index buffer to 2 bytes only, so it can start at an address that is 2
    mod 4 (`blas_grid_u16_offset2`);
 2. a 30-bit Morton key of each box centre, then a stable sort: up to 1,024 keys in one workgroup's shared memory
-   (one dispatch), more with a radix sort of 8 passes of 4-bit digits over 256-element tiles (24 dispatches
-   whatever the count, no padding to a power of two);
+   (one dispatch), more with a radix sort of 8 passes of 4-bit digits over 256-element tiles (24 steps whatever
+   the count, each one dispatch or, past the limit below, several; no padding to a power of two);
 3. a binary radix tree over the sorted keys (Karras 2012; equal keys are told apart by their sorted position), one
    thread per inner node;
 4. the inner nodes: those at an even depth of the binary tree, each taking the children of its children (two to
    four), numbered in sorted order by a scan, so the root is node 0; with the parent table. They are BOX32, or
    BOX16 (below), and TRI1 pairing (below) happens here;
-5. the boxes, bottom-up in one dispatch: each element writes its box into its parent's slot and merges it into the
+5. the boxes, bottom-up in one step: each element writes its box into its parent's slot and merges it into the
    parent's accumulator; the last child to arrive carries on with the parent's box. The invocations meet only
-   through atomics ordered by `memoryBarrierBuffer`, so no plain load reads another workgroup's store of the same
-   dispatch. An instance's `ParentNode` is written here;
+   through device-scope acquire-release atomics (the accumulators and the arrival counters), so no plain load reads
+   another invocation's store of the same step, and no invocation waits for another. That holds when the step is
+   several dispatches with no barrier between them (below), whatever order they run in. An instance's
+   `ParentNode` is written here;
 6. the header.
+
+A step whose grid has more workgroups of 64 than the device's `maxComputeWorkGroupCount[0]` (Vulkan guarantees only
+65,535, which a BOX32 BLAS passes from 98,689 triangles in the copy before a refit into another buffer, 1,677,697 in the
+parent table's initialisation and 4,194,241 in the steps of one thread per element; a CLONE or COMPACT copy, one thread
+per word of the destination's room, passes it from a 16 MiB room) is recorded as several dispatches, each with the index
+of its first thread in the push constants (`pc.base`). The backend passes the device's limit
+(`VulkanContext::configure_xdxr_dispatch`); `xdxr_dispatch_limit` checks the split on a mock, and `vk_xdxr_build_test`'s
+`blas_chunked_*` cases build with one workgroup per dispatch and compare the bytes with the same builds recorded whole.
 
 The tree used to group four consecutive sorted elements per node, level by level. Those groups ignore where the
 Morton prefix changes, so sibling boxes overlapped and a ray took about twice as many steps (found by DaniSBR1 on

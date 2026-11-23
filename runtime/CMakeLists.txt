@@ -3400,6 +3400,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_query_edges_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_query_edges COMMAND replay_query_edges_test)
+    # XdxrBuilder splits a dispatch at maxComputeWorkGroupCount[0] (src/xdxr_build.h), with a CPU mock (no GPU).
+    add_executable(xdxr_dispatch_limit_test test/xdxr_dispatch_limit_test.cpp)
+    target_link_libraries(xdxr_dispatch_limit_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(xdxr_dispatch_limit_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME xdxr_dispatch_limit COMMAND xdxr_dispatch_limit_test)
     # GFX10 T#/S#/V# descriptor encoding and its Vulkan mappings (src/gfx10_descriptors.h).
     add_executable(gfx10_descriptors_test test/gfx10_descriptors_test.cpp)
     target_link_libraries(gfx10_descriptors_test PRIVATE Vulkan::Headers)

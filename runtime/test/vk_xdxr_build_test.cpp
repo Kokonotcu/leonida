@@ -12,7 +12,9 @@
 // BOX16 builds (blas_box16_*: half boxes, which check-build compares bit for bit with tools/xdxr_bvh.py encode_box16),
 // including coordinates past the half range and below its smallest normal, and a refit; TRI1 pairing (blas_paired_*:
 // sibling triangles that share an edge in one leaf), on grids, BOX16, a transform, inactive triangles, triangles that
-// share an edge in the same direction or across geometries (never paired), and the radix-sort path.
+// share an edge in the same direction or across geometries (never paired), and the radix-sort path; a build and a
+// refit into another buffer recorded one workgroup per dispatch (blas_chunked_*: what a step whose grid passes
+// maxComputeWorkGroupCount[0] becomes), which must equal the same ones recorded whole, byte for byte.
 // Exit 77 when there is no Vulkan device with bufferDeviceAddress.
 // `vk_xdxr_build_test <out dir> <triangles>` instead times BLAS builds of that many random triangles (wall clock of
 // one submission each, after one warm-up; result and scratch in device-local memory), then in-place updates
@@ -132,7 +134,7 @@ struct Built {
     std::uint64_t address = 0;
     std::size_t size = 0;              // as the header gives it
     std::vector<Tri> tris;
-    std::vector<char> bytes;           // the structure as built (not for updates)
+    std::vector<char> bytes;           // the structure as built (or as updated)
 };
 
 // With `moved` (the same geometries with new vertex positions) the BLAS is then updated: refitted in place, or with
@@ -238,6 +240,13 @@ int build_blas(vktest::Device& gpu, XdxrBuilder& builder, const std::string& dir
     }));
     if (into_other) EXPECT(dump(name + "_source", dst, base, built.tris));     // a refit must not touch its source
     EXPECT(dump(name, into_other ? other : dst, target, moved_tris));
+    {
+        const Buffer& result = into_other ? other : dst;
+        const char* bytes = static_cast<const char*>(result.map) + (target - result.address);
+        const std::size_t size = header_size(bytes);
+        EXPECT(size <= layout.size);                    // as in dump(): a bad header must not read past the map
+        built.bytes.assign(bytes, bytes + size);
+    }
     built.tris = moved_tris;
     built.address = target;
     std::printf("%s: %u triangles refitted %s, %u bytes\n", name.c_str(), total,
@@ -485,6 +494,26 @@ int main(int argc, char** argv) {
         if (build_blas(gpu, builder, dir, "blas_paired_sort_tiles", {grid(60, 3, false)}, p4, 200, nullptr, false,
                        false, true))
             return 1;
+    }
+
+    // A step's workgroups split over several dispatches (pc.base): a builder that dispatches one workgroup at a time
+    // must write the same bytes as one that dispatches each step whole. 5,000 triangles take the radix-sort path (20
+    // tiles), so the per-tile modes run chunked too; the refit into another buffer chunks MODE_COPY_AS, MODE_CLEAR
+    // and MODE_PROPAGATE.
+    {
+        XdxrBuilder chunked(gpu.device_proc, gpu.device, 1);
+        EXPECT(chunked.loaded() && chunked.max_groups() == 1);
+        const Geometry g = soup(5000);
+        Built whole, split;
+        if (build_blas(gpu, builder, dir, "blas_chunked_reference", {g}, whole, 50)) return 1;
+        if (build_blas(gpu, chunked, dir, "blas_chunked", {g}, split, 50)) return 1;
+        EXPECT(!whole.bytes.empty() && split.bytes == whole.bytes);
+        const Geometry gg = grid(12, 4, false);
+        const std::vector<Geometry> after = {move(gg, 0.3f)};
+        Built whole_refit, split_refit;
+        if (build_blas(gpu, builder, dir, "blas_chunked_refit_reference", {gg}, whole_refit, 0, &after, true)) return 1;
+        if (build_blas(gpu, chunked, dir, "blas_chunked_refit", {gg}, split_refit, 0, &after, true)) return 1;
+        EXPECT(!whole_refit.bytes.empty() && split_refit.bytes == whole_refit.bytes);
     }
 
     // TLAS: instances over blas_random and blas_grid_u16_stride16. An instance names its BLAS by a 40-bit address

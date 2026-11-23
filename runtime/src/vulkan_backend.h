@@ -1116,6 +1116,12 @@ public:
         std::unique_lock lock(resource_mutex_);
         counted_dispatch_ = std::make_unique<IndirectDispatchCounter>(get, device_, memory, limits);
     }
+    // The XDXR builder splits its dispatches at limits.maxComputeWorkGroupCount[0] (65,535, the least Vulkan allows,
+    // until this is called). Configure before submitting work.
+    void configure_xdxr_dispatch(const VkPhysicalDeviceLimits& limits) {
+        std::unique_lock lock(resource_mutex_);
+        if (xdxr_) xdxr_->set_max_groups(limits.maxComputeWorkGroupCount[0]);
+    }
     VkDevice device() const { return device_; }
 
     // Debug markers become labels from here on; call before any queue or list uses the context. Incomplete sets

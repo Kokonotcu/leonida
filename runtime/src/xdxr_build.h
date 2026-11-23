@@ -10,11 +10,15 @@
 // to four children per node by keeping every other level; the root is node 0. Their count depends on the keys, so
 // the layout has room for the most there can be and the header counts the ones a build wrote.
 //
-// XdxrBuilder records the dispatches into a command buffer. Every address is a buffer device address; `bias` is
-// added to the BLAS addresses read from instance descs (the distance between the application's GPU virtual
-// addresses and device addresses; 0 where they are the same). An INSTANCE record holds its BLAS address in 256-byte
-// units in 32 bits, so the application's BLAS addresses must be below 2^40, as console GPU addresses are; where
-// device addresses are wider (llvmpipe's are host pointers), the layer must present a narrower window and a bias.
+// XdxrBuilder records the dispatches into a command buffer. A step whose grid has more workgroups than the device's
+// maxComputeWorkGroupCount[0] (`max_groups`; Vulkan guarantees only 65,535) is recorded as several dispatches, each
+// with the index of its first thread in the push constants (xdxr_build.comp pc.base); the chunks of one step touch
+// different words, or meet only through atomics, as the invocations of one dispatch do, so no barrier separates them.
+// Every address is a buffer device address; `bias` is added to the BLAS addresses read from instance descs (the
+// distance between the application's GPU virtual addresses and device addresses; 0 where they are the same). An
+// INSTANCE record holds its BLAS address in 256-byte units in 32 bits, so the application's BLAS addresses must be
+// below 2^40, as console GPU addresses are; where device addresses are wider (llvmpipe's are host pointers), the layer
+// must present a narrower window and a bias.
 #pragma once
 
 #include <algorithm>
@@ -107,7 +111,9 @@ struct XdxrTriangles {
 
 class XdxrBuilder {
 public:
-    XdxrBuilder(PFN_vkGetDeviceProcAddr get, VkDevice device) : device_(device) {
+    // `max_groups`: VkPhysicalDeviceLimits::maxComputeWorkGroupCount[0]; 0 is the least Vulkan allows.
+    XdxrBuilder(PFN_vkGetDeviceProcAddr get, VkDevice device, std::uint32_t max_groups = 0) : device_(device) {
+        set_max_groups(max_groups);
         loaded_ = load(get) && make_pipeline();
     }
     ~XdxrBuilder() {
@@ -118,6 +124,8 @@ public:
     XdxrBuilder& operator=(const XdxrBuilder&) = delete;
 
     bool loaded() const { return loaded_; }
+    void set_max_groups(std::uint32_t groups) { max_groups_ = groups ? groups : min_max_groups; }
+    std::uint32_t max_groups() const { return max_groups_; }
 
     // Records a bottom-level build into `dst` (layout.size bytes) using `scratch` (layout.scratch bytes). `layout`
     // must come from compute() with the sum of the geometries' triangle counts.
@@ -224,9 +232,11 @@ private:
         Addr dst, scratch, src0, src1, src2, bias;
         std::uint32_t mode = 0, count = 0, first = 0, arg0 = 0, arg1 = 0, arg2 = 0, geometry = 0, elements = 0,
                       sort_size = 0, elements_off = 0, nodes_off = 0, parents_off = 0, total_size = 0, flags = 0;
+        std::uint32_t base = 0;   // the first thread of this dispatch in its step (dispatch() sets it)
     };
     enum : std::uint32_t { flag_tlas = 1, flag_box16 = 2, flag_pair = 4 };  // xdxr_build.comp FLAG_*
-    static_assert(sizeof(Push) == 104, "push constants must match xdxr_build.comp");
+    static_assert(sizeof(Push) == 108, "push constants must match xdxr_build.comp");
+    static constexpr std::uint32_t min_max_groups = 65535;   // the least maxComputeWorkGroupCount[0] Vulkan allows
 
     static Addr split(std::uint64_t a) { return {std::uint32_t(a), std::uint32_t(a >> 32)}; }
 
@@ -337,11 +347,16 @@ private:
         dispatch(cb, h, 1, false);
     }
 
-    // One dispatch, then a compute-to-compute dependency so the next step sees its writes. The last step leaves the
+    // One step: its workgroups of 64 threads in dispatches of at most max_groups_ each, pc.base the first thread of
+    // each, then a compute-to-compute dependency so the next step sees its writes. The last step leaves the
     // dependency on its results to the caller's barrier (the application's UAV or AS barrier).
-    void dispatch(VkCommandBuffer cb, const Push& p, std::uint32_t threads, bool barrier = true) {
-        vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &p);
-        vk_.vkCmdDispatch(cb, (threads + 63) / 64, 1, 1);
+    void dispatch(VkCommandBuffer cb, Push p, std::uint32_t threads, bool barrier = true) {
+        const std::uint32_t groups = std::uint32_t((std::uint64_t(threads) + 63) / 64);
+        for (std::uint32_t first = 0; first < groups; first += std::min(groups - first, max_groups_)) {
+            p.base = first * 64;                        // < threads: no overflow
+            vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &p);
+            vk_.vkCmdDispatch(cb, std::min(groups - first, max_groups_), 1, 1);
+        }
         if (!barrier) return;
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -396,6 +411,7 @@ private:
     Functions vk_;
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
+    std::uint32_t max_groups_ = min_max_groups;
     bool loaded_ = false;
 };
 

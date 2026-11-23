@@ -5276,6 +5276,7 @@ public:
                 VkPhysicalDeviceProperties props{};
                 get_props(info.physical, &props);
                 state_.context->configure_counted_dispatch(get_device, state_.memory, props.limits);
+                state_.context->configure_xdxr_dispatch(props.limits);
             }
         }
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of
