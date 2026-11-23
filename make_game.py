@@ -2346,8 +2346,11 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
         build = cross_build_runtime(jobs)
     else:
         log("runtime: building")
+        # LEONIDA_SDL3_FETCH=1: let CMake download the pinned SDL3 release, so the GameInput shim (docs/gameinput.md)
+        # is built in; without it and without an installed SDL3 the game gets the host's GameInput.dll or nothing.
+        fetch = ["-FetchSdl3"] if os.environ.get("LEONIDA_SDL3_FETCH") == "1" else []
         run([windows_powershell(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-             os.path.join(ROOT, "scripts", "build_runtime.ps1"), "-Jobs", str(jobs)])
+             os.path.join(ROOT, "scripts", "build_runtime.ps1"), "-Jobs", str(jobs), *fetch])
         build = os.path.join(ROOT, "runtime", "build")
     artifacts = [os.path.join(build, name) for name in RUNTIME_FILES]
     for built in artifacts:
