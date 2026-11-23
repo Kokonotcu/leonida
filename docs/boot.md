@@ -5,9 +5,14 @@ repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the
 separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
 `DllMain`s without an exception
 ([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
-trace tool for the first boot. The executable's `ws2_32.dll` imports are served by the offline Winsock2 shim
-([`runtime_imports.md`](runtime_imports.md#winsock2-offline)), like `winhttp.dll`, so no socket or DNS query leaves the
+trace tool for the first boot. The executable's `ws2_32.dll` imports are served by the offline Winsock2 shim, like
+`winhttp.dll` (`runtime/shims/ws2_32_offline.cpp`), so no socket or DNS query leaves the
 process. Nothing here quotes game data; a real trace stays on the player's machine.
+
+Loader switches for the first boot: `LEONIDA_TLS_GA_PATCH=0` turns off the rewrite of the executable's index-0 TLS
+reads (`gs:[58h]`, pe_loader.cpp); `LEONIDA_HEAP_PROBE=1` validates the CRT heap at each `GetModuleHandleW` and logs it
+(library_loader.cpp), to find which call first sees a corrupt heap; `LEONIDA_CPU_PATCH=0` and `LEONIDA_CPU_SITES` are
+in [cpu_features.md](cpu_features.md).
 
 ## 1. What the first boot produces
 
