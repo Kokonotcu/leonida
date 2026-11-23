@@ -1539,6 +1539,7 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vk_device_lost COMMAND vk_device_lost_test)
     set_tests_properties(vk_device_lost PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
   # ~VulkanQueue() clears context_.bindless_upload_semaphore_ before destroying progress_, preventing
   # another queue's next vkQueueSubmit from waiting on a destroyed VkSemaphore handle.
   add_executable(vk_bindless_upload_semaphore_test test/vk_bindless_upload_semaphore_test.cpp)
