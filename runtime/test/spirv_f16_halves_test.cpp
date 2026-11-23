@@ -1092,9 +1092,12 @@ int main() {
         int unpacks = 0, privs = 0;
         std::set<std::uint32_t> ep_iface;
         CHECK(verify_spirv_structure(vs_w, kStorageOutput, vs_locs, unpacks, privs, ep_iface));
-        CHECK(privs == 2);
+        // The unused pair may be demoted to Private (2 variables) or moved to free locations; either way no VS output
+        // stays at the PS's raw input 26, and every output is within the budget.
+        CHECK(privs == 2 || privs == 0);
         CHECK(!vs_locs.count(26) && !vs_locs.count(27));
         CHECK(vs_locs.count(28) == 1 && vs_locs.count(29) == 1);
+        for (const auto& [loc, var] : vs_locs) CHECK(loc <= 29);
     }
 
     // 9. Demoting a static VS half variable strips non-Location interface-only decorations (e.g. Flat, Component)
@@ -1139,12 +1142,13 @@ int main() {
         CHECK(f16_half_top_location(4, 64) == 0);
 
         // Matching VS/PS static halves at [28, 29], but 14 raw VS outputs (0..13) leave only location 14 free (< 2):
-        // must fail cleanly instead of taking the fast path with out-of-range locations.
+        // must fail cleanly instead of taking the fast path with out-of-range locations. The PS reads every raw
+        // output, so none can be given up for the halves (case 12 on: an unread one would be).
         ShaderEntry vs_e, ps_e;
         vs_e.f16_halves = {{0, {28, 29}}};
         ps_e.f16_halves = {{0, {28, 29}}};
         auto vs_w = build_vs(0x00010500u, 14, vs_e.f16_halves);
-        auto ps_w = build_ps(0x00010500u, {0}, ps_e.f16_halves);
+        auto ps_w = build_ps(0x00010500u, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13}, ps_e.f16_halves);
         const auto vs_orig = vs_w, ps_orig = ps_w;
         std::string err;
         CHECK(!link_f16_halves(vs_w, vs_e, ps_w, ps_e, &err, 14));

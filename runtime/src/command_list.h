@@ -652,8 +652,9 @@ struct ExecuteIndirect {
     // as it is.
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
-    // Set for a signature with more than the draw or dispatch argument (null for the simple ones, and for the raw
-    // calls of the unit tests): `kind` and `stride` then repeat its values. `argument_offset` still names the draw or
+    // Set for a signature with more than the draw or dispatch argument, or with the action at an offset (null for one
+    // argument at a record's start, and for the raw calls of the unit tests; only a signature that is not simple() gets
+    // generated commands): `kind` and `stride` then repeat its values. `argument_offset` still names the draw or
     // dispatch arguments of the first record; the record itself starts signature->action_offset() bytes before.
     // Last, so the unit tests that fill the struct in order are unaffected.
     std::shared_ptr<const IndirectSignature> signature;

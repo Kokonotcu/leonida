@@ -70,8 +70,11 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
     struct Unregister {
         ~Unregister() { rt::d3d12_xs::set_console_descriptor_heap_handler(nullptr); }
     } unregister;
+    // The proxy takes ownership of one reference to the device (d3d12_xs_device.h); main keeps its own.
+    real_device->AddRef();
     void* proxy_raw = nullptr;
     if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, __uuidof(ID3D12Device), &proxy_raw)) || !proxy_raw) {
+        real_device->Release();
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }
@@ -96,10 +99,14 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
                      static_cast<unsigned long>(hr));
         return false;
     }
-    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
-    if (cpu.ptr != static_cast<SIZE_T>(console.address)) {
+    // The heap proxy answers in the console's ABI, as the title calls it: slot 9 returns the handle in RAX. The PC
+    // C++ call (a hidden return pointer) is not how the proxy is reached.
+    using CpuStartFn = std::uint64_t(WINAPI*)(void*);
+    void* const heap_object = heap.get();
+    const std::uint64_t cpu_ptr = reinterpret_cast<CpuStartFn>((*reinterpret_cast<void***>(heap_object))[9])(heap_object);
+    if (cpu_ptr != console.address) {
         std::fprintf(stderr, "proxy CPU heap start mismatch: got 0x%llx want 0x%llx\n",
-                     static_cast<unsigned long long>(cpu.ptr),
+                     static_cast<unsigned long long>(cpu_ptr),
                      static_cast<unsigned long long>(console.address));
         return false;
     }
