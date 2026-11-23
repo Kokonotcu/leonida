@@ -1493,8 +1493,12 @@ private:
 
     // The list's graphics state as a mesh draw: no vertex input or input assembly; the group counts go in
     // count/instances/first.
+    // The user data is the graphics root arguments in the console layout with the heap bases (graphics_user_data); a
+    // mesh draw whose windows overlap keeps the vertex window only (DispatchMesh refuses that case itself).
     leonida::Draw make_mesh_draw(UINT x, UINT y, UINT z) {
-        leonida::Draw draw{graphics_pipeline_, graphics_.data, draw_views(), depth_, {}, 0, viewport_, scissor_,
+        UserData data;
+        if (!graphics_user_data(true, data)) graphics_user_data(false, data);
+        leonida::Draw draw{graphics_pipeline_, data, draw_views(), depth_, {}, 0, viewport_, scissor_,
                            blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         draw.mesh = true;
         return draw;
@@ -1503,7 +1507,9 @@ private:
     // The list's graphics state as a draw (see record_draw for what has to be set).
     leonida::Draw make_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex,
                             UINT first_instance) {
-        return {graphics_pipeline_, graphics_.data, draw_views(), depth_, index_, topology_, viewport_, scissor_,
+        UserData data;
+        graphics_user_data(false, data);  // the vertex window alone always fits
+        return {graphics_pipeline_, data, draw_views(), depth_, index_, topology_, viewport_, scissor_,
                 blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first, base_vertex,
                 first_instance};
     }
