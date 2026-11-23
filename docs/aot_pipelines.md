@@ -1,6 +1,20 @@
 # Ahead-of-time GPU code: no shader or pipeline compiles while the game runs
 
-**Status: local work branch (`leonida/work`). Step 1 is implemented; steps 2 and 3 are the plan.**
+**Status: local work branch (`leonida/work`). Steps 1 and 2 are implemented (step 2 behind `LEONIDA_SHADER_OBJECTS=1`,
+graphics and compute); step 3 is the plan.**
+
+How to use it today:
+
+```powershell
+gta6rt.exe --prebuild-shaders            # once per driver: every translated shader -> shader_binaries\
+$env:LEONIDA_SHADER_OBJECTS = "1"        # the run then creates its shaders from those binaries
+gta6rt.exe --run game_scarlett_master.exe --game-dir <package>
+gta6rt.exe --prebuild-pipelines          # without shader objects: compile what the last run recorded
+```
+
+`make_game.py`'s pipelines stage runs both prebuilds. Checked on an RTX 3080 Laptop (NVIDIA 617.42) by
+`shader_object_draw_test`: the shader-object draw writes the pipeline draw's pixels, and after `--prebuild-shaders`
+a new device makes its shaders from the stored binaries (0 compiled from SPIR-V) and draws the same pixels.
 
 The game's CPU code needs no translation: the Xbox Series executable is x86-64 and `gta6rt` maps and runs it as is.
 Its GPU programs are RDNA2 machine code; the build translates all of them to SPIR-V once (`make_game.py`, shaders

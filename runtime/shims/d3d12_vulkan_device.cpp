@@ -1329,16 +1329,27 @@ struct DeviceState {
         return layout;
     }
 
-    // The shared shader object for `source`; VK_NULL_HANDLE when neither the binary nor the SPIR-V makes one.
-    VkShaderEXT shader_object(const leonida::shader_objects::ShaderSource& source) {
+    // The layout a compute shader object is made with: set 0 when the shader declares bindings (as create_compute's
+    // pipeline layout), and the compute push-constant range. It depends on the shader only, so its binary is shared.
+    leonida::shader_objects::Layout so_compute_layout(bool uses_set0) const {
+        leonida::shader_objects::Layout layout;
+        layout.set0 = uses_set0 && bindless ? bindless->layout() : VK_NULL_HANDLE;
+        layout.push = {VK_SHADER_STAGE_COMPUTE_BIT, 0, std::uint32_t(sizeof(leonida::ShaderUserData))};
+        return layout;
+    }
+
+    // The shared shader object for `source` (made with `layout`: so_graphics_layout() for every graphics stage,
+    // so_compute_layout() for compute); VK_NULL_HANDLE when neither the binary nor the SPIR-V makes one.
+    VkShaderEXT shader_object(const leonida::shader_objects::ShaderSource& source,
+                              const leonida::shader_objects::Layout& layout) {
         const auto key = std::make_tuple(std::uint32_t(source.stage), source.name, source.spirv_hash,
                                          std::uint32_t(source.flags), source.subgroup);
         std::lock_guard lock(so_mutex);
         if (const auto it = so_shaders.find(key); it != so_shaders.end()) return it->second;
         leonida::shader_objects::Origin origin = leonida::shader_objects::Origin::failed;
         const VkShaderEXT shader = leonida::shader_objects::create_shader(
-            so_fn, info.device, source, so_graphics_layout(), info.features.geometryShader == VK_TRUE, so_binaries,
-            so_driver, &origin);
+            so_fn, info.device, source, layout, info.features.geometryShader == VK_TRUE, so_binaries, so_driver,
+            &origin);
         if (!shader) {
             std::fprintf(stderr, "[rt] d3d12: no shader object for %s\n", source.name.c_str());
             return VK_NULL_HANDLE;
@@ -4172,7 +4183,7 @@ public:
                 so.spirv_hash = m.hash;
                 so.subgroup = m.required_subgroup;
                 so.flags = leonida::shader_objects::shader_flags(so.stage, m.flags);
-                const VkShaderEXT shader = device_.shader_object(so);
+                const VkShaderEXT shader = device_.shader_object(so, device_.so_graphics_layout());
                 if (!shader) return E_FAIL;
                 switch (so.stage) {
                     case VK_SHADER_STAGE_VERTEX_BIT: shaders.vertex = shader; break;
@@ -4297,10 +4308,15 @@ public:
             return E_FAIL;
         }
 
-        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        module_info.codeSize = words.size() * 4;
-        module_info.pCode = words.data();
-        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
+        // docs/aot_pipelines.md step 2: with shader objects the dispatch binds the shared shader object (made from the
+        // build's stored binary where it fits) and no compute pipeline is compiled.
+        const bool shader_object = device_.shader_objects_ready();
+        if (!shader_object) {
+            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            module_info.codeSize = words.size() * 4;
+            module_info.pCode = words.data();
+            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
+        }
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
@@ -4321,13 +4337,31 @@ public:
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
         pipeline_info.layout = pipeline_.layout;
-        if (device_.create_pipeline(
-                [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
-                    return vk.vkCreateComputePipelines(dev, cache, 1, &create, nullptr, &pipeline_.pipeline);
-                },
-                pipeline_info) != VK_SUCCESS)
-            return E_FAIL;
-        device_.pipeline_created();
+        if (shader_object) {
+            leonida::shader_objects::ShaderSource so;
+            so.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            so.name = entry->name;
+            so.spirv = &words;
+            so.spirv_hash = leonida::pso::spirv_hash(words);
+            so.subgroup = pipeline_info.stage.pNext ? required_size.requiredSubgroupSize : 0u;
+            so.flags = leonida::shader_objects::shader_flags(so.stage, pipeline_info.stage.flags);
+            const VkShaderEXT shader =
+                device_.shader_object(so, device_.so_compute_layout(entry->binding_count != 0));
+            if (!shader) return E_FAIL;
+            const leonida::shader_objects::Functions* fn = &device_.so_fn;
+            pipeline_.bind_shader = [fn, shader](VkCommandBuffer cb) {
+                const VkShaderStageFlagBits stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                fn->vkCmdBindShadersEXT(cb, 1, &stage, &shader);
+            };
+        } else {
+            if (device_.create_pipeline(
+                    [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
+                        return vk.vkCreateComputePipelines(dev, cache, 1, &create, nullptr, &pipeline_.pipeline);
+                    },
+                    pipeline_info) != VK_SUCCESS)
+                return E_FAIL;
+            device_.pipeline_created();
+        }
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
         // translator's code offsets are into the bytes the key hashes (the FSSM blob, or the kind-6 program).
@@ -10356,7 +10390,7 @@ int prebuild_shader_binaries(unsigned threads) {
     }
     std::vector<const leonida::ShaderEntry*> entries;
     library->for_each_entry([&](const leonida::ShaderEntry& e) {
-        if (e.stage == "vs" || e.stage == "ps" || e.stage == "ms" ||
+        if (e.stage == "vs" || e.stage == "ps" || e.stage == "ms" || e.stage == "cs" ||
             (e.stage == "gs" && s.info.features.geometryShader == VK_TRUE))
             entries.push_back(&e);
     });
@@ -10364,9 +10398,10 @@ int prebuild_shader_binaries(unsigned threads) {
         return stage == "vs"   ? VK_SHADER_STAGE_VERTEX_BIT
                : stage == "gs" ? VK_SHADER_STAGE_GEOMETRY_BIT
                : stage == "ms" ? VK_SHADER_STAGE_MESH_BIT_EXT
+               : stage == "cs" ? VK_SHADER_STAGE_COMPUTE_BIT
                                : VK_SHADER_STAGE_FRAGMENT_BIT;
     };
-    const leonida::shader_objects::Layout layout = s.so_graphics_layout();
+    const leonida::shader_objects::Layout graphics_layout = s.so_graphics_layout();
     const bool geometry = s.info.features.geometryShader == VK_TRUE;
     std::atomic<std::size_t> next{0}, written{0}, current{0}, failed{0}, skipped{0};
     const auto worker = [&] {
@@ -10396,6 +10431,8 @@ int prebuild_shader_binaries(unsigned threads) {
             source.subgroup = info.pNext ? required.requiredSubgroupSize : 0u;
             source.flags = leonida::shader_objects::shader_flags(stage, info.flags);
             const auto path = leonida::shader_objects::binary_path(s.so_binaries, stage, e.name);
+            const leonida::shader_objects::Layout layout =
+                stage == VK_SHADER_STAGE_COMPUTE_BIT ? s.so_compute_layout(e.binding_count != 0) : graphics_layout;
             leonida::shader_objects::Origin origin = leonida::shader_objects::Origin::failed;
             const VkShaderEXT shader = leonida::shader_objects::create_shader(
                 s.so_fn, s.info.device, source, layout, geometry, s.so_binaries, s.so_driver, &origin);
@@ -10424,7 +10461,7 @@ int prebuild_shader_binaries(unsigned threads) {
     for (std::thread& t : pool) t.join();
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     std::fprintf(stderr,
-                 "[rt] prebuild: %zu graphics shaders: %zu binaries written, %zu already current, %zu failed, %zu "
+                 "[rt] prebuild: %zu graphics and compute shaders: %zu binaries written, %zu already current, %zu failed, %zu "
                  "skipped (no mesh shaders on this device) in %.1f s on %u threads -> %s\n",
                  entries.size(), written.load(), current.load(), failed.load(), skipped.load(), seconds, n,
                  s.so_binaries.string().c_str());
