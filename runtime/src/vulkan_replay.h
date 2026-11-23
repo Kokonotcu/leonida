@@ -47,6 +47,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <span>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -2077,12 +2078,20 @@ inline ReplayResult keep_around_resolve(const ReplayFunctions& vk, Prepared& p) 
 }
 
 // The layout a copy uses for a range: D3D12 requires copy_dest/copy_source, or common (GENERAL), where an implicit
-// promotion lets the copy run in place. Anything else is moved to `wanted` and tracked.
+// promotion lets the copy run in place. A promoted texture decays back to common with no barrier (when a copy
+// queue's ExecuteCommandLists ends, and after a read-only promotion on any queue), and a shader may then sample it
+// through its set-0 descriptor, written in GENERAL. So a range with any piece in GENERAL, or never used (UNDEFINED:
+// as far as the layer knows, created in common), is copied in GENERAL, all of it; the tracker keeps GENERAL. A range
+// with no such piece is moved to `wanted` and tracked.
 inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer command_buffer,
                                  const ResourceBinding& resource, ResourceId id, const VkImageSubresourceRange& range,
                                  VkImageLayout wanted, VkAccessFlags access, LayoutTracker* tracker) {
-    const VkImageLayout target = image_layout(resource, wanted);
-    auto pieces = current(tracker, id, range, target);
+    const VkImageLayout transfer = image_layout(resource, wanted);
+    auto pieces = current(tracker, id, range, transfer);
+    bool promoted = false;
+    for (const auto& piece : pieces)
+        promoted = promoted || piece.layout == VK_IMAGE_LAYOUT_GENERAL || piece.layout == VK_IMAGE_LAYOUT_UNDEFINED;
+    const VkImageLayout target = promoted ? VK_IMAGE_LAYOUT_GENERAL : transfer;
     initialize(vk, command_buffer, resource, id, pieces, target, tracker);
     // D3D12 orders back-to-back copies and resolves on a resource that stays in COPY_DEST or COPY_SOURCE without a
     // barrier from the application; Vulkan does not. A piece already in the transfer layout gets no layout
@@ -2092,9 +2101,9 @@ inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer comm
         memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access,
                        VK_PIPELINE_STAGE_TRANSFER_BIT);
     };
-    if (pieces.size() == 1 && (pieces[0].layout == target || pieces[0].layout == VK_IMAGE_LAYOUT_GENERAL)) {
+    if (pieces.size() == 1 && pieces[0].layout == target) {
         after_transfer_writes();
-        return pieces[0].layout;
+        return target;
     }
     bool ordered = false;
     for (const auto& piece : pieces) {
@@ -2387,6 +2396,45 @@ inline std::pair<ResourceId, ResourceId> copy_ids(const Command& command) {
     if (const auto* c = std::get_if<CopyResource>(&command)) return {c->dst, c->src};
     if (const auto* c = std::get_if<ResolveSubresource>(&command)) return {c->dst, c->src};
     return {0, 0};
+}
+
+// D3D12 decays every resource a copy queue's ExecuteCommandLists accessed back to common when that work ends, with no
+// barrier from the application ("Implicit State Transitions"), and another queue may then sample it through an
+// implicit promotion, in GENERAL (the layout of its set-0 descriptor). Copies over common already run in GENERAL
+// (copy_layout); an explicit COPY_DEST or COPY_SOURCE barrier is what leaves a transfer layout. Recorded at the end
+// of a copy queue's command buffer: the textures the lists copy or transition, moved back to GENERAL where they are
+// tracked in another layout. Untracked images and swapchain images are left as they are.
+template<typename Resolve>
+void decay_to_common(const ReplayFunctions& vk, VkCommandBuffer command_buffer,
+                     std::span<const CommandList* const> lists, Resolve&& resolve, LayoutTracker* tracker) {
+    if (!tracker) return;
+    std::vector<ResourceId> touched;
+    const auto note = [&](ResourceId id) {
+        if (id && std::find(touched.begin(), touched.end(), id) == touched.end()) touched.push_back(id);
+    };
+    for (const CommandList* list : lists)
+        for (const Command& command : list->commands()) {
+            const auto [dst, src] = copy_ids(command);
+            note(dst);
+            note(src);
+            if (const auto* t = std::get_if<TransitionBarrier>(&command)) note(t->resource);
+            if (const auto* t = std::get_if<TextureBarrier>(&command)) note(t->resource);
+        }
+    LayoutPieces pieces;
+    for (const ResourceId id : touched) {
+        const ResourceBinding* resource = resolve(id);
+        if (!resource || !resource->image || resource->presentable) continue;
+        const VkImageSubresourceRange all{resource->aspects, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        if (!tracker->pieces(id, all, pieces)) continue;
+        for (const auto& piece : pieces) {
+            if (piece.layout == VK_IMAGE_LAYOUT_GENERAL || piece.layout == VK_IMAGE_LAYOUT_UNDEFINED) continue;
+            detail::image_barrier(vk, command_buffer, *resource, piece.range, piece.layout, VK_IMAGE_LAYOUT_GENERAL,
+                                  VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                  VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            tracker->set(id, piece.range, VK_IMAGE_LAYOUT_GENERAL);
+        }
+    }
 }
 
 // The heap, type and query range of a query command; count 0 for any other command.

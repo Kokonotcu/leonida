@@ -2738,6 +2738,7 @@ private:
             readback_stages |= list.readback_src_stages;
         }
         close_labels(command_buffer, replay, open_labels);
+        if (kind_ == QueueKind::copy) decay_to_common(replay, command_buffer, lists, resolve, &next_tracker);
         // Only flush GPU writes to the host domain when this batch actually wrote to a readback buffer.
         if (wrote_readback) {
             const VkPipelineStageFlags2 allowed = queue_supported_stages(kind_);
