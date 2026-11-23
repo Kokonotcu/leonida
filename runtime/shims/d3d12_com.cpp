@@ -1483,11 +1483,18 @@ public:
     bool ok() const { return fence_.semaphore() != VK_NULL_HANDLE; }
     VkSemaphore semaphore() const { return fence_.semaphore(); }
 
-    // A Vulkan timeline only increases; D3D12 allows setting a fence lower. Such a signal is reported and dropped.
-    // A queue's claim also records the value as one the GPU will signal, which a later CPU signal must not overtake.
-    bool claim(UINT64 value, bool queue = false) {
+    // A Vulkan timeline only increases; D3D12 allows setting a fence lower. Such a signal is reported and dropped
+    // (S_OK, `submit` not called). A queue's Signal also records the value as one the GPU will signal, which a later
+    // CPU signal must not overtake, but only once `submit` (the queue's submission, or its hold) succeeded: a value
+    // whose submission failed is never reached, and a CPU signal held behind it would wait forever. The claim lock is
+    // held across `submit`, so no CPU signal runs between the two.
+    template<typename Submit>
+    HRESULT queue_signal(UINT64 value, Submit&& submit) {
         std::lock_guard lock(claim_mutex_);
-        return claim_locked(value, queue);
+        if (!above(value)) return S_OK;
+        if (!submit()) return E_FAIL;
+        highest_ = queued_ = value;
+        return S_OK;
     }
 
     UINT64 STDMETHODCALLTYPE GetCompletedValue() override {
@@ -1502,7 +1509,8 @@ public:
     // would already read `value`.
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override {
         std::lock_guard lock(claim_mutex_);
-        if (!claim_locked(value, false)) return S_OK;
+        if (!above(value)) return S_OK;
+        highest_ = value;
         const UINT64 queued = queued_;
         if (held_->load() == 0 && fence_.completed() >= queued) return fence_.signal(value) ? S_OK : E_FAIL;
         held_->fetch_add(1);
@@ -1552,15 +1560,12 @@ public:
     static Fence* from(IUnknown* object) { return Child::from<Fence>(object); }
 
 private:
-    bool claim_locked(UINT64 value, bool queue) {
-        if (value <= highest_) {
-            std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
-                         static_cast<unsigned long long>(value), static_cast<unsigned long long>(highest_));
-            return false;
-        }
-        highest_ = value;
-        if (queue) queued_ = value;
-        return true;
+    // claim_mutex_ held. False (reported) when `value` is not above the highest value claimed so far.
+    bool above(UINT64 value) const {
+        if (value > highest_) return true;
+        std::fprintf(stderr, "[rt] d3d12: fence signal %llu is not above %llu; Vulkan timelines cannot go back\n",
+                     static_cast<unsigned long long>(value), static_cast<unsigned long long>(highest_));
+        return false;
     }
 
     leonida::VulkanContext& context_;
@@ -1742,8 +1747,9 @@ public:
         Fence* f = Fence::from(fence);
         if (!f) return d3d12_trace::result(method, E_INVALIDARG);
         std::lock_guard lock(mutex_);
-        if (!f->claim(value, true)) return d3d12_trace::result(method, S_OK);
-        return d3d12_trace::result(method, queue_.signal(f->semaphore(), value, fence_pin(fence)) ? S_OK : E_FAIL);
+        return d3d12_trace::result(method, f->queue_signal(value, [&] {
+            return queue_.signal(f->semaphore(), value, fence_pin(fence));
+        }));
     }
 
     HRESULT STDMETHODCALLTYPE Wait(ID3D12Fence* fence, UINT64 value) override {
