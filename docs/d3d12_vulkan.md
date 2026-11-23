@@ -3554,8 +3554,10 @@ Not implemented yet:
   - Replay: one token per argument at its byte offset in the record, the stride the sequence stride. Root constants and
     root descriptors are push-constant tokens into the 144-byte block of section 3.5 (`user_dword * 4`, 4 bytes a
     constant, 8 for a VA: the same dwords `SetGraphicsRoot32BitConstants` and `SetGraphicsRootConstantBufferView`
-    write for a draw signature, and `SetComputeRoot*` for a dispatch one, whose dwords are the console compute layout
-    from s4 of D3D-448, `RootArgumentLayout::compute_offset`; so a translated shader sees no difference), the list's own
+    write for a draw signature, in the console graphics layout from s8 (`RootArgumentLayout::user_offset`, section
+    3.5), and `SetComputeRoot*` for a dispatch one, in the console compute layout from s4 (D3D-448,
+    `RootArgumentLayout::compute_offset`); so a translated shader sees no difference, and the heap bases the list writes
+    after the arguments are left alone, as no token covers them), the list's own
     arguments at the call are pushed first and the records overwrite what they set. The draw or dispatch is a `DRAW`, `DRAW_INDEXED` or `DISPATCH` token (the same
     structures). Vertex and index buffer views hold console VAs and the tokens want device addresses, so a signature
     with one first runs `indirect_patch.comp` (outside the render pass): it copies the records to scratch and adds
