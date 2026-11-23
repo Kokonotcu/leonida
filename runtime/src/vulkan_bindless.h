@@ -52,6 +52,7 @@
 #include <cstring>
 #include <functional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace leonida {
@@ -370,6 +371,7 @@ public:
     bool fallbacks_ready() const { return fallbacks_ready_; }
     void record_fallback_init(VkCommandBuffer command_buffer) {
         fallbacks_ready_ = true;
+        fallback_init_unflushed_ = true;  // reported by the next flush's last_flush_uploaded()
         std::vector<VkImageMemoryBarrier> barriers;
         for (const auto& image : fallback_images_) {
             if (!image.image) continue;  // unsupported multisample component class
@@ -496,6 +498,7 @@ public:
         bool replaced = false;
         bool written = true;
         const bool must_replace = flush_replaces_table();
+        last_flush_uploaded_ = std::exchange(fallback_init_unflushed_, false);
         if (table_dirty_ || !table_uploaded_) written = upload_table(command_buffer, retire_ticket, replaced);
         last_flush_replaced_ = replaced;
         // The new generation could not be made: the current set is the one running work reads, so its descriptors are
@@ -544,6 +547,11 @@ public:
     // True when the last flush() started a new generation: its table upload is in that flush's command buffer, so
     // work on other queues that binds the new set must run after it (the owner orders them).
     bool last_flush_replaced() const { return last_flush_replaced_; }
+    // True when the last flush() recorded a table upload in its command buffer, in place or into a new generation, or
+    // record_fallback_init() was recorded since the flush before it (in the same command buffer, by the contract
+    // above). An in-place upload (new entries, emptied slots) changes the table every queue's shaders probe, so work on
+    // other queues submitted after it has to wait for it as much as for a new generation's.
+    bool last_flush_uploaded() const { return last_flush_uploaded_; }
     // The ticket of the oldest retired generation (0 when there is none).
     std::uint64_t oldest_retired_ticket() const { return retired_.empty() ? 0 : retired_.front().ticket; }
     // How many generations flush() has made after the first, and how many wait for release_retired().
@@ -889,6 +897,7 @@ private:
         if (!recorded) return true;  // nothing was copied: keep the obligation for the next flush
         record_table_barrier(command_buffer);
         upload_in_flight_ = true;
+        last_flush_uploaded_ = true;
         table_dirty_ = existing_entries_changed_ = false;
         table_uploaded_ = true;
         force_full_upload_ = false;
@@ -1047,6 +1056,8 @@ private:
     std::vector<Generation> retired_;
     std::uint64_t generations_made_ = 0;
     bool last_flush_replaced_ = false;
+    bool last_flush_uploaded_ = false;
+    bool fallback_init_unflushed_ = false;  // record_fallback_init() ran since the last flush()
     std::array<VkDescriptorPoolSize, bindless::bindings.size()> pool_sizes_{};
     std::uint32_t pool_size_count_ = 0;
     // Every descriptor written to the set (the table's binding aside), to fill the next generation's set.

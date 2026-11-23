@@ -961,6 +961,8 @@ int main(int argc, char** argv) {
         const std::uint32_t depth = probe_depth(table.build_gpu_buffer(), tsharp);
         EXPECT(slot_count() == slots && depth == 3 && !set.flush_replaces_table());
         EXPECT(flush());
+        // Added in place: no new generation, but an upload other queues have to wait for (B9).
+        EXPECT(set.last_flush_uploaded() && !set.last_flush_replaced());
         CHECK(draw());
         compare("1 gradient", nullptr);
 
@@ -969,6 +971,7 @@ int main(int argc, char** argv) {
         EXPECT(set.erase_key(tsharp) && !set.erase_key(tsharp));
         EXPECT(!set.flush_replaces_table());  // erasing empties its slot only: the three keys ahead stay where they are
         EXPECT(flush() && !set.flush_replaces_table());
+        EXPECT(set.last_flush_uploaded() && !set.last_flush_replaced());  // the emptied slot, in place
         CHECK(draw());
         compare("2 miss", zeros);
 
@@ -1022,6 +1025,7 @@ int main(int argc, char** argv) {
         // Another view at the same index, then removal of the index.
         set.update_image(ImageDimension::dim_2d, gradient_index, decoy_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         EXPECT(flush());
+        EXPECT(!set.last_flush_uploaded());  // a descriptor write only: the table is unchanged, nothing to wait for
         CHECK(draw());
         compare("7 other view", orange_colour);
         set.remove_image(ImageDimension::dim_2d, gradient_index);

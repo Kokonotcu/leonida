@@ -5655,7 +5655,10 @@ public:
             // is not yet submitted, so every submission that can have bound the set being replaced has a ticket up to
             // the one read here.
             const bool flushed = state_.bindless->flush(command_buffer, context.submitted_retire_ticket());
-            if (flushed && state_.bindless->last_flush_replaced()) context.note_bindless_upload();
+            // Any GPU write to the set's table or fallback images in this command buffer, a new generation or an
+            // in-place add: other queues' next submissions wait for it (VulkanQueue::execute_now). Descriptors
+            // created before their ExecuteCommandLists must not read the fallback (B9).
+            if (state_.bindless->last_flush_uploaded()) context.note_bindless_upload();
             return flushed;
         });
         state_.context->set_bindless_current([this]() {

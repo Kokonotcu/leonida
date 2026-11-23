@@ -2648,10 +2648,14 @@ private:
         }
         if (!tracker_lock.owns_lock()) tracker_lock.lock();
         if (!transfer_only && context_.bindless_prepare_ && !context_.bindless_prepare_(command_buffer)) {
+            // What the failed flush did record (the fallback images' first initialization, say) still goes out with
+            // this submission, and other queues wait for it as for any other.
+            const bool uploaded = std::exchange(context_.bindless_upload_pending_, false);
             const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
             resource_lock.unlock();
             const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
             if (!submitted) discard();
+            if (submitted && uploaded) publish_bindless_upload();
             if (depth24_guard.active) {
                 context_.depth24_->retire(progress_, 0);
                 depth24_guard.active = false;
@@ -2684,8 +2688,8 @@ private:
                 wait_values_.push_back(context_.storage_init_value_);
                 storage_init_seen_ = context_.storage_init_version_;
             }
-            // The set this submission binds may be a new generation whose table another queue's submission uploads:
-            // wait for that one, as for the storage images (the table's buffers are used by one queue family only:
+            // The set this submission binds may be a new generation whose table another queue's submission uploads,
+            // or the same one with entries that submission adds in place: wait for it, as for the storage images (the table's buffers are used by one queue family only:
             // every D3D12 queue of the device is made in info.queue_family).
             if (context_.bindless_upload_semaphore_ && context_.bindless_upload_semaphore_ != progress_ &&
                 context_.bindless_upload_version_ != bindless_upload_seen_) {
@@ -2790,13 +2794,7 @@ private:
             ++context_.storage_init_version_;
             storage_init_seen_ = context_.storage_init_version_;
         }
-        if (submitted && bindless_uploaded) {
-            std::lock_guard lock(context_.storage_mutex_);
-            context_.bindless_upload_semaphore_ = progress_;
-            context_.bindless_upload_value_ = submitted_;
-            ++context_.bindless_upload_version_;
-            bindless_upload_seen_ = context_.bindless_upload_version_;
-        }
+        if (submitted && bindless_uploaded) publish_bindless_upload();
         if (wait_previous && !submitted && !waits_.empty()) {  // a failed submit keeps the waits for the next one
             waits_.pop_back();
             wait_values_.pop_back();
@@ -2886,6 +2884,16 @@ private:
         waits_.clear();
         wait_values_.clear();
         retire_pins(wait_pins_, ticket);
+    }
+
+    // The submission just made (submitted_) carries a write to the bindless set's table or fallback images: every
+    // other queue's next submission waits for it (execute_now). tracker_mutex_ held.
+    void publish_bindless_upload() {
+        std::lock_guard lock(context_.storage_mutex_);
+        context_.bindless_upload_semaphore_ = progress_;
+        context_.bindless_upload_value_ = submitted_;
+        ++context_.bindless_upload_version_;
+        bindless_upload_seen_ = context_.bindless_upload_version_;
     }
 
     void retire_pins(std::vector<std::shared_ptr<void>>& pins, std::uint64_t ticket) {
