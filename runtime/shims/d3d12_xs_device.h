@@ -218,6 +218,16 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler);
 using PlacedAtVaPagesHook = bool (*)(const void* va, std::size_t bytes);
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook);
 
+// Device slot 14 with the console's extended description (a PC D3D12_DESCRIPTOR_HEAP_DESC followed by the heap's
+// console address and size, issue #313) goes to this handler when one is registered and the address is not 0. The
+// Vulkan layer registers rt::d3d12::create_console_descriptor_heap only under LEONIDA_CONSOLE_HEAP_VA=1, because that
+// heap reports the title's address without backing it; the default is the XMem-backed heap slot 14 makes otherwise.
+// With none, the extra words are ignored and the PC description makes the heap.
+using ConsoleDescriptorHeapHandler = HRESULT (*)(ID3D12Device* real, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                                 D3D12_GPU_VIRTUAL_ADDRESS address, std::uint64_t size, REFIID riid,
+                                                 void** out);
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 13 (console-sized D3D12_OPTIONS), 14 (descriptor heap proxy), 17-24 (CPU
 // descriptor handle translation), 25/26 (the console's struct-return form), 31/34/35/45/46/50 (proxies unwrapped),
