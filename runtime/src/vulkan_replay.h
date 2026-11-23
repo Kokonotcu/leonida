@@ -2387,6 +2387,23 @@ inline void to_attachment(const ReplayFunctions& vk, VkCommandBuffer command_buf
     if (tracker) tracker->set(a.id, range, layout);
 }
 
+// The layout a draw renders into its depth-stencil view in: DEPTH_STENCIL_ATTACHMENT_OPTIMAL, unless set 0 names the
+// texture in GENERAL (sampled_in_general) and every tracked piece of the view is in GENERAL already. That is the
+// layout of DEPTH_READ | *_SHADER_RESOURCE (vulkan_access), in which D3D12 lets one draw test against the texture
+// through a read-only DSV and sample it, and a shader reads it in its descriptor's layout (VUID-vkCmdDraw-None-09600):
+// moving it to the attachment layout for the draw would sample it in the wrong one and lose the read state in the
+// tracker. GENERAL also allows the depth and stencil tests and writes.
+inline VkImageLayout depth_attachment_layout(const PreparedDraw::Attachment& a, const LayoutTracker* tracker,
+                                             bool separate) {
+    const VkImageLayout attachment = image_layout(a.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    if (!a.binding.sampled_in_general || !tracker || attachment == VK_IMAGE_LAYOUT_GENERAL) return attachment;
+    LayoutPieces pieces;
+    if (!tracker->pieces(a.id, planes_for_layout(a.binding, a.range, separate), pieces)) return attachment;
+    for (const auto& piece : pieces)
+        if (piece.layout != VK_IMAGE_LAYOUT_GENERAL) return attachment;
+    return VK_IMAGE_LAYOUT_GENERAL;
+}
+
 } // namespace detail
 
 // Destination and source of a copy or resolve command.
@@ -4287,10 +4304,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 if (!a.id) return {};
                 return {a.view, image_layout(a.binding, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)};
             };
+            const VkImageLayout depth_layout =
+                d.depth.id ? detail::depth_attachment_layout(d.depth, tracker, separate) : VK_IMAGE_LAYOUT_UNDEFINED;
             const std::pair<VkImageView, VkImageLayout> depth_key =
-                d.depth.id ? std::pair{d.depth.view, image_layout(d.depth.binding,
-                                                                  VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)}
-                           : std::pair<VkImageView, VkImageLayout>{};
+                d.depth.id ? std::pair{d.depth.view, depth_layout} : std::pair<VkImageView, VkImageLayout>{};
             bool same_scope = scope.open && scope.color_count == d.colors.size() && scope.depth == depth_key &&
                               scope.depth_attached == depth_attached && scope.stencil_attached == stencil_attached &&
                               scope.area.width == d.area.width && scope.area.height == d.area.height &&
@@ -4314,11 +4331,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 }
                 VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
                 if (d.depth.id) {
-                    const VkImageLayout layout = image_layout(d.depth.binding, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-                    detail::to_attachment(vk, command_buffer, d.depth, layout, depth_access, depth_stages, tracker,
+                    detail::to_attachment(vk, command_buffer, d.depth, depth_layout, depth_access, depth_stages, tracker,
                                           separate);
                     depth.imageView = d.depth.view;
-                    depth.imageLayout = layout;
+                    depth.imageLayout = depth_layout;
                     depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                     depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
                 }
