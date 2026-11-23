@@ -515,7 +515,9 @@ def diff(pa, pb):
 # ---------------------------------------------------------------------------------------------- import
 def xgs_encode(name):
     """Same rule as encode_name() in runtime/shims/xgameruntime_gamesave.cpp: keep
-    [A-Za-z0-9_-] and '.' except as the first character; everything else becomes %XX (uppercase hex) per UTF-8 byte."""
+    [A-Za-z0-9_-] and '.' except as the first character; everything else becomes %XX (uppercase hex) per UTF-8 byte.
+    A final '.' and the first character of a Windows device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9 before the first
+    '.', any case) are encoded too, so every name stays a file of its own."""
     out = []
     for c in name.encode('utf-8'):
         ch = chr(c)
@@ -523,7 +525,13 @@ def xgs_encode(name):
             out.append(ch)
         else:
             out.append('%%%02X' % c)
-    return ''.join(out)
+    s = ''.join(out)
+    if s.endswith('.'):
+        s = s[:-1] + '%2E'
+    base = s.split('.', 1)[0].lower()
+    if base in ('con', 'prn', 'aux', 'nul') or (len(base) == 4 and base[:3] in ('com', 'lpt') and base[3] in '123456789'):
+        s = '%%%02X' % ord(s[0]) + s[1:]
+    return s
 
 
 def save_slot(folder):

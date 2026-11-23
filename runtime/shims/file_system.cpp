@@ -141,6 +141,20 @@ Drive console_drive(const std::wstring& path, size_t& prefix_length) {
     return letter == L'g' ? Drive::Game : Drive::Scratch;
 }
 
+// Win32 turns these names, with any extension and in any folder, into devices: "GAME:\aux.log" joined under the package
+// would open \\.\AUX, and "x\NUL.txt" the null device, instead of a file. A console path never names a device, so a
+// component like that is refused. The base name is what precedes the first dot, with trailing spaces ignored, as Win32
+// compares it.
+bool device_name(const std::wstring& part) {
+    std::wstring base = lower(part.substr(0, part.find(L'.')));
+    while (!base.empty() && base.back() == L' ') base.pop_back();
+    if (base == L"con" || base == L"prn" || base == L"aux" || base == L"nul" || base == L"conin$" || base == L"conout$")
+        return true;
+    if (base.size() != 4 || (base.compare(0, 3, L"com") != 0 && base.compare(0, 3, L"lpt") != 0)) return false;
+    const wchar_t n = base[3];
+    return (n >= L'1' && n <= L'9') || n == L'\u00b9' || n == L'\u00b2' || n == L'\u00b3';
+}
+
 Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
     size_t prefix_length = 0;
     const Drive drive = console_drive(path, prefix_length);
@@ -164,7 +178,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
         if (part == L"..") {
             if (parts.size() <= floor) return false;
             parts.pop_back();
-        } else if (part.find(L':') != std::wstring::npos) {
+        } else if (part.find(L':') != std::wstring::npos || device_name(part)) {
             return false;
         } else {
             parts.push_back(part);
@@ -986,8 +1000,18 @@ BOOL create_directory(LPCWSTR template_name, LPCWSTR name, LPSECURITY_ATTRIBUTES
     std::error_code ec;
     std::filesystem::create_directories(target.parent_path(), ec);
     if (ec) return fail_bool(static_cast<DWORD>(ec.value()));
-    return template_name ? ::CreateDirectoryExW(template_path.c_str(), target.c_str(), security)
-                         : ::CreateDirectoryW(target.c_str(), security);
+    const BOOL created = template_name ? ::CreateDirectoryExW(template_path.c_str(), target.c_str(), security)
+                                       : ::CreateDirectoryW(target.c_str(), security);
+    if (created) {
+        // Keep markers for deleted children, which must remain hidden after the folder is recreated.
+        std::filesystem::remove(marker(r.overlay, parts) / kRemovedDirMarker, ec);
+        if (ec) {
+            const DWORD error = static_cast<DWORD>(ec.value());
+            ::RemoveDirectoryW(target.c_str());
+            return fail_bool(error);
+        }
+    }
+    return created;
 }
 
 }  // namespace
@@ -1289,14 +1313,14 @@ HRESULT WINAPI copy_file2(PCWSTR from, PCWSTR to, COPYFILE2_EXTENDED_PARAMETERS*
     if (parameters && parameters->dwSize < sizeof(COPYFILE2_EXTENDED_PARAMETERS)) return E_INVALIDARG;
     const CopyFile2Fn host = host_copy_file2();
     if (!host && !fallback_supports(parameters)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
-    const bool fail_if_exists = parameters && (parameters->dwCopyFlags & COPY_FILE_FAIL_IF_EXISTS) != 0;
-    std::filesystem::path source, destination;
-    DWORD error = 0;
-    if (!copy_paths(from, to, fail_if_exists, source, destination, error)) return HRESULT_FROM_WIN32(error);
     // A cancel flag already set is answered here, for the host's CopyFile2 as well as the fallback: Windows returns
     // ERROR_REQUEST_ABORTED and writes nothing, while Wine reads the flag in neither call (Wine 11.20's CopyFile2 logs
     // "pfCancel is not supported" and copies, dlls/kernelbase/file.c copy_file; Wine 9 has only CopyFileExW).
     if (parameters && parameters->pfCancel && *parameters->pfCancel) return HRESULT_FROM_WIN32(ERROR_REQUEST_ABORTED);
+    const bool fail_if_exists = parameters && (parameters->dwCopyFlags & COPY_FILE_FAIL_IF_EXISTS) != 0;
+    std::filesystem::path source, destination;
+    DWORD error = 0;
+    if (!copy_paths(from, to, fail_if_exists, source, destination, error)) return HRESULT_FROM_WIN32(error);
     if (host) return host(source.c_str(), destination.c_str(), parameters);
     return copy_file2_fallback(source.c_str(), destination.c_str(), parameters);
 }

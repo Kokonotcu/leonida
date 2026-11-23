@@ -282,8 +282,35 @@ int main() {
         vk.merge_draw_scopes = true;
     }
 
+    // 6. LayoutTracker transactions (review I2): a rolled-back submission leaves the tracker as before it, a committed
+    //    one keeps its changes, and images tracked or forgotten inside the transaction are undone too.
+    {
+        LayoutTracker tracker;
+        tracker.track(color_a, rt_a, VK_IMAGE_LAYOUT_GENERAL);
+        tracker.track(color_b, rt_b, VK_IMAGE_LAYOUT_GENERAL);
+        const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        tracker.begin();
+        tracker.set(color_a, all, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        tracker.set(color_a, all, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);  // journaled once: the first state is kept
+        tracker.forget(color_b);
+        tracker.track(depth_id, ds, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        tracker.rollback();
+        expect(tracker.layout(color_a, 0) == VK_IMAGE_LAYOUT_GENERAL, "rollback: a changed layout is restored");
+        expect(tracker.tracked(color_b) && tracker.layout(color_b, 0) == VK_IMAGE_LAYOUT_GENERAL,
+               "rollback: a forgotten image is back");
+        expect(!tracker.tracked(depth_id), "rollback: an image tracked inside the transaction is gone");
+        tracker.begin();
+        tracker.set(color_a, all, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        tracker.commit();
+        tracker.set(color_b, all, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);  // outside a transaction: not journaled
+        tracker.rollback();                                               // nothing to undo
+        expect(tracker.layout(color_a, 0) == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL &&
+                   tracker.layout(color_b, 0) == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               "commit: the changes are kept");
+    }
+
     if (failures) return 1;
     std::puts("draw scopes: same targets share one scope; other targets, commands between draws and predication "
-              "end it; merging off gives a scope per draw");
+              "end it; merging off gives a scope per draw; tracker transactions roll back and commit");
     return 0;
 }
