@@ -3159,6 +3159,13 @@ public:
         return desc;
     }
 
+    // ID3D12Heap1: the layer has no protected resource sessions, so no heap belongs to one. The host runtime and
+    // WARP answer DXGI_ERROR_NOT_FOUND with a null interface for an unprotected heap, whatever the IID asked for.
+    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(REFIID, void** out) override {
+        if (out) *out = nullptr;
+        return DXGI_ERROR_NOT_FOUND;
+    }
+
     // The heap's range in the GPU address arena is reserved when a buffer first needs it (a placed buffer, or buffer
     // tiles sharing the arena): textures never use it, and a D3D12 heap has no GPU VA of its own, so a heap that only
     // ever holds textures costs no arena space.
