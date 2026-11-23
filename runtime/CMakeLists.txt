@@ -2852,6 +2852,44 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_m3_first_pass COMMAND d3d12_m3_frame_test --first-pass-only)
       set_tests_properties(d3d12_m3_frame d3d12_m3_first_pass PROPERTIES SKIP_RETURN_CODE 77)
 
+      # ExecuteIndirect with multi-argument command signatures (VK_EXT_device_generated_commands): root constants, vertex
+      # and index buffer views and root descriptors per record, drawn and dispatched, with a count buffer, and
+      # CreateCommandSignature compared with the host runtime. vs_ma (with a vertex-fetch input signature), ps_ma, cs_ma.
+      # The second test runs the draws and dispatches again on the runtime's own device with shader objects
+      # (LEONIDA_SHADER_OBJECTS=1), where the generated commands name the bound shaders instead of a pipeline; the third
+      # on a layer told it has no generated commands (the draw or dispatch arguments alone, read past the leading ones).
+      set(LEONIDA_MA_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/ma_shaders)
+      set(LEONIDA_MA_FILES ${LEONIDA_MA_DIR}/spirv/index.json ${LEONIDA_MA_DIR}/fssm/vs_ma.fssm
+                           ${LEONIDA_MA_DIR}/fssm/ps_ma.fssm ${LEONIDA_MA_DIR}/fssm/cs_ma.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_MA_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_MA_DIR}
+        # LEONIDA_USER_DATA_SHIFT=4: cs_ma reads its root arguments from s0 in the source; a D3D12 compute PSO gets
+        # them from s4 (rt::rootsig::pack_stage, D3D-448). Only the cs_ fixtures are shifted.
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                LEONIDA_USER_DATA_SHIFT=4
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_MA_DIR} vs_ma ps_ma cs_ma
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_ma.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_ma.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_ma.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating vs_ma, ps_ma and cs_ma for the multi-argument ExecuteIndirect test"
+        VERBATIM)
+      add_executable(d3d12_indirect_multiarg_test test/d3d12_indirect_multiarg_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_MA_FILES})
+      target_link_libraries(d3d12_indirect_multiarg_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+      target_compile_definitions(d3d12_indirect_multiarg_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_MA_DIR="${LEONIDA_MA_DIR}")
+      target_compile_options(d3d12_indirect_multiarg_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_indirect_multiarg COMMAND d3d12_indirect_multiarg_test)
+      add_test(NAME d3d12_indirect_multiarg_shader_objects COMMAND d3d12_indirect_multiarg_test --shader-objects)
+      add_test(NAME d3d12_indirect_multiarg_no_dgc COMMAND d3d12_indirect_multiarg_test --no-dgc)
+      set_tests_properties(d3d12_indirect_multiarg d3d12_indirect_multiarg_shader_objects d3d12_indirect_multiarg_no_dgc
+                           PROPERTIES SKIP_RETURN_CODE 77)
+
       # M4 (synthetic part): compute PSOs, a UAV table (structured and raw buffers, an R32_UINT storage image), an indirect
       # dispatch from arguments a first dispatch wrote, and a copy queue that streams the input in and reads the results
       # back across queue fences. cs_m4_fill.asm and cs_m4_indirect.asm go through the same build; build.py publishes
@@ -3426,6 +3464,16 @@ if(TARGET Vulkan::Headers)
       add_test(NAME shader_object_draw COMMAND shader_object_draw_test)
       set_tests_properties(shader_object_draw PROPERTIES SKIP_RETURN_CODE 77
                            FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+      # docs/aot_pipelines.md step 3: PSOs linked from pipeline libraries draw the whole pipelines' pixels, and after
+      # --prebuild-shaders a new device makes every shared shader part from the pipeline cache.
+      add_executable(gpl_draw_test test/gpl_draw_test.cpp ${LEONIDA_TEST_VS_DEPTH} ${LEONIDA_TEST_FS_SOLID})
+      target_link_libraries(gpl_draw_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(gpl_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_DEPTH_SPV="${LEONIDA_TEST_VS_DEPTH}"
+                                 LEONIDA_TEST_FS_SOLID_SPV="${LEONIDA_TEST_FS_SOLID}")
+      target_compile_options(gpl_draw_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME gpl_draw COMMAND gpl_draw_test)
+      set_tests_properties(gpl_draw PROPERTIES SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
       # D3D-29: mesh-shader PSOs from pipeline state streams and DispatchMesh (skips without VK_EXT_mesh_shader).
       set(LEONIDA_TEST_MS ${CMAKE_CURRENT_BINARY_DIR}/generated/ms_draw.spv)

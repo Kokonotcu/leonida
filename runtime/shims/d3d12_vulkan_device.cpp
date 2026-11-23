@@ -32,6 +32,7 @@
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/shader_library.h"
+#include "../src/pso_library.h"
 #include "../src/pso_recipe.h"
 #include "../src/vulkan_shader_objects.h"
 #include "../src/spirv_f16_halves.h"
@@ -1415,6 +1416,99 @@ struct DeviceState {
             std::fprintf(stderr, "[rt] d3d12: %zu shader objects: %u from stored binaries, %u compiled from SPIR-V\n",
                          so_shaders.size(), so_from_binary.load(), so_from_spirv.load());
         so_shaders.clear();
+    }
+
+    // docs/aot_pipelines.md step 3 (info.graphics_pipeline_library): graphics PSOs linked from pipeline-library parts
+    // (src/pso_library.h). The pre-rasterization and fragment shader parts depend on their shader only and are shared
+    // by every PSO here, made through the device's pipeline cache (which --prebuild-shaders fills).
+    leonida::pso::LibraryState::Functions gpl_fn;
+    std::once_flag gpl_once;
+    bool gpl_ok = false;
+    VkPipelineLayout gpl_layout = VK_NULL_HANDLE;  // the layout every shared part is made with
+    std::mutex gpl_mutex;
+    std::map<std::uint64_t, VkPipeline> gpl_libraries;  // shared parts by pso::library_key
+    std::atomic<std::uint32_t> gpl_parts_made{0}, gpl_parts_cached{0}, gpl_links{0}, gpl_links_cached{0};
+
+    bool gpl_ready() {
+        if (!info.graphics_pipeline_library || info.shader_objects) return false;
+        std::call_once(gpl_once, [this] {
+            const auto gdpa =
+                reinterpret_cast<PFN_vkGetDeviceProcAddr>(info.get_instance_proc(info.instance, "vkGetDeviceProcAddr"));
+            if (!gdpa || !gpl_fn.load(gdpa, info.device)) {
+                std::fprintf(stderr, "[rt] d3d12: pipeline libraries are enabled but the dynamic-state entry points "
+                                     "are missing; graphics PSOs are built whole\n");
+                return;
+            }
+            leonida::pso::Recipe layout_recipe;
+            layout_recipe.push_stages = gpl_push_stages();
+            layout_recipe.push_size = sizeof(leonida::ShaderUserData);
+            layout_recipe.bindless = bindless != nullptr;
+            const leonida::pso::LayoutCreateInfo layout(layout_recipe, bindless ? bindless->layout() : VK_NULL_HANDLE);
+            if (context->vk.vkCreatePipelineLayout(info.device, &layout.info, nullptr, &gpl_layout) != VK_SUCCESS) {
+                gpl_layout = VK_NULL_HANDLE;
+                return;
+            }
+            gpl_ok = true;
+        });
+        return gpl_ok;
+    }
+
+    // The push range of every GPL PSO's layout and of the shared parts': every graphics stage the device has (the
+    // parts must be made with identically defined layouts, VUID-VkGraphicsPipelineCreateInfo-pLibraries-06613).
+    VkShaderStageFlags gpl_push_stages() const {
+        return leonida::shader_objects::graphics_push_stages(info.features.geometryShader == VK_TRUE, info.mesh_shader);
+    }
+
+    // Creates one pipeline (a part or a link) through the device's cache; `cached` says whether the cache answered it
+    // (VkPipelineCreationFeedback). Counted like every other pipeline creation.
+    VkPipeline gpl_create(const VkGraphicsPipelineCreateInfo& create, bool& cached) {
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        const std::uint32_t hits_before = pipeline_cache_hits.load();
+        if (create_pipeline(
+                [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& i) {
+                    return context->vk.vkCreateGraphicsPipelines(info.device, cache, 1, &i, nullptr, &pipeline);
+                },
+                create) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        cached = pipeline_cache_hits.load() != hits_before;
+        return pipeline;
+    }
+
+    // The shared pre-rasterization or fragment shader part for `recipe` (modules[i] for recipe.stages[i]), made on
+    // first use. Null when it cannot be made.
+    VkPipeline gpl_library(leonida::pso::Part part, const leonida::pso::Recipe& recipe,
+                           const std::vector<VkShaderModule>& modules, bool per_sample = false) {
+        const std::uint64_t key = leonida::pso::library_key(part, recipe, per_sample);
+        {
+            std::lock_guard lock(gpl_mutex);
+            if (const auto it = gpl_libraries.find(key); it != gpl_libraries.end()) return it->second;
+        }
+        // Made outside the lock: two threads that race make the same part twice and keep the first.
+        const leonida::pso::LibraryCreateInfo create(part, recipe, modules, gpl_layout, per_sample);
+        bool cached = false;
+        const VkPipeline library = gpl_create(create.info, cached);
+        if (!library) return VK_NULL_HANDLE;
+        ++gpl_parts_made;
+        if (cached) ++gpl_parts_cached;
+        std::lock_guard lock(gpl_mutex);
+        const auto [it, inserted] = gpl_libraries.emplace(key, library);
+        if (!inserted) context->vk.vkDestroyPipeline(info.device, library, nullptr);
+        return it->second;
+    }
+
+    // At teardown, once no PSO links with them.
+    void destroy_gpl_libraries() {
+        std::lock_guard lock(gpl_mutex);
+        if (context)
+            for (const auto& [key, library] : gpl_libraries) context->vk.vkDestroyPipeline(info.device, library, nullptr);
+        if (!gpl_libraries.empty() || gpl_links.load())
+            std::fprintf(stderr, "[rt] d3d12: pipeline libraries: %zu shared shader parts (%u of %u made from the "
+                                 "pipeline cache), %u PSOs linked (%u from the cache)\n",
+                         gpl_libraries.size(), gpl_parts_cached.load(), gpl_parts_made.load(), gpl_links.load(),
+                         gpl_links_cached.load());
+        gpl_libraries.clear();
+        if (gpl_layout && context) context->vk.vkDestroyPipelineLayout(info.device, gpl_layout, nullptr);
+        gpl_layout = VK_NULL_HANDLE;
     }
 
     std::mutex descriptor_mutex;  // the set and the containers below
@@ -3891,6 +3985,8 @@ public:
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
+        for (VkPipeline output : gpl_outputs_) vk.vkDestroyPipeline(dev, output, nullptr);
+        if (gpl_input_) vk.vkDestroyPipeline(dev, gpl_input_, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
@@ -4514,8 +4610,12 @@ public:
         bool builtin_stage = false;
         for (const leonida::pso::Stage& m : stage_meta_) builtin_stage = builtin_stage || m.name.starts_with("<");
         const bool shader_objects = !builtin_stage && device_.shader_objects_ready();
+        // Pipeline libraries (docs/aot_pipelines.md step 3) without shader objects, for every PSO but a mesh one.
+        gpl_ = !shader_objects && !mesh && device_.gpl_ready();
         // The layout through pso_recipe.h's LayoutCreateInfo, as --prebuild-pipelines makes it again. With shader
-        // objects it is the shared one every shader object is made with (one push range over all graphics stages).
+        // objects it is the shared one every shader object is made with (one push range over all graphics stages);
+        // with pipeline libraries the one the shared parts are made with (the same push range, set 0 when the device
+        // has it, so a part fits every PSO whatever its other stage declares).
         layout_push_stages_ = graphics_.push_stages;
         layout_push_size_ = sizeof(leonida::ShaderUserData);
         layout_bindless_ = uses_bindless;
@@ -4524,6 +4624,11 @@ public:
             layout_push_stages_ = so_layout.push.stageFlags;
             graphics_.push_stages = layout_push_stages_;
             layout_bindless_ = so_layout.set0 != VK_NULL_HANDLE;
+            uses_bindless = layout_bindless_;
+        } else if (gpl_) {
+            layout_push_stages_ = device_.gpl_push_stages();
+            graphics_.push_stages = layout_push_stages_;
+            layout_bindless_ = device_.bindless != nullptr;
             uses_bindless = layout_bindless_;
         }
         {
@@ -4586,6 +4691,7 @@ public:
             const leonida::shader_objects::Functions* fn = &device_.so_fn;
             const bool conservative = device_.info.conservative_rasterization;
             graphics_.pipeline = VK_NULL_HANDLE;
+            graphics_.shader_objects = {shaders.vertex, shaders.geometry, shaders.fragment, shaders.mesh};
             graphics_.bind_shaders = [fn, shaders, recipe, device_stages, conservative](
                                          VkCommandBuffer cb, const VkViewport& viewport, const VkRect2D& scissor,
                                          const VkDeviceSize* strides, std::uint32_t stride_count) {
@@ -4595,6 +4701,17 @@ public:
                 fn->vkCmdSetScissorWithCount(cb, 1, &scissor);
             };
         } else {
+            if (gpl_) {
+                // The pixel shader part carries the multisample state only when the shader runs per sample.
+                gpl_per_sample_ = recipe_.multisample.sampleShadingEnable == VK_TRUE;
+                for (const Stage& s : stages)
+                    if (s.entry && s.bit == VK_SHADER_STAGE_FRAGMENT_BIT)
+                        gpl_per_sample_ = gpl_per_sample_ || leonida::pso::spirv_runs_per_sample(s.words);
+                // What the linked pipeline takes at the draw that the whole one bakes in.
+                const leonida::pso::LibraryState state(to_recipe(0));
+                const leonida::pso::LibraryState::Functions* fn = &device_.gpl_fn;
+                graphics_.set_state = [fn, state](VkCommandBuffer cb) { state.emit(*fn, cb); };
+            }
             graphics_.pipeline = build(0);
             if (!graphics_.pipeline) return E_FAIL;
             graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
@@ -4733,6 +4850,7 @@ public:
                 device_.shader_object(so, device_.so_compute_layout(entry->binding_count != 0));
             if (!shader) return E_FAIL;
             const leonida::shader_objects::Functions* fn = &device_.so_fn;
+            pipeline_.shader_object = shader;
             pipeline_.bind_shader = [fn, shader](VkCommandBuffer cb) {
                 const VkShaderStageFlagBits stage = VK_SHADER_STAGE_COMPUTE_BIT;
                 fn->vkCmdBindShadersEXT(cb, 1, &stage, &shader);
@@ -4840,10 +4958,11 @@ private:
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined,
     // made through pso_recipe.h's GraphicsCreateInfo (so --prebuild-pipelines makes the very same create info) and
     // recorded in pso_recipes.jsonl once it exists.
-    VkPipeline build(std::uint32_t unbound) const {
+    VkPipeline build(std::uint32_t unbound) {
         const leonida::pso::Recipe recipe = to_recipe(unbound);
         std::vector<VkShaderModule> modules;
         for (const VkPipelineShaderStageCreateInfo& s : recipe_.stages) modules.push_back(s.module);
+        if (gpl_) return link(recipe, modules);
         const leonida::pso::GraphicsCreateInfo create(recipe, modules, graphics_.layout);
         VkPipeline pipeline = VK_NULL_HANDLE;
         if (device_.create_pipeline(
@@ -4853,6 +4972,38 @@ private:
                 },
                 create.info) != VK_SUCCESS)
             return VK_NULL_HANDLE;
+        if (leonida::pso::Recorder* recorder = device_.pso_recorder()) recorder->record(recipe);
+        device_.pipeline_created();
+        return pipeline;
+    }
+
+    // docs/aot_pipelines.md step 3: the pipeline as a fast link of four parts (src/pso_library.h). The vertex input
+    // and fragment output parts are this PSO's (cheap: no shader); the two shader parts are the device's shared ones,
+    // which --prebuild-shaders has put in the pipeline cache. The recipe is recorded as for a whole pipeline, so
+    // --prebuild-pipelines still has it. Called under variants_mutex_ for a variant, from create_graphics otherwise.
+    VkPipeline link(const leonida::pso::Recipe& recipe, const std::vector<VkShaderModule>& modules) {
+        using leonida::pso::Part;
+        auto& vk = device_.context->vk;
+        bool cached = false;
+        if (!gpl_input_) {
+            const leonida::pso::LibraryCreateInfo create(Part::vertex_input, recipe, modules, VK_NULL_HANDLE);
+            gpl_input_ = device_.gpl_create(create.info, cached);
+        }
+        const leonida::pso::LibraryCreateInfo output_create(Part::output, recipe, modules, VK_NULL_HANDLE);
+        const VkPipeline output = device_.gpl_create(output_create.info, cached);
+        const VkPipeline pre_raster = device_.gpl_library(Part::pre_raster, recipe, modules);
+        const VkPipeline fragment = device_.gpl_library(Part::fragment, recipe, modules, gpl_per_sample_);
+        if (!gpl_input_ || !output || !pre_raster || !fragment) {
+            if (output) vk.vkDestroyPipeline(device_.info.device, output, nullptr);
+            log_once("a graphics PSO could not be linked from pipeline libraries; stages", int(recipe.stages.size()));
+            return VK_NULL_HANDLE;
+        }
+        gpl_outputs_.push_back(output);
+        const leonida::pso::LinkCreateInfo create({gpl_input_, pre_raster, fragment, output}, graphics_.layout);
+        const VkPipeline pipeline = device_.gpl_create(create.info, cached);
+        if (!pipeline) return VK_NULL_HANDLE;
+        ++device_.gpl_links;
+        if (cached) ++device_.gpl_links_cached;
         if (leonida::pso::Recorder* recorder = device_.pso_recorder()) recorder->record(recipe);
         device_.pipeline_created();
         return pipeline;
@@ -4883,6 +5034,12 @@ private:
     bool layout_bindless_ = false;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
+    // Pipeline libraries (docs/aot_pipelines.md step 3): this PSO's vertex input part and its fragment output parts
+    // (one per variant), kept with the pipelines linked from them; the shader parts are the device's.
+    bool gpl_ = false;
+    bool gpl_per_sample_ = false;
+    VkPipeline gpl_input_ = VK_NULL_HANDLE;
+    std::vector<VkPipeline> gpl_outputs_;
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::vector<VkShaderModule> modules_;
     VkDeviceSize code_base_ = 0;
@@ -5825,6 +5982,13 @@ public:
         }
         state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count,
                                               info.max_draw_indirect_count ? info.max_draw_indirect_count : UINT32_MAX);
+        if (info.indirect_commands && info.buffer_device_address)
+            state_.context->enable_indirect_commands(get_device, info.indirect_properties,
+                                                     [this](const VkMemoryRequirements& requirements) {
+                                                         return state_.allocate(requirements, 0,
+                                                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                                                nullptr, true);
+                                                     });
         if (!info.draw_indirect_first_instance)
             std::fprintf(stderr, "[rt] d3d12: drawIndirectFirstInstance is not enabled: ExecuteIndirect records with "
                                  "a StartInstanceLocation other than 0 are invalid\n");
@@ -6193,6 +6357,7 @@ public:
             state_.bindless.reset();
         }
         state_.destroy_shader_objects();
+        state_.destroy_gpl_libraries();
         state_.report_arena();
         if (state_.context && state_.arena.buffer) {
             auto& vk = state_.context->vk;
@@ -6554,38 +6719,84 @@ public:
         }
         if (desc->ByteStride % 4 || desc->ByteStride < size) return E_INVALIDARG;
         if (!out) return E_UNEXPECTED;  // the host's answer for a valid description and no output
-        leonida::IndirectKind kind;
+        leonida::IndirectKind kind = leonida::IndirectKind::draw;
+        leonida::IndirectArgumentType action = leonida::IndirectArgumentType::draw;
+        UINT action_size = 0;
         switch (desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type) {
-        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
-        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
-        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+            kind = leonida::IndirectKind::draw, action = leonida::IndirectArgumentType::draw;
+            action_size = sizeof(D3D12_DRAW_ARGUMENTS);
+            break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+            kind = leonida::IndirectKind::draw_indexed, action = leonida::IndirectArgumentType::draw_indexed;
+            action_size = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+            break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+            kind = leonida::IndirectKind::dispatch, action = leonida::IndirectArgumentType::dispatch;
+            action_size = sizeof(D3D12_DISPATCH_ARGUMENTS);
+            break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
             // Replayed as vkCmdDrawMeshTasksIndirect(Count)EXT; without VK_EXT_mesh_shader there is no mesh PSO to
             // run it with (the device reports MeshShaderTier NOT_SUPPORTED then).
             if (!state_.info.mesh_shader || !state_.context->vk.vkCmdDrawMeshTasksIndirectEXT) return E_NOTIMPL;
-            // Root arguments or views before it would need the per-record expansion the draw kinds lack too
-            // (section 4.7); refuse rather than read the group counts from the record's first bytes.
+            // Root arguments or views before it would need a mesh-tasks token (not generated here, section 4.7);
+            // refuse rather than read the group counts from the record's first bytes.
             if (desc->NumArgumentDescs != 1) return E_NOTIMPL;
-            kind = leonida::IndirectKind::dispatch_mesh;
+            kind = leonida::IndirectKind::dispatch_mesh, action = leonida::IndirectArgumentType::dispatch_mesh;
+            action_size = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
             break;
         default: return E_NOTIMPL;
         }
-        // Review B2: the draw or dispatch arguments come last in each record, after any root arguments or views. The
-        // replay reads them from there; the leading ones are not applied yet (the per-record expansion of
-        // docs/d3d12_vulkan.md 4.7), which the first such signature says once.
-        UINT arguments_offset = 0;
-        for (UINT i = 0; i + 1 < desc->NumArgumentDescs; ++i) {
-            const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
-            arguments_offset += arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW ? sizeof(D3D12_VERTEX_BUFFER_VIEW)
-                                : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW ? sizeof(D3D12_INDEX_BUFFER_VIEW)
-                                : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT ? 4u * arg.Constant.Num32BitValuesToSet
-                                : arg.Type == compat::kIndirectArgumentIncrementingConstant ? 4u
-                                : UINT(sizeof(D3D12_GPU_VIRTUAL_ADDRESS));
+        // The record layout, and the rules that need the root signature and the whole argument list (a root argument of
+        // a kind the root signature lacks, constants past a parameter, a slot twice, a view in a dispatch).
+        std::shared_ptr<const leonida::IndirectSignature> signature;
+        HRESULT hr = kind == leonida::IndirectKind::dispatch_mesh ? E_NOTIMPL
+                                                                   : build_indirect_signature(desc, root_signature, signature);
+        if (hr == E_INVALIDARG) return hr;
+        if (FAILED(hr)) {
+            // Arguments the generated commands cannot carry (an incrementing constant, root arguments past the 32
+            // user-data dwords), or a mesh dispatch: the draw or dispatch arguments alone, read past the leading
+            // ones (review B2), which are not applied; the first such signature says so once.
+            auto fallback = std::make_shared<leonida::IndirectSignature>();
+            UINT arguments_offset = 0;
+            for (UINT i = 0; i + 1 < desc->NumArgumentDescs; ++i) {
+                const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
+                arguments_offset += arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW ? sizeof(D3D12_VERTEX_BUFFER_VIEW)
+                                    : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW ? sizeof(D3D12_INDEX_BUFFER_VIEW)
+                                    : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT ? 4u * arg.Constant.Num32BitValuesToSet
+                                    : arg.Type == compat::kIndirectArgumentIncrementingConstant ? 4u
+                                    : UINT(sizeof(D3D12_GPU_VIRTUAL_ADDRESS));
+            }
+            if (arguments_offset)
+                log_once("ExecuteIndirect: a signature's root arguments/views cannot be generated per record and are "
+                         "not applied; bytes",
+                         int(arguments_offset));
+            leonida::IndirectArgument a;
+            a.type = action;
+            a.offset = arguments_offset;
+            a.size = action_size;
+            fallback->stride = desc->ByteStride;
+            fallback->kind = kind;
+            fallback->arguments.push_back(a);
+            fallback->arguments_size = arguments_offset + action_size;
+            signature = std::move(fallback);
+        } else if (!signature->simple()) {
+            // The limits of VK_EXT_device_generated_commands that a signature alone decides are checked now, so the
+            // application is told at creation. A device without the extension still creates it: the replay then
+            // runs the draw or dispatch arguments alone (the leading ones not applied, logged once).
+            if (state_.info.indirect_commands) {
+                if (const char* reason =
+                        leonida::IndirectExpander::limit_refusal(*signature, state_.info.indirect_properties)) {
+                    std::fprintf(stderr, "[rt] d3d12: CreateCommandSignature refused: %s\n", reason);
+                    return E_NOTIMPL;
+                }
+            } else {
+                log_once("ExecuteIndirect: no VK_EXT_device_generated_commands, a signature's root arguments/views "
+                         "before its draw are not applied; bytes",
+                         int(signature->action_offset()));
+            }
         }
-        if (arguments_offset)
-            log_once("ExecuteIndirect: a signature's root arguments/views before its draw are not applied yet; bytes",
-                     int(arguments_offset));
-        return create_command_signature(kind, desc->ByteStride, riid, out, identity(), arguments_offset);
+        return create_command_signature(std::move(signature), riid, out, identity());
     }
 
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
@@ -6817,7 +7028,8 @@ public:
             layout.parameters.push_back({parsed.sig.params[i].type,
                                          packed.ok ? packed.first_sgpr[i] : rt::rootsig::kNoSgpr,
                                          parsed.sig.params[i].num_values,
-                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
+                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
+                                         parsed.sig.params[i].descriptor_type});
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(
             std::move(layout), leonida::sha256_hex({static_cast<const std::uint8_t*>(blob), size}));
@@ -9845,6 +10057,17 @@ PipelineCacheSources pipeline_cache_sources(ID3D12Device* device) {
     return out;
 }
 
+PipelineLibraryStats pipeline_library_stats(ID3D12Device* device) {
+    if (!device) return {};
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    const Device* d = Device::from<Device>(real);
+    if (!d) return {};
+    const DeviceState& state = d->state();
+    return {state.gpl_parts_made.load(), state.gpl_parts_cached.load(), state.gpl_links.load(),
+            state.gpl_links_cached.load()};
+}
+
 namespace {
 const leonida::BindlessSet* bindless_of(ID3D12Device* device) {
     if (!device) return nullptr;
@@ -10340,7 +10563,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
         std::vector<VkExtensionProperties> extensions(extension_count);
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, extensions.data());
-        bool has_as = false, has_dho = false, has_rq = false;
+        bool has_as = false, has_dho = false, has_rq = false, has_gpl = false, has_pipeline_library = false;
         for (const auto& e : extensions) {
             if (!std::strcmp(e.extensionName, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &conditional};
@@ -10364,7 +10587,28 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &so};
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.shader_objects = so.shaderObject == VK_TRUE;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+                has_gpl = true;
+            } else if (!std::strcmp(e.extensionName, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+                has_pipeline_library = true;
             }
+        }
+        // docs/aot_pipelines.md step 3: graphics PSOs linked from per-shader pipeline libraries, where shader objects
+        // are not in use. LEONIDA_GPL=0 turns it off, =1 asks for it even where the device does not link fast; by
+        // default it is on where graphicsPipelineLibraryFastLinking is.
+        const std::wstring gpl_switch = environment_text(L"LEONIDA_GPL");
+        if (has_gpl && has_pipeline_library && !info.shader_objects && gpl_switch != L"0") {
+            VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT gpl{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
+            VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &gpl};
+            vkGetPhysicalDeviceFeatures2(info.physical, &features);
+            VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT gpl_props{
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_PROPERTIES_EXT};
+            VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &gpl_props};
+            vkGetPhysicalDeviceProperties2(info.physical, &props);
+            info.gpl_fast_linking = gpl_props.graphicsPipelineLibraryFastLinking == VK_TRUE;
+            info.graphics_pipeline_library =
+                gpl.graphicsPipelineLibrary == VK_TRUE && (info.gpl_fast_linking || gpl_switch == L"1");
         }
         if (!info.mesh_shader)
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_mesh_shader: mesh-shader PSOs are unsupported\n");
@@ -10414,6 +10658,16 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         ext_chain = &enable_shader_object;
         std::fprintf(stderr, "[rt] d3d12: LEONIDA_SHADER_OBJECTS=1: graphics PSOs use shader objects "
                              "(docs/aot_pipelines.md)\n");
+    }
+    VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT enable_gpl{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT};
+    enable_gpl.graphicsPipelineLibrary = VK_TRUE;
+    if (info.graphics_pipeline_library) {
+        enable_gpl.pNext = ext_chain;
+        ext_chain = &enable_gpl;
+        std::fprintf(stderr, "[rt] d3d12: graphics PSOs are linked from pipeline libraries%s (docs/aot_pipelines.md; "
+                             "LEONIDA_GPL=0 builds them whole)\n",
+                     info.gpl_fast_linking ? "" : " without fast linking (LEONIDA_GPL=1)");
     }
     if (info.ray_tracing) {
         enable_rq.pNext = ext_chain;
@@ -10598,6 +10852,19 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (has_host_image_copy) {
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &host_copy};
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
+    }
+    // ExecuteIndirect with multi-argument command signatures (vulkan_indirect.h).
+    leonida::IndirectExpander::Support indirect_support;
+    if (chosen12.bufferDeviceAddress &&
+        indirect_support.query(vkGetPhysicalDeviceFeatures2, vkGetPhysicalDeviceProperties2, info.physical, extensions)) {
+        const void* head = *v13.next();
+        indirect_support.chain(head);
+        *v13.next() = const_cast<void*>(head);
+        info.indirect_commands = true;
+        info.indirect_properties = indirect_support.properties;
+    } else {
+        std::fprintf(stderr, "[rt] d3d12: no VK_EXT_device_generated_commands: ExecuteIndirect with more than a draw or "
+                             "dispatch argument per command runs that argument alone\n");
     }
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
     info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
@@ -10821,6 +11088,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+    if (info.indirect_commands) leonida::IndirectExpander::Support::add_extensions(device_extensions);
     if (info.fragment_shader_barycentric)
         device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     if (info.fragment_shader_interlock) device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
@@ -10838,6 +11106,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
     if (info.shader_objects) device_extensions.push_back(VK_EXT_SHADER_OBJECT_EXTENSION_NAME);
+    if (info.graphics_pipeline_library) {
+        device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+        device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+    }
     if (info.buffer_marker) device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
 #if defined(VK_EXT_device_fault)
     if (info.device_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
@@ -11060,13 +11332,101 @@ int prebuild_recorded_pipelines(const std::filesystem::path& recipes_path, unsig
     return file.recipes.empty() || built.load() ? 0 : 4;
 }
 
+// --prebuild-shaders on a device without shader objects (docs/aot_pipelines.md, step 3): every translated vertex
+// shader's pre-rasterization part (with depth clipping and with depth clamping) and every pixel shader's fragment
+// part (and the part of a PSO without a pixel shader) made through the device's pipeline cache, exactly as a PSO
+// asks for them (pso::LibraryCreateInfo, the GPL layout, the subgroup request), and the cache saved. A PSO that pairs
+// these shaders as they are then links without compiling; one whose shaders the runtime edits (a geometry shader, the
+// f16 VS/PS link, a D24 depth-bias pixel shader) compiles its parts on first use and caches them.
+static int prebuild_pipeline_libraries(DeviceState& s, unsigned threads) {
+    using leonida::pso::Part;
+    const leonida::ShaderLibrary* library = s.library();
+    if (!library || !library->loaded()) {
+        std::fprintf(stderr, "[rt] prebuild: no translated shaders (shader_path.txt)\n");
+        return 2;
+    }
+    std::vector<const leonida::ShaderEntry*> entries;
+    library->for_each_entry([&](const leonida::ShaderEntry& e) {
+        if (e.stage == "vs" || e.stage == "ps") entries.push_back(&e);
+    });
+    auto& vk = s.context->vk;
+    const bool depth_clamp = s.info.features.depthClamp == VK_TRUE;
+    const std::uint32_t made_before = s.gpl_parts_made.load(), cached_before = s.gpl_parts_cached.load();
+    // The recipe fields a shared part depends on, as PipelineState::to_recipe gives them for a GPL PSO.
+    const auto base_recipe = [&] {
+        leonida::pso::Recipe r;
+        r.polygon_mode = VK_POLYGON_MODE_FILL;
+        r.push_stages = s.gpl_push_stages();
+        r.push_size = sizeof(leonida::ShaderUserData);
+        r.bindless = s.bindless != nullptr;
+        return r;
+    };
+    s.gpl_library(Part::fragment, base_recipe(), {});  // a PSO without a pixel shader (depth only)
+    std::atomic<std::size_t> next{0}, failed{0};
+    const auto worker = [&] {
+        for (std::size_t i = next++; i < entries.size(); i = next++) {
+            const leonida::ShaderEntry& e = *entries[i];
+            const bool vertex = e.stage == "vs";
+            const VkShaderStageFlagBits stage = vertex ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT;
+            const std::vector<std::uint32_t> words = library->spirv(e);
+            VkShaderModule module = VK_NULL_HANDLE;
+            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            module_info.codeSize = words.size() * 4;
+            module_info.pCode = words.data();
+            if (words.empty() || vk.vkCreateShaderModule(s.info.device, &module_info, nullptr, &module) != VK_SUCCESS) {
+                ++failed;
+                continue;
+            }
+            // The flags and subgroup request a PSO gives this shader (subgroup_size_for).
+            VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required{
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+            VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            info.stage = stage;
+            leonida::apply_subgroup_request(leonida::decide_subgroup_size(e, s.info.subgroup), required, info);
+            leonida::pso::Recipe r = base_recipe();
+            r.stages.push_back({std::uint32_t(stage), e.name, std::uint32_t(info.flags),
+                                info.pNext ? required.requiredSubgroupSize : 0u, leonida::pso::spirv_hash(words)});
+            const std::vector<VkShaderModule> modules{module};
+            bool ok = true;
+            if (vertex) {
+                ok = s.gpl_library(Part::pre_raster, r, modules) != VK_NULL_HANDLE;
+                if (depth_clamp) {  // DepthClipEnable = FALSE
+                    r.depth_clamp = true;
+                    ok = s.gpl_library(Part::pre_raster, r, modules) != VK_NULL_HANDLE && ok;
+                }
+            } else {
+                // A shader that runs per sample is keyed by the PSO's multisample state too: single-sampled here.
+                const bool per_sample = leonida::pso::spirv_runs_per_sample(words);
+                ok = s.gpl_library(Part::fragment, r, modules, per_sample) != VK_NULL_HANDLE;
+            }
+            if (!ok) ++failed;
+            vk.vkDestroyShaderModule(s.info.device, module, nullptr);
+        }
+    };
+    const unsigned n = std::max(1u, std::min<unsigned>(threads ? threads : std::thread::hardware_concurrency() / 2,
+                                                       unsigned(std::max<std::size_t>(entries.size(), 1))));
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < n; ++t) pool.emplace_back(worker);
+    for (std::thread& t : pool) t.join();
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    const std::uint32_t made = s.gpl_parts_made.load() - made_before, cached = s.gpl_parts_cached.load() - cached_before;
+    std::fprintf(stderr,
+                 "[rt] prebuild: no shader objects: %zu vertex and pixel shaders made into %u pipeline-library parts "
+                 "(%u already in the pipeline cache), %zu failed, in %.1f s on %u threads\n",
+                 entries.size(), made, cached, failed.load(), seconds, n);
+    s.save_pipeline_cache();
+    return entries.empty() || made ? 0 : 4;
+}
+
 // gta6rt --prebuild-shaders (docs/aot_pipelines.md, step 2): every translated vertex, geometry, pixel and mesh shader
 // made into a shader object on the game's device, with the flags and subgroup request a game run gives it, and its
 // driver binary stored under shader_binaries/ (or LEONIDA_SHADER_BINARIES). A shader whose binary is already there
-// for this driver and SPIR-V is loaded from it, which checks it. Exit codes: 0 done, 2 no device or shaders,
-// 5 the device has no VK_EXT_shader_object, 4 every shader failed.
+// for this driver and SPIR-V is loaded from it, which checks it. On a device without shader objects (or with
+// LEONIDA_SHADER_OBJECTS=0) the pipeline-library parts instead (step 3, prebuild_pipeline_libraries). Exit codes: 0
+// done, 2 no device or shaders, 5 the device has neither shader objects nor pipeline libraries, 4 every shader failed.
 int prebuild_shader_binaries(unsigned threads) {
-    _wputenv_s(L"LEONIDA_SHADER_OBJECTS", L"1");
+    if (environment_text(L"LEONIDA_SHADER_OBJECTS") != L"0") _wputenv_s(L"LEONIDA_SHADER_OBJECTS", L"1");
     ID3D12Device* device = nullptr;
     if (FAILED(create_vulkan_device_standalone(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device),
                                                QueueTestSettings::ignore)) ||
@@ -11082,7 +11442,9 @@ int prebuild_shader_binaries(unsigned threads) {
     if (!d) return 2;
     DeviceState& s = d->mutable_state();
     if (!s.shader_objects_ready()) {
-        std::fprintf(stderr, "[rt] prebuild: this device has no VK_EXT_shader_object; no shader binaries\n");
+        if (s.gpl_ready()) return prebuild_pipeline_libraries(s, threads);
+        std::fprintf(stderr, "[rt] prebuild: this device has no VK_EXT_shader_object and no pipeline libraries; no "
+                             "shader binaries\n");
         return 5;
     }
     const leonida::ShaderLibrary* library = s.library();
