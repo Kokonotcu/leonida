@@ -407,9 +407,10 @@ int main(int argc, char** argv) {
             const std::uint32_t counts[4] = {5, 0, 100, 0};
             EXPECT(new_buffer(default_heap, records.size(), D3D12_RESOURCE_STATE_COPY_DEST, arguments_buffer));
             EXPECT(new_buffer(default_heap, 256, D3D12_RESOURCE_STATE_COPY_DEST, count_buffer));
-            // Records 0..7 again in a buffer that ends where the last record's arguments do (D3D12 asks for no more: the
-            // 80 - 72 bytes of its stride past them need not exist).
-            constexpr UINT exact_bytes = 7 * draw_stride + 72;
+            // Records 0..7 again in a buffer exactly MaxCommandCount * stride long, the span D3D12 measures (upstream's
+            // ExecuteIndirect check, compared with the host); the generated commands still read only the arguments of
+            // the last record, not the 80 - 72 bytes of its stride past them.
+            constexpr UINT exact_bytes = 8 * draw_stride;
             EXPECT(new_buffer(default_heap, exact_bytes, D3D12_RESOURCE_STATE_COPY_DEST, exact_buffer));
             std::vector<std::uint8_t> constant_records(2 * constant_stride, 0xA5);
             for (unsigned r = 0; r < 2; ++r) {
@@ -726,7 +727,7 @@ int main(int argc, char** argv) {
     else
         std::printf("multi-argument ExecuteIndirect (%s): %u cells drawn by 6 calls (root constants, a vertex buffer view "
                     "with a base vertex, a 16- or 32-bit index buffer view and DRAW_INDEXED per record; a count buffer: 5 "
-                    "of 8, 0, 100 of 2; one call from an argument buffer exactly (n - 1) * stride + the arguments long; "
+                    "of 8, 0, 100 of 2; one call from an argument buffer exactly n * stride long; "
                     "one of constants only inside the rendering scope a plain draw left open) "
                     "and %u groups run by 2 dispatch calls (root constants and a root UAV per record; 3 of 4 by a count "
                     "buffer) matched the CPU reference (error 0)\n",

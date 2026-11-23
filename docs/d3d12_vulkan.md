@@ -3577,8 +3577,9 @@ Not implemented yet:
     buffer) is retired with the submission like the copy scratch (`vulkan_scratch.h`); one layout is cached for each
     description of records and pipeline layout (signatures that describe the same records share it), at most 64: past
     that the least recently used layout that no running submission uses is destroyed, and when every one is busy the
-    call is refused. The patch pass copies exactly `(MaxCommandCount - 1) * ByteStride + the arguments` bytes (the tail
-    of the last record's stride need not exist in the application's buffer, as D3D12 allows) in a 2D grid, so any
+    call takes the fallback. The patch pass copies exactly `(MaxCommandCount - 1) * ByteStride + the arguments` bytes
+    (the application's buffer holds `MaxCommandCount * ByteStride` from the offset, the span D3D12 checks, but the
+    last record's tail past its arguments is never read) in a 2D grid, so any
     `MaxCommandCount` fits; the preprocess buffer comes from a pool for the memory types and with the alignment each
     layout asks for.
   - Views must point into the GPU address arena (DEFAULT-heap buffers), as for a V# (section 3.3): an upload-heap view
