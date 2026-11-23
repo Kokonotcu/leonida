@@ -211,6 +211,13 @@ bool make_texture(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Command
 }  // namespace
 
 int main() {
+    // The host d3d12.dll stays loaded for the whole process, as it does in the runtime (d3d12_xs.cpp never frees it).
+    // This test does not import it, and a driver that presents a windowed Vulkan swapchain through DXGI (NVIDIA) loads
+    // it for the swapchain and frees it at teardown while D3D12Core.dll's worker threads still read it: an access
+    // violation in D3D12Core.dll on an address of the unloaded d3d12.dll, in roughly one run in four on an RTX 3080
+    // Laptop with driver 617.42 (Windows 10). Holding a reference of our own keeps it mapped.
+    LoadLibraryExW(L"d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+
     vktest::Device vk;
     if (!vk.create(true)) {
         std::printf("presentx_window: no Vulkan device with presentation: skipped\n");
