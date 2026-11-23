@@ -673,6 +673,8 @@ OTHER_HARNESS = {"ps_m15": "d3d12_translated_draw_test", "vs_m15": "d3d12_transl
                  "vs_m5": "d3d12_m5_world_test", "ps_m5_inst": "d3d12_m5_world_test",
                  "ps_m5_flat": "d3d12_m5_world_test", "ps_m5_tex": "d3d12_m5_world_test",
                  "ms_m5": "d3d12_m5_mesh_test", "ps_m5_mesh": "d3d12_m5_mesh_test",
+                 "vs_ma": "d3d12_indirect_multiarg_test", "ps_ma": "d3d12_indirect_multiarg_test",
+                 "cs_ma": "d3d12_indirect_multiarg_test",
                  "ps_live_width": "w64_graphics.py"}
 
 

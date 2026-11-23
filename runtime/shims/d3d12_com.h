@@ -55,12 +55,23 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
                             void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
-// `arguments_offset`: where the draw/dispatch arguments start in each record (after leading root arguments or views,
-// which are not applied yet: review B2 / docs/d3d12_vulkan.md 4.7), so their counts are read from the right bytes.
-HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
-                                 IUnknown* device = nullptr, UINT arguments_offset = 0);
+HRESULT create_command_signature(std::shared_ptr<const leonida::IndirectSignature> signature, REFIID riid, void** out,
+                                 IUnknown* device = nullptr);
+// What a command list needs of a signature: kind and stride, where the draw or dispatch arguments start in each record
+// (`arguments_offset`, past the root arguments and views before them), and the full description (null for a signature
+// the replay runs as a plain vkCmd*Indirect call: one argument only, or leading arguments it cannot generate).
 bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride,
-                            UINT* arguments_offset = nullptr);
+                            UINT* arguments_offset = nullptr,
+                            std::shared_ptr<const leonida::IndirectSignature>* full = nullptr);
+// CreateCommandSignature's checks and layout (D3D12_COMMAND_SIGNATURE_DESC against `root_signature`, which must come
+// from a Vulkan device): E_INVALIDARG for what D3D12 refuses (an action that is not last or that comes twice, a root
+// argument without a root signature or one the root signature does not have, a stride below the arguments or not a
+// multiple of 4), E_NOTIMPL for the arguments the layer cannot generate per record (mesh and ray dispatch,
+// incrementing constants, root arguments past the 32 user-data dwords). Root arguments land where the bind point of
+// the signature's action puts them: the compute layout for DISPATCH, the graphics one for the draws
+// (RootArgumentLayout).
+HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D12RootSignature* root_signature,
+                                 std::shared_ptr<const leonida::IndirectSignature>& out);
 
 // ID3D12Device1::SetEventOnMultipleFenceCompletion on fences from create_fence: sets `event` once every fence
 // (D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL) or any fence (_ANY) has reached its value; a null event blocks until then.
@@ -116,6 +127,10 @@ struct VulkanDeviceInfo {
     // drawIndirectFirstInstance is enabled: indirect records may have a StartInstanceLocation other than 0. Without
     // it such a record is invalid Vulkan (the layer cannot see inside the GPU buffer, so it only says so once).
     bool draw_indirect_first_instance = false;
+    // VK_EXT_device_generated_commands and VK_KHR_maintenance5 are enabled (IndirectExpander::Support): ExecuteIndirect
+    // with a command signature of more than one argument. Without them such a call is unsupported.
+    bool indirect_commands = false;
+    leonida::IndirectExpander::Properties indirect_properties;
     // VkPhysicalDeviceLimits::maxDrawIndirectCount (a call takes at most this many records); 0 means unknown, no cap.
     std::uint32_t max_draw_indirect_count = 0;
     bool sampler_mirror_clamp_to_edge = false;
@@ -423,6 +438,7 @@ struct RootArgumentLayout {
         std::uint32_t user_offset;     // graphics: first dword; unused for a parameter with no dwords
         std::uint32_t constant_count;  // constants only
         std::uint32_t compute_offset = rt::rootsig::kNoSgpr;  // compute: first user SGPR
+        std::uint32_t descriptor_type = 0;  // root descriptors: 2 CBV, 3 SRV, 4 UAV
     };
     std::vector<Parameter> parameters;
     std::uint32_t flags = 0;  // D3D12_ROOT_SIGNATURE_FLAGS from the serialized blob

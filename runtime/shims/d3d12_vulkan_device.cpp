@@ -4202,6 +4202,7 @@ public:
             const leonida::shader_objects::Functions* fn = &device_.so_fn;
             const bool conservative = device_.info.conservative_rasterization;
             graphics_.pipeline = VK_NULL_HANDLE;
+            graphics_.shader_objects = {shaders.vertex, shaders.geometry, shaders.fragment, shaders.mesh};
             graphics_.bind_shaders = [fn, shaders, recipe, device_stages, conservative](
                                          VkCommandBuffer cb, const VkViewport& viewport, const VkRect2D& scissor,
                                          const VkDeviceSize* strides, std::uint32_t stride_count) {
@@ -4349,6 +4350,7 @@ public:
                 device_.shader_object(so, device_.so_compute_layout(entry->binding_count != 0));
             if (!shader) return E_FAIL;
             const leonida::shader_objects::Functions* fn = &device_.so_fn;
+            pipeline_.shader_object = shader;
             pipeline_.bind_shader = [fn, shader](VkCommandBuffer cb) {
                 const VkShaderStageFlagBits stage = VK_SHADER_STAGE_COMPUTE_BIT;
                 fn->vkCmdBindShadersEXT(cb, 1, &stage, &shader);
@@ -5415,6 +5417,13 @@ public:
         }
         state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count,
                                               info.max_draw_indirect_count ? info.max_draw_indirect_count : UINT32_MAX);
+        if (info.indirect_commands && info.buffer_device_address)
+            state_.context->enable_indirect_commands(get_device, info.indirect_properties,
+                                                     [this](const VkMemoryRequirements& requirements) {
+                                                         return state_.allocate(requirements, 0,
+                                                                                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                                                nullptr, true);
+                                                     });
         if (!info.draw_indirect_first_instance)
             std::fprintf(stderr, "[rt] d3d12: drawIndirectFirstInstance is not enabled: ExecuteIndirect records with "
                                  "a StartInstanceLocation other than 0 are invalid\n");
@@ -6140,38 +6149,84 @@ public:
         }
         if (desc->ByteStride % 4 || desc->ByteStride < size) return E_INVALIDARG;
         if (!out) return E_UNEXPECTED;  // the host's answer for a valid description and no output
-        leonida::IndirectKind kind;
+        leonida::IndirectKind kind = leonida::IndirectKind::draw;
+        leonida::IndirectArgumentType action = leonida::IndirectArgumentType::draw;
+        UINT action_size = 0;
         switch (desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type) {
-        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
-        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
-        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+            kind = leonida::IndirectKind::draw, action = leonida::IndirectArgumentType::draw;
+            action_size = sizeof(D3D12_DRAW_ARGUMENTS);
+            break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+            kind = leonida::IndirectKind::draw_indexed, action = leonida::IndirectArgumentType::draw_indexed;
+            action_size = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+            break;
+        case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+            kind = leonida::IndirectKind::dispatch, action = leonida::IndirectArgumentType::dispatch;
+            action_size = sizeof(D3D12_DISPATCH_ARGUMENTS);
+            break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
             // Replayed as vkCmdDrawMeshTasksIndirect(Count)EXT; without VK_EXT_mesh_shader there is no mesh PSO to
             // run it with (the device reports MeshShaderTier NOT_SUPPORTED then).
             if (!state_.info.mesh_shader || !state_.context->vk.vkCmdDrawMeshTasksIndirectEXT) return E_NOTIMPL;
-            // Root arguments or views before it would need the per-record expansion the draw kinds lack too
-            // (section 4.7); refuse rather than read the group counts from the record's first bytes.
+            // Root arguments or views before it would need a mesh-tasks token (not generated here, section 4.7);
+            // refuse rather than read the group counts from the record's first bytes.
             if (desc->NumArgumentDescs != 1) return E_NOTIMPL;
-            kind = leonida::IndirectKind::dispatch_mesh;
+            kind = leonida::IndirectKind::dispatch_mesh, action = leonida::IndirectArgumentType::dispatch_mesh;
+            action_size = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
             break;
         default: return E_NOTIMPL;
         }
-        // Review B2: the draw or dispatch arguments come last in each record, after any root arguments or views. The
-        // replay reads them from there; the leading ones are not applied yet (the per-record expansion of
-        // docs/d3d12_vulkan.md 4.7), which the first such signature says once.
-        UINT arguments_offset = 0;
-        for (UINT i = 0; i + 1 < desc->NumArgumentDescs; ++i) {
-            const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
-            arguments_offset += arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW ? sizeof(D3D12_VERTEX_BUFFER_VIEW)
-                                : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW ? sizeof(D3D12_INDEX_BUFFER_VIEW)
-                                : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT ? 4u * arg.Constant.Num32BitValuesToSet
-                                : arg.Type == compat::kIndirectArgumentIncrementingConstant ? 4u
-                                : UINT(sizeof(D3D12_GPU_VIRTUAL_ADDRESS));
+        // The record layout, and the rules that need the root signature and the whole argument list (a root argument of
+        // a kind the root signature lacks, constants past a parameter, a slot twice, a view in a dispatch).
+        std::shared_ptr<const leonida::IndirectSignature> signature;
+        HRESULT hr = kind == leonida::IndirectKind::dispatch_mesh ? E_NOTIMPL
+                                                                   : build_indirect_signature(desc, root_signature, signature);
+        if (hr == E_INVALIDARG) return hr;
+        if (FAILED(hr)) {
+            // Arguments the generated commands cannot carry (an incrementing constant, root arguments past the 32
+            // user-data dwords), or a mesh dispatch: the draw or dispatch arguments alone, read past the leading
+            // ones (review B2), which are not applied; the first such signature says so once.
+            auto fallback = std::make_shared<leonida::IndirectSignature>();
+            UINT arguments_offset = 0;
+            for (UINT i = 0; i + 1 < desc->NumArgumentDescs; ++i) {
+                const D3D12_INDIRECT_ARGUMENT_DESC& arg = desc->pArgumentDescs[i];
+                arguments_offset += arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW ? sizeof(D3D12_VERTEX_BUFFER_VIEW)
+                                    : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW ? sizeof(D3D12_INDEX_BUFFER_VIEW)
+                                    : arg.Type == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT ? 4u * arg.Constant.Num32BitValuesToSet
+                                    : arg.Type == compat::kIndirectArgumentIncrementingConstant ? 4u
+                                    : UINT(sizeof(D3D12_GPU_VIRTUAL_ADDRESS));
+            }
+            if (arguments_offset)
+                log_once("ExecuteIndirect: a signature's root arguments/views cannot be generated per record and are "
+                         "not applied; bytes",
+                         int(arguments_offset));
+            leonida::IndirectArgument a;
+            a.type = action;
+            a.offset = arguments_offset;
+            a.size = action_size;
+            fallback->stride = desc->ByteStride;
+            fallback->kind = kind;
+            fallback->arguments.push_back(a);
+            fallback->arguments_size = arguments_offset + action_size;
+            signature = std::move(fallback);
+        } else if (!signature->simple()) {
+            // The limits of VK_EXT_device_generated_commands that a signature alone decides are checked now, so the
+            // application is told at creation. A device without the extension still creates it: the replay then
+            // runs the draw or dispatch arguments alone (the leading ones not applied, logged once).
+            if (state_.info.indirect_commands) {
+                if (const char* reason =
+                        leonida::IndirectExpander::limit_refusal(*signature, state_.info.indirect_properties)) {
+                    std::fprintf(stderr, "[rt] d3d12: CreateCommandSignature refused: %s\n", reason);
+                    return E_NOTIMPL;
+                }
+            } else {
+                log_once("ExecuteIndirect: no VK_EXT_device_generated_commands, a signature's root arguments/views "
+                         "before its draw are not applied; bytes",
+                         int(signature->action_offset()));
+            }
         }
-        if (arguments_offset)
-            log_once("ExecuteIndirect: a signature's root arguments/views before its draw are not applied yet; bytes",
-                     int(arguments_offset));
-        return create_command_signature(kind, desc->ByteStride, riid, out, identity(), arguments_offset);
+        return create_command_signature(std::move(signature), riid, out, identity());
     }
 
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
@@ -6393,7 +6448,8 @@ public:
                     break;
                 }
             layout.parameters.push_back({parsed.sig.params[i].type, first, parsed.sig.params[i].num_values,
-                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr});
+                                         compute.ok ? compute.first_sgpr[i] : rt::rootsig::kNoSgpr,
+                                         parsed.sig.params[i].descriptor_type});
         }
         register_static_samplers(parsed.sig);
         auto* signature = new RootSignature(
@@ -9924,6 +9980,19 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &host_copy};
         vkGetPhysicalDeviceFeatures2(info.physical, &query);
     }
+    // ExecuteIndirect with multi-argument command signatures (vulkan_indirect.h).
+    leonida::IndirectExpander::Support indirect_support;
+    if (chosen12.bufferDeviceAddress &&
+        indirect_support.query(vkGetPhysicalDeviceFeatures2, vkGetPhysicalDeviceProperties2, info.physical, extensions)) {
+        const void* head = *v13.next();
+        indirect_support.chain(head);
+        *v13.next() = const_cast<void*>(head);
+        info.indirect_commands = true;
+        info.indirect_properties = indirect_support.properties;
+    } else {
+        std::fprintf(stderr, "[rt] d3d12: no VK_EXT_device_generated_commands: ExecuteIndirect with more than a draw or "
+                             "dispatch argument per command runs that argument alone\n");
+    }
     const char* host_image_copy_name = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
     info.host_image_copy = has_host_image_copy && host_copy.hostImageCopy;
     if (info.host_image_copy) {
@@ -10135,6 +10204,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);
+    if (info.indirect_commands) leonida::IndirectExpander::Support::add_extensions(device_extensions);
     if (info.fragment_shader_barycentric)
         device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
     if (info.fragment_shader_interlock) device_extensions.push_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
