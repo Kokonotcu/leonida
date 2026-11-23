@@ -123,21 +123,6 @@ constexpr std::uint32_t kStoragePrivate = 6;
 constexpr std::uint32_t kDecorationLocation = 30;
 constexpr std::uint32_t kGlslUnpackHalf2x16 = 62;
 
-inline constexpr bool is_interface_only_decoration(std::uint32_t dec) {
-    switch (dec) {
-    case 13:  // NoPerspective
-    case 14:  // Flat
-    case 15:  // Patch
-    case 16:  // Centroid
-    case 17:  // Sample
-    case 18:  // Invariant
-    case kDecorationLocation:
-    case 31:  // Component
-        return true;
-    default:
-        return false;
-    }
-}
 
 struct Inst {
     std::uint16_t opcode = 0;

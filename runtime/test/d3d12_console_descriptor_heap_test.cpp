@@ -24,6 +24,7 @@ struct Ref {
         return &p;
     }
     T* get() const { return p; }
+    T* operator->() const { return p; }
 };
 
 bool check_console_addressed_heap(ID3D12Device* device) {
@@ -64,8 +65,13 @@ bool check_console_addressed_heap(ID3D12Device* device) {
 }
 
 bool check_xs_proxy_slot14(ID3D12Device* real_device) {
+    // Slot 14's console-extended path is opt-in (LEONIDA_CONSOLE_HEAP_VA=1 registers this handler at device creation).
+    rt::d3d12_xs::set_console_descriptor_heap_handler(&rt::d3d12::create_console_descriptor_heap);
+    struct Unregister {
+        ~Unregister() { rt::d3d12_xs::set_console_descriptor_heap_handler(nullptr); }
+    } unregister;
     void* proxy_raw = nullptr;
-    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(&proxy_raw))) || !proxy_raw) {
+    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, __uuidof(ID3D12Device), &proxy_raw)) || !proxy_raw) {
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }

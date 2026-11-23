@@ -905,6 +905,7 @@ if(BUILD_TESTING)
       shims/xmem.cpp
       shims/d3d12_xs.cpp
       shims/d3d12_xs_device.cpp
+      shims/presentx_capture.cpp
     )
     target_include_directories(pe_loader_fuzz PRIVATE
       ${CMAKE_CURRENT_SOURCE_DIR}/src

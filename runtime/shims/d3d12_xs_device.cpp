@@ -1245,7 +1245,7 @@ bool is_child_proxy(const void* object) {
     return object && *reinterpret_cast<void* const*>(object) == reinterpret_cast<void*>(get_child_vtable<K>());
 }
 
-constexpr unsigned kListSlots = 160;
+// kListSlots (160) is the child-proxy table's constant above: ListProxy's table is the same size.
 constexpr unsigned kConsoleSetDescriptorHeaps = 32;
 constexpr unsigned kConsoleExecuteBundle = 31;
 constexpr unsigned kConsoleBarrier = 146;
@@ -2393,6 +2393,8 @@ HRESULT proxy_check_feature_support(DeviceProxy* self, std::uint64_t feature, st
     return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<13>(self, feature, data, size, a4, a5)));
 }
 
+std::atomic<ConsoleDescriptorHeapHandler> g_console_heap{nullptr};  // set_console_descriptor_heap_handler
+
 static bool readable_range(const void* ptr, std::size_t bytes) {
     if (!ptr || !bytes) return false;
     const auto* p = static_cast<const std::uint8_t*>(ptr);
@@ -2463,11 +2465,11 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
             // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
             // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
+            const ConsoleDescriptorHeapHandler console_heap = g_console_heap.load(std::memory_order_acquire);
+            if (address != 0 && console_heap) {
                 console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
-                    self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
-                    __uuidof(ID3D12DescriptorHeap), &created);
+                hr = console_heap(self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
+                                  __uuidof(ID3D12DescriptorHeap), &created);
             }
         }
     }
@@ -3788,6 +3790,10 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler) {
 
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
     g_placed_at_va_pages.store(hook, std::memory_order_release);
+}
+
+void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler) {
+    g_console_heap.store(handler, std::memory_order_release);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {
