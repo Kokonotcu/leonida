@@ -9,6 +9,7 @@
 //      the context lost (returning 0) on VK_ERROR_DEVICE_LOST.
 //   4. wait_retire_ticket() must use a bounded vkWaitSemaphores timeout (never UINT64_MAX) and abort
 //      immediately if another thread marks the device lost.
+//   5. VulkanQueue::signal() that is not held keeps its pin (the fence) until the submission has completed.
 // Skips with exit code 77 when no Vulkan 1.3 device is available. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
@@ -322,6 +323,44 @@ int main() {
         }
         EXPECT(q.idle());
         std::printf("case 4 (bounded wait slice wakes on concurrent device loss): ok\n");
+    }
+
+    // 5. An unheld queue Signal keeps its fence pinned until the submission that signals it has completed (B11): an
+    //    application may release the fence right after ID3D12CommandQueue::Signal, and destroying a semaphore with a
+    //    pending signal is undefined (VUID-vkDestroySemaphore-semaphore-05149). The submission waits on a gate the
+    //    CPU opens later, so the signal is still pending when the call returns.
+    {
+        driver::reset_case();
+        VulkanContext context(driver::get_device, d.device, true);
+        EXPECT(context.loaded());
+        VulkanQueue q(context, d.queue, d.family);
+        EXPECT(q.ok());
+        VulkanFence gate(context, 0), fence(context, 0);
+        EXPECT(gate.semaphore() != VK_NULL_HANDLE && fence.semaphore() != VK_NULL_HANDLE);
+        ScopeExit gate_cleanup{[&] {
+            gate.signal(1);
+            q.idle();
+        }};
+        context.holds().signaled(gate.semaphore(), 1);  // counts as submitted: the Signal below is not held
+        q.wait(gate.semaphore(), 1);
+        auto object = std::make_shared<int>(0);  // stands for the ID3D12Fence the pin holds a reference to
+        const std::weak_ptr<int> watch = object;
+        bool pinned = false;
+        EXPECT(q.signal(fence.semaphore(), 1, [&]() -> std::shared_ptr<void> {
+            pinned = true;
+            return object;
+        }));
+        object.reset();  // the application's own reference
+        EXPECT(pinned && !watch.expired());
+        EXPECT(fence.completed() == 0);
+        gate.signal(1);
+        EXPECT(fence.wait(1, 5'000'000'000ull));
+        gate_cleanup.fn = {};
+        EXPECT(q.execute({&p_empty, 1}) == ReplayResult::success);  // drains the pins whose submission completed
+        EXPECT(q.idle());
+        EXPECT(q.execute({&p_empty, 1}) == ReplayResult::success);
+        EXPECT(watch.expired());
+        std::printf("case 5 (unheld Signal keeps its fence until the GPU signal completes): ok\n");
     }
 
     const unsigned val_errors = d.validation_errors();

@@ -2198,8 +2198,10 @@ public:
     }
 
     // ID3D12CommandQueue::Signal: the fence reaches `value` after all work submitted so far. Held behind earlier
-    // held operations, so the fence does not run ahead of the work it follows. `pin` (called only when the Signal is
-    // held) keeps the fence object alive until it has been submitted, as D3D12 does.
+    // held operations, so the fence does not run ahead of the work it follows. `pin` keeps the fence object alive
+    // until the submission that signals it has completed, as D3D12 does: the application may release the fence
+    // right after the call, and destroying a semaphore with a signal still pending on the GPU is undefined
+    // (VUID-vkDestroySemaphore-semaphore-05149).
     bool signal(VkSemaphore fence, std::uint64_t value, const PinFn& pin = {}) {
         bool ok = true;
         std::vector<std::shared_ptr<void>> retired;
@@ -2214,6 +2216,10 @@ public:
                 hold(std::move(op));
             } else {
                 ok = submit(VK_NULL_HANDLE, fence, value);
+                if (ok && pin) {
+                    std::vector<std::shared_ptr<void>> pins{pin()};
+                    retire_pins(pins, submitted_);
+                }
             }
             drain_pins(retired);
         }
