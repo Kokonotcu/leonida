@@ -608,6 +608,31 @@ binds its console imports (`xmem.dll`, `d3d12_xs.dll`) through the shim registry
 and resolves direct, ordinal and forwarded exports from the mapped image. `run_tiny_bundled_load` exercises this path
 end to end with a synthetic bundled DLL importing `xmem.dll!XMemAlloc` and `XMemFree`.
 
+## Winsock2 offline
+
+`game_scarlett_master.exe` imports 25 functions from `ws2_32.dll` (23 by classic Winsock ordinal plus `getaddrinfo` and
+`freeaddrinfo`). Like `winhttp.dll`, `gta6rt` owns `ws2_32.dll` (`runtime/shims/ws2_32_offline.cpp`) and answers 89
+Winsock2 functions in-process under both export name and official Windows ordinal (178 registry entries), with no link
+dependency on or call into the host's `ws2_32.dll`:
+
+- `WSAStartup` and `WSACleanup` keep an initialization reference count; `socket` / `WSASocketA/W` allocate local
+  4-aligned handles; `bind`, `getsockname`, `listen`, `setsockopt`, `getsockopt`, `ioctlsocket`, `WSAIoctl`,
+  `WSAEventSelect`, `WSAEnumNetworkEvents`, `shutdown` and `closesocket` keep per-socket state in-process.
+- `connect`, `WSAConnect`, `WSAConnectByNameA/W`, `WSAConnectByList`, `sendto`, `WSASendTo` and `WSASendMsg` fail with
+  `WSAENETUNREACH`, record `SO_ERROR`, signal `FD_CONNECT` if selected, and log each distinct destination once
+  (`[rt] ws2_32: offline, refused <kind> <target>`).
+- Stream `send`, `recv` and `getpeername` return `WSAENOTCONN`; bound non-blocking UDP `recvfrom` returns
+  `WSAEWOULDBLOCK` immediately, while blocking UDP `recv*` and listening `accept` sleep briefly (honouring capped
+  `SO_RCVTIMEO` with `WSAETIMEDOUT`, or 1 ms with `WSAENETUNREACH`) so dedicated polling threads do not spin at 100%.
+- `select` and `WSAPoll` validate handles, report bound UDP sockets writable (`writefds` / `POLLWRNORM`, and `FD_WRITE`
+  through `WSAEventSelect`), and cap non-ready sleeps to 10 ms (1 ms for infinite waits).
+- `getaddrinfo`, `GetAddrInfoW`, `GetAddrInfoExA/W` and `gethostbyname` resolve numeric IPv4/IPv6 literals, passive
+  wildcards and `localhost` in-process; any other hostname is logged once and fails immediately with
+  `WSAHOST_NOT_FOUND`.
+
+`runtime/test/ws2_32_offline_test.cpp` (ctest `ws2_32_offline`) checks all 89 name/ordinal pairs, local socket state,
+offline refusals and DNS helpers with `.invalid` and RFC 5737/3849 addresses; the test binary imports no `ws2_32.dll`.
+
 ## WinHTTP offline
 
 `XCurl.dll` and `libHttpClient.GDK.dll` do their HTTP through WinHTTP: between them they import 16 functions from

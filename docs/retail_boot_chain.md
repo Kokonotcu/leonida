@@ -83,6 +83,15 @@ package doesn't export it). The shim's unknown-IID log names it on the player's 
 `ID3D12GraphicsCommandList` of that type and handing out #2490's console list
 proxy gets all 581 lists created and closed.
 
+Two console list layouts exist in the shim, and neither is proven past boot: that proxy (PC slots in place, Reset
+at console slot 139), the default, and `ListProxy` (console extras at slots 27..30 shift the PC slots up by 4, Reset
+at 10). `LEONIDA_XS_LIST_LAYOUT=shifted` hands every slot-73 list out as a `ListProxy`; try it when the title
+faults or draws nothing inside command-list code.
+
+Device slot 14 can also take the console's extended heap description (the PC description followed by the heap's
+address and size). `LEONIDA_CONSOLE_HEAP_VA=1` makes such a heap report the title's address as its start handles;
+that heap is not backed by the title's memory, so it is off by default.
+
 ### 3.4 Device slot 133 places a resource at a virtual address
 
 Xbox device slot 133 is `(va, const D3D12_RESOURCE_DESC*, state, clear, riid, out)` with `riid = IID_ID3D12Resource`
