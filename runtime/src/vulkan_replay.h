@@ -942,8 +942,8 @@ struct ReplayFunctions {
     std::uint32_t max_draw_indirect_count = UINT32_MAX;
     // ExecuteIndirect with a multi-argument command signature (vulkan_indirect.h, VK_EXT_device_generated_commands):
     // `indirect_prepare` makes the plan while the list is checked, `indirect_prepass` records the pass that rebases
-    // buffer views (outside rendering), `indirect_execute` the generated commands. Without them such a call is
-    // unsupported.
+    // buffer views and bounds the count (outside rendering), `indirect_execute` the generated commands. Without them
+    // (or when a call cannot be planned) the call runs its draw or dispatch arguments alone (detail::prepare_generated).
     std::function<bool(const IndirectExpander::Request&, IndirectPlan&)> indirect_prepare;
     std::function<void(VkCommandBuffer, const IndirectPlan&)> indirect_prepass;
     std::function<void(VkCommandBuffer, const IndirectPlan&)> indirect_execute;
