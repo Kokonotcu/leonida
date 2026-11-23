@@ -40,6 +40,12 @@
 #include "../shims/shims.h"
 #include "../shims/startup_trace.h"
 
+#ifdef LEONIDA_VULKAN_DEVICE
+namespace rt::d3d12 {
+int prebuild_recorded_pipelines(const std::filesystem::path& recipes, unsigned threads);  // shims/d3d12_com.h
+}
+#endif
+
 namespace {
 
 const char* binding_name(rt::Binding b) {
@@ -55,8 +61,44 @@ int usage() {
     std::fprintf(stderr,
                  "usage: gta6rt --dry-run <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace FILE]\n"
                  "       gta6rt --init <image> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE]\n"
-                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n");
+                 "       gta6rt --run <exe> [--game-dir DIR] [--overlay DIR] [--mods DIR] [--archetype-lookup RVA[,ARG]] [--view-mode-getter RVA] [--trace-d3d12] [--trace FILE] [-- game arguments...]\n"
+                 "       gta6rt --prebuild-pipelines [--recipes FILE] [--jobs N]\n");
     return 2;
+}
+
+// gta6rt --prebuild-pipelines [--recipes FILE] [--jobs N] (docs/aot_pipelines.md): every graphics pipeline a game run
+// recorded (pso_recipes.jsonl beside gta6rt.exe by default) is built on the game's Vulkan device into the pipeline
+// cache, which is saved, so the next run compiles none of them. Runs no game code.
+int prebuild_pipelines_command(int argc, wchar_t** argv) {
+#ifdef LEONIDA_VULKAN_DEVICE
+    std::filesystem::path recipes;
+    unsigned jobs = 0;
+    for (int i = 2; i < argc; ++i) {
+        const std::wstring a = argv[i];
+        if (a == L"--recipes" && i + 1 < argc) recipes = argv[++i];
+        else if (a == L"--jobs" && i + 1 < argc) {
+            wchar_t* end = nullptr;
+            const unsigned long n = std::wcstoul(argv[++i], &end, 10);
+            if (!end || *end || n == 0 || n > 256) return usage();
+            jobs = static_cast<unsigned>(n);
+        } else {
+            return usage();
+        }
+    }
+    if (recipes.empty()) {
+        std::wstring self(32768, L'\0');
+        const DWORD n = GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size()));
+        if (!n || n >= self.size()) return 2;
+        self.resize(n);
+        recipes = std::filesystem::path(self).parent_path() / L"pso_recipes.jsonl";
+    }
+    return rt::d3d12::prebuild_recorded_pipelines(recipes, jobs);
+#else
+    (void)argc;
+    (void)argv;
+    std::fprintf(stderr, "gta6rt: --prebuild-pipelines needs the Vulkan device (build with the Vulkan SDK)\n");
+    return 2;
+#endif
 }
 
 }  // namespace
@@ -268,6 +310,7 @@ int wmain(int argc, wchar_t** argv) {
     bool dry_run = false, init = false, run = false, trace_d3d12 = false;
     std::vector<std::wstring> game_args;  // wide: path::string() throws on a character the code page lacks (RT-84)
     std::wstring trace_file;
+    if (argc >= 2 && std::wstring(argv[1]) == L"--prebuild-pipelines") return prebuild_pipelines_command(argc, argv);
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
         if (a == L"--") {

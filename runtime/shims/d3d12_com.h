@@ -12,6 +12,7 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <filesystem>
 #include <memory>
 #include <vector>
 
@@ -221,6 +222,11 @@ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** o
 enum class QueueTestSettings { apply, ignore };
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out,
                                         QueueTestSettings queue_test_settings = QueueTestSettings::apply);
+
+// gta6rt --prebuild-pipelines (docs/aot_pipelines.md): builds every graphics pipeline recorded in `recipes` on the
+// device a game run creates and saves the pipeline cache. 0 done, 2 nothing to build with, 3 recipes from another
+// set-0 layout, 4 every pipeline failed. `threads` 0: half the hardware threads.
+int prebuild_recorded_pipelines(const std::filesystem::path& recipes, unsigned threads = 0);
 
 // Tells a device from create_vulkan_device* that `outer` (the Xbox-ABI proxy that owns it) is what its children's
 // GetDevice must return. No reference is taken: the outer object owns the device. `outer` may be the proxy's

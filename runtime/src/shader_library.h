@@ -795,6 +795,16 @@ public:
         return lookup(entries_, stage, fssm_sha256);
     }
 
+    // Calls f(const ShaderEntry&) for every entry loaded, the main index's and the FSPX/BVH/library ones (for tools that
+    // look entries up by name, such as gta6rt --prebuild-pipelines).
+    template<typename F>
+    void for_each_entry(F&& f) const {
+        for (const auto& [key, list] : entries_)
+            for (const ShaderEntry& e : list) f(e);
+        for (const auto& [key, list] : fspx_entries_)
+            for (const ShaderEntry& e : list) f(e);
+    }
+
     // The entries of an FSPX program, by the SHA-256 of its kind-6 bytes (fspx_code_sha256).
     std::vector<const ShaderEntry*> fspx_candidates(std::string_view stage, std::string_view fspx_code_sha256) const {
         return lookup(fspx_entries_, stage, fspx_code_sha256);

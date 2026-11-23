@@ -3404,6 +3404,10 @@ if(TARGET Vulkan::Headers)
     add_executable(subgroup_size_test test/subgroup_size_test.cpp)
     target_link_libraries(subgroup_size_test PRIVATE Vulkan::Headers)
     add_test(NAME subgroup_size COMMAND subgroup_size_test)
+    # A graphics pipeline recipe (docs/aot_pipelines.md): JSON round trip, key, the create info, the recipes file.
+    add_executable(pso_recipe_test test/pso_recipe_test.cpp)
+    target_link_libraries(pso_recipe_test PRIVATE Vulkan::Headers)
+    add_test(NAME pso_recipe COMMAND pso_recipe_test)
     add_executable(conservative_raster_test test/conservative_raster_test.cpp)
     add_test(NAME conservative_raster COMMAND conservative_raster_test)
     # The GPU address arena's size from LEONIDA_ARENA_MB and synthetic device buffer limits.

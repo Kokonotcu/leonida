@@ -50,6 +50,7 @@
 #include <atomic>
 #include <bit>
 #include <cctype>
+#include <chrono>
 #include <climits>
 #include <cstdlib>
 #include <filesystem>
@@ -61,6 +62,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <cwchar>
 #include <vector>
@@ -1252,10 +1254,11 @@ struct DeviceState {
     std::unique_ptr<leonida::pso::Recorder> pso_recorder_;
     leonida::pso::Recorder* pso_recorder() {
         std::call_once(pso_recorder_once, [this] {
-            if (const char* off = std::getenv("LEONIDA_PSO_RECORD"); off && std::strcmp(off, "0") == 0) return;
-            std::filesystem::path path;
-            if (const char* where = std::getenv("LEONIDA_PSO_RECIPES"); where && *where) path = where;
-            else if (const auto cache = pipeline_cache_path(); !cache.empty()) path = cache.parent_path() / L"pso_recipes.jsonl";
+            if (environment_text(L"LEONIDA_PSO_RECORD") == L"0") return;
+            std::filesystem::path path = environment_text(L"LEONIDA_PSO_RECIPES");
+            if (path.empty())
+                if (const auto cache = pipeline_cache_path(); !cache.empty())
+                    path = cache.parent_path() / L"pso_recipes.jsonl";
             if (path.empty()) return;
             pso_recorder_ = std::make_unique<leonida::pso::Recorder>(path, set0_layout_desc());
             if (!pso_recorder_->ok()) pso_recorder_.reset();
@@ -10031,6 +10034,133 @@ bool has_global_realtime_privilege() {
 
 void set_global_realtime_privilege_override_for_test(int state) {
     g_global_realtime_privilege_override.store(state, std::memory_order_relaxed);
+}
+
+// gta6rt --prebuild-pipelines (docs/aot_pipelines.md, step 1): every recorded graphics pipeline, built on the device a
+// game run creates, into the device's pipeline cache, which is then saved (D3D-704). Exit codes: 0 done (some recipes
+// may have been skipped, each class counted), 2 no device / no recipes / no shaders, 3 the recipes belong to another
+// set-0 layout (another GPU or bindless sizing), 4 every pipeline failed.
+int prebuild_recorded_pipelines(const std::filesystem::path& recipes_path, unsigned threads) {
+    leonida::pso::RecipesFile file;
+    if (!leonida::pso::read_recipes(recipes_path, file)) {
+        std::fprintf(stderr, "[rt] prebuild: cannot read %s\n", recipes_path.string().c_str());
+        return 2;
+    }
+    ID3D12Device* device = nullptr;
+    if (FAILED(create_vulkan_device_standalone(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device),
+                                               QueueTestSettings::ignore)) ||
+        !device) {
+        std::fprintf(stderr, "[rt] prebuild: the Vulkan device could not be created\n");
+        return 2;
+    }
+    struct Release {
+        ID3D12Device* d;
+        ~Release() { d->Release(); }
+    } release{device};
+    Device* d = Device::from<Device>(device);
+    if (!d) return 2;
+    DeviceState& s = d->mutable_state();
+    if (const leonida::pso::SetLayoutDesc here = s.set0_layout_desc(); file.set0 != here) {
+        std::size_t first = 0;
+        while (first < file.set0.bindings.size() && first < here.bindings.size() &&
+               file.set0.bindings[first] == here.bindings[first])
+            ++first;
+        std::fprintf(stderr,
+                     "[rt] prebuild: %s was recorded with another set-0 layout (another GPU or bindless sizing): "
+                     "%zu bindings, flags 0x%x recorded; %zu, flags 0x%x on this device; first difference at entry "
+                     "%zu; nothing built\n",
+                     recipes_path.string().c_str(), file.set0.bindings.size(), file.set0.create_flags,
+                     here.bindings.size(), here.create_flags, first);
+        return 3;
+    }
+    const leonida::ShaderLibrary* library = s.library();
+    if (!library || !library->loaded()) {
+        std::fprintf(stderr, "[rt] prebuild: no translated shaders (shader_path.txt)\n");
+        return 2;
+    }
+    std::map<std::string, const leonida::ShaderEntry*, std::less<>> by_name;
+    library->for_each_entry([&](const leonida::ShaderEntry& e) { by_name.emplace(e.name, &e); });
+
+    const auto& vk = s.context->vk;
+    const VkDevice dev = s.info.device;
+    const VkDescriptorSetLayout set0 = s.bindless ? s.bindless->layout() : VK_NULL_HANDLE;
+    const std::uint32_t hits_before = s.pipeline_cache_hits.load();
+    const std::uint32_t created_before = s.pipelines_created.load();
+    std::atomic<std::size_t> next{0}, built{0}, missing{0}, changed{0}, failed{0};
+    const auto worker = [&] {
+        for (std::size_t i = next++; i < file.recipes.size(); i = next++) {
+            const leonida::pso::Recipe& r = file.recipes[i];
+            std::vector<VkShaderModule> modules;
+            bool ok = true;
+            for (const leonida::pso::Stage& st : r.stages) {
+                const auto it = by_name.find(st.name);
+                if (it == by_name.end()) {  // also the built-in depth24 shader, which is not in the index
+                    ++missing;
+                    ok = false;
+                    break;
+                }
+                const std::vector<std::uint32_t> words = library->spirv(*it->second);
+                if (words.empty() || leonida::pso::spirv_hash(words) != st.hash) {
+                    ++changed;  // retranslated since the run, or patched at PSO creation (f16 link, depth24)
+                    ok = false;
+                    break;
+                }
+                VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                info.codeSize = words.size() * sizeof(std::uint32_t);
+                info.pCode = words.data();
+                VkShaderModule module = VK_NULL_HANDLE;
+                if (vk.vkCreateShaderModule(dev, &info, nullptr, &module) != VK_SUCCESS) {
+                    ++failed;
+                    ok = false;
+                    break;
+                }
+                modules.push_back(module);
+            }
+            VkPipelineLayout layout = VK_NULL_HANDLE;
+            if (ok) {
+                const leonida::pso::LayoutCreateInfo layout_info(r, set0);
+                if (vk.vkCreatePipelineLayout(dev, &layout_info.info, nullptr, &layout) != VK_SUCCESS) {
+                    ++failed;
+                    ok = false;
+                }
+            }
+            if (ok) {
+                const leonida::pso::GraphicsCreateInfo create(r, modules, layout);
+                VkPipeline pipeline = VK_NULL_HANDLE;
+                const VkResult result = s.create_pipeline(
+                    [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& info) {
+                        return vk.vkCreateGraphicsPipelines(dev, cache, 1, &info, nullptr, &pipeline);
+                    },
+                    create.info);
+                if (result == VK_SUCCESS) {
+                    ++built;
+                    s.pipeline_created();
+                    vk.vkDestroyPipeline(dev, pipeline, nullptr);
+                } else {
+                    ++failed;
+                }
+            }
+            if (layout) vk.vkDestroyPipelineLayout(dev, layout, nullptr);
+            for (VkShaderModule m : modules) vk.vkDestroyShaderModule(dev, m, nullptr);
+        }
+    };
+    const unsigned n = std::max(1u, std::min<unsigned>(threads ? threads : std::thread::hardware_concurrency() / 2,
+                                                       unsigned(std::max<std::size_t>(file.recipes.size(), 1))));
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<std::thread> pool;
+    for (unsigned t = 0; t < n; ++t) pool.emplace_back(worker);
+    for (std::thread& t : pool) t.join();
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    const std::uint32_t hits = s.pipeline_cache_hits.load() - hits_before;
+    const std::uint32_t counted = s.pipelines_created.load() - created_before;
+    std::fprintf(stderr,
+                 "[rt] prebuild: %zu recipes: %zu built (%u already in the cache of %u with feedback) in %.1f s on %u "
+                 "threads; %zu skipped (shader not in the index), %zu skipped (shader changed since recorded), %zu "
+                 "failed; %zu unreadable lines\n",
+                 file.recipes.size(), built.load(), hits, counted, seconds, n, missing.load(), changed.load(),
+                 failed.load(), file.bad_lines);
+    s.save_pipeline_cache();
+    return file.recipes.empty() || built.load() ? 0 : 4;
 }
 
 }  // namespace rt::d3d12
