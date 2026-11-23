@@ -9,17 +9,20 @@
 // loading or calling the host's ws2_32.dll:
 //   - WSAStartup / WSACleanup maintain an initialization refcount and populate WSADATA cleanly.
 //   - WSAGetLastError / WSASetLastError use the thread's Win32 last-error slot, matching Windows ws2_32.dll.
-//   - socket / WSASocketA / WSASocketW allocate local synthetic SOCKET handles (never OS sockets).
+//   - socket / WSASocketA / WSASocketW allocate 4-aligned local synthetic SOCKET handles (never OS sockets).
 //   - bind / getsockname / listen / setsockopt / getsockopt / ioctlsocket / WSAIoctl / WSAEventSelect /
 //     WSAEnumNetworkEvents / shutdown / closesocket maintain per-socket state in-process so engine networking init
 //     succeeds without asserting.
 //   - connect / WSAConnect / WSAConnectByName* / WSAConnectByList / sendto / WSASendTo / WSASendMsg log each unique
 //     destination once and fail immediately with WSAENETUNREACH; stream send / recv / getpeername fail with WSAENOTCONN;
-//     bound non-blocking UDP recvfrom returns WSAEWOULDBLOCK so per-frame receive loops see "no packet".
-//   - select / WSAPoll validate socket handles, clear readiness sets, and cap positive timeouts to 10 ms (1 ms for
-//     infinite waits) so offline polling loops neither hang forever nor spin at 100% CPU.
-//   - getaddrinfo / GetAddrInfoW / GetAddrInfoEx* resolve numeric IPv4/IPv6 literals, empty/null passive nodes, and
-//     "localhost" in-process; any other hostname is logged once and fails immediately with WSAHOST_NOT_FOUND.
+//     bound non-blocking UDP recvfrom returns WSAEWOULDBLOCK immediately, while blocking UDP recv* / listening accept
+//     sleep briefly (honouring capped SO_RCVTIMEO -> WSAETIMEDOUT, else 1 ms -> WSAENETUNREACH) so dedicated polling
+//     threads do not spin a core at 100%.
+//   - select / WSAPoll validate socket handles, report bound UDP sockets as writable (writefds / POLLWRNORM, and
+//     FD_WRITE via WSAEventSelect), clear non-ready sets, and cap positive timeouts to 10 ms (1 ms for infinite waits).
+//   - getaddrinfo / GetAddrInfoW / GetAddrInfoEx* / gethostbyname resolve numeric IPv4/IPv6 literals, empty/null
+//     passive nodes, and "localhost" in-process; any other hostname is logged once and fails immediately with
+//     WSAHOST_NOT_FOUND.
 //   - Byte-order helpers (htons/htonl/ntohs/ntohl/WSA*), address string helpers (inet_addr/inet_ntoa/inet_pton/
 //     inet_ntop/InetPtonW/InetNtopW/WSAAddressToString*/WSAStringToAddress*), __WSAFDIsSet, and WSA event helpers work
 //     entirely in-process.
@@ -103,12 +106,21 @@ struct SocketState {
     int event_errors[FD_MAX_EVENTS]{};
 };
 
+struct HostentSlot {
+    char name[16];
+    char addr[4];
+    char* aliases[1];
+    char* addrs[2];
+    hostent ent;
+};
+
 struct GlobalState {
     std::unordered_map<SOCKET, SocketState> sockets;
     std::set<std::string> logged_targets;
-    std::uint64_t next_socket = 0x4C450000ull;  // non-zero synthetic handles ("LE..")
+    std::uint64_t next_socket = 0x4C450000ull;  // non-zero 4-aligned synthetic handles ("LE..")
     std::uint16_t next_ephemeral_port = 49152u;
     DWORD inet_ntoa_fls = FLS_OUT_OF_INDEXES;
+    DWORD hostent_fls = FLS_OUT_OF_INDEXES;
 };
 
 SRWLOCK g_state_lock = SRWLOCK_INIT;
@@ -131,12 +143,14 @@ protoent g_proto_icmp{g_proto_icmp_name, g_no_aliases, IPPROTO_ICMP};
 protoent g_proto_tcp{g_proto_tcp_name, g_no_aliases, IPPROTO_TCP};
 protoent g_proto_udp{g_proto_udp_name, g_no_aliases, IPPROTO_UDP};
 char g_inet_ntoa_fallback[16]{};
+HostentSlot g_hostent_fallback{};
 
-VOID WINAPI free_inet_ntoa_fls(PVOID ptr) { std::free(ptr); }
+VOID WINAPI free_fls_ptr(PVOID ptr) { std::free(ptr); }
 
 BOOL CALLBACK init_global_state(PINIT_ONCE, PVOID, PVOID*) {
     auto* st = new GlobalState();
-    st->inet_ntoa_fls = ::FlsAlloc(free_inet_ntoa_fls);
+    st->inet_ntoa_fls = ::FlsAlloc(free_fls_ptr);
+    st->hostent_fls = ::FlsAlloc(free_fls_ptr);
     g_state = st;
     return TRUE;
 }
@@ -222,6 +236,66 @@ bool parse_ipv4_strict(const char* s, std::uint8_t out[4]) {
         }
     }
     return *p == '\0';
+}
+
+// BSD/Winsock inet_addr grammar: 1 to 4 dot-separated parts in decimal, octal (leading 0), or hex (0x).
+bool parse_ipv4_inet_addr(const char* s, std::uint8_t out[4]) {
+    if (!s || !*s) return false;
+    std::uint64_t parts[4]{};
+    int count = 0;
+    const char* p = s;
+    for (;;) {
+        if (count >= 4 || *p == '\0') return false;
+        unsigned base = 10u;
+        if (p[0] == '0') {
+            if (p[1] == 'x' || p[1] == 'X') {
+                base = 16u;
+                p += 2;
+                if (*p == '\0' || *p == '.') return false;
+            } else if (p[1] != '\0' && p[1] != '.') {
+                base = 8u;
+                ++p;
+            }
+        }
+        std::uint64_t val = 0;
+        int digits = 0;
+        while (*p && *p != '.') {
+            unsigned d = 0;
+            if (*p >= '0' && *p <= '9') d = static_cast<unsigned>(*p - '0');
+            else if (base == 16u && *p >= 'a' && *p <= 'f') d = static_cast<unsigned>(*p - 'a' + 10);
+            else if (base == 16u && *p >= 'A' && *p <= 'F') d = static_cast<unsigned>(*p - 'A' + 10);
+            else return false;
+            if (d >= base) return false;
+            val = val * base + d;
+            if (val > 0xFFFFFFFFull) return false;
+            ++digits;
+            ++p;
+        }
+        if (digits == 0) return false;
+        parts[count++] = val;
+        if (*p == '\0') break;
+        if (*p != '.') return false;
+        ++p;
+    }
+
+    std::uint32_t host = 0;
+    if (count == 1) {
+        host = static_cast<std::uint32_t>(parts[0]);
+    } else if (count == 2) {
+        if (parts[0] > 0xFFull || parts[1] > 0xFFFFFFull) return false;
+        host = static_cast<std::uint32_t>((parts[0] << 24) | parts[1]);
+    } else if (count == 3) {
+        if (parts[0] > 0xFFull || parts[1] > 0xFFull || parts[2] > 0xFFFFull) return false;
+        host = static_cast<std::uint32_t>((parts[0] << 24) | (parts[1] << 16) | parts[2]);
+    } else {
+        if (parts[0] > 0xFFull || parts[1] > 0xFFull || parts[2] > 0xFFull || parts[3] > 0xFFull) return false;
+        host = static_cast<std::uint32_t>((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]);
+    }
+    out[0] = static_cast<std::uint8_t>((host >> 24) & 0xFFu);
+    out[1] = static_cast<std::uint8_t>((host >> 16) & 0xFFu);
+    out[2] = static_cast<std::uint8_t>((host >> 8) & 0xFFu);
+    out[3] = static_cast<std::uint8_t>(host & 0xFFu);
+    return true;
 }
 
 bool parse_ipv6_strict(const char* s, std::uint8_t out[16]) {
@@ -498,7 +572,8 @@ SOCKET create_offline_socket(int af, int type, int protocol) {
 
     SrwLockGuard lock(g_state_lock);
     GlobalState& st = state();
-    const SOCKET handle = static_cast<SOCKET>(st.next_socket++);
+    const SOCKET handle = static_cast<SOCKET>(st.next_socket);
+    st.next_socket += 4ull;  // step by 4 to match Windows kernel handle alignment
     st.sockets.emplace(handle, ss);
     return handle;
 }
@@ -570,6 +645,11 @@ int WSAAPI ws_bind(SOCKET s, const sockaddr* name, int namelen) {
         return fail_sock(WSAEAFNOSUPPORT);
     }
     ss.bound = true;
+    if (ss.type == SOCK_DGRAM && ss.event_handle && (ss.event_mask & FD_WRITE)) {
+        ss.pending_events |= FD_WRITE;
+        ss.event_errors[FD_WRITE_BIT] = 0;
+        ::SetEvent(ss.event_handle);
+    }
     return 0;
 }
 
@@ -611,12 +691,18 @@ int WSAAPI ws_listen(SOCKET s, int) {
 
 SOCKET WSAAPI ws_accept(SOCKET s, sockaddr*, int*) {
     if (!require_initialized()) return INVALID_SOCKET;
-    SrwLockGuard lock(g_state_lock);
-    auto it = state().sockets.find(s);
-    if (it == state().sockets.end()) return fail_invalid_sock(WSAENOTSOCK);
-    if (it->second.type != SOCK_STREAM) return fail_invalid_sock(WSAEOPNOTSUPP);
-    if (!it->second.listening) return fail_invalid_sock(WSAEINVAL);
-    return fail_invalid_sock(it->second.nonblocking ? WSAEWOULDBLOCK : WSAENETUNREACH);
+    bool nonblocking = false;
+    {
+        SrwLockGuard lock(g_state_lock);
+        auto it = state().sockets.find(s);
+        if (it == state().sockets.end()) return fail_invalid_sock(WSAENOTSOCK);
+        if (it->second.type != SOCK_STREAM) return fail_invalid_sock(WSAEOPNOTSUPP);
+        if (!it->second.listening) return fail_invalid_sock(WSAEINVAL);
+        nonblocking = it->second.nonblocking;
+    }
+    if (nonblocking) return fail_invalid_sock(WSAEWOULDBLOCK);
+    ::Sleep(1);
+    return fail_invalid_sock(WSAENETUNREACH);
 }
 
 SOCKET WSAAPI ws_wsa_accept(SOCKET s, sockaddr* addr, LPINT addrlen, LPCONDITIONPROC, DWORD_PTR) {
@@ -874,26 +960,37 @@ int WSAAPI ws_sendto(SOCKET s, const char* buf, int len, int, const sockaddr* to
     return fail_sock(WSAENETUNREACH);
 }
 
+int finish_offline_udp_recv(SOCKET s) {
+    bool nonblocking = false;
+    int rcvtimeo = 0;
+    {
+        SrwLockGuard lock(g_state_lock);
+        auto it = state().sockets.find(s);
+        if (it == state().sockets.end()) return fail_sock(WSAENOTSOCK);
+        if (it->second.type == SOCK_STREAM) return fail_sock(WSAENOTCONN);
+        if (!it->second.bound) return fail_sock(WSAEINVAL);
+        nonblocking = it->second.nonblocking;
+        rcvtimeo = it->second.so_rcvtimeo;
+    }
+    if (nonblocking) return fail_sock(WSAEWOULDBLOCK);
+    if (rcvtimeo > 0) {
+        ::Sleep(static_cast<DWORD>(std::min<int>(rcvtimeo, static_cast<int>(kMaxPollSleepMs))));
+        return fail_sock(WSAETIMEDOUT);
+    }
+    ::Sleep(1);
+    return fail_sock(WSAENETUNREACH);
+}
+
 int WSAAPI ws_recv(SOCKET s, char* buf, int len, int) {
     if (!require_initialized()) return SOCKET_ERROR;
     if (len < 0 || (len > 0 && !buf)) return fail_sock(WSAEFAULT);
-    SrwLockGuard lock(g_state_lock);
-    auto it = state().sockets.find(s);
-    if (it == state().sockets.end()) return fail_sock(WSAENOTSOCK);
-    if (it->second.type == SOCK_STREAM) return fail_sock(WSAENOTCONN);
-    if (!it->second.bound) return fail_sock(WSAEINVAL);
-    return fail_sock(it->second.nonblocking ? WSAEWOULDBLOCK : WSAENETUNREACH);
+    return finish_offline_udp_recv(s);
 }
 
 int WSAAPI ws_recvfrom(SOCKET s, char* buf, int len, int, sockaddr*, int*) {
     if (!require_initialized()) return SOCKET_ERROR;
     if (len < 0 || (len > 0 && !buf)) return fail_sock(WSAEFAULT);
-    SrwLockGuard lock(g_state_lock);
-    auto it = state().sockets.find(s);
-    if (it == state().sockets.end()) return fail_sock(WSAENOTSOCK);
-    if (it->second.type == SOCK_STREAM) return fail_sock(WSAENOTCONN);
-    if (!it->second.bound) return fail_sock(WSAEINVAL);
-    return fail_sock(it->second.nonblocking ? WSAEWOULDBLOCK : WSAENETUNREACH);
+    return finish_offline_udp_recv(s);
 }
 
 int WSAAPI ws_wsa_send(SOCKET s, LPWSABUF bufs, DWORD count, LPDWORD sent, DWORD, LPWSAOVERLAPPED,
@@ -941,12 +1038,7 @@ int WSAAPI ws_wsa_recv(SOCKET s, LPWSABUF bufs, DWORD count, LPDWORD recvd, LPDW
     if (!require_initialized()) return SOCKET_ERROR;
     if (count > 0 && !bufs) return fail_sock(WSAEFAULT);
     if (recvd) *recvd = 0;
-    SrwLockGuard lock(g_state_lock);
-    auto it = state().sockets.find(s);
-    if (it == state().sockets.end()) return fail_sock(WSAENOTSOCK);
-    if (it->second.type == SOCK_STREAM) return fail_sock(WSAENOTCONN);
-    if (!it->second.bound) return fail_sock(WSAEINVAL);
-    return fail_sock(it->second.nonblocking ? WSAEWOULDBLOCK : WSAENETUNREACH);
+    return finish_offline_udp_recv(s);
 }
 
 int WSAAPI ws_wsa_recv_from(SOCKET s, LPWSABUF bufs, DWORD count, LPDWORD recvd, LPDWORD, sockaddr*, LPINT,
@@ -954,12 +1046,7 @@ int WSAAPI ws_wsa_recv_from(SOCKET s, LPWSABUF bufs, DWORD count, LPDWORD recvd,
     if (!require_initialized()) return SOCKET_ERROR;
     if (count > 0 && !bufs) return fail_sock(WSAEFAULT);
     if (recvd) *recvd = 0;
-    SrwLockGuard lock(g_state_lock);
-    auto it = state().sockets.find(s);
-    if (it == state().sockets.end()) return fail_sock(WSAENOTSOCK);
-    if (it->second.type == SOCK_STREAM) return fail_sock(WSAENOTCONN);
-    if (!it->second.bound) return fail_sock(WSAEINVAL);
-    return fail_sock(it->second.nonblocking ? WSAEWOULDBLOCK : WSAENETUNREACH);
+    return finish_offline_udp_recv(s);
 }
 
 int WSAAPI ws_wsa_send_disconnect(SOCKET s, LPWSABUF) { return ws_shutdown(s, SD_SEND); }
@@ -998,6 +1085,7 @@ int WSAAPI ws_select(int, fd_set* readfds, fd_set* writefds, fd_set* exceptfds, 
     if (total == 0) return fail_sock(WSAEINVAL);
     if (timeout && (timeout->tv_sec < 0 || timeout->tv_usec < 0)) return fail_sock(WSAEINVAL);
 
+    u_int ready_write = 0;
     {
         SrwLockGuard lock(g_state_lock);
         const auto& socks = state().sockets;
@@ -1009,11 +1097,21 @@ int WSAAPI ws_select(int, fd_set* readfds, fd_set* writefds, fd_set* exceptfds, 
             return true;
         };
         if (!validate(readfds) || !validate(writefds) || !validate(exceptfds)) return fail_sock(WSAENOTSOCK);
+        if (writefds) {
+            for (u_int i = 0; i < writefds->fd_count; ++i) {
+                const SOCKET fd = writefds->fd_array[i];
+                const auto it = socks.find(fd);
+                if (it != socks.end() && it->second.type == SOCK_DGRAM && it->second.bound) {
+                    writefds->fd_array[ready_write++] = fd;
+                }
+            }
+        }
     }
 
     if (readfds) readfds->fd_count = 0;
-    if (writefds) writefds->fd_count = 0;
+    if (writefds) writefds->fd_count = ready_write;
     if (exceptfds) exceptfds->fd_count = 0;
+    if (ready_write > 0) return static_cast<int>(ready_write);
 
     if (!timeout) {
         ::Sleep(1);
@@ -1031,20 +1129,24 @@ int WSAAPI ws_wsa_poll(LPWSAPOLLFD fdArray, ULONG fds, INT timeout) {
     if (!require_initialized()) return SOCKET_ERROR;
     if (fds == 0 || !fdArray) return fail_sock(WSAEINVAL);
 
-    int invalid_count = 0;
+    int ready_count = 0;
     {
         SrwLockGuard lock(g_state_lock);
         const auto& socks = state().sockets;
         for (ULONG i = 0; i < fds; ++i) {
             fdArray[i].revents = 0;
             if (fdArray[i].fd == INVALID_SOCKET) continue;
-            if (socks.find(fdArray[i].fd) == socks.end()) {
+            const auto it = socks.find(fdArray[i].fd);
+            if (it == socks.end()) {
                 fdArray[i].revents = POLLNVAL;
-                ++invalid_count;
+                ++ready_count;
+            } else if ((fdArray[i].events & POLLWRNORM) != 0 && it->second.type == SOCK_DGRAM && it->second.bound) {
+                fdArray[i].revents = POLLWRNORM;
+                ++ready_count;
             }
         }
     }
-    if (invalid_count > 0) return invalid_count;
+    if (ready_count > 0) return ready_count;
     if (timeout > 0) ::Sleep(static_cast<DWORD>(std::min<INT>(timeout, static_cast<INT>(kMaxPollSleepMs))));
     else if (timeout < 0) ::Sleep(1);
     return 0;
@@ -1083,6 +1185,11 @@ int WSAAPI ws_wsa_event_select(SOCKET s, WSAEVENT event_object, long network_eve
     it->second.event_handle = network_events ? event_object : nullptr;
     it->second.event_mask = event_object ? network_events : 0;
     if (event_object && network_events != 0) it->second.nonblocking = true;
+    if (event_object && (network_events & FD_WRITE) && it->second.type == SOCK_DGRAM && it->second.bound) {
+        it->second.pending_events |= FD_WRITE;
+        it->second.event_errors[FD_WRITE_BIT] = 0;
+        ::SetEvent(event_object);
+    }
     return 0;
 }
 
@@ -1128,9 +1235,8 @@ int WSAAPI ws_wsa_enum_protocols_w(LPINT, LPWSAPROTOCOL_INFOW, LPDWORD buf_len) 
 
 unsigned long WSAAPI ws_inet_addr(const char* cp) {
     if (!cp) return INADDR_NONE;
-    if (std::strcmp(cp, "255.255.255.255") == 0) return INADDR_NONE;
     std::uint8_t b[4]{};
-    if (!parse_ipv4_strict(cp, b)) return INADDR_NONE;
+    if (!parse_ipv4_inet_addr(cp, b)) return INADDR_NONE;
     unsigned long result = 0;
     std::memcpy(&result, b, 4);
     return result;
@@ -1676,8 +1782,37 @@ int WSAAPI ws_gethostname_w(PWSTR name, int namelen) {
 
 hostent* WSAAPI ws_gethostbyname(const char* name) {
     if (!require_initialized()) return nullptr;
+    std::uint8_t b[4]{};
+    if (name && *name && parse_ipv4_inet_addr(name, b)) {
+        HostentSlot* slot = &g_hostent_fallback;
+        const DWORD fls = state().hostent_fls;
+        if (fls != FLS_OUT_OF_INDEXES) {
+            auto* per_thread = static_cast<HostentSlot*>(::FlsGetValue(fls));
+            if (!per_thread) {
+                per_thread = static_cast<HostentSlot*>(std::malloc(sizeof(HostentSlot)));
+                if (per_thread) {
+                    if (!::FlsSetValue(fls, per_thread)) {
+                        std::free(per_thread);
+                        per_thread = nullptr;
+                    }
+                }
+            }
+            if (per_thread) slot = per_thread;
+        }
+        std::snprintf(slot->name, sizeof(slot->name), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+        std::memcpy(slot->addr, b, 4);
+        slot->aliases[0] = nullptr;
+        slot->addrs[0] = slot->addr;
+        slot->addrs[1] = nullptr;
+        slot->ent.h_name = slot->name;
+        slot->ent.h_aliases = slot->aliases;
+        slot->ent.h_addrtype = AF_INET;
+        slot->ent.h_length = 4;
+        slot->ent.h_addr_list = slot->addrs;
+        return &slot->ent;
+    }
     if (!name || !*name || equals_ignore_case_ascii(name, "localhost") ||
-        equals_ignore_case_ascii(name, "leonida-offline") || std::strcmp(name, "127.0.0.1") == 0) {
+        equals_ignore_case_ascii(name, "leonida-offline")) {
         return &g_lo_hostent;
     }
     log_refused_once("DNS", name);

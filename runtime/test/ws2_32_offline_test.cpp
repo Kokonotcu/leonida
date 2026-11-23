@@ -376,15 +376,19 @@ void test_before_startup_and_pure_helpers() {
     check(fn_htonl(0x12345678ul) == 0x78563412ul && fn_ntohl(0x78563412ul) == 0x12345678ul,
           "htonl / ntohl byte swap");
 
-    // inet_addr & inet_ntoa (including per-thread FLS isolation).
+    // inet_addr & inet_ntoa (including short BSD forms and per-thread FLS isolation).
     const unsigned long addr_v4 = fn_inet_addr("192.0.2.42");
     in_addr ia{};
     std::memcpy(&ia, &addr_v4, 4);
     const char* s1 = fn_inet_ntoa(ia);
     check(addr_v4 != INADDR_NONE && s1 && std::strcmp(s1, "192.0.2.42") == 0, "inet_addr / inet_ntoa IPv4 round-trip");
-    check(fn_inet_addr("255.255.255.255") == INADDR_NONE && fn_inet_addr("01.2.3.4") == INADDR_NONE &&
-              fn_inet_addr("not-an-ip") == INADDR_NONE,
-          "inet_addr rejects broadcast/leading-zero/invalid inputs");
+    check(fn_inet_addr("127.1") == fn_inet_addr("127.0.0.1") &&
+              fn_inet_addr("0x7f000001") == fn_inet_addr("127.0.0.1") &&
+              fn_inet_addr("0177.0.0.1") == fn_inet_addr("127.0.0.1"),
+          "inet_addr accepts Windows short/hex/octal IPv4 forms");
+    check(fn_inet_addr("255.255.255.255") == INADDR_NONE && fn_inet_addr("256.0.0.1") == INADDR_NONE &&
+              fn_inet_addr("1.2.3.4.5") == INADDR_NONE && fn_inet_addr("not-an-ip") == INADDR_NONE,
+          "inet_addr rejects broadcast/overflow/invalid inputs");
 
     std::atomic<bool> thread_ok{false};
     std::thread t([&]() {
@@ -422,9 +426,10 @@ void test_before_startup_and_pure_helpers() {
     check(fn_inet_pton(AF_INET6, "::", &p6) == 1 && fn_inet_ntop(AF_INET6, &p6, n6, sizeof(n6)) == n6 &&
               std::strcmp(n6, "::") == 0,
           "inet_pton / inet_ntop IPv6 unspecified ::");
-    check(fn_inet_pton(AF_INET, "256.0.0.1", &p4) == 0 && fn_inet_pton(AF_INET6, "1::2::3", &p6) == 0 &&
+    check(fn_inet_pton(AF_INET, "256.0.0.1", &p4) == 0 && fn_inet_pton(AF_INET, "127.1", &p4) == 0 &&
+              fn_inet_pton(AF_INET, "01.2.3.4", &p4) == 0 && fn_inet_pton(AF_INET6, "1::2::3", &p6) == 0 &&
               fn_inet_pton(AF_UNIX, "127.0.0.1", &p4) == -1 && fn_get_err() == WSAEAFNOSUPPORT,
-          "inet_pton rejects invalid literals and unsupported address families");
+          "inet_pton rejects short/leading-zero/invalid literals and unsupported address families");
 
     // __WSAFDIsSet.
     fd_set fds{};
@@ -636,9 +641,10 @@ void test_local_sockets_and_options() {
     check(fn_wsa_htons(INVALID_SOCKET, 1, &ns) == SOCKET_ERROR && fn_get_err() == WSAENOTSOCK,
           "WSAHtons rejects INVALID_SOCKET with WSAENOTSOCK");
 
-    // IPv6 UDP socket via WSASocketW + WSAIoctl(SIO_UDP_CONNRESET, FIONREAD, FIONBIO).
+    // IPv6 UDP socket via WSASocketW + 4-aligned handle step + WSAIoctl(SIO_UDP_CONNRESET, FIONREAD, FIONBIO).
     const SOCKET udp6 = fn_wsa_socket_w(AF_INET6, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0, WSA_FLAG_OVERLAPPED);
-    check(udp6 != INVALID_SOCKET, "WSASocketW creates IPv6 UDP socket");
+    check(udp6 != INVALID_SOCKET && (tcp & 3u) == 0 && (udp6 & 3u) == 0 && (udp6 - tcp) == 4u,
+          "WSASocketW creates IPv6 UDP socket and handles step by 4");
     int v6only = 0;
     check(fn_setsockopt(udp6, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char*>(&v6only), sizeof(v6only)) == 0,
           "setsockopt(IPV6_V6ONLY, 0) succeeds on IPv6 socket");
@@ -691,6 +697,7 @@ void test_offline_wall_and_logging() {
     auto fn_wsa_recv_from = resolve<WSARecvFromFn>("WSARecvFrom");
     auto fn_get_overlapped = resolve<WSAGetOverlappedResultFn>("WSAGetOverlappedResult");
     auto fn_getsockopt = resolve<GetsockoptFn>("getsockopt");
+    auto fn_setsockopt = resolve<SetsockoptFn>("setsockopt");
     auto fn_ioctlsocket = resolve<IoctlsocketFn>("ioctlsocket");
     auto fn_create_event = resolve<WSACreateEventFn>("WSACreateEvent");
     auto fn_close_event = resolve<WSACloseEventFn>("WSACloseEvent");
@@ -704,8 +711,8 @@ void test_offline_wall_and_logging() {
     if (!fn_socket || !fn_bind || !fn_connect || !fn_wsa_connect || !fn_connect_by_name_a || !fn_connect_by_name_w ||
         !fn_connect_by_list || !fn_send || !fn_sendto || !fn_recv || !fn_recvfrom || !fn_wsa_send || !fn_wsa_send_to ||
         !fn_wsa_send_msg || !fn_wsa_recv || !fn_wsa_recv_from || !fn_get_overlapped || !fn_getsockopt ||
-        !fn_ioctlsocket || !fn_create_event || !fn_close_event || !fn_event_select || !fn_enum_events ||
-        !fn_wait_events || !fn_closesocket || !fn_htons || !fn_inet_pton || !fn_get_err) {
+        !fn_setsockopt || !fn_ioctlsocket || !fn_create_event || !fn_close_event || !fn_event_select ||
+        !fn_enum_events || !fn_wait_events || !fn_closesocket || !fn_htons || !fn_inet_pton || !fn_get_err) {
         check(false, "offline wall functions resolved");
         return;
     }
@@ -809,8 +816,32 @@ void test_offline_wall_and_logging() {
     sockaddr_in bind_any{};
     bind_any.sin_family = AF_INET;
     check(fn_bind(udp, reinterpret_cast<const sockaddr*>(&bind_any), sizeof(bind_any)) == 0, "bind UDP socket");
-    check(fn_recvfrom(udp, buf, sizeof(buf), 0, nullptr, nullptr) == SOCKET_ERROR && fn_get_err() == WSAENETUNREACH,
-          "bound blocking UDP recvfrom returns WSAENETUNREACH");
+    {
+        const auto bt0 = std::chrono::steady_clock::now();
+        bool all_unreach = true;
+        for (int i = 0; i < 3; ++i) {
+            if (fn_recvfrom(udp, buf, sizeof(buf), 0, nullptr, nullptr) != SOCKET_ERROR ||
+                fn_get_err() != WSAENETUNREACH)
+                all_unreach = false;
+        }
+        const auto bt_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - bt0).count();
+        check(all_unreach && bt_ms >= 2 && bt_ms < 500,
+              "bound blocking UDP recvfrom returns WSAENETUNREACH with bounded sleep (no spin)");
+    }
+    {
+        const int rcv_timeout_ms = 50;
+        check(fn_setsockopt(udp, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcv_timeout_ms),
+                            sizeof(rcv_timeout_ms)) == 0,
+              "set SO_RCVTIMEO on blocking UDP socket");
+        const auto tt0 = std::chrono::steady_clock::now();
+        const int r = fn_recvfrom(udp, buf, sizeof(buf), 0, nullptr, nullptr);
+        const int err = fn_get_err();
+        const auto tt_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tt0).count();
+        check(r == SOCKET_ERROR && err == WSAETIMEDOUT && tt_ms >= 1 && tt_ms < 500,
+              "blocking UDP recvfrom with SO_RCVTIMEO returns WSAETIMEDOUT with capped sleep");
+    }
     u_long nb = 1;
     check(fn_ioctlsocket(udp, static_cast<long>(FIONBIO), &nb) == 0, "set UDP socket non-blocking");
     check(fn_recvfrom(udp, buf, sizeof(buf), 0, nullptr, nullptr) == SOCKET_ERROR && fn_get_err() == WSAEWOULDBLOCK,
@@ -836,6 +867,7 @@ void test_offline_wall_and_logging() {
 
 void test_polling_and_events() {
     auto fn_socket = resolve<SocketFn>("socket");
+    auto fn_bind = resolve<BindFn>("bind");
     auto fn_closesocket = resolve<ClosesocketFn>("closesocket");
     auto fn_select = resolve<SelectFn>("select");
     auto fn_poll = resolve<WSAPollFn>("WSAPoll");
@@ -843,14 +875,16 @@ void test_polling_and_events() {
     auto fn_set_event = resolve<WSASetEventFn>("WSASetEvent");
     auto fn_reset_event = resolve<WSAResetEventFn>("WSAResetEvent");
     auto fn_wait_events = resolve<WSAWaitForMultipleEventsFn>("WSAWaitForMultipleEvents");
+    auto fn_event_select = resolve<WSAEventSelectFn>("WSAEventSelect");
+    auto fn_enum_events = resolve<WSAEnumNetworkEventsFn>("WSAEnumNetworkEvents");
     auto fn_close_event = resolve<WSACloseEventFn>("WSACloseEvent");
     auto fn_async_select = resolve<WSAAsyncSelectFn>("WSAAsyncSelect");
     auto fn_enum_proto_a = resolve<WSAEnumProtocolsAFn>("WSAEnumProtocolsA");
     auto fn_enum_proto_w = resolve<WSAEnumProtocolsWFn>("WSAEnumProtocolsW");
     auto fn_get_err = resolve<WSAGetLastErrorFn>("WSAGetLastError");
-    if (!fn_socket || !fn_closesocket || !fn_select || !fn_poll || !fn_create_event || !fn_set_event ||
-        !fn_reset_event || !fn_wait_events || !fn_close_event || !fn_async_select || !fn_enum_proto_a ||
-        !fn_enum_proto_w || !fn_get_err) {
+    if (!fn_socket || !fn_bind || !fn_closesocket || !fn_select || !fn_poll || !fn_create_event || !fn_set_event ||
+        !fn_reset_event || !fn_wait_events || !fn_event_select || !fn_enum_events || !fn_close_event ||
+        !fn_async_select || !fn_enum_proto_a || !fn_enum_proto_w || !fn_get_err) {
         check(false, "polling and event functions resolved");
         return;
     }
@@ -903,6 +937,33 @@ void test_polling_and_events() {
     pfd[1].fd = static_cast<SOCKET>(0xBAD00001ull);
     check(fn_poll(pfd, 2, 0) == 1 && pfd[0].revents == 0 && pfd[1].revents == POLLNVAL,
           "WSAPoll reports POLLNVAL for unknown socket");
+
+    // Bound UDP writability in select(writefds), WSAPoll(POLLWRNORM), and WSAEventSelect(FD_WRITE).
+    const SOCKET tcp_unconn = fn_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in udp_bind{};
+    udp_bind.sin_family = AF_INET;
+    check(fn_bind(s, reinterpret_cast<const sockaddr*>(&udp_bind), sizeof(udp_bind)) == 0,
+          "bind UDP socket for writability checks");
+    fd_set wfds{};
+    wfds.fd_count = 2;
+    wfds.fd_array[0] = tcp_unconn;
+    wfds.fd_array[1] = s;
+    check(fn_select(0, nullptr, &wfds, nullptr, &zero_tv) == 1 && wfds.fd_count == 1 && wfds.fd_array[0] == s,
+          "select(writefds) reports bound UDP writable and unconnected TCP non-writable");
+    pfd[0].fd = s;
+    pfd[0].events = POLLRDNORM | POLLWRNORM;
+    pfd[1].fd = tcp_unconn;
+    pfd[1].events = POLLWRNORM;
+    check(fn_poll(pfd, 2, 0) == 1 && pfd[0].revents == POLLWRNORM && pfd[1].revents == 0,
+          "WSAPoll(POLLWRNORM) reports bound UDP writable and unconnected TCP non-writable");
+    const WSAEVENT wr_ev = fn_create_event();
+    WSANETWORKEVENTS wr_net{};
+    check(fn_event_select(s, wr_ev, FD_WRITE) == 0 && fn_wait_events(1, &wr_ev, FALSE, 0, FALSE) == WSA_WAIT_EVENT_0 &&
+              fn_enum_events(s, wr_ev, &wr_net) == 0 && (wr_net.lNetworkEvents & FD_WRITE) != 0 &&
+              wr_net.iErrorCode[FD_WRITE_BIT] == 0,
+          "WSAEventSelect(FD_WRITE) signals writable on bound UDP socket");
+    check(fn_event_select(s, nullptr, 0) == 0 && fn_close_event(wr_ev) == TRUE && fn_closesocket(tcp_unconn) == 0,
+          "cleanup writability test objects");
 
     // WSAEvent helpers.
     const WSAEVENT ev = fn_create_event();
@@ -1067,6 +1128,28 @@ void test_offline_dns_and_address_strings() {
               static_cast<unsigned char>(lo->h_addr_list[0][0]) == 127 &&
               static_cast<unsigned char>(lo->h_addr_list[0][3]) == 1,
           "gethostbyname(localhost) returns 127.0.0.1");
+    hostent* num_lo = fn_ghbn("127.0.0.1");
+    check(num_lo != nullptr && num_lo->h_name != nullptr && std::strcmp(num_lo->h_name, "127.0.0.1") == 0 &&
+              static_cast<unsigned char>(num_lo->h_addr_list[0][0]) == 127 &&
+              static_cast<unsigned char>(num_lo->h_addr_list[0][3]) == 1,
+          "gethostbyname(127.0.0.1) reports literal h_name 127.0.0.1");
+    hostent* num_doc = fn_ghbn("192.0.2.7");
+    check(num_doc != nullptr && num_doc->h_name != nullptr && std::strcmp(num_doc->h_name, "192.0.2.7") == 0 &&
+              static_cast<unsigned char>(num_doc->h_addr_list[0][0]) == 192 &&
+              static_cast<unsigned char>(num_doc->h_addr_list[0][1]) == 0 &&
+              static_cast<unsigned char>(num_doc->h_addr_list[0][2]) == 2 &&
+              static_cast<unsigned char>(num_doc->h_addr_list[0][3]) == 7,
+          "gethostbyname(192.0.2.7) resolves numeric literal without DNS");
+    std::atomic<bool> ghbn_thread_ok{false};
+    std::thread ghbn_t([&]() {
+        hostent* th = fn_ghbn("198.51.100.9");
+        ghbn_thread_ok.store(th != nullptr && th->h_name != nullptr && std::strcmp(th->h_name, "198.51.100.9") == 0 &&
+                                 static_cast<unsigned char>(th->h_addr_list[0][3]) == 9,
+                             std::memory_order_release);
+    });
+    ghbn_t.join();
+    check(ghbn_thread_ok.load(std::memory_order_acquire) && std::strcmp(num_doc->h_name, "192.0.2.7") == 0,
+          "gethostbyname numeric hostent uses isolated per-thread FLS storage");
 
     // getprotoby* & getservby*.
     protoent* ptcp = fn_gpbn("TCP");
@@ -1117,8 +1200,9 @@ void test_offline_dns_and_address_strings() {
     check(count_occurrences(errlog, "wide.example.invalid") == 1 &&
               count_occurrences(errlog, "exa.example.invalid") == 1 &&
               count_occurrences(errlog, "exw.example.invalid") == 1 &&
-              count_occurrences(errlog, "legacy.example.invalid") == 1,
-          "refused DNS targets across W/Ex/gethostbyname each logged once");
+              count_occurrences(errlog, "legacy.example.invalid") == 1 &&
+              count_occurrences(errlog, "192.0.2.7") == 0,
+          "refused DNS targets across W/Ex/gethostbyname each logged once and numeric gethostbyname logs no refusal");
 }
 
 }  // namespace

@@ -186,9 +186,9 @@ What this does not show: `--run` has not been run, so the entry point has not be
 reached on the way to the first frame. A bound import is not a working one (the binding only says a function with
 that name exists), and an unimplemented import stops the run only if the title calls it
 ([When an unimplemented import is called](#when-an-unimplemented-import-is-called)). The executable imports 25
-functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`) and the loader binds them to the
-host's, so a `--run` can open real sockets: run it with the network off. `winhttp.dll` is served by the offline shim,
-which opens none.
+functions from `ws2_32.dll` (23 by ordinal, plus `getaddrinfo` and `freeaddrinfo`); `gta6rt` serves them through the
+offline Winsock2 shim ([Winsock2 offline](#winsock2-offline)), like `winhttp.dll`, so neither opens host sockets or
+issues DNS queries.
 
 ## Console paths and the write overlay
 

@@ -5,8 +5,9 @@ repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the
 separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
 `DllMain`s without an exception
 ([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
-trace tool for the first boot. The executable's `ws2_32.dll` imports bind to the host's, so run `--run` with the
-network off. Nothing here quotes game data; a real trace stays on the player's machine.
+trace tool for the first boot. The executable's `ws2_32.dll` imports are served by the offline Winsock2 shim
+([`runtime_imports.md`](runtime_imports.md#winsock2-offline)), like `winhttp.dll`, so no socket or DNS query leaves the
+process. Nothing here quotes game data; a real trace stays on the player's machine.
 
 ## 1. What the first boot produces
 
