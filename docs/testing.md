@@ -20,7 +20,9 @@ This page collects the setup steps and the problems testers have run into so far
   - `llvm-21` in WSL, with `LLVM_MC` set to the whole command:
     `LLVM_MC="wsl -d Ubuntu -e /usr/lib/llvm-21/bin/llvm-mc"`.
 
-  On Linux, the distribution's `llvm-mc` on `PATH` is enough, if it is 21 or newer. On macOS, Homebrew's `llvm` is
+  On Linux, the distribution's `llvm-mc` on `PATH` is enough, if it is 21 or newer. Debian and Ubuntu's `llvm-21`
+  installs it only as `llvm-mc-21` and `/usr/lib/llvm-21/bin/llvm-mc`; with `LLVM_MC` unset, the tools take the newest
+  such versioned install when there is no plain `llvm-mc` (`tools/mc_command.py`). On macOS, Homebrew's `llvm` is
   keg-only, so `brew install llvm` doesn't put `llvm-mc` on `PATH`: the pytest suites find it in
   `/opt/homebrew/opt/llvm*/bin` (or `/usr/local/opt/llvm*/bin` on Intel), and the other tools need
   `LLVM_MC="$(brew --prefix llvm)/bin/llvm-mc"`.

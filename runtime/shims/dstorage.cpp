@@ -447,6 +447,7 @@ struct Entry {
     File* file = nullptr;          // a reference, for a file request naming a live file
     bool file_counted = false;     // the file's pending count was raised at submit
     bool cancelled = false;        // CancelRequestsWithTag matched it before it started
+    bool counted = false;          // a request the title passed: counted in the statistics when it is submitted
     HRESULT enqueue_error = S_OK;  // found at enqueue: reported when the entry is reached, in order
     StatusArray* status = nullptr;  // a reference
     IDStorageStatusArrayX* status_as_given = nullptr;
@@ -515,11 +516,7 @@ public:
                 e.file = live_file(e.request.File);
                 if (!e.file) e.enqueue_error = E_DSTORAGE_INVALID_FILE_HANDLE;
             }
-            std::lock_guard lock(stats().mutex);
-            auto& p = priority_stats(stats().s, desc_.Priority);
-            ++p.TotalRequestCount;
-            p.TotalRequestSourceByteCount += request->SourceSize;
-            p.TotalRequestDestinationByteCount += request->DestinationSize;
+            e.counted = true;  // TotalRequestCount is "submitted requests" (DSTORAGE_PRIORITY_STATS): see submit_locked
         }
         enqueue(std::move(e));
     }
@@ -683,9 +680,23 @@ private:
     }
 
     void submit_locked() {
+        uint32_t requests = 0;
+        uint64_t source_bytes = 0, destination_bytes = 0;
         for (size_t i = submitted_; i < entries_.size(); ++i) {
             Entry& e = entries_[i];
             if (e.file) e.file_counted = e.file->add_pending();
+            if (e.counted) {
+                ++requests;
+                source_bytes += e.request.SourceSize;
+                destination_bytes += e.request.DestinationSize;
+            }
+        }
+        if (requests) {
+            std::lock_guard stats_lock(stats().mutex);
+            auto& p = priority_stats(stats().s, desc_.Priority);
+            p.TotalRequestCount += requests;
+            p.TotalRequestSourceByteCount += source_bytes;
+            p.TotalRequestDestinationByteCount += destination_bytes;
         }
         if (entries_.size() > submitted_) {
             submitted_ = entries_.size();
@@ -726,7 +737,10 @@ private:
                 if (e.cancelled) {
                     hr = S_OK;
                 } else if (SUCCEEDED(hr)) {
+                    // Pending: processing has started and not completed (DSTORAGE_PRIORITY_STATS).
+                    set_pending(+1);
                     hr = execute_request(e);
+                    set_pending(-1);
                 }
                 if (e.file && e.file_counted) e.file->finish_pending();
                 if (FAILED(hr) && SUCCEEDED(since_notify_)) since_notify_ = hr;

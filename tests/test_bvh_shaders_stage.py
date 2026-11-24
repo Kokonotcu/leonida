@@ -376,7 +376,8 @@ class ShadersStageWithTheDlls(unittest.TestCase):
                           ("SortKeys" if builder else "shader") + ".s")
                 elif tool_name == "rdna2spirv.py":
                     out = args[args.index("--out") + 1]
-                    # the FSPX step keeps its output only when the index names a program whose module is there
+                    # the FSPX step keeps its output only when the index names a compute program whose module is
+                    # there, keyed by fspx_code_sha256 (make_game.fspx_cache_complete, tests/test_fspx_shaders_stage)
                     name = "SortKeys" if builder else "Upscale"
                     write('{"%s": {"stage": "cs", "fssm_sha256": "%s"}}' % (name, "a" * 64) if builder else
                           # FSPX entries carry their runtime lookup key, as rdna2spirv.py writes them

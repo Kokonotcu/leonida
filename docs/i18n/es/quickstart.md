@@ -100,7 +100,7 @@ python -I make_game.py --game "D:\ruta\al\paquete" --wav  # además decodifica e
 python -I make_game.py --wave64-emulate off            # auto (predeterminado), on u off
 ```
 
-Las etapas se ejecutan en este orden: `check` → `shaders` → `assets` → `runtime` → `pipelines`.
+La etapa `check` se ejecuta siempre primero; después, cuando se seleccionan, `shaders`, `assets` y `runtime` se ejecutan a la vez (no dependen entre sí). `pipelines` empieza en cuanto los shaders traducidos están listos.
 
 La traducción de shaders es la etapa más larga; por defecto usa la mitad de los hilos del procesador (ajustable
 con `--jobs`). La etapa `pipelines` comprueba que el controlador de su GPU puede crear los shaders traducidos e

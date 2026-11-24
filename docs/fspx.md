@@ -191,9 +191,10 @@ translates them into `<work>/shaders/spirv/library/`, with the same keys, the sa
 `library_build.json`.
 
 **Run time.** `ShaderLibrary::load(dir)` (`runtime/src/shader_library.h`) reads `<dir>/index.json` and then, when they
-are there, `<dir>/fspx/index.json` and `<dir>/library/index.json` (and `bvh/`, [embedded_shaders.md](embedded_shaders.md)),
-whose entries are named `fspx/<name>` and `library/<name>`. A missing or unreadable one leaves the others loaded.
-Entries are found by `fssm_sha256` or by `fspx_code_sha256`, in two separate tables.
+are there, `<dir>/fspx/index.json`, `<dir>/bvh/index.json` ([embedded_shaders.md](embedded_shaders.md)), and
+`<dir>/library/index.json`, whose entries are named `fspx/<name>`, `bvh/<name>`, and `library/<name>`. A missing or
+unreadable one leaves the others loaded. Entries are found by `fssm_sha256` or by `fspx_code_sha256`, in two separate
+tables.
 `compute_program()` decides what a compute PSO's bytecode is looked up by:
 
 | Bytecode | Key | Who passes it |

@@ -37,7 +37,8 @@ extension is only a name) with `mod.json` at its top level or inside one top-lev
 paths that climb out of the package, links and manifests the runtime would reject; it never goes online and never
 copies game data.
 
-On Windows, double-click **`Mods.bat`** for the Tkinter window: choose the port folder, install a ZIP or folder,
+On Windows, double-click **`Mods.bat`** for the Tkinter window (on Linux and macOS, run **`./Mods.sh`**; it needs
+Tkinter, `python3-tk` on Debian and Ubuntu): choose the port folder, install a ZIP or folder,
 toggle a mod, create a swap, pack or remove one, and launch `gta6rt` normally or as a dry run. The GUI uses the same
 standard-library code as the CLI below.
 

@@ -6650,6 +6650,7 @@ int main() {
                                                                   nullptr, IID_PPV_ARGS(&one.p))));
                 EXPECT(SUCCEEDED(device10->CreateReservedResource2(&tiled_desc, D3D12_BARRIER_LAYOUT_COMMON, nullptr,
                                                                    nullptr, 0, nullptr, IID_PPV_ARGS(&two.p))));
+                EXPECT(one.p && two.p);
                 UINT tiles = 0;
                 device->GetResourceTiling(two.p, &tiles, nullptr, nullptr, nullptr, 0, nullptr);
                 EXPECT(tiles == 1);  // 8x8 RGBA8: one packed tile

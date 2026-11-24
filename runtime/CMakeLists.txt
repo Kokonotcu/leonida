@@ -16,6 +16,29 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "gta6rt must be built for x64 (run from an x64 Native Tools prompt or vcvars64.bat)")
 endif()
 
+# Portable root-signature model + packer to user SGPRs (no d3d12.h, no windows.h), and the host CPU preflight of
+# --init/--run (src/host_cpu.h). Built on every OS, so their tests run in the Linux and macOS jobs as well as with the
+# Windows runtime.
+add_library(gta6rt_root_signature STATIC
+  src/root_signature.cpp
+)
+target_include_directories(gta6rt_root_signature PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Portable contract test: model, packer, canonical codec and RTS0 hypothesis. Needs neither d3d12.lib nor the game.
+add_executable(root_signature_test
+  test/root_signature_test.cpp
+)
+target_link_libraries(root_signature_test PRIVATE gta6rt_root_signature)
+# AVX, OSXSAVE and XCR0 YMM state from synthetic CPUID/XCR0 words, plus one call on the real host.
+add_executable(host_cpu_test test/host_cpu_test.cpp src/host_cpu.cpp)
+target_include_directories(host_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(MSVC)
+  foreach(_portable gta6rt_root_signature root_signature_test host_cpu_test)
+    target_compile_definitions(${_portable} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(${_portable} PRIVATE /W4 /permissive- /utf-8)
+  endforeach()
+  target_link_options(root_signature_test PRIVATE /OPT:NOREF)
+endif()
+
 option(LEONIDA_BUILD_WINDOWS_RUNTIME "Build the Windows runtime, its shims and their tests" ${WIN32})
 if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   # Custom CMAKE_CXX_FLAGS can replace MSVC's default /EHsc. Require C++ stack unwinding so error
@@ -54,30 +77,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_include_directories(gta6rt_d3d12_xs_rootsig PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/shims)
   target_compile_definitions(gta6rt_d3d12_xs_rootsig PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(gta6rt_d3d12_xs_rootsig PRIVATE /W4 /permissive- /utf-8)
-
-  # Portable root-signature model + packer to user SGPRs (no d3d12.h, no windows.h).
-  add_library(gta6rt_root_signature STATIC
-    src/root_signature.cpp
-  )
-  target_include_directories(gta6rt_root_signature PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_compile_definitions(gta6rt_root_signature PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(gta6rt_root_signature PRIVATE /W4 /permissive- /utf-8)
-
-  # Portable contract test: model, packer, canonical codec and RTS0 hypothesis.
-  # Needs neither d3d12.lib nor the game; runs on Windows CI like the rest here.
-  add_executable(root_signature_test
-    test/root_signature_test.cpp
-  )
-  target_link_libraries(root_signature_test PRIVATE gta6rt_root_signature)
-  target_compile_definitions(root_signature_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-  target_compile_options(root_signature_test PRIVATE /W4 /permissive- /utf-8)
-  target_link_options(root_signature_test PRIVATE /OPT:NOREF)
-
-  # Host CPU preflight of --init/--run (src/host_cpu.h): AVX, OSXSAVE and XCR0 YMM state. The test feeds synthetic
-  # CPUID/XCR0 words.
-  add_executable(host_cpu_test test/host_cpu_test.cpp src/host_cpu.cpp)
-  target_include_directories(host_cpu_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
-  target_compile_options(host_cpu_test PRIVATE /W4 /permissive- /utf-8)
 
   # XTaskQueue/XAsync from microsoft/libHttpClient (MIT), vendored in third_party/xtaskqueue; shims/xtaskqueue/pch.h
   # stands in for libHttpClient's pch.h so only the task queue builds. Used by the xgameruntime shim.
@@ -119,7 +118,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/winhttp_offline.cpp
     shims/ws2_32_offline.cpp
     shims/xmem.cpp
-    shims/audio_stub.cpp
     shims/acphal.cpp
     shims/d3d12_xs.cpp
     shims/d3d12_xs_device.cpp
@@ -136,7 +134,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/dstorage.cpp
     shims/com_shim.cpp
     shims/bcrypt_rng.cpp
+    shims/xapu_chad.cpp
+    shims/dstorage.cpp
   )
+  # dstorage.cpp's guarded_move turns an access violation in a title's buffer into E_DSTORAGE_ACCESS_VIOLATION with
+  # __try. MSVC always catches it; clang-cl only with asynchronous exceptions (as for tiny_dll below). A source file
+  # property, so gta6rt and dstorage_test both get it.
+  set_source_files_properties(shims/dstorage.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:Clang>:/EHa>")
   add_dependencies(gta6rt gta6rt_tls_host)
   target_compile_definitions(gta6rt PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
   target_compile_options(gta6rt PRIVATE /W4 /permissive- /utf-8)
@@ -234,11 +238,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_link_options(xmem_test PRIVATE /OPT:NOREF)
   target_link_libraries(xmem_test PRIVATE psapi)
 
-  # Audio boot shims: xapu.dll and chad.dll (audio_stub.cpp), and the measured boot sequence through them and
-  # acphal.dll (acphal.cpp). Resolves every name through the registry. No game data, no device.
+  # The measured audio boot sequence through xapu.dll and chad.dll (xapu_chad.cpp) and acphal.dll (acphal.cpp).
+  # Resolves every name through the registry. No game data, no device.
   add_executable(audio_stub_test
     test/audio_stub_test.cpp
-    shims/audio_stub.cpp
+    shims/xapu_chad.cpp
     shims/acphal.cpp
     shims/registry.cpp
   )
@@ -293,6 +297,37 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(acphal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(acphal_test PRIVATE /OPT:NOREF)
+
+  # The Zen 2 instructions a desktop CPU may lack (src/cpu_emulation.h): decoded, emulated on a CONTEXT, and run for
+  # real with the #UD handler installed, so an Intel host takes the emulated path and an AMD one the native path.
+  add_executable(cpu_emulation_test test/cpu_emulation_test.cpp)
+  target_include_directories(cpu_emulation_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_definitions(cpu_emulation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(cpu_emulation_test PRIVATE /W4 /permissive- /utf-8)
+
+  # Xbox DirectStorage (DStorageGetFactory under dstorage_xs.dll, xcrdapi.dll and dstorage.dll) over synthetic files:
+  # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data.
+  add_executable(dstorage_test
+    test/dstorage_test.cpp
+    shims/dstorage.cpp
+    shims/file_system.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(dstorage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(dstorage_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(dstorage_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(dstorage_test PRIVATE /OPT:NOREF)
+
+  # xapu.dll and chad.dll, the APU and audio DSP command queues, resolved through the registry like xmem_test.
+  add_executable(xapu_chad_test
+    test/xapu_chad_test.cpp
+    shims/xapu_chad.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(xapu_chad_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(xapu_chad_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(xapu_chad_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(xapu_chad_test PRIVATE /OPT:NOREF)
 
   # The process shim's command line: GetCommandLineW must parse (CommandLineToArgvW) back to its __wargv.
   add_executable(process_cmdline_test
@@ -561,6 +596,8 @@ elseif(NOT WIN32)
 endif()
 
 include(CTest)
+# LEONIDA_TRANSLATOR_DEPS: what the rules that run test/shaders/build.py depend on besides their .asm files.
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/translator_deps.cmake")
 if(BUILD_TESTING)
   add_executable(gfx10_tiling_test test/gfx10_tiling_test.cpp)
   add_test(NAME gfx10_tiling COMMAND gfx10_tiling_test)
@@ -1297,6 +1334,12 @@ if(BUILD_TESTING)
   if(WIN32 AND TARGET acphal_test)
     add_test(NAME acphal COMMAND acphal_test)
   endif()
+  if(WIN32 AND TARGET cpu_emulation_test)
+    add_test(NAME cpu_emulation COMMAND cpu_emulation_test)
+  endif()
+  if(WIN32 AND TARGET xapu_chad_test)
+    add_test(NAME xapu_chad COMMAND xapu_chad_test)
+  endif()
   if(WIN32 AND TARGET process_cmdline_test)
     add_test(NAME process_cmdline COMMAND process_cmdline_test)
   endif()
@@ -1463,10 +1506,10 @@ if(BUILD_TESTING)
       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_game_dir.cmake")
   endif()
-  if(WIN32 AND TARGET root_signature_test)
+  if(TARGET root_signature_test)
     add_test(NAME root_signature COMMAND root_signature_test)
   endif()
-  if(WIN32 AND TARGET host_cpu_test)
+  if(TARGET host_cpu_test)
     add_test(NAME host_cpu COMMAND host_cpu_test)
   endif()
   if(WIN32 AND TARGET root_signature_oracle_test)
@@ -2847,11 +2890,9 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M15_DIR} vs_m15 ps_m15
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m15.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m15.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_m15 and ps_m15 for the translated draw test"
         VERBATIM)
       add_executable(d3d12_translated_draw_test test/d3d12_translated_draw_test.cpp shims/d3d12_xs_device.cpp
@@ -2874,11 +2915,10 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_BINDLESS_DIR} vs_ids ps_tex ps_imgatomic
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_ids.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_tex.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_imgatomic.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_ids, ps_tex and ps_imgatomic for vk_bindless_test"
         VERBATIM)
       add_custom_target(vk_bindless_shaders ALL DEPENDS ${LEONIDA_BINDLESS_FILES})
@@ -2902,13 +2942,11 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M2_DIR} vs_m2 ps_m2 ps_m2_uoff ps_m2_literal
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2_uoff.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2_literal.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_m2 and ps_m2 for the textured draw test"
         VERBATIM)
       add_executable(d3d12_m2_textured_test test/d3d12_m2_textured_test.cpp shims/d3d12_xs_device.cpp
@@ -2931,12 +2969,10 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M2F_DIR} vs_m2 ps_m2 ps_m2_array
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m2_array.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_m2, ps_m2 and ps_m2_array for the M2 formats test"
         VERBATIM)
       add_executable(d3d12_m2_formats_test test/d3d12_m2_formats_test.cpp shims/d3d12_xs_device.cpp
@@ -2961,14 +2997,12 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M3_DIR} vs_m3 ps_m3 vs_m2 ps_m3_post ps_m3_query
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m3.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3_post.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m3_query.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating M3 frame and single-output occlusion-probe shaders"
         VERBATIM)
       add_executable(d3d12_m3_frame_test test/d3d12_m3_frame_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M3_FILES})
@@ -3035,11 +3069,9 @@ if(TARGET Vulkan::Headers)
                 LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M4_DIR} cs_m4_fill cs_m4_indirect
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m4_fill.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_m4_indirect.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating cs_m4_fill and cs_m4_indirect for the compute test"
         VERBATIM)
       add_executable(d3d12_m4_compute_test test/d3d12_m4_compute_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M4_FILES})
@@ -3170,11 +3202,9 @@ if(TARGET Vulkan::Headers)
                 LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_BUFFER_UAV_DIR} cs_buf_typed cs_buf_counter
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_buf_typed.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_buf_counter.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating cs_buf_typed and cs_buf_counter for the buffer UAV test"
         VERBATIM)
       add_executable(d3d12_buffer_uav_test test/d3d12_buffer_uav_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_BUFFER_UAV_FILES})
@@ -3765,10 +3795,8 @@ if(TARGET Vulkan::Headers)
                   LEONIDA_USER_DATA_SHIFT=4
                   $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                   ${LEONIDA_SG_DIR}/${folder} ${shader}
-          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
-                  ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+          DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                   ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/${shader}.asm
-                  ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
           COMMENT "Translating ${shader} for the subgroup size test (${folder})"
           VERBATIM)
         list(APPEND LEONIDA_SG_INDEXES ${index})

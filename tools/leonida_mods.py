@@ -68,11 +68,14 @@ class ModInfo:
 
 
 def joaat(name: str) -> int:
-    """RAGE's joaat over the name's UTF-8 bytes, ASCII-lowercased like the C++ runtime."""
+    """RAGE's joaat over the lowercased latin-1 bytes, the rule ``tools/hashdict.py`` (the pinned name
+    dictionary) and every other name-hashing tool use.
+
+    Encoding to UTF-8 first gives a different hash for any non-ASCII character (``é`` is one byte 0xE9, not
+    0xC3 0xA9), so a model or swap name written with an accent would resolve to an id nothing in the package
+    has. Characters outside latin-1 hash as ``?``, as ``hashdict.joaat`` does."""
     h = 0
-    for byte in name.encode("utf-8"):
-        if 0x41 <= byte <= 0x5A:
-            byte += 0x20
+    for byte in name.lower().encode("latin-1", "replace"):
         h = (h + byte) & 0xFFFFFFFF
         h = (h + (h << 10)) & 0xFFFFFFFF
         h ^= h >> 6
@@ -596,8 +599,9 @@ def run_gui(args: argparse.Namespace, initial_mods_dir: str | None) -> int:
         import tkinter as tk
         from tkinter import filedialog, messagebox, ttk
     except ImportError as exc:
-        raise ModsError("Tkinter is not installed; on Windows install Python from python.org with Tcl/Tk") \
-            from exc
+        hint = ("on Windows install Python from python.org with Tcl/Tk" if os.name == "nt" else
+                "install your distribution's Tkinter package (Debian and Ubuntu: sudo apt install python3-tk)")
+        raise ModsError(f"Tkinter is not installed; {hint}") from exc
 
     class ModsApp:
         def __init__(self, root):
@@ -943,7 +947,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_target_args(parser)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    commands.add_parser("gui", help="open the Windows mod-manager window")
+    commands.add_parser("gui", help="open the mod-manager window")
     commands.add_parser("path", help="print the managed mods folder")
 
     listing = commands.add_parser("list", help="list installed mods")

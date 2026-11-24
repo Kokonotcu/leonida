@@ -134,11 +134,12 @@ python -I tools/cpu_ref.py <listing.s> --json
 python -I tests/test_cpu_ref.py
 ```
 
-The scalar ALU has its own differential fuzzer (FUZZ-4), `tools/salu_diff.py`: a separate reference for 87
-SOP1/SOP2/SOPC/SOPK opcodes with SCC kept explicit, seeded programs, the translated SPIR-V run in
-`tests/semantic/spirv_mini_interp.py`, and failing programs shrunk to the instructions that matter.
-64-bit mask ops are left out by default (the translator models them as wave masks), and `s_bfe_*` control
-words stay inside offset + width <= 32 unless `--bfe-any`. Its docstring lists the known divergences.
+The scalar ALU has its own differential fuzzer (FUZZ-4), `tools/salu_diff.py`. It has a separate reference for
+117 SOP1/SOP2/SOPC/SOPK opcodes in `OPS`, all listed by `--list-ops`. The default translator comparison selects
+from 104 opcodes, excluding the 13 wave-mask operations in `LANE_MASK_OPS`. The fuzzer keeps SCC explicit,
+generates seeded programs, runs translated SPIR-V in `tests/semantic/spirv_mini_interp.py`, and shrinks failing
+programs to the instructions that matter. `s_bfe_*` control words stay inside offset + width <= 32 unless
+`--bfe-any`. Its docstring lists the known divergences.
 
 `--branches` puts SCC into control flow, one lane: after an SCC producer comes either a chain of 1..3 consumers
 (`s_cselect_b32`, `s_addc_u32`, `s_subb_u32`) or `s_cbranch_scc0`/`scc1` forward over the next 1..3 scalar

@@ -1517,6 +1517,15 @@ The layer therefore owns the console VAs. It returns them from `ID3D12Resource::
 | Shader code | Each FSSM blob is uploaded to the arena; its console VA is the code base. |
 | Upload/readback | `D3D12_HEAP_TYPE_UPLOAD`/`READBACK` buffers are ranges of the arena (M8, decided by the measurement below): host-visible, mapped through the arena's mapping, console VA = offset, like default-heap buffers. Only when the arena is full (or `LEONIDA_UPLOAD_SYSMEM=1` for upload buffers) does one keep its own memory with the biased VA described next, logged once. |
 
+**Measured (XCL, retail title, PR #168):** the console answers a placed texture's `GetGPUVirtualAddress` with the
+address the title placed it at; the title clears a 256×256 `R32_FLOAT` texture through that value as a CPU pointer.
+On the PC, where D3D12 answers 0 for a texture, that write went to address 0. XCL returns the title address when the
+PC answers 0 and leaves buffers and resources with a PC address unchanged
+([`real.rs`](https://github.com/ivall/xcl/blob/main/crates/xcl/src/hle/d3d12x/real.rs), PR
+[#168](https://github.com/ivall/xcl/pull/168)). Facts only: XCL is GPL-2.0-only and no code is copied. This layer
+sets a slot-133 fallback texture's `GetGPUVirtualAddress` to the title address; the image itself still does not
+alias the title's pages.
+
 Non-arena buffers (upload/readback) can still be addressed by the shader without putting them in the arena: pass
 `console_va = host_bda - heap_base` (mod 2^64) in root descriptors and vertex/index/indirect views, so the shader's
 `heap_base + console_va` equals the host BDA. For descriptors, patch the V# base field the same way when the layer
