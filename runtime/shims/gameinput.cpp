@@ -477,7 +477,12 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
     ULONG STDMETHODCALLTYPE Release() override { return release_floor(refs_); }
 
-    const GameInputDeviceInfo* STDMETHODCALLTYPE GetDeviceInfo() override { return &info; }
+    // The block published at the last completed connect (publish_info), or the live one before any (the aggregate
+    // device's, which never changes).
+    const GameInputDeviceInfo* STDMETHODCALLTYPE GetDeviceInfo() override {
+        const GameInputDeviceInfo* p = published_.load(std::memory_order_acquire);
+        return p ? p : &info;
+    }
     uint32_t STDMETHODCALLTYPE GetDeviceStatus() override { return status.load(); }
     void STDMETHODCALLTYPE GetBatteryState(GameInputBatteryState* state) override;
     HRESULT STDMETHODCALLTYPE CreateForceFeedbackEffect(uint32_t motorIndex, const void* params, void** effect) override;
@@ -516,10 +521,36 @@ public:
     GameInputForceFeedbackMotorInfo ff_motor_info{};  // filled when SDL opened the pad as a haptic device
     GameInputHapticFeedbackMotorInfo haptic_motor_info[kHapticMotors]{};   // the trigger motors, when the pad has them
     GameInputHapticWaveformInfo haptic_waveform_info[kHapticMotors]{};     // one waveform each, an intensity
+
+    // What GetDeviceInfo hands out (review D8): the fields above are rewritten in place on a reconnect, under g().mu,
+    // while a title reads GetDeviceInfo's block with no lock at all, so it would see zero counts or a dangling
+    // report-info pointer mid-reconnect. Each completed connect publishes a copy of the whole block with every pointer
+    // aimed into the copy; copies are never freed (a title may keep pointers into one, and reconnects are rare).
+    struct PublishedInfo {
+        GameInputDeviceInfo info{};
+        std::string name;
+        GameInputString display_name{};
+        GameInputControllerAxisInfo axis_info[kAxisCount]{};
+        GameInputControllerButtonInfo button_info[kButtonCount]{};
+        GameInputGamepadInfo gamepad_info{};
+        GameInputUiNavigationInfo ui_info{};
+        GameInputMotionInfo motion_info{};
+        GameInputForceFeedbackMotorInfo ff_motor_info{};
+        GameInputHapticFeedbackMotorInfo haptic_motor_info[kHapticMotors]{};
+        GameInputHapticWaveformInfo haptic_waveform_info[kHapticMotors]{};
+        std::vector<GameInputRawDeviceReportInfo> raw_in, raw_out, raw_feature;
+    };
+    std::atomic<const GameInputDeviceInfo*> published_{nullptr};
+    void publish_info();  // under g().mu, once the live fields describe the connected pad
+
     std::atomic<uint32_t> status{GameInputDeviceNoStatus};
     std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
     uint64_t evicted_order = 0;    // order of the newest reading dropped from history
     Reading* latest() const { return history.empty() ? nullptr : history.back(); }
+    // When its input other than motion last changed (or it connected). A pad with sensors makes a reading every
+    // ~8 ms while idle; GetCurrentReading(kind, nullptr) for a kind other than motion picks the device by this, so
+    // that stream does not hide another device's held input (review B14). Under g().mu.
+    uint64_t last_change_us = 0;
     uint64_t seq = 0;
     Rumble wanted;
     float motor_gain = 1.0f;                     // SetForceFeedbackMotorGain, 0..1
@@ -833,11 +864,13 @@ struct State {
     uint64_t last_order = 0;  // Reading::order of the newest reading
     int dispatchers = 0;
     HANDLE wait_event = nullptr;  // auto-reset, signalled when a dispatcher has work
+    HANDLE first_poll = nullptr;  // manual-reset, set once the first poll has opened the pads present at start
     rt::gameinput::Config config;
     bool config_read = false;
     bool sdl_ready = false, sdl_failed = false;
     bool thread_started = false;
     std::atomic<DWORD> delivering_thread{0};  // written by the delivering thread, read unlocked by UnregisterCallback
+    std::atomic<GameInputCallbackToken> running_token{0};  // the callback running now; UnregisterCallback waits on it
 };
 
 // Never destroyed: the poll thread may still run while the process exits.
@@ -927,11 +960,17 @@ void deliver_event(const Event& e) {
     for (const Callback& c : targets) {
         bool still = false;
         {
+            // Marked running under the same lock UnregisterCallback removes it under: either the removal comes first
+            // and it is not called, or UnregisterCallback sees it running and waits for it.
             std::lock_guard lock(s.mu);
             for (const Callback& now : s.callbacks)
                 if (now.token == c.token) still = now.active;
+            if (still) s.running_token.store(c.token, std::memory_order_release);
         }
-        if (still) call(c, e);
+        if (still) {
+            call(c, e);
+            s.running_token.store(0, std::memory_order_release);
+        }
     }
     if (e.device) e.device->Release();
     if (e.reading) e.reading->Release();
@@ -1291,6 +1330,45 @@ Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
     return h.back();
 }
 
+void Device::publish_info() {
+    auto* p = new PublishedInfo;  // never freed: see PublishedInfo
+    p->info = info;
+    p->name = name;
+    std::memcpy(p->axis_info, axis_info, sizeof axis_info);
+    std::memcpy(p->button_info, button_info, sizeof button_info);
+    p->gamepad_info = gamepad_info;
+    p->ui_info = ui_info;
+    p->motion_info = motion_info;
+    p->ff_motor_info = ff_motor_info;
+    std::memcpy(p->haptic_motor_info, haptic_motor_info, sizeof haptic_motor_info);
+    std::memcpy(p->haptic_waveform_info, haptic_waveform_info, sizeof haptic_waveform_info);
+    p->raw_in = raw_in;
+    p->raw_out = raw_out;
+    p->raw_feature = raw_feature;
+    // Every pointer the live block has, aimed at the copy's own storage instead.
+    GameInputDeviceInfo& i = p->info;
+    if (i.displayName) {
+        p->display_name = display_name;
+        p->display_name.data = p->name.c_str();
+        i.displayName = &p->display_name;
+    }
+    if (i.controllerAxisInfo) i.controllerAxisInfo = p->axis_info;
+    if (i.controllerButtonInfo) i.controllerButtonInfo = p->button_info;
+    if (i.gamepadInfo) i.gamepadInfo = &p->gamepad_info;
+    if (i.uiNavigationInfo) i.uiNavigationInfo = &p->ui_info;
+    if (i.motionInfo) i.motionInfo = &p->motion_info;
+    if (i.forceFeedbackMotorInfo) i.forceFeedbackMotorInfo = &p->ff_motor_info;
+    if (i.hapticFeedbackMotorInfo) {
+        i.hapticFeedbackMotorInfo = p->haptic_motor_info;
+        for (uint32_t m = 0; m < kHapticMotors; ++m)
+            if (p->haptic_motor_info[m].waveformInfo) p->haptic_motor_info[m].waveformInfo = &p->haptic_waveform_info[m];
+    }
+    i.inputReportInfo = p->raw_in.empty() ? nullptr : p->raw_in.data();
+    i.outputReportInfo = p->raw_out.empty() ? nullptr : p->raw_out.data();
+    i.featureReportInfo = p->raw_feature.empty() ? nullptr : p->raw_feature.data();
+    published_.store(&p->info, std::memory_order_release);
+}
+
 // Raw HID (RT-175): opens the pad's HID device with the current backend and builds the report tables from its report
 // descriptor. A pad the backend cannot open, or whose descriptor cannot be read or declares no report, gets no raw
 // I/O: no GameInputKindRawDeviceReport, no report tables, and E_NOTIMPL from the raw device calls. Opening it is device
@@ -1554,11 +1632,13 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     uint32_t status = kConnectedStatus;
     if (d->info.capabilities & GameInputDeviceCapabilityWireless) status |= GameInputDeviceWireless;
     if (d->hid) status |= GameInputDeviceRawIoEnabled;
+    d->publish_info();  // complete now: GetDeviceInfo hands out this copy from here on
     d->status = status;
     s.connected.push_back(d);
 
     const Snapshot snap = read_pad(d);
     d->last_snap = snap;
+    d->last_change_us = ts;
     push_reading(d, snap, ts);
     queue_event({CbType::Device, d, nullptr, ts, status, GameInputDeviceNoStatus, false, 0});
     std::fprintf(stderr, "[rt] gameinput: connected %s (%04x:%04x, player %d%s%s%s%s)\n", d->name.c_str(),
@@ -2018,7 +2098,10 @@ bool init_sdl() {
 void poll_once() {
     State& s = g();
     std::lock_guard pl(s.poll_mu);
-    if (!init_sdl()) return;
+    if (!init_sdl()) {
+        if (s.first_poll) SetEvent(s.first_poll);  // no pads will come: nobody waits for them
+        return;
+    }
     apply_prompt_config();
     update_keyboard_pad();
     SDL_UpdateGamepads();
@@ -2071,6 +2154,7 @@ void poll_once() {
         const bool motion_tick = snap.has_motion && now - d->last_reading_us >= kMotionReadingUs;
         if (changed || motion_tick) {
             std::lock_guard lock(s.mu);
+            if (changed) d->last_change_us = now;
             queue_event({CbType::Reading, d, push_reading(d, snap, now), now, 0, 0, false, 0});
         }
         if (guide_changed) {
@@ -2080,6 +2164,7 @@ void poll_once() {
         refresh_battery(d, now);
         apply_output(d, now);
     }
+    if (s.first_poll) SetEvent(s.first_poll);  // the pads present at start are open (blocking enumeration waits)
 }
 
 void poll_and_deliver() {
@@ -2116,6 +2201,7 @@ void ensure_started() {
         s.config = read_config();
         s.config_read = true;
         s.wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        s.first_poll = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     }
     if (s.config.background_thread && !s.thread_started) {
         s.thread_started = true;
@@ -2475,16 +2561,28 @@ public:
         if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
         std::lock_guard lock(g().mu);
         Reading* best = nullptr;
+        // Across devices, the newest is the one whose input of this kind changed last. For motion that is every
+        // reading; for any other kind, a pad streaming motion readings while idle must not win over a device whose
+        // buttons or sticks really moved (review B14), so the device's last non-motion change decides.
+        const bool by_reading = (kind & GameInputKindMotion) != 0;
+        uint64_t best_key = 0;
+        const auto consider = [&](Device* cd) {
+            Reading* r = cd->latest();
+            if (!r) return;
+            const uint64_t key = by_reading ? r->GetTimestamp() : cd->last_change_us;
+            if (!best || key >= best_key) {
+                best = r;
+                best_key = key;
+            }
+        };
         if (device) {
             Device* d = as_device(device);
             if (d->info.deviceFamily == GameInputFamilyAggregate) {
                 if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
                     return GAMEINPUT_E_READING_NOT_FOUND;
                 const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & d->info.supportedInput) : d->info.supportedInput;
-                for (Device* cd : g().connected) {
-                    if (!(effective_kind & cd->info.supportedInput)) continue;
-                    if (Reading* r = cd->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
-                }
+                for (Device* cd : g().connected)
+                    if (effective_kind & cd->info.supportedInput) consider(cd);
             } else {
                 if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
                 if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
@@ -2492,8 +2590,9 @@ public:
                 best = d->latest();
             }
         } else {
-            for (Device* d : g().connected)  // the most recent reading from any gamepad
-                if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+            // The most recent reading from any device that does this kind (motion only from pads with sensors).
+            for (Device* d : g().connected)
+                if (kind == GameInputKindUnknown || (kind & d->info.supportedInput)) consider(d);
         }
         if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
         best->AddRef();
@@ -2532,6 +2631,17 @@ public:
         if (!fn) return E_INVALIDARG;
         if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
         State& s = g();
+        // Blocking enumeration right after GameInputCreate: SDL starts on the poll thread, so the pads already plugged
+        // in are opened by its first poll. Wait for that poll (bounded) so they are reported now, not as later
+        // connects (review B14). Without the poll thread (tests poll by hand) there is nothing to wait for.
+        if (enumeration == GameInputBlockingEnumeration) {
+            HANDLE first = nullptr;
+            {
+                std::lock_guard lock(s.mu);
+                if (s.thread_started) first = s.first_poll;
+            }
+            if (first) WaitForSingleObject(first, 2000);
+        }
         GameInputCallbackToken t;
         std::vector<Event> now;
         {
@@ -2581,21 +2691,29 @@ public:
             if (c.token == token) c.active = false;
     }
 
-    // Removes the callback and, unless called from inside a callback, waits for one that is running to return.
-    // VERIFY: the timeout is not honoured; the wait is for at most one callback.
-    bool STDMETHODCALLTYPE UnregisterCallback(GameInputCallbackToken token, uint64_t) override {
+    // Removes the callback; it is never called again. If that very callback is running on another thread, waits for it
+    // to return, for at most timeoutInMicroseconds, and returns false when the wait ran out (review B14: the whole
+    // delivery batch was waited for without a limit, so a title thread holding a lock a running callback wanted
+    // deadlocked). Called from inside a callback, it does not wait.
+    bool STDMETHODCALLTYPE UnregisterCallback(GameInputCallbackToken token, uint64_t timeout_us) override {
         State& s = g();
-        bool found = false;
+        bool found = false, running = false;
         {
             std::lock_guard lock(s.mu);
             auto it = std::find_if(s.callbacks.begin(), s.callbacks.end(), [token](const Callback& c) { return c.token == token; });
             if (it != s.callbacks.end()) {
                 s.callbacks.erase(it);
                 found = true;
+                running = s.running_token.load(std::memory_order_acquire) == token;
             }
         }
-        if (found && s.delivering_thread != GetCurrentThreadId()) std::lock_guard wait(s.deliver_mu);
-        return found;
+        if (!found || !running || s.delivering_thread == GetCurrentThreadId()) return found;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeout_us);
+        while (s.running_token.load(std::memory_order_acquire) == token) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            SwitchToThread();
+        }
+        return true;
     }
 
     HRESULT STDMETHODCALLTYPE CreateDispatcher(IGameInputDispatcher** out) override {
@@ -2633,10 +2751,16 @@ public:
         agg->display_name.sizeInBytes = static_cast<uint32_t>(agg->name.size());
         agg->display_name.codePointCount = static_cast<uint32_t>(agg->name.size());
         agg->info.displayName = &agg->display_name;
+        // A full info block, as every other device has (review B14): infoSize set and the per-kind info pointers
+        // non-null, so a title reading gamepadInfo or uiNavigationInfo off any device it holds finds a (zeroed) block.
+        agg->info.infoSize = sizeof(GameInputDeviceInfo);
+        agg->info.gamepadInfo = &agg->gamepad_info;
+        agg->info.uiNavigationInfo = &agg->ui_info;
 
         std::memcpy(agg->info.deviceId.value, "LEONIDA_AGGREGATE_DEVICE_ID\0\0\0\0", 32);
         agg->info.deviceId.value[28] = static_cast<uint8_t>(kind & 0xff);
         agg->info.deviceId.value[29] = static_cast<uint8_t>((kind >> 8) & 0xff);
+        agg->info.deviceRootId = agg->info.deviceId;
 
         g().devices.push_back(agg);
         agg->AddRef();

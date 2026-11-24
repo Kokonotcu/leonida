@@ -132,8 +132,13 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 //     pointer s4, one-dword tables).
 //   - vertex/pixel/geometry s8 and mesh s16: a hypothesis from the corpus census only (lowest pointer SGPR per stage);
 //     no signature confirms them, and visibility is not modelled (every parameter takes its place in every stage).
-// A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
-// every parameter after it; that array is not modelled, so such a signature is refused, never truncated.
+// A parameter that does not fit goes to the console's spill array together with every parameter after it.
+//   - compute: measured (section 7, the console compiler's output): the array is packed in root order with no
+//     alignment, a constant taking 4 bytes per value and a root CBV/SRV/UAV 8 (its 64-bit VA), and the 40-bit pointer
+//     to it is in s[0:1]. Such a parameter's first_sgpr is kMaxUserSgprs + its byte offset / 4 (a "spill dword"; the
+//     command list writes those into the array). A descriptor table in the spill, or a heap base that does not fit,
+//     is refused: their size and place there are not measured (no translated shader reads a spill, D3D-315).
+//   - graphics: where the pointer goes is not measured, so a spill is refused, never truncated.
 //
 // Direct heap indexing (docs/d3d12_vulkan.md section 3.4, D3D-329): a signature with
 // D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED gets one more SGPR right after its last parameter, the
@@ -177,8 +182,8 @@ constexpr uint32_t kFlagSamplerHeapDirectlyIndexed = 0x800;
 struct StagePackResult {
     bool ok = false;
     std::string error;            // set when !ok; names the refusing parameter
-    // !ok only because a parameter or heap base would spill (a valid D3D12 signature whose spill array is not
-    // modelled), not because the signature breaks a D3D12 limit.
+    // !ok only because a parameter or heap base would spill where the spill is not modelled (any graphics spill; a
+    // table or heap base in the compute spill), not because the signature breaks a D3D12 limit.
     bool spills = false;
     Stage stage = Stage::Compute;
     uint32_t base = 0;            // stage_base(stage)
@@ -187,7 +192,13 @@ struct StagePackResult {
     uint32_t sampler_heap_sgpr = kNoSgpr;   // the bound sampler heap's base (kNoSgpr: the flag is clear)
     uint32_t end_sgpr = 0;        // one past the last SGPR used: the RSRC2 USER_SGPR count the layout implies
     uint32_t d3d12_cost = 0;      // cost against the 64-dword D3D12 limit
+    uint32_t spill_bytes = 0;     // compute: the spill array's size (0: nothing spills, s[0:1] is not a pointer)
 };
+
+// A first_sgpr at kMaxUserSgprs or above is a dword of the compute spill array, not a user SGPR (pack_stage).
+[[nodiscard]] constexpr bool is_spill_dword(uint32_t dword) noexcept {
+    return dword >= kMaxUserSgprs && dword != kNoSgpr;
+}
 
 // Lays the parameters out for `stage` in the console layout, then the heap bases the signature's flags ask for.
 // Fails like pack() on more than 64 parameters, a constant parameter of 0 values or the 64-dword cost limit, and on

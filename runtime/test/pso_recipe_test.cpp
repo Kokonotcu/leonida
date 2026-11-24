@@ -119,6 +119,11 @@ int main() {
               i.pColorBlendState->blendConstants[0] == 0.5f,
           "blend");
     check(i.pDynamicState->dynamicStateCount == 7, "seven dynamic states with vertex bindings");
+    // M4: the viewport and scissor counts are dynamic, so a draw binds up to 16 for SV_ViewportArrayIndex.
+    check(i.pDynamicState->pDynamicStates[0] == VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT &&
+              i.pDynamicState->pDynamicStates[1] == VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT &&
+              i.pViewportState->viewportCount == 0 && i.pViewportState->scissorCount == 0,
+          "viewport and scissor counts are dynamic");
     Recipe no_vb = a;
     no_vb.bindings.clear();
     no_vb.attributes.clear();

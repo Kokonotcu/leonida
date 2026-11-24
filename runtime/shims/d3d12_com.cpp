@@ -166,12 +166,46 @@ public:
     // {7d0e6b51-34a2-4f0c-9a61-0c5b2e8f4a10}, public in d3d12_xs_device.h: the device proxy's slot 9 wraps an allocator
     // in an Xbox-ABI allocator proxy only when it answers this tag, because from() below resolves such a proxy.
     static constexpr GUID kTag = d3d12_xs::kLeonidaCommandAllocatorTag;
-    explicit CommandAllocator(D3D12_COMMAND_LIST_TYPE type) : type_(type) {}
-    // Lists own their recorded commands, so there is nothing to free. As on the PC runtime (D3D-51, measured by
-    // d3d12_vulkan_device_test): E_FAIL while a list is recording into this allocator, and S_OK while its lists are
-    // still executing on the GPU (keeping that safe is the application's job on D3D12 too).
-    HRESULT STDMETHODCALLTYPE Reset() override { return recording_ ? E_FAIL : S_OK; }
+    CommandAllocator(D3D12_COMMAND_LIST_TYPE type, std::shared_ptr<ArenaPages> pages)
+        : type_(type), pages_(std::move(pages)) {}
+    ~CommandAllocator() override {
+        for (const Page& page : pages_used_) pages_->release(page.va, page.bytes);
+    }
+    // Lists own their recorded commands; what this allocator holds is the GPU data they wrote (sub_allocate), which a
+    // Reset rewinds for reuse. As on the PC runtime (D3D-51, measured by d3d12_vulkan_device_test): E_FAIL while a
+    // list is recording into this allocator, and S_OK while its lists are still executing on the GPU (keeping that
+    // safe is the application's job on D3D12 too, the reason it may reuse the allocator's memory).
+    HRESULT STDMETHODCALLTYPE Reset() override {
+        if (recording_) return E_FAIL;
+        page_ = 0;
+        used_ = 0;
+        return S_OK;
+    }
     D3D12_COMMAND_LIST_TYPE type() const { return type_; }
+    // `bytes` of host-visible GPU memory in the GPU address arena for data a recorded command reads (a dispatch's
+    // compute root spill array, M10): its console VA and host mapping, 16-byte aligned, alive until the allocator is
+    // reset or released. False without an arena (pages_ null) or when the arena is full.
+    bool sub_allocate(std::uint32_t bytes, std::uint64_t& va, std::uint8_t*& host) {
+        if (!pages_ || !bytes) return false;
+        const std::uint64_t need = (std::uint64_t(bytes) + 15) & ~std::uint64_t(15);
+        for (; page_ < pages_used_.size(); ++page_, used_ = 0) {
+            const Page& page = pages_used_[page_];
+            if (page.bytes - used_ >= need) {
+                va = page.va + used_;
+                host = page.host + used_;
+                used_ += need;
+                return true;
+            }
+        }
+        Page page{0, nullptr, std::max<std::uint64_t>(kPageBytes, need)};
+        if (!pages_->allocate(page.bytes, page.va, page.host)) return false;
+        pages_used_.push_back(page);
+        page_ = pages_used_.size() - 1;
+        va = page.va;
+        host = page.host;
+        used_ = need;
+        return true;
+    }
     // The one list that is recording into this allocator, or null. D3D12 allows one at a time.
     const void* recording() const { return recording_; }
     void set_recording(const void* list) { recording_ = list; }
@@ -183,8 +217,18 @@ public:
     }
 
 private:
+    struct Page {
+        std::uint64_t va;
+        std::uint8_t* host;
+        std::uint64_t bytes;
+    };
+    static constexpr std::uint64_t kPageBytes = 64 * 1024;
     D3D12_COMMAND_LIST_TYPE type_;
     const void* recording_ = nullptr;
+    std::shared_ptr<ArenaPages> pages_;
+    std::vector<Page> pages_used_;  // kept across Reset, released with the allocator
+    std::size_t page_ = 0;          // the page sub_allocate takes from
+    std::uint64_t used_ = 0;        // bytes of it handed out since the last Reset
 };
 
 class GraphicsCommandList final
@@ -421,17 +465,23 @@ public:
         set_index_buffer(view);
     }
 
-    // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw).
+    // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw). More than one go to the draws
+    // as a ViewportArray, for SV_ViewportArrayIndex (M4).
     void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        viewport_array_stale_ = true;
         if (!count) {
             viewport_ = {};
+            viewport_count_ = 0;
             return;
         }
         if (!viewports || count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return check(false);
-        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetViewports (more than one viewport; the first is used)");
-        const D3D12_VIEWPORT& v = viewports[0];
-        viewport_ = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+        for (UINT i = 0; i < count; ++i) {
+            const D3D12_VIEWPORT& v = viewports[i];
+            viewports_[i] = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
+        }
+        viewport_ = viewports_[0];
+        viewport_count_ = count;
     }
 
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
@@ -440,11 +490,17 @@ public:
         // With no scissor bound, the rasterizer clips every fragment, as on native D3D12.
         if (!count) {
             scissor_ = {};
+            scissor_count_ = 0;
+            viewport_array_stale_ = true;
             return;
         }
         if (!rects) return;
-        if (count > 1) stub("ID3D12GraphicsCommandList::RSSetScissorRects (more than one rectangle; the first is used)");
-        scissor_ = {rects[0].left, rects[0].top, rects[0].right, rects[0].bottom};
+        // D3D12 takes at most 16; the debug layer reports more, and the rest are ignored here.
+        count = std::min<UINT>(count, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
+        for (UINT i = 0; i < count; ++i) scissors_[i] = {rects[i].left, rects[i].top, rects[i].right, rects[i].bottom};
+        scissor_ = scissors_[0];
+        scissor_count_ = count;
+        viewport_array_stale_ = true;
     }
 
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
@@ -502,13 +558,14 @@ public:
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
         note_direct_heap_indexing(graphics_.layout);
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+        if (!rasterizes()) return;  // as record_draw: nothing is rasterized
         UserData data;
         if (!graphics_user_data(true, data))
             return stub("DispatchMesh(root arguments past s16: the mesh and pixel windows overlap)");
         leonida::Draw draw{graphics_pipeline_, data, draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         draw.mesh = true;
+        draw.viewports = viewport_array();
         check(list_.draw(std::move(draw)));
     }
 
@@ -947,7 +1004,7 @@ public:
         const bool mesh = kind == leonida::IndirectKind::dispatch_mesh;
         if (kind != leonida::IndirectKind::dispatch && max_command_count && graphics_pipeline_ && graphics_.layout &&
             (topology_ || mesh)) {
-            if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+            if (!rasterizes()) return;
             cmd.state = std::make_shared<const leonida::Draw>(
                 mesh ? make_mesh_draw(0, 0, 0) : make_draw(kind == leonida::IndirectKind::draw_indexed, 0, 0, 0, 0, 0));
         }
@@ -965,7 +1022,7 @@ public:
             if (!compute_pipeline_ || !compute_.layout) return check(false);
             cmd.pipeline = compute_pipeline_;
             note_direct_heap_indexing(compute_.layout);
-            cmd.user_data = compute_user_data();
+            if (!compute_user_data(cmd.user_data)) return check(false);
         }
         check(list_.execute_indirect(cmd));
     }
@@ -1284,6 +1341,8 @@ private:
     struct RootState {
         const RootArgumentLayout* layout = nullptr;
         std::array<std::uint32_t, rt::rootsig::kMaxUserSgprs> data{};
+        // Compute: the console's spill array (layout->compute_spill_bytes), copied into GPU memory at each dispatch.
+        std::vector<std::uint32_t> spill;
     };
 
     // D3D12 leaves root arguments undefined after a root-signature change; they start at zero here. Setting the
@@ -1304,6 +1363,7 @@ private:
         hold(signature);  // state.layout points into it
         state.layout = layout;
         state.data = {};
+        state.spill.assign(layout && is_compute(state) ? layout->compute_spill_bytes / 4 : 0, 0);
         // CreateRootSignature accepted it for the other bind point only (its log line says why).
         if (layout && !(is_compute(state) ? layout->compute_ok : layout->graphics_ok)) {
             stub(is_compute(state) ? "SetComputeRootSignature(signature that does not fit the compute layout)"
@@ -1329,12 +1389,15 @@ private:
         return &state.layout->parameters[index];
     }
 
-    // Dwords beyond the 32 user registers are what the console spills to memory; that layout is still open.
+    // Dwords from kMaxUserSgprs on are the compute spill array's (rt::rootsig::pack_stage, M10). No other layout
+    // places a parameter there: a signature that would spill at the graphics bind point is not bound there.
     void write(RootState& state, std::uint32_t dword, std::uint32_t value) {
         if (dword < rt::rootsig::kMaxUserSgprs)
             state.data[dword] = value;
+        else if (rt::rootsig::is_spill_dword(dword) && dword - rt::rootsig::kMaxUserSgprs < state.spill.size())
+            state.spill[dword - rt::rootsig::kMaxUserSgprs] = value;
         else
-            stub("root arguments beyond 32 user-data dwords (spill not modelled)");
+            stub("root arguments past the user-data dwords outside a compute spill array");
     }
 
     void constants(RootState& state, UINT index, UINT count, const void* data, UINT offset) {
@@ -1394,8 +1457,15 @@ private:
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
-    leonida::Viewport viewport_{};
-    leonida::Rect scissor_{};
+    leonida::Viewport viewport_{};  // viewports_[0], or empty with none bound
+    leonida::Rect scissor_{};       // scissors_[0], or empty with none bound
+    std::array<leonida::Viewport, leonida::ViewportArray::max> viewports_{};
+    std::array<leonida::Rect, leonida::ViewportArray::max> scissors_{};
+    UINT viewport_count_ = 0;
+    UINT scissor_count_ = 0;
+    // The draws' ViewportArray while more than one viewport is bound, rebuilt when either set changes.
+    std::shared_ptr<const leonida::ViewportArray> viewport_array_;
+    bool viewport_array_stale_ = true;
     std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets_{};
     UINT render_target_count_ = 0;
     // One block shared by every draw that keeps the same targets and buffers, rebuilt when either changes, so a
@@ -1488,12 +1558,27 @@ private:
         if (sampler_sgpr < data.size()) data[sampler_sgpr] = std::uint32_t(sampler_base_);
     }
 
-    // The user data a dispatch records: the compute root arguments and the heap bases.
-    UserData compute_user_data() const {
-        UserData data = compute_.data;
-        if (const RootArgumentLayout* layout = compute_.layout)
-            write_heap_bases(data, layout->compute_resource_heap_sgpr, layout->compute_sampler_heap_sgpr);
-        return data;
+    // The user data a dispatch records: the compute root arguments and the heap bases. With a spill (M10), a copy
+    // of the spill array in GPU memory from the list's allocator, its 40-bit VA in s[0:1] (docs/d3d12_vulkan.md
+    // section 7): each dispatch reads the arguments set before it, as root arguments are. False (noted once) when there
+    // is no memory for it; the caller invalidates the list rather than run the dispatch without its arguments.
+    bool compute_user_data(UserData& data) {
+        data = compute_.data;
+        const RootArgumentLayout* layout = compute_.layout;
+        if (!layout) return true;
+        write_heap_bases(data, layout->compute_resource_heap_sgpr, layout->compute_sampler_heap_sgpr);
+        if (compute_.spill.empty()) return true;
+        const std::uint32_t bytes = std::uint32_t(4 * compute_.spill.size());
+        std::uint64_t va = 0;
+        std::uint8_t* host = nullptr;
+        if (!allocator_ || !allocator_->sub_allocate(bytes, va, host)) {
+            stub("Dispatch with a compute root spill (no GPU address arena memory for the spill array)");
+            return false;
+        }
+        std::memcpy(host, compute_.spill.data(), bytes);
+        data[0] = std::uint32_t(va);
+        data[1] = std::uint32_t(va >> 32) & 0xFFu;  // a 40-bit pointer; arena VAs are below 4 GiB
+        return true;
     }
 
     // The user data a draw records: the graphics root arguments and the heap bases from s8, where the vertex, pixel
@@ -1529,6 +1614,9 @@ private:
         index_ = {};
         viewport_ = {};
         scissor_ = {};
+        viewport_count_ = scissor_count_ = 0;
+        viewport_array_.reset();
+        viewport_array_stale_ = true;
         render_targets_.fill({});
         render_target_count_ = 0;
         draw_views_stale_ = true;
@@ -1553,7 +1641,9 @@ private:
     void record_dispatch(UINT x, UINT y, UINT z) {
         if (!compute_pipeline_ || !compute_.layout) return check(false);
         note_direct_heap_indexing(compute_.layout);
-        check(list_.dispatch({compute_pipeline_, compute_user_data(), x, y, z}));
+        UserData data;
+        if (!compute_user_data(data)) return check(false);
+        check(list_.dispatch({compute_pipeline_, data, x, y, z}));
     }
 
     // The views block a draw records. Rebuilt only when the render targets or the bound vertex buffers change.
@@ -1569,10 +1659,38 @@ private:
         return draw_views_;
     }
 
+    // Whether a bound viewport has an area. With none (never set, or unbound with RSSetViewports(0)) or only empty
+    // ones, D3D12 rasterizes nothing, and Vulkan forbids a 0x0 viewport, so the draw is not recorded. An empty one
+    // among others is replayed as a 1x1 viewport with an empty scissor (prepare_draw).
+    bool rasterizes() const {
+        const UINT count = std::max<UINT>(viewport_count_, 1);
+        for (UINT i = 0; i < count; ++i) {
+            const leonida::Viewport& v = i ? viewports_[i] : viewport_;
+            if (v.width > 0 && v.height > 0) return true;
+        }
+        return false;
+    }
+
+    // The ViewportArray the draws take while more than one viewport is bound, else null.
+    const std::shared_ptr<const leonida::ViewportArray>& viewport_array() {
+        if (viewport_array_stale_) {
+            viewport_array_.reset();
+            if (viewport_count_ > 1) {
+                auto array = std::make_shared<leonida::ViewportArray>();
+                array->count = viewport_count_;
+                array->viewports = viewports_;
+                std::copy_n(scissors_.begin(), scissor_count_, array->scissors.begin());
+                viewport_array_ = std::move(array);
+            }
+            viewport_array_stale_ = false;
+        }
+        return viewport_array_;
+    }
+
     // A mesh draw needs a graphics pipeline and a graphics root signature; it has no topology or vertex input.
     void record_mesh_draw(UINT x, UINT y, UINT z) {
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;  // as record_draw: nothing is rasterized
+        if (!rasterizes()) return;  // as record_draw: nothing is rasterized
         check(list_.draw(make_mesh_draw(x, y, z)));
     }
 
@@ -1580,9 +1698,7 @@ private:
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
         if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
         note_direct_heap_indexing(graphics_.layout);
-        // No viewport (never set, or unbound with RSSetViewports(0)) or an empty one: D3D12 rasterizes nothing,
-        // and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
-        if (!(viewport_.width > 0) || !(viewport_.height > 0)) return;
+        if (!rasterizes()) return;
         check(list_.draw(make_draw(indexed, count, instances, first, base_vertex, first_instance)));
     }
 
@@ -1596,6 +1712,7 @@ private:
         leonida::Draw draw{graphics_pipeline_, data, draw_views(), depth_, {}, 0, viewport_, scissor_,
                            blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         draw.mesh = true;
+        draw.viewports = viewport_array();
         return draw;
     }
 
@@ -1606,7 +1723,7 @@ private:
         graphics_user_data(false, data);  // the vertex window alone always fits
         return {graphics_pipeline_, data, draw_views(), depth_, index_, topology_, viewport_, scissor_,
                 blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first, base_vertex,
-                first_instance};
+                first_instance, false, viewport_array()};
     }
 };
 
@@ -2157,13 +2274,14 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
     return hand_out(object, riid, out);
 }
 
-HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device) {
+HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device,
+                                 std::shared_ptr<ArenaPages> pages) {
     // The host runtime's order (d3d12_vulkan_device_test, compare_invalid_arguments "command allocator:"): a type
     // past VIDEO_ENCODE is E_INVALIDARG, then a null output is E_UNEXPECTED.
     if (out) *out = nullptr;
     if (UINT(type) > UINT(D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE)) return E_INVALIDARG;
     if (!out) return E_UNEXPECTED;
-    auto* object = new CommandAllocator(type);
+    auto* object = new CommandAllocator(type, std::move(pages));
     object->attach_device(device);
     return hand_out(object, riid, out);
 }
@@ -2311,7 +2429,7 @@ HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D1
             if (first == rt::rootsig::kNoSgpr) return E_NOTIMPL;
             a.user_dword = first + dest;
             a.dwords = count;
-            // Dwords past the 32 user registers are what the console spills to memory (not modelled).
+            // Dwords past the 32 user registers are the compute spill array, which no token writes (M10).
             return std::uint64_t(a.user_dword) + count > rt::rootsig::kMaxUserSgprs ? E_NOTIMPL : S_OK;
         };
         HRESULT hr = S_OK;

@@ -69,6 +69,18 @@ int main() {
     image.type = ImageType::image_3d;  // TYPE 10; DEPTH = depth - 1, word 4 bits 12:0
     image.depth = 8192;
     CHECK((changed(image) == ImageWords{0, 0, 0, 0x90000000u ^ 0xA0000000u, 0x1FFF, 0, 0, 0}));
+    // A sliced 3D view (a RWTexture3D UAV of slices 2..4): DEPTH = the last slice, BASE_ARRAY = the first, and
+    // ARRAY_PITCH (word 5 bits 3:0) = 1, as RADV's GFX10 sliced views of VK_EXT_image_sliced_view_of_3d.
+    image.depth = 8;
+    image.sliced = true;
+    image.first_layer = 2;
+    image.layer_count = 3;
+    CHECK((changed(image) == ImageWords{0, 0, 0, 0x90000000u ^ 0xA0000000u, 0x00020004, 1, 0, 0}));
+    {
+        Image out{};
+        CHECK(decode(encode(image), out) && out.sliced && out.first_layer == 2 && out.layer_count == 3 &&
+              out.depth == 5);
+    }
     image = {};
     image.type = ImageType::image_2d_msaa;  // TYPE 14; log2(samples) in LAST_LEVEL and MAX_MIP
     image.samples = 8;

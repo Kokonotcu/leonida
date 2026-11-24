@@ -123,12 +123,13 @@ int check_layouts(ID3D12Device* device) {
         EXPECT(layout->graphics_sampler_heap_sgpr == want.graphics_smp);
         EXPECT(layout->graphics_end_sgpr == want.graphics_end);
     }
-    // 25 constants fit compute (s4..s28) but not the graphics stages (s8..s32); 29 fit neither. Both are valid D3D12
-    // signatures the console spills, so both are created.
+    // 25 constants fit compute (s4..s28) but not the graphics stages (s8..s32); 29 fit neither, and go to the compute
+    // spill array (M10). Both are valid D3D12 signatures the console spills, so both are created; a graphics spill is
+    // not modelled, so that bind point is unusable.
     const struct {
         UINT constants;
         bool compute_ok, graphics_ok;
-    } spills[] = {{24, true, true}, {25, true, false}, {28, true, false}, {29, false, false}};
+    } spills[] = {{24, true, true}, {25, true, false}, {28, true, false}, {29, true, false}};
     for (const auto& want : spills) {
         const auto blob = root_signature(0, want.constants);
         EXPECT(!blob.empty());

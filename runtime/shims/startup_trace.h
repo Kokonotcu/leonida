@@ -181,6 +181,16 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 const auto op = r.ExceptionInformation[0];
                 f += ",\"access\":" + quote(op == 0 ? "read" : op == 1 ? "write" : "execute") +
                      ",\"address\":" + quote(hex(r.ExceptionInformation[1]));
+                // A call through a null or bad pointer leaves no frame to unwind from; the return address is the
+                // word at RSP, which names the call site (from PR #8134).
+                if (op == 8 && info.ContextRecord) {
+                    uint64_t ret = 0;
+                    SIZE_T got = 0;
+                    if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(info.ContextRecord->Rsp),
+                                          &ret, sizeof(ret), &got) && got == sizeof(ret)) {
+                        f += ",\"return_to\":" + quote(where(ret));
+                    }
+                }
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);

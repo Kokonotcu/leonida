@@ -172,6 +172,19 @@ def clip_container():
             + b"OSG1" + struct.pack("<I", len(payload)) + payload)
 
 
+# Vertex shaders with misc system-value outputs: their OSG1 as (system value, component type, register, mask). 5 is
+# D3D_NAME_VIEWPORT_ARRAY_INDEX (a uint, component type 1), which sends the misc vector to pos1.
+MISC_CASES = {"vs_vpindex": [(1, 3, 0, 0xF), (5, 1, 1, 0x1)]}
+
+
+def misc_container(elements):
+    """A DXBC container holding only an OSG1 of unnamed elements (system value, component type, register, mask)."""
+    payload = struct.pack("<II", len(elements), 8) + b"".join(
+        struct.pack("<6I2B6x", 0, 0, 0, sv, ctype, reg, mask, mask) for sv, ctype, reg, mask in elements)
+    return (b"DXBC" + bytes(16) + struct.pack("<4I", 1, 36 + 8 + len(payload), 1, 36)
+            + b"OSG1" + struct.pack("<I", len(payload)) + payload)
+
+
 def gs_container():
     # ISG1 and OSG1 of the gs_* fixtures, as scripts/run_gpu_tests.py makes them for gs_tri: SV_Position (system value
     # 1) in register 0 and TEXCOORD0 in register 1, float4 (component type 3), no names.
@@ -231,6 +244,8 @@ def translate_tests(work, names):
             (work / (n + ".dxbc")).write_bytes(fetch_container(FETCH_CASES[n]))
         elif n in CLIP_CASES and n != "vs_clip_undeclared":
             (work / (n + ".dxbc")).write_bytes(clip_container())
+        elif n in MISC_CASES:
+            (work / (n + ".dxbc")).write_bytes(misc_container(MISC_CASES[n]))
         elif n.startswith("gs_"):
             (work / (n + ".dxbc")).write_bytes(gs_container())
         elif n.startswith("ms_"):

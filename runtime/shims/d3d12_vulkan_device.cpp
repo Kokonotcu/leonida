@@ -667,7 +667,10 @@ struct DeviceState {
     VkPhysicalDeviceMemoryProperties memory{};
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
+    // M8: committed upload buffers live in the arena, whose memory prefers the same; LEONIDA_UPLOAD_SYSMEM=1 keeps
+    // them out of it, in their own system memory (upload_sysmem), with the old VA (a V# cannot reach them).
     bool upload_in_vram = false;
+    bool upload_sysmem = false;
     // D3D-299: the first texture or default-heap buffer that lands outside device-local memory is logged, once.
     mutable std::once_flag spill_logged;
 
@@ -1772,6 +1775,17 @@ struct DeviceState {
                                : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
                                                                        : VK_IMAGE_ASPECT_COLOR_BIT),
             image.first_mip, image.mip_count, image.first_layer, image.layer_count};
+        // A 3D view has one layer; a sliced one's W range goes on its storage view only (below). Its sampled view is
+        // the whole volume, which the translator's reads offset by the T#'s first slice (rdna2spirv.py,
+        // sliced_3d_offset).
+        if (image.type == g::ImageType::image_3d) {
+            view_info.subresourceRange.baseArrayLayer = 0;
+            view_info.subresourceRange.layerCount = 1;
+        }
+        if (image.sliced && (!storage || !info.image_sliced_view_of_3d)) {
+            log_once("a W range of a 3D UAV needs VK_EXT_image_sliced_view_of_3d; first slice", int(image.first_layer));
+            return false;
+        }
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
         leonida::StorageViews views{};
@@ -1780,10 +1794,19 @@ struct DeviceState {
             storage_info.components = {};
             VkImageViewUsageCreateInfo storage_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
             const VkFormat storage_format = uint_backed ? image_format : view_format;
-            if (uint_backed) {
+            // A sliced view may only be used as a storage image (VUID-VkImageViewSlicedCreateInfoEXT-None-07871).
+            const bool storage_only = uint_backed || image.sliced;
+            if (storage_only) {
                 storage_info.format = storage_format;
                 storage_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
                 storage_info.pNext = &storage_usage;
+            }
+            VkImageViewSlicedCreateInfoEXT sliced{VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT};
+            if (image.sliced) {
+                sliced.sliceOffset = image.first_layer;
+                sliced.sliceCount = image.layer_count;
+                sliced.pNext = storage_info.pNext;
+                storage_info.pNext = &sliced;
             }
             if (vk.vkCreateImageView(info.device, &storage_info, nullptr, &entry.storage) != VK_SUCCESS) {
                 vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
@@ -2733,9 +2756,12 @@ public:
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
     const DeviceState& device_state() const { return device_; }
 
-    // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
-    // mapping. Upload and readback buffers keep their own host memory; with buffer device addresses their console
-    // VA is their device address minus heap_base, so a shader's heap_base + VA still lands on them (section 3.3).
+    // Every buffer is a range of the GPU address arena: console VA = offset, zeroed through the arena's host mapping.
+    // Upload and readback buffers too (M8): the arena is host-visible and coherent, so their Map pointer is that
+    // range's mapping, and their VA is an arena offset like any other, which a V# (48 bits), a 32-bit table pointer and
+    // the BVH builder (below 2^40) can all hold (docs/d3d12_vulkan.md section 3.3, "Measured (D3D-53)"). When the arena
+    // has no room for one, it keeps its own memory as before (logged once): its VA is then its device address minus
+    // heap_base, which root descriptors and views resolve but a V# does not.
     HRESULT create_buffer(D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON) {
         auto& vk = device_.context->vk;
         // A buffer has at least one byte, and its size must survive alignment to 64 KiB without wrapping.
@@ -2743,6 +2769,29 @@ public:
         const bool host = cpu_visible();
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
+        if (host && device_.arena.mapped && !(heap_.Type == D3D12_HEAP_TYPE_UPLOAD && device_.upload_sysmem)) {
+            if (device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
+                                       DeviceState::arena_buffer)) {
+                in_arena_ = true;
+                va_ = arena_offset_;
+                mapped_ = device_.arena.mapped + arena_offset_;
+                std::memset(mapped_, 0, std::size_t(desc_.Width));  // committed resources start zeroed
+                memory_flags_ = device_.memory.memoryTypes[device_.arena.memory_type].propertyFlags;
+                binding.va = va_;
+                binding.buffer = device_.arena.buffer;
+                binding.buffer_offset = arena_offset_;
+                // Upload (and CPU-written custom) bytes are inputs host_at() may read; readback bytes are GPU-written.
+                binding.host = cpu_writable() ? static_cast<const std::uint8_t*>(mapped_) : nullptr;
+                binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+                                         (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                                          heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
+                device_.context->add_resource(id(), binding);
+                return S_OK;
+            }
+            log_once("GPU address arena full: an upload or readback buffer keeps its own memory, so a V# cannot "
+                     "reach it (raise LEONIDA_ARENA_MB); size in KiB:",
+                     int(desc_.Width / 1024));
+        }
         if (!host && device_.arena.mapped) {
             if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
                                         DeviceState::arena_buffer)) {
@@ -4981,12 +5030,13 @@ public:
             graphics_.pipeline = VK_NULL_HANDLE;
             graphics_.shader_objects = {shaders.vertex, shaders.geometry, shaders.fragment, shaders.mesh};
             graphics_.bind_shaders = [fn, shaders, recipe, device_stages, conservative](
-                                         VkCommandBuffer cb, const VkViewport& viewport, const VkRect2D& scissor,
-                                         const VkDeviceSize* strides, std::uint32_t stride_count) {
+                                         VkCommandBuffer cb, const VkViewport* viewports, const VkRect2D* scissors,
+                                         std::uint32_t viewport_count, const VkDeviceSize* strides,
+                                         std::uint32_t stride_count) {
                 leonida::shader_objects::bind(*fn, cb, shaders, device_stages);
                 leonida::shader_objects::emit_state(*fn, cb, *recipe, conservative, strides, stride_count);
-                fn->vkCmdSetViewportWithCount(cb, 1, &viewport);
-                fn->vkCmdSetScissorWithCount(cb, 1, &scissor);
+                fn->vkCmdSetViewportWithCount(cb, viewport_count, viewports);
+                fn->vkCmdSetScissorWithCount(cb, viewport_count, scissors);
             };
         } else {
             if (gpl_) {
@@ -5420,6 +5470,9 @@ struct TextureView {
     UINT mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     UINT plane = 0;
     float min_lod = 0.0f;
+    // A 3D UAV's W range at its mip (FirstWSlice, WSize; ~0: to the last slice). All slices: a plain 3D view.
+    UINT first_w = 0;
+    UINT w_count = ~0u;
 };
 
 // In-memory pipeline library (docs/d3d12_vulkan.md sections 3.6 and 4). D3D12 cached blobs are driver-specific
@@ -6009,6 +6062,21 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         log_once("view of no mips or no layers; type", int(view.type));
         return false;
     }
+    if (volume) {
+        // A W range of the view's mip (a RWTexture3D UAV): all of it is a plain 3D view, part of it a sliced one
+        // (gfx10::Image::sliced; VK_EXT_image_sliced_view_of_3d in bind_image).
+        const UINT slices = std::max<UINT>(1, UINT(desc.DepthOrArraySize) >> view.first_mip);
+        if (view.first_w >= slices) {
+            log_once("3D view starts past the slices of its mip; first slice", int(view.first_w));
+            return false;
+        }
+        const UINT count = std::min<UINT>(view.w_count, slices - view.first_w);
+        if (view.first_w || count != slices) {
+            out.sliced = true;
+            out.first_layer = view.first_w;
+            out.layer_count = count;
+        }
+    }
     // D3D12's component mapping picks, for each of R, G, B, A, a channel of the format or a constant; the T#
     // says the same about the hardware's channels, which the format places.
     // A stencil view's format has its eight bits in G and no R, B or A of its own (0, 0, 1 when read).
@@ -6175,6 +6243,26 @@ private:
     bool registered_ = false;            // added to the context, so removed from it on destruction
 };
 
+// The arena ranges command allocators sub-allocate GPU data from (the compute root spill arrays, M10). An allocator
+// holds a reference to its device, so the device's state outlives every range taken here.
+class DeviceArenaPages final : public ArenaPages {
+public:
+    explicit DeviceArenaPages(DeviceState& state) : state_(state) {}
+    bool allocate(std::uint64_t bytes, std::uint64_t& va, std::uint8_t*& host) override {
+        VkDeviceSize offset = 0;
+        if (!state_.arena.mapped || !state_.arena_allocate(bytes, 256, offset, DeviceState::arena_buffer)) return false;
+        va = offset;
+        host = state_.arena.mapped + offset;
+        return true;
+    }
+    void release(std::uint64_t va, std::uint64_t bytes) override {
+        state_.arena_release(va, bytes, DeviceState::arena_buffer);
+    }
+
+private:
+    DeviceState& state_;
+};
+
 // The Vulkan device create_vulkan_device_standalone made, destroyed with the D3D12 device. The instance belongs to
 // the process and is never destroyed (create_vulkan_device_standalone).
 struct OwnedRuntime {
@@ -6199,6 +6287,10 @@ public:
         if (const char* v = std::getenv("LEONIDA_CONSOLE_HEAP_VA"); v && v[0] == '1')
             rt::d3d12_xs::set_console_descriptor_heap_handler(&create_console_descriptor_heap);
         state_.info = info;
+        // The translated shader index (26k entries for the retail corpus) is read off the title's thread from now
+        // on: read cold at the first pipeline it outlasted the retail watchdog (about 30 s; PR #8134's boot runs).
+        // library() is locked, so a pipeline that comes first waits only for what is left of the read.
+        library_preload_ = std::thread([this] { state_.library(); });
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
@@ -6245,6 +6337,7 @@ public:
             size_t length = 0;
             const bool sysmem = getenv_s(&length, text, "LEONIDA_UPLOAD_SYSMEM") == 0 && length > 1 && text[0] != '0';
             state_.upload_in_vram = leonida::resizable_bar(state_.memory) && !sysmem;
+            state_.upload_sysmem = sysmem;
             std::fprintf(stderr, "[rt] d3d12: upload heaps in %s\n",
                          state_.upload_in_vram ? "VRAM (DEVICE_LOCAL | HOST_VISIBLE, Resizable BAR)"
                          : sysmem             ? "system memory (LEONIDA_UPLOAD_SYSMEM)"
@@ -6330,6 +6423,7 @@ public:
         }
         state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count,
                                               info.max_draw_indirect_count ? info.max_draw_indirect_count : UINT32_MAX);
+        state_.context->set_max_viewports(info.max_viewports);
         if (info.indirect_commands && info.buffer_device_address)
             state_.context->enable_indirect_commands(get_device, info.indirect_properties,
                                                      [this](const VkMemoryRequirements& requirements) {
@@ -6692,10 +6786,12 @@ public:
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
+        arena_pages_ = std::make_shared<DeviceArenaPages>(state_);
         return true;
     }
 
     ~Device() override {
+        if (library_preload_.joinable()) library_preload_.join();
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
@@ -6994,7 +7090,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandAllocator";
-        return d3d12_trace::result(method, create_command_allocator(type, riid, out, identity()));
+        return d3d12_trace::result(method, create_command_allocator(type, riid, out, identity(), arena_pages_));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandList(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
@@ -7019,7 +7115,7 @@ public:
             return d3d12_trace::result(method, E_INVALIDARG);
         if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         ID3D12CommandAllocator* allocator = nullptr;
-        HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity());
+        HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity(), arena_pages_);
         if (FAILED(hr)) return d3d12_trace::result(method, hr);
         ID3D12GraphicsCommandList* list = nullptr;
         hr = create_command_list(type, allocator, IID_PPV_ARGS(&list), identity());
@@ -7349,9 +7445,8 @@ public:
             std::memcpy(&container_size, bytes + 24, sizeof(container_size));
             if (container_size != size) return E_INVALIDARG;
         }
-        // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then pack
-        // the parameters into the 32 user-data dwords. pack() refuses what it cannot place (more than 32 dwords:
-        // the console spills those to memory, in a layout that is still open), and so does this.
+        // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then lay the
+        // parameters out in the user-data dwords and, for compute, the spill array (pack_stage, below).
         const rt::rootsig::DecodeResult parsed = rt::rootsig::parse_rts0(bytes, size);
         if (!parsed.ok) {
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
@@ -7359,8 +7454,10 @@ public:
         }
         // Two layouts, one per bind point (RootArgumentLayout), both the console's (pack_stage, D3D-448): graphics
         // from s8 (the vertex, pixel and geometry stages), compute from s4. A signature that breaks a D3D12 limit is
-        // refused. One that is valid but would spill at a bind point (the console's spill array is not modelled) is
-        // created, as on the console, and marked unusable there: binding it there invalidates the list, loudly.
+        // refused. A compute spill of constants and root descriptors goes to the console's spill array behind s[0:1]
+        // (M10). One that is valid but would spill where that is not modelled (any graphics spill; a table or heap
+        // base in the compute spill) is created, as on the console, and marked unusable there: binding it there
+        // invalidates the list, loudly.
         const rt::rootsig::StagePackResult packed = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Pixel);
         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
         if ((!packed.ok && !packed.spills) || (!compute.ok && !compute.spills)) {
@@ -7382,6 +7479,7 @@ public:
         if (compute.ok) {
             layout.compute_resource_heap_sgpr = compute.resource_heap_sgpr;
             layout.compute_sampler_heap_sgpr = compute.sampler_heap_sgpr;
+            layout.compute_spill_bytes = compute.spill_bytes;
         }
         if (packed.ok) {
             layout.graphics_resource_heap_sgpr = packed.resource_heap_sgpr;
@@ -8050,7 +8148,10 @@ public:
         view.mip_count = 1;
         if (!desc) {
             const bool array = r->desc().DepthOrArraySize > 1;
-            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
+            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                view.type = leonida::gfx10::ImageType::image_3d;  // mip 0, every slice
+                view.layer_count = 1;
+            } else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
                 view.type = leonida::gfx10::ImageType::image_1d;
                 view.layer_count = 1;
             } else if (array)
@@ -8074,6 +8175,14 @@ public:
                 view.first_layer = desc->Texture2DArray.FirstArraySlice;
                 view.layer_count = desc->Texture2DArray.ArraySize;
                 view.plane = desc->Texture2DArray.PlaneSlice;
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE3D:
+                // One mip; all its slices, or the W range FirstWSlice..+WSize (WSize ~0: to the last).
+                view.type = leonida::gfx10::ImageType::image_3d;
+                view.first_mip = desc->Texture3D.MipSlice;
+                view.layer_count = 1;
+                view.first_w = desc->Texture3D.FirstWSlice;
+                view.w_count = desc->Texture3D.WSize;
                 break;
             default:
                 log_once("unordered-access view dimension not supported:", desc->ViewDimension);
@@ -10170,6 +10279,9 @@ private:
     std::vector<std::uint32_t> compute_users_;
     std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
+    std::thread library_preload_;  // state_.library() at creation (see the constructor)
+    // What the command allocators take spill arrays from (DeviceArenaPages); null without an arena.
+    std::shared_ptr<ArenaPages> arena_pages_;
     std::atomic<bool> removed_{false};
     DeviceRemovedData dred_;
     OwnedRuntime owned_;
@@ -10278,6 +10390,19 @@ VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource) {
 VkBuffer vulkan_buffer(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
     return r ? r->buffer() : VK_NULL_HANDLE;
+}
+
+bool vulkan_buffer_range(ID3D12Resource* resource, VkBuffer& buffer, VkDeviceSize& offset) {
+    Resource* r = Resource::from<Resource>(resource);
+    if (!r || r->image()) return false;
+    if (r->buffer()) {
+        buffer = r->buffer();
+        offset = 0;
+        return true;
+    }
+    buffer = r->device_state().arena.buffer;  // an arena range: its offset is its console VA
+    offset = r->GetGPUVirtualAddress();
+    return buffer != VK_NULL_HANDLE;
 }
 
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
@@ -10979,6 +11104,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 has_gpl = true;
             } else if (!std::strcmp(e.extensionName, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
                 has_pipeline_library = true;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME)) {
+                VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT sliced{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT};
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &sliced};
+                vkGetPhysicalDeviceFeatures2(info.physical, &features);
+                info.image_sliced_view_of_3d = sliced.imageSlicedViewOf3D == VK_TRUE;
             }
         }
         // docs/aot_pipelines.md step 3: graphics PSOs linked from per-shader pipeline libraries, where shader objects
@@ -11056,6 +11187,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         std::fprintf(stderr, "[rt] d3d12: graphics PSOs are linked from pipeline libraries%s (docs/aot_pipelines.md; "
                              "LEONIDA_GPL=0 builds them whole)\n",
                      info.gpl_fast_linking ? "" : " without fast linking (LEONIDA_GPL=1)");
+    }
+    VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT enable_sliced{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT};
+    enable_sliced.imageSlicedViewOf3D = VK_TRUE;
+    if (info.image_sliced_view_of_3d) {  // RWTexture3D UAVs of a W range
+        enable_sliced.pNext = ext_chain;
+        ext_chain = &enable_sliced;
     }
     if (info.ray_tracing) {
         enable_rq.pNext = ext_chain;
@@ -11343,6 +11481,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
     enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
+    // M4: up to D3D12's 16 viewports per draw, picked by SV_ViewportArrayIndex (cascaded shadow maps).
+    enable.multiViewport = chosen_features.multiViewport;
+    info.max_viewports = chosen_features.multiViewport
+                             ? std::min<std::uint32_t>(chosen.limits.maxViewports,
+                                                       D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+                             : 1;
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, image stores
     // without a format (StorageImageWriteWithoutFormat), gather offsets (ImageGatherExtended) and LOD-clamped samples
@@ -11497,6 +11641,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
         device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
     }
+    if (info.image_sliced_view_of_3d) device_extensions.push_back(VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME);
     if (info.buffer_marker) device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
 #if defined(VK_EXT_device_fault)
     if (info.device_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);

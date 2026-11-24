@@ -467,24 +467,42 @@ int main() {
               "pack_stage: a heap base that does not fit is refused and named");
     }
 
-    // pack_stage refuses a spill instead of truncating: compute has 28 SGPRs above s4, mesh 16 above s16.
+    // Compute has 28 SGPRs above s4; what does not fit goes to the spill array behind s[0:1] (M10, section 7):
+    // packed in root order, no alignment, 4 bytes per constant, 8 per root descriptor, its dwords numbered from
+    // kMaxUserSgprs. A graphics spill (mesh has 16 SGPRs above s16) is refused instead of truncated.
     {
         RootSignature exact;
         exact.params = {consts(28)};
-        check(pack_stage(exact, Stage::Compute).ok, "pack_stage: 28 constants fill compute exactly");
+        const StagePackResult e = pack_stage(exact, Stage::Compute);
+        check(e.ok && e.spill_bytes == 0 && e.end_sgpr == 32, "pack_stage: 28 constants fill compute exactly");
         RootSignature over;
-        over.params = {consts(27), view()};  // the view would need s31..s32
+        over.params = {consts(27), view(), consts(3)};  // the view would need s31..s32
         const StagePackResult r = pack_stage(over, Stage::Compute);
-        check(!r.ok && r.first_sgpr.empty() && r.error.find("root parameter 1") != std::string::npos &&
-                  r.error.find("spill") != std::string::npos && r.spills,
-              "pack_stage: a parameter that does not fit whole is refused and named");
-        // The same signature fits the graphics stages from s8 only up to 24 SGPRs: a spill there too, still valid.
+        check(r.ok && !r.spills && r.first_sgpr.size() == 3 && r.first_sgpr[0] == 4 &&
+                  r.first_sgpr[1] == kMaxUserSgprs && r.first_sgpr[2] == kMaxUserSgprs + 2 && r.spill_bytes == 20 &&
+                  r.end_sgpr == 31 && is_spill_dword(r.first_sgpr[1]) && !is_spill_dword(r.first_sgpr[0]),
+              "pack_stage: the parameter that does not fit and the ones after it go to the compute spill array");
+        // The same signature fits the graphics stages from s8 only up to 24 SGPRs: a spill there, refused.
         const StagePackResult g = pack_stage(over, Stage::Pixel);
-        check(!g.ok && g.spills, "pack_stage: a valid signature that spills from s8 is marked as a spill");
+        check(!g.ok && g.spills && g.first_sgpr.empty() && g.error.find("root parameter 0") != std::string::npos &&
+                  g.error.find("not measured") != std::string::npos,
+              "pack_stage: a valid signature that spills from s8 is refused, as a spill, and named");
         RootSignature fits_old;
-        fits_old.params = {consts(30)};  // fits pack()'s 32 from s0, not 28 from s4
-        check(pack(fits_old).ok && !pack_stage(fits_old, Stage::Compute).ok,
-              "pack_stage: compute budget is 28, not 32");
+        fits_old.params = {consts(30)};  // fits pack()'s 32 from s0, not 28 from s4: the whole parameter spills
+        const StagePackResult f = pack_stage(fits_old, Stage::Compute);
+        check(pack(fits_old).ok && f.ok && f.first_sgpr[0] == kMaxUserSgprs && f.spill_bytes == 120 &&
+                  f.end_sgpr == 4,
+              "pack_stage: compute budget is 28, not 32; the rest spills");
+        RootSignature spilled_table;
+        spilled_table.params = {consts(28), table()};
+        const StagePackResult t = pack_stage(spilled_table, Stage::Compute);
+        check(!t.ok && t.spills && t.error.find("descriptor table") != std::string::npos,
+              "pack_stage: a descriptor table in the compute spill is refused (its size there is not measured)");
+        RootSignature spilled_heap = over;
+        spilled_heap.flags = kFlagResourceHeapDirectlyIndexed;
+        const StagePackResult h = pack_stage(spilled_heap, Stage::Compute);
+        check(!h.ok && h.spills && h.error.find("heap base") != std::string::npos,
+              "pack_stage: a heap base after a compute spill is refused (its place is not measured)");
         RootSignature tables;
         tables.params.assign(20, table());  // one dword each: compute s4..s23; pack() needs 40
         check(pack_stage(tables, Stage::Compute).ok && !pack(tables).ok,

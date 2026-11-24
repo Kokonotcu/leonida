@@ -175,7 +175,10 @@ class LoadOnlyShaders(unittest.TestCase):
                     self.assertEqual(mask, "Lod")
                     op, coords = m.defs[xyz]
                     self.assertEqual((op, coords[0]), ("OpCompositeConstruct", "%v3int"))
-                    self.assertEqual([m.integer_coord_vgpr(v) for v in [*coords[1:], lod]], [4, 5, 6, 7])
+                    # z gets a W-range view's first slice (docs/design.md, "W-range 3D UAVs"): z + offset.
+                    z_op, z_add = m.defs[coords[3]]
+                    self.assertEqual(z_op, "OpIAdd")
+                    self.assertEqual([m.integer_coord_vgpr(v) for v in [*coords[1:3], z_add[1], lod]], [4, 5, 6, 7])
                 for fmt, kind in ((75, "uint"), (76, "sint"), (77, "float")):  # RGBA32 formats
                     self.assertEqual(m.branch(fmt << 20, 1), kind)
                     self.assertEqual(m.branch(fmt << 20, 0), "float")

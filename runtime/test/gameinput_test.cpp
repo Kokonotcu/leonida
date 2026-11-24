@@ -651,6 +651,38 @@ void test_motion(IGameInput* input) {
     check(input->GetCurrentReading(GameInputKindGamepad, mdev, &r) == S_OK && r && !r->GetMotionState(nullptr) &&
               (r->GetInputKind() & GameInputKindMotion),
           "motion: GetMotionState(nullptr) is false; the gyro pad's reading kind includes Motion");
+
+    // Review B14: the plain pad's held button stays the current gamepad reading although the idle gyro pad keeps
+    // streaming motion readings; a motion query still takes the gyro pad's newest reading.
+    {
+        if (r) r->Release();
+        r = nullptr;
+        SDL_SetJoystickVirtualButton(plain.js, SDL_GAMEPAD_BUTTON_EAST, true);
+        rt::gameinput::poll();
+        for (int i = 0; i < 4; ++i) {  // motion ticks: one reading each from the gyro pad, nothing else changes
+            send_motion(gyro_pad, 0.0f, 0.0f, 9.80665f, 1.0f + i, 0.0f, 0.0f);
+            Sleep(12);
+            rt::gameinput::poll();
+        }
+        IGameInputDevice* owner = nullptr;
+        const bool got_pad = input->GetCurrentReading(GameInputKindGamepad, nullptr, &r) == S_OK && r;
+        if (r) r->GetDevice(&owner);
+        check(got_pad && owner == pdev && (buttons_of(r) & GameInputGamepadB),
+              "motion: an idle pad streaming motion does not hide another pad's held button (kind Gamepad)");
+        if (owner) owner->Release();
+        if (r) r->Release();
+        r = nullptr;
+        owner = nullptr;
+        const bool got_motion = input->GetCurrentReading(GameInputKindMotion, nullptr, &r) == S_OK && r;
+        if (r) r->GetDevice(&owner);
+        check(got_motion && owner == mdev, "motion: kind Motion with no device takes the gyro pad's newest reading");
+        if (owner) owner->Release();
+        if (r) r->Release();
+        r = nullptr;
+        SDL_SetJoystickVirtualButton(plain.js, SDL_GAMEPAD_BUTTON_EAST, false);
+        rt::gameinput::poll();
+        check(input->GetCurrentReading(GameInputKindGamepad, mdev, &r) == S_OK && r, "motion: gyro pad reading again");
+    }
     if (r) r->Release();
     unused = {};
     check(input->GetCurrentReading(GameInputKindGamepad, pdev, &r) == S_OK && r &&
@@ -1147,6 +1179,9 @@ void test_aggregate_device(IGameInput* input) {
               "aggregate device reports supportedInput == GameInputKindGamepad");
         check(agg->GetDeviceStatus() == GameInputDeviceConnected,
               "aggregate device status is GameInputDeviceConnected");
+        check(info && info->infoSize == sizeof(GameInputDeviceInfo) && info->gamepadInfo && info->uiNavigationInfo &&
+                  std::memcmp(&info->deviceRootId, &info->deviceId, sizeof info->deviceId) == 0,
+              "aggregate device info is a full block: infoSize, gamepad and UI-navigation info, root id");
 
         IGameInputDevice* agg2 = nullptr;
         check(input->CreateAggregateDevice(GameInputKindGamepad, &agg2) == S_OK && agg2 == agg,
@@ -2101,6 +2136,16 @@ int main() {
     check(g_device_events.back().device == dev && (g_device_events.back().current & GameInputDeviceConnected),
           "the same pad plugged back in is the same device object");
     check(xbox2.player == 0, "it takes the free player slot 0");
+    // Review D8: the info block a title got before the reconnect stays as it was (it may still be reading it, or keep
+    // a pointer into it); the reconnected pad publishes a new block with the same description.
+    {
+        const GameInputDeviceInfo* again = dev->GetDeviceInfo();
+        check(again != info && info->controllerAxisCount == again->controllerAxisCount &&
+                  info->controllerAxisInfo != again->controllerAxisInfo &&
+                  info->controllerAxisInfo[0].restValue == again->controllerAxisInfo[0].restValue &&
+                  std::memcmp(&info->deviceId, &again->deviceId, sizeof info->deviceId) == 0,
+              "a reconnect publishes a new info block and leaves the one a title holds intact");
+    }
 
     // Async enumeration delivers on the next poll; unregistering stops callbacks.
     std::vector<DeviceEvent> before = g_device_events;
@@ -2113,6 +2158,36 @@ int main() {
     for (size_t i = before.size(); i < g_device_events.size(); ++i) async_events += g_device_events[i].token == async_token;
     check(async_events == 2, "async enumeration reports both connected pads to the new callback only");
 
+    // Review B14: unregistering a callback that is running on another thread waits for it at most the timeout. A
+    // title thread that holds a lock the running callback waits for would otherwise deadlock.
+    {
+        static HANDLE s_entered = nullptr, s_release = nullptr;
+        s_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        s_release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        GameInputReadingCallback blocking = [](GameInputCallbackToken, void*, IGameInputReading*, bool) {
+            SetEvent(s_entered);
+            WaitForSingleObject(s_release, 10000);  // stands for a lock the unregistering thread holds
+        };
+        GameInputCallbackToken blocking_token = 0;
+        check(input->RegisterReadingCallback(nullptr, GameInputKindGamepad, 0.0f, nullptr, blocking, &blocking_token) ==
+                  S_OK,
+              "register a callback that blocks");
+        SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_NORTH, true);
+        std::thread poller([] { rt::gameinput::poll(); });  // delivers on this thread: no dispatcher
+        const bool entered = WaitForSingleObject(s_entered, 5000) == WAIT_OBJECT_0;
+        const auto start = std::chrono::steady_clock::now();
+        const bool unregistered = input->UnregisterCallback(blocking_token, 50'000);
+        const auto waited = std::chrono::steady_clock::now() - start;
+        SetEvent(s_release);
+        poller.join();
+        check(entered && !unregistered && waited < std::chrono::seconds(2),
+              "UnregisterCallback of a running callback returns false once its timeout has passed, instead of waiting");
+        check(!input->UnregisterCallback(blocking_token, 0), "and the callback is gone all the same");
+        SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_NORTH, false);
+        rt::gameinput::poll();
+        CloseHandle(s_entered);
+        CloseHandle(s_release);
+    }
     check(input->UnregisterCallback(reading_token, 0), "UnregisterCallback");
     check(!input->UnregisterCallback(reading_token, 0), "a second UnregisterCallback returns false");
     const int after_unregister = g_reading_events;

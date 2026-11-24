@@ -51,7 +51,20 @@ HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out,
                              IUnknown* device = nullptr, const QueueClock& clock = {},
                              std::shared_ptr<void> queue_lease = {});
-HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr);
+// Host-visible ranges of the GPU address arena a command allocator sub-allocates per-command GPU data from (the
+// compute root spill arrays, M10), so a shader reaches them by console VA (the arena offset).
+class ArenaPages {
+public:
+    virtual ~ArenaPages() = default;
+    // `bytes` of the arena: its console VA and host mapping (host-coherent). False when the arena has no room.
+    virtual bool allocate(std::uint64_t bytes, std::uint64_t& va, std::uint8_t*& host) = 0;
+    virtual void release(std::uint64_t va, std::uint64_t bytes) = 0;
+};
+
+// `pages` (optional): where the allocator's lists put the GPU data their commands read; without it a dispatch that
+// needs such data (a compute root spill) invalidates its list.
+HRESULT create_command_allocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out, IUnknown* device = nullptr,
+                                 std::shared_ptr<ArenaPages> pages = {});
 HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator* allocator, REFIID riid,
                             void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
@@ -161,6 +174,9 @@ struct VulkanDeviceInfo {
     // pipelineCreationCacheControl is enabled: a linked PSO first asks the pipeline cache for its optimised link
     // (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) before it fast-links.
     bool pipeline_creation_cache_control = false;
+    // VK_EXT_image_sliced_view_of_3d and imageSlicedViewOf3D are enabled: a RWTexture3D UAV of a W range (FirstWSlice,
+    // WSize short of the whole mip) gets a sliced 3D storage view. Without it such a view is refused (logged).
+    bool image_sliced_view_of_3d = false;
     bool tessellation_shader = false;  // tessellationShader enabled: a shader-object draw binds those stages to null
     // Opt in only for shader libraries whose InnerCoverage input contract uses FullyCoveredEXT. The device
     // still checks physical Tier 2 and fullyCoveredFragmentShaderInputVariable properties. The standalone
@@ -232,6 +248,9 @@ struct VulkanDeviceInfo {
     // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).
     bool shader_output_layer = false;
     bool shader_output_viewport_index = false;
+    // multiViewport enabled: the viewports a draw may bind for SV_ViewportArrayIndex (maxViewports, at most D3D12's
+    // 16). 1 without it: a draw after RSSetViewports with more uses the first, as before M4.
+    std::uint32_t max_viewports = 1;
     // The translator's output folder for pipeline creation. An empty value uses LEONIDA_SHADERS or the packaged path.
     std::string shader_dir;
     // VK_EXT_custom_border_color (with customBorderColors and customBorderColorWithoutFormat) is enabled on
@@ -293,8 +312,11 @@ HRESULT create_console_descriptor_heap(ID3D12Device* device, const D3D12_DESCRIP
 
 // The VkImage behind a texture created by such a device, or VK_NULL_HANDLE. For tests and the swapchain.
 VkImage vulkan_image(ID3D12Resource* resource);
-// The VkBuffer behind a buffer created by such a device, or VK_NULL_HANDLE. For tests.
+// The VkBuffer of its own behind a buffer created by such a device, or VK_NULL_HANDLE: a buffer that is a range of the
+// GPU address arena (default, upload and readback buffers, placed ones) has none. For tests.
 VkBuffer vulkan_buffer(ID3D12Resource* resource);
+// The VkBuffer that holds a buffer and where in it the buffer starts (its own at 0, or the arena at its VA). For tests.
+bool vulkan_buffer_range(ID3D12Resource* resource, VkBuffer& buffer, VkDeviceSize& offset);
 // What a device from create_vulkan_device* was created with (enabled features included), or null. For tests.
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device);
 // True when `device` has VK_KHR_acceleration_structure + VK_KHR_ray_query enabled.
@@ -507,6 +529,10 @@ struct RootArgumentLayout {
     std::uint32_t graphics_sampler_heap_sgpr = rt::rootsig::kNoSgpr;
     // Graphics: one past the last user SGPR the arguments and heap bases take from s8 (the pixel stage's user count).
     std::uint32_t graphics_end_sgpr = 0;
+    // Compute: the bytes of the console's spill array (M10, rt::rootsig::pack_stage), 0 when nothing spills. A
+    // compute_offset at kMaxUserSgprs or above is then a dword of that array; each dispatch gets its own copy in the
+    // GPU address arena, from its command allocator, and s[0:1] its 40-bit VA.
+    std::uint32_t compute_spill_bytes = 0;
     bool graphics_ok = true;
     bool compute_ok = true;
 };

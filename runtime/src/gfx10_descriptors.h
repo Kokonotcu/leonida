@@ -108,6 +108,9 @@ struct Image {
     std::uint32_t samples = 1;        // a power of two
     Swizzle swizzle = identity_swizzle;
     float min_lod = 0.0f;             // the view's LOD clamp, 0..15 in steps of 1/256 (D3D12 ResourceMinLODClamp)
+    // 3D only: the view is a W range of its mip's slices (a D3D12 RWTexture3D UAV's FirstWSlice/WSize),
+    // first_layer..first_layer + layer_count - 1. Shader coordinates are relative to first_layer.
+    bool sliced = false;
     bool operator==(const Image&) const = default;
 };
 
@@ -119,6 +122,8 @@ struct Image {
 //   WORD4  DEPTH [12:0] = depth - 1 for 3D, else the last layer; BASE_ARRAY [28:16] = the first layer
 //   WORD5  MAX_MIP [7:4] = resource mips - 1
 // A multisampled image has BASE_LEVEL 0 and log2(samples) in LAST_LEVEL and MAX_MIP.
+// A sliced 3D view (Image::sliced) is RADV's GFX10 form of VK_EXT_image_sliced_view_of_3d: DEPTH = the last slice,
+// BASE_ARRAY = the first, and ARRAY_PITCH [3:0] of WORD5 = 1. The volume's own depth is then not in the T#.
 inline ImageWords encode(const Image& image) {
     using detail::field;
     const bool msaa = multisampled(image.type);
@@ -126,8 +131,9 @@ inline ImageWords encode(const Image& image) {
     const std::uint32_t base_level = msaa ? 0 : image.first_mip;
     const std::uint32_t last_level = msaa ? sample_log2 : image.first_mip + image.mip_count - 1;
     const std::uint32_t max_mip = msaa ? sample_log2 : image.resource_mips - 1;
-    const std::uint32_t last =
-        image.type == ImageType::image_3d ? image.depth - 1 : image.first_layer + image.layer_count - 1;
+    const bool sliced = image.type == ImageType::image_3d && image.sliced;
+    const std::uint32_t last = image.type == ImageType::image_3d && !sliced ? image.depth - 1
+                                                                            : image.first_layer + image.layer_count - 1;
     const std::uint64_t units = image.address >> 8;
     const std::uint32_t width = image.width - 1, height = image.height - 1;
     ImageWords words{};
@@ -139,7 +145,7 @@ inline ImageWords encode(const Image& image) {
                field(image.swizzle[3], 9, 3) | field(base_level, 12, 4) | field(last_level, 16, 4) |
                field(std::uint32_t(image.type), 28, 4);
     words[4] = field(last, 0, 13) | field(image.first_layer, 16, 13);
-    words[5] = field(max_mip, 4, 4);
+    words[5] = field(sliced ? 1u : 0u, 0, 4) | field(max_mip, 4, 4);
     return words;
 }
 
@@ -178,7 +184,12 @@ inline bool decode(const ImageWords& words, Image& out) {
 
     const std::uint32_t last = get(words[4], 0, 13);
     image.first_layer = get(words[4], 16, 13);
-    if (image.type == ImageType::image_3d) {
+    if (image.type == ImageType::image_3d && get(words[5], 0, 4) == 1) {
+        if (last < image.first_layer) return false;
+        image.sliced = true;
+        image.layer_count = last - image.first_layer + 1;
+        image.depth = last + 1;  // the least the volume can be: the T# does not carry its depth
+    } else if (image.type == ImageType::image_3d) {
         image.depth = last + 1;
     } else {
         if (last < image.first_layer) return false;

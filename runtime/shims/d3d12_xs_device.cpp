@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <functional>
 #include <cerrno>
 #include <cstddef>
@@ -2707,21 +2708,59 @@ HRESULT proxy_create_command_signature(DeviceProxy* self, const D3D12_COMMAND_SI
 // CreateSampler's two arguments. Measured on the retail title's boot (stop 20 in #6910's RT-5 measurements): the
 // title calls it once per sampler after its descriptor heaps exist, and it goes on when the call is served by the PC
 // CreateSampler. The PC slot 61 is CreateMetaCommand, which would take these words as (CommandId, NodeMask, ...).
-// HYPOTHESIS: the console description begins with the PC D3D12_SAMPLER_DESC (52 bytes), which is what got the title
-// past this call; whatever follows it is not known and not read. The title was not seen testing a result, so a null
-// description is skipped rather than reported. The handle is passed as given: a handle in the title's own heap range
-// is #7021's translation.
-void proxy_create_sampler_x(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, std::uint64_t dest) {
+// The description is the console's own 0x54-byte one, not the PC D3D12_SAMPLER_DESC (that was the earlier hypothesis:
+// the call is accepted either way, but read as a PC desc every field lands on the wrong word, the min filter as
+// AddressU and the reduction as MaxAnisotropy). Its fields as PR #8134 read them from the retail code that builds it
+// (RVA 0x12b96b0, called through 0x12b9800), not from a header:
+//   +0x04 min, +0x08 mag, +0x0c mip filter (1 = point, 2 = linear), +0x10 a fourth filter word (unused here),
+//   +0x14 reduction (0 standard, 1 comparison, 2 minimum, 3 maximum), +0x18/+0x1c/+0x20 address U/V/W,
+//   +0x24 MinLOD, +0x28 MaxLOD, +0x30 MipLODBias, +0x34 MaxAnisotropy, +0x40 ComparisonFunc, +0x44 border (float4).
+// ASSUMPTION (as there): these encodings are the PC enums' values; anything out of the PC's range is clamped (address
+// to WRAP, comparison to NEVER). The title was not seen testing a result, so a null description is skipped. The
+// destination is translated like slots 17-24's: a sampler heap the title backs has its own address range.
+void proxy_create_sampler_x(DeviceProxy* self, const std::uint8_t* x, std::uint64_t dest) {
     note_slot(61);
-    if (!desc) {
+    if (!x) {
         static std::atomic<bool> logged{false};
         if (!logged.exchange(true, std::memory_order_relaxed))
             std::fprintf(stderr, "[rt] d3d12_xs: slot 61 CreateSamplerX without a description (skipped)\n");
         return;
     }
+    const auto u32 = [&](std::size_t o) { std::uint32_t v; std::memcpy(&v, x + o, 4); return v; };
+    const auto f32 = [&](std::size_t o) { float v; std::memcpy(&v, x + o, 4); return v; };
+    const auto filter_type = [](std::uint32_t v) {
+        return v >= 2 ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+    };
+    const auto address = [](std::uint32_t v) {
+        return v >= 1 && v <= 5 ? static_cast<D3D12_TEXTURE_ADDRESS_MODE>(v) : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    };
+    const std::uint32_t reduction_word = u32(0x14);
+    const auto reduction = static_cast<D3D12_FILTER_REDUCTION_TYPE>(reduction_word <= 3 ? reduction_word : 0);
+    D3D12_SAMPLER_DESC desc{};
+    desc.MaxAnisotropy = std::clamp<UINT>(u32(0x34), 1, 16);
+    desc.Filter = desc.MaxAnisotropy > 1 ? D3D12_ENCODE_ANISOTROPIC_FILTER(reduction)
+                                         : D3D12_ENCODE_BASIC_FILTER(filter_type(u32(0x04)), filter_type(u32(0x08)),
+                                                                     filter_type(u32(0x0c)), reduction);
+    desc.AddressU = address(u32(0x18));
+    desc.AddressV = address(u32(0x1c));
+    desc.AddressW = address(u32(0x20));
+    desc.MipLODBias = std::isfinite(f32(0x30)) ? std::clamp(f32(0x30), -16.0f, 15.99f) : 0.0f;
+    const std::uint32_t cmp = u32(0x40);
+    desc.ComparisonFunc = cmp >= 1 && cmp <= 8 ? static_cast<D3D12_COMPARISON_FUNC>(cmp) : D3D12_COMPARISON_FUNC_NEVER;
+    for (int i = 0; i < 4; ++i) desc.BorderColor[i] = f32(0x44 + 4 * i);
+    desc.MinLOD = std::isfinite(f32(0x24)) ? f32(0x24) : 0.0f;
+    desc.MaxLOD = std::isnan(f32(0x28)) ? D3D12_FLOAT32_MAX : f32(0x28);
+    if (desc.MaxLOD < desc.MinLOD) desc.MaxLOD = desc.MinLOD;
     D3D12_CPU_DESCRIPTOR_HANDLE handle{};
     handle.ptr = static_cast<SIZE_T>(dest);
-    self->real->CreateSampler(desc, handle);
+    self->real->CreateSampler(&desc, translate_cpu_handle(self, handle));
+    static std::atomic<unsigned> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 12)
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot 61 sampler: filters %u/%u/%u reduction %u address %u/%u/%u lod %g..%g bias %g "
+                     "aniso %u cmp %u -> filter 0x%x\n",
+                     u32(0x04), u32(0x08), u32(0x0c), reduction_word, u32(0x18), u32(0x1c), u32(0x20), f32(0x24),
+                     f32(0x28), f32(0x30), u32(0x34), cmp, static_cast<unsigned>(desc.Filter));
 }
 
 // The Xbox slot 67 creates a compute pipeline from native GPU code: (desc, riid, out), named
@@ -3375,7 +3414,7 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
             self, reinterpret_cast<const D3D12_COMMAND_SIGNATURE_DESC*>(a1), a2, reinterpret_cast<const IID*>(a3),
             reinterpret_cast<void**>(a4)));
     } else if constexpr (Slot == 61) {
-        proxy_create_sampler_x(self, reinterpret_cast<const D3D12_SAMPLER_DESC*>(a1), a2);
+        proxy_create_sampler_x(self, reinterpret_cast<const std::uint8_t*>(a1), a2);
         return 0;
     } else if constexpr (Slot == 67) {
         return hr_to_u64(proxy_create_compute_pipeline_from_native_code(
@@ -3429,6 +3468,19 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         // methods. The check is before the slot-count refusal because slot 80 is outside a PC ID3D12Device11 table.
         std::uint64_t routed = 0;
         if (route_xbox_device_slot(self, Slot, a1, a2, a3, a4, a5, routed)) return routed;
+        {
+            // First call of a generically forwarded slot: its argument words and caller, so a console slot that lands
+            // on the wrong PC method can be told apart from the right one (from PR #8134's boot runs).
+            static std::atomic<bool> shown{false};
+            if (!shown.exchange(true, std::memory_order_relaxed)) {
+                std::fprintf(stderr, "[rt] d3d12_xs: device slot %u forwarded, from %p, args 0x%llx 0x%llx 0x%llx | "
+                             "stack 0x%llx 0x%llx 0x%llx 0x%llx\n", Slot, _ReturnAddress(),
+                             static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4),
+                             static_cast<unsigned long long>(a5), static_cast<unsigned long long>(a6),
+                             static_cast<unsigned long long>(a7));
+            }
+        }
         if (Slot >= self->slot_count) return hr_to_u64(refuse_beyond_device(Slot, self->slot_count));
 
         // The PC vtable entry, called with the PC device as `this`. Integer/pointer arguments, the hidden
