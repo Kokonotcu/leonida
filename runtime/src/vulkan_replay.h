@@ -31,6 +31,7 @@
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
 #include "command_list.h"
+#include "debug_targets.h"
 #include "depth24.h"
 #include "uav_clear.h"
 
@@ -5119,6 +5120,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             ShaderUserData data{};
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
             detail::map_title_user_data(vk, data.s, draw->user_data.size());
+            if (!graphics.debug_name.empty() && debug_targets::dump_at() &&
+                (graphics.debug_name.find("default_ps_tex") != std::string::npos ||
+                 graphics.debug_name.find("BlitColour") != std::string::npos ||
+                 graphics.debug_name.find("exe/container") != std::string::npos)) {
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 9)
+                    debug_targets::log_user_data(graphics.debug_name.c_str(), data.s, draw->user_data.size());
+            }
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the

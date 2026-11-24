@@ -1692,6 +1692,38 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         note_list_slot(Slot, a1, a2, a3, a4);
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
+            if constexpr (Slot == 71 || Slot == 72) {
+                // Write32BitValueBottomOfPipeX / Write64BitValueBottomOfPipeX(address, value, flush, flags) of the
+                // newer console list layout (XCL real.rs and list_x.rs; VIctory list.rs): the title marks its GPU
+                // progress in its own memory with them and waits on the values. Dropped, they never arrived.
+                // Recorded as PC WriteBufferImmediate (slot 66, MARKER_OUT: written when the work before it is
+                // done), which reaches title memory through the page table's imports (buffer_at). A 64-bit write
+                // with flags & 3 asks for a GPU timestamp: a monotonic CPU count stands in for it.
+                constexpr unsigned kWriteBufferImmediate = 66;
+                if (kWriteBufferImmediate < self->pc_slot_count && a1) {
+                    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER params[2]{};
+                    D3D12_WRITEBUFFERIMMEDIATE_MODE modes[2] = {D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT,
+                                                                D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT};
+                    std::uint64_t value = a2;
+                    if (Slot == 72 && (a4 & 3)) {
+                        LARGE_INTEGER now{};
+                        QueryPerformanceCounter(&now);
+                        value = static_cast<std::uint64_t>(now.QuadPart);
+                    }
+                    params[0] = {a1, static_cast<UINT>(value)};
+                    params[1] = {a1 + 4, static_cast<UINT>(value >> 32)};
+                    using WriteFn = void(WINAPI*)(void*, UINT, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER*,
+                                                  const D3D12_WRITEBUFFERIMMEDIATE_MODE*);
+                    auto** const vt = *reinterpret_cast<void***>(self->real);
+                    reinterpret_cast<WriteFn>(vt[kWriteBufferImmediate])(self->real, Slot == 72 ? 2 : 1, params, modes);
+                    static std::atomic<int> told{0};
+                    if (told.fetch_add(1, std::memory_order_relaxed) < 6)
+                        std::fprintf(stderr, "[rt] d3d12_xs: list slot %u: bottom-of-pipe write of %#llx to %#llx%s\n",
+                                     Slot, static_cast<unsigned long long>(value), static_cast<unsigned long long>(a1),
+                                     (Slot == 72 && (a4 & 3)) ? " (timestamp)" : "");
+                }
+                return 0;
+            }
             if constexpr (Slot == 148) {
                 static std::atomic<bool> logged{false};
                 if (!logged.exchange(true, std::memory_order_relaxed))
@@ -2114,6 +2146,19 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         unsigned fwd = Slot;
         if constexpr (K == ChildKind::queue) {
             if (self->console_layout) fwd = console_queue_slot(Slot);
+        }
+        if constexpr (K == ChildKind::queue && Slot == 31) {
+            // CopyPageMappingsBatchX(count, batches, pool, pages) of the newer queue layout (VIctory queue.rs; XCL
+            // answers S_OK): the title maps pages of its 6 GB physical pool into its tiled heap. Our title memory is
+            // host memory the page table imports wherever the title addresses it, so nothing is remapped here;
+            // E_NOTIMPL told the title its streaming mapping failed.
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 3)
+                std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31 CopyPageMappingsBatchX (%llu batch(es), pool %#llx, "
+                                     "%llu pages): S_OK\n",
+                             static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a3),
+                             static_cast<unsigned long long>(a4));
+            return hr_to_u64(S_OK);
         }
         if (fwd >= self->slot_count) {
             bool expected = false;

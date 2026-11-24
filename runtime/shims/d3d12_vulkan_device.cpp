@@ -27,6 +27,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
 #include "../src/rect_list_gs.h"
+#include "../src/debug_targets.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
@@ -7554,6 +7555,8 @@ public:
                          static_cast<unsigned long long>(va), mapped ? "mapped" : "not mapped", words);
         });
         arena_pages_ = std::make_shared<DeviceArenaPages>(state_);
+        leonida::debug_targets::arena_mapped = arena.mapped;  // diagnostics read descriptors through it
+        leonida::debug_targets::arena_size = arena.size;
         return true;
     }
 
