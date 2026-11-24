@@ -7947,19 +7947,25 @@ class Gen:
             self.emit(f"{p1} = OpFMul %float {a1} {b1}")
             self.emit(f"{s} = OpFAdd %float {p0} {p1}")
             self.emit(f"{r} = OpFAdd %float {s} {acc}")
-            r = self.clamp_mods(r, ["clamp"] if "clamp" in mods else [])
+            # Measured natively on AMD RDNA2 (gfx1036 across all ieee/dx10_clamp/denorm MODEs):
+            # VOP3P v_dot2_f32_f16 ignores its clamp bit (hardware no-op: +3.0, -3.0, +inf, NaN stay unclamped).
+            if op == "v_dot2c_f32_f16" and "clamp" in mods:
+                r = self.clamp_mods(r, ["clamp"])
             self.dst(a[0], self.tou(r))
         elif op in ("v_pk_lshlrev_b16", "v_pk_lshrrev_b16", "v_pk_ashrrev_i16"):
             # Packed 16-bit shifts (VOP3P): result half h = src1 half (op_sel / op_sel_hi) shifted by src0 half & 15.
             # A half of a register is read with a shift and a mask, not with OpBitField{S,U}Extract at offset 16,
             # as for every other 16-bit half reader (docs/design.md, "16-bit high-half reads", #1506). The field
-            # extract here is what @Dark0rz measured miscompiled on an AMD Windows driver 25.10.36 (gfx1036): the
+            # extract here is what @Darkz0rz measured miscompiled on an AMD Windows driver 25.10.36 (gfx1036): the
             # offset came back taken mod 16, so both result halves read the low half of the source, in 5 of the
             # 2,000 wave32 programs of `tools/valu_fuzz.py --family f16 --seed 1`. The same programs run clean on
             # a second gfx1036 with driver 31.0.24002.92 (2000/2000 match), which is why this is a driver-proof
             # lowering and not a value change: on 200,010 inputs (0, 1, 0xFFFF, 0x10000, 0x80000000, 0xFFFFFFFF,
             # 0x7FFFFFFF, 0x8000 and random) BitField{S,U}Extract(x, 16, 16) equals x >> 16 with the matching
-            # right shift, and BitFieldUExtract(x, 16, 4) equals (x >> 16) & 15.
+            # right shift, and BitFieldUExtract(x, 16, 4) equals (x >> 16) & 15. Both halves now come from
+            # Gen.u16_half / Gen.i16_half, and with them v_pk_ashrrev_i16 weights its half as %int: its
+            # OpShiftRightArithmetic sign-extends by its own type, instead of relying on a compiler reading it as
+            # arithmetic on a %uint whose bit 31 this code put there.
             def bits(name, default):
                 m = next((m for m in mods if m.startswith(name + ":")), None)
                 if m is None:
@@ -7971,9 +7977,9 @@ class Gen:
                     return [int(v) for v in body[:-1].split(",")]
                 except (IndexError, ValueError):
                     raise Unsupported(op + " modifiers") from None
-            if "clamp" in mods:
-                raise Unsupported(op + " clamp")
-            if (any(not m.startswith(("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods)
+            # VOP3P clamp on packed 16-bit shifts is a hardware no-op (measured natively on gfx1036:
+            # v_pk_lshlrev_b16/v_pk_lshrrev_b16/v_pk_ashrrev_i16 clamp wrap each 16-bit half without saturating).
+            if (any(m != "clamp" and not m.startswith(("op_sel:", "op_sel_hi:", "neg_lo:", "neg_hi:")) for m in mods)
                     or any(s.get("neg") or s.get("abs") for s in a)):
                 raise Unsupported(op + " modifiers")
             sel, selhi = bits("op_sel", [0, 0]), bits("op_sel_hi", [1, 1])
@@ -7988,23 +7994,23 @@ class Gen:
             signed = op.endswith("i16")
             halves = []
             for h, sl in ((0, sel), (1, selhi)):
-                amt, val, am, r16 = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                amt, r16 = self.tmp(), self.tmp()
                 if sl[0]:
                     half = self.tmp()
                     self.emit(f"{half} = OpShiftRightLogical %uint {sh_src} {self.cu(16)}")
                     self.emit(f"{amt} = OpBitwiseAnd %uint {half} {self.cu(15)}")
                 else:
                     self.emit(f"{amt} = OpBitFieldUExtract %uint {sh_src} {self.cu(0)} {self.cu(4)}")
-                if sl[1]:
-                    # The high half: x >> 16 already extends it the right way for the shift that follows.
-                    right = "OpShiftRightArithmetic" if signed else "OpShiftRightLogical"
-                    self.emit(f"{val} = {right} %uint {val_src} {self.cu(16)}")
+                val = self.i16_half(val_src, sl[1]) if signed else self.u16_half(val_src, sl[1])
+                if signed:
+                    # Sign-extended %int value, arithmetic shift, then back to the unsigned half-width result.
+                    shifted = self.tmp()
+                    self.emit(f"{shifted} = OpShiftRightArithmetic %int {val} {amt}")
+                    am = self.int_bits(shifted)
                 else:
-                    ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
-                    self.emit(f"{val} = {ext} %uint {val_src} {self.cu(0)} {self.cu(16)}")
-                k = {"v_pk_lshlrev_b16": "OpShiftLeftLogical", "v_pk_lshrrev_b16": "OpShiftRightLogical",
-                     "v_pk_ashrrev_i16": "OpShiftRightArithmetic"}[op]
-                self.emit(f"{am} = {k} %uint {val} {amt}")
+                    am = self.tmp()
+                    k = {"v_pk_lshlrev_b16": "OpShiftLeftLogical", "v_pk_lshrrev_b16": "OpShiftRightLogical"}[op]
+                    self.emit(f"{am} = {k} %uint {val} {amt}")
                 self.emit(f"{r16} = OpBitwiseAnd %uint {am} {self.cu(0xFFFF)}")
                 halves.append(r16)
             hi, r = self.tmp(), self.tmp()
@@ -9136,20 +9142,22 @@ class Gen:
                 else:
                     self.emit(f"{r} = OpExtInst %uint %glsl {'UMax' if 'max' in op else 'UMin'} {x} {y}")
             if "clamp" in mods:
-                # VOP3 clamp saturates the unsigned add/sub to [0, 0xFFFF], as for the 32-bit ops (docs/design.md,
-                # "Integer clamp"). The operands are zero-extended, so a result past 0xFFFF is an overflow (add) or a
-                # borrow (sub). Other 16-bit ops: rejected rather than guessed.
+                # VOP3 clamp saturates v_add/v_sub_{u16,i16} to [0, 0xFFFF] / [-32768, 32767] (docs/design.md,
+                # "Integer clamp"). On v_mul_lo_u16, v_max/v_min_{u16,i16}, and the 16-bit shifts
+                # (v_lshlrev_b16, v_lshrrev_b16, v_ashrrev_i16), VOP3 clamp is a hardware no-op (measured
+                # natively on AMD gfx1036; v_mul_lo_u16 wraps modulo 2^16).
                 if op in ("v_add_i16", "v_sub_i16"):
                     sat = self.tmp()
                     self.emit(f"{sat} = OpExtInst %uint %glsl SClamp {r} {self.cu(0xFFFF8000)} {self.cu(0x7FFF)}")
                     r = sat
-                elif op not in ("v_add_u16", "v_sub_u16"):
-                    raise Unsupported(op + " clamp")
-                if op in ("v_add_u16", "v_sub_u16"):
+                elif op in ("v_add_u16", "v_sub_u16"):
                     ov, sat = self.tmp(), self.tmp()
                     self.emit(f"{ov} = OpUGreaterThan %bool {r} {self.cu(0xFFFF)}")
                     self.emit(f"{sat} = OpSelect %uint {ov} {self.cu(0 if 'sub' in op else 0xFFFF)} {r}")
                     r = sat
+                elif op not in ("v_mul_lo_u16", "v_max_u16", "v_min_u16", "v_max_i16", "v_min_i16",
+                                "v_lshlrev_b16", "v_lshrrev_b16", "v_ashrrev_i16"):
+                    raise Unsupported(op + " clamp")
             lo = self.tmp()
             self.emit(f"{lo} = OpBitwiseAnd %uint {r} {self.cu(0xFFFF)}")
             if e64 and sb[2]:

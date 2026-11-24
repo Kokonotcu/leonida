@@ -1341,10 +1341,35 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             f.write(sources + "\n")
         translate(disasm, spirv, jobs, emulate=emulate, fallbacks=fallbacks)
     verify_translation_completeness(dxbc, spirv)
+    native_pso_hashes(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
+
+
+def native_pso_hashes(dxbc: str, spirv: str) -> None:
+    """Index the carved containers named by native graphics PSOs, including on a resumed translation."""
+    import native_pso_hashes as tool
+
+    index = os.path.join(spirv, "index.json")
+    if not os.path.isfile(index) or not os.path.isdir(dxbc):
+        return
+    output = os.path.join(spirv, tool.OUT_NAME)
+    if os.path.isfile(output):
+        stamp = os.stat(output).st_mtime_ns
+        inputs = (index, dxbc, os.path.join(dxbc, "index.json"), tool.__file__,
+                  os.path.join(os.path.dirname(tool.__file__), "shader_carve.py"))
+        if all(not os.path.exists(p) or os.stat(p).st_mtime_ns <= stamp for p in inputs):
+            with os.scandir(dxbc) as files:
+                if all(not f.name.endswith(".dxbc") or f.stat().st_mtime_ns <= stamp for f in files):
+                    return
+    try:
+        table = tool.build(dxbc, spirv)
+        tool.write(spirv, table)
+    except (OSError, ValueError) as error:
+        fail(f"shaders: could not index native graphics pipelines: {error}")
+    log(f"shaders: indexed {len(table)} native shader digests")
 
 
 FSPX_DLL = "amd_fidelityfx_upscaler_xbox.dll"
