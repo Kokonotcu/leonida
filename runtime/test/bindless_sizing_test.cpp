@@ -112,6 +112,44 @@ int main() {
                         count(f, D::dim_2d), f.counts[bindless::sampler_binding], storage(f, D::dim_2d), totals(f).all);
     }
 
+    // Past max_2d_images the 2D array grows to max_2d_images_large only for an update-after-bind, partially bound set
+    // and only while large_set_generations whole sets fit maxUpdateAfterBindDescriptorsInAllPools.
+    {
+        const Device d = uniform(1048576, 1048576);  // pools unlimited, as NVIDIA's
+        BindlessFeatures f = with_ms(true);
+        f.partially_bound = true;
+        EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12));
+        EXPECT(count(f, D::dim_2d) == bindless::max_2d_images_large);
+        EXPECT(storage(f, D::dim_2d) == bindless::max_storage_indices && storage_consistent(f));
+        EXPECT(f.counts[bindless::sampler_binding] == 4000 - bindless::reserved_samplers);
+        const std::uint32_t unlimited = count(f, D::dim_2d);
+
+        Device intel = uniform(1048576, 1048576);
+        intel.v12.maxUpdateAfterBindDescriptorsInAllPools = 1048576;  // Intel UHD's
+        f = with_ms(true);
+        f.partially_bound = true;
+        EXPECT(bindless::size_bindings(f, intel.limits, intel.v11, intel.v12));
+        EXPECT(count(f, D::dim_2d) > bindless::max_2d_images && count(f, D::dim_2d) < bindless::max_2d_images_large);
+        EXPECT(std::uint64_t(totals(f).all) * bindless::large_set_generations <= 1048576);
+        EXPECT(bindless::spare_sets(f) == 1 && bindless::retired_generation_cap(f, 8) >= 4);
+        const std::uint32_t pooled = count(f, D::dim_2d);
+
+        // A pool limit that holds fewer than large_set_generations sets even at max_2d_images: no growth past it.
+        Device tight = uniform(1048576, 1048576);
+        tight.v12.maxUpdateAfterBindDescriptorsInAllPools = 400000;
+        f = with_ms(true);
+        f.partially_bound = true;
+        EXPECT(bindless::size_bindings(f, tight.limits, tight.v11, tight.v12));
+        EXPECT(count(f, D::dim_2d) == bindless::max_2d_images);
+
+        // Not partially bound (every index of a new generation would need its fallback written): no growth past it.
+        f = with_ms(true);
+        EXPECT(bindless::size_bindings(f, d.limits, d.v11, d.v12));
+        EXPECT(count(f, D::dim_2d) == bindless::max_2d_images);
+        std::printf("large 2D arrays: %u with unlimited pools, %u within 1048576, %u without partial binding\n",
+                    unlimited, pooled, count(f, D::dim_2d));
+    }
+
     // At today's sizes exactly (5632 sampled images, 1024 samplers, 3584 storage images): today's set, no MS pairs.
     {
         Device d = uniform(1048576, 1048576);

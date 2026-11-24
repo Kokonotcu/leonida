@@ -205,6 +205,13 @@ struct SetLayout {
 // What size_bindings() grows to where the device's limits allow. At 32-64 bytes a descriptor the whole set is then
 // 3-6 MiB (93793 descriptors on an RTX 5070).
 inline constexpr std::uint32_t max_2d_images = 65536;
+// Past max_2d_images the 2D array grows on to this, last, where the set is update-after-bind and partially bound (no
+// fallback written into every unused index of a new generation) and large_set_generations whole sets still fit
+// maxUpdateAfterBindDescriptorsInAllPools (D4's retired generations and I8's spare keep their room): NVIDIA's pools
+// are unlimited, Intel's UHD 770 has 1048576. A retail boot filled the 65536-image array within 46 s
+// (docs/retail_boot_intel_host.md section 3: "a full bindless image array"), after which new texture views failed.
+inline constexpr std::uint32_t max_2d_images_large = 262144;
+inline constexpr std::uint32_t large_set_generations = 8;
 inline constexpr std::uint32_t max_storage_indices = 4096;  // in each storage array, at most its dimension's images
 // A full D3D12 shader-visible sampler heap (2048) and room for literal and static S#s, within what the device can
 // create (maxSamplerAllocationCount, at least 4000) less the samplers that are not in the set.
@@ -252,6 +259,7 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     auto& counts = features.counts;
     counts = default_counts();
     std::uint32_t images = 1, samplers = 1, storage = 1;
+    std::uint64_t pool_sets = 1;  // whole sets that must fit pool_limit; large_set_generations for the last growth
     // Until the end the 2D storage arrays are not capped by the 2D images, which grow after them: capping can only
     // take descriptors away.
     const auto apply = [&](bool final) {
@@ -280,6 +288,7 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
         const std::uint64_t all = sampled + sampler + stored + buffers;
         return within(sampled, sampled_limit) && within(sampler, sampler_limit) && within(stored, storage_limit) &&
                within(sampled + stored + buffers, resource_limit) && all <= pool_limit &&
+               (pool_limit == 0xffffffffu || all * pool_sets <= pool_limit) &&
                (all <= set_limit || (layout_supported && layout_supported(features)));
     };
     // Raises n to the largest value up to `high` that fits; leaves it where it is when none does.
@@ -314,6 +323,11 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     grow(samplers, std::max(samplers, std::min(max_samplers, creatable)), growth_headroom, set_limit);
     grow(images, std::max(images, max_2d_images), growth_headroom, set_limit);
     grow(storage, std::max(storage, max_storage_indices), growth_headroom, set_limit);
+    if (uab && features.partially_bound && images == max_2d_images) {
+        pool_sets = large_set_generations;
+        grow(images, max_2d_images_large, growth_headroom, set_limit);
+        pool_sets = 1;
+    }
     apply(true);
     return full;
 }
