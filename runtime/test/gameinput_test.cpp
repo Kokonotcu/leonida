@@ -1179,6 +1179,9 @@ void test_aggregate_device(IGameInput* input) {
               "aggregate device reports supportedInput == GameInputKindGamepad");
         check(agg->GetDeviceStatus() == GameInputDeviceConnected,
               "aggregate device status is GameInputDeviceConnected");
+        check(info && info->infoSize == sizeof(GameInputDeviceInfo) && info->gamepadInfo && info->uiNavigationInfo &&
+                  std::memcmp(&info->deviceRootId, &info->deviceId, sizeof info->deviceId) == 0,
+              "aggregate device info is a full block: infoSize, gamepad and UI-navigation info, root id");
 
         IGameInputDevice* agg2 = nullptr;
         check(input->CreateAggregateDevice(GameInputKindGamepad, &agg2) == S_OK && agg2 == agg,

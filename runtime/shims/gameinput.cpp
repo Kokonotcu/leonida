@@ -2684,10 +2684,16 @@ public:
         agg->display_name.sizeInBytes = static_cast<uint32_t>(agg->name.size());
         agg->display_name.codePointCount = static_cast<uint32_t>(agg->name.size());
         agg->info.displayName = &agg->display_name;
+        // A full info block, as every other device has (review B14): infoSize set and the per-kind info pointers
+        // non-null, so a title reading gamepadInfo or uiNavigationInfo off any device it holds finds a (zeroed) block.
+        agg->info.infoSize = sizeof(GameInputDeviceInfo);
+        agg->info.gamepadInfo = &agg->gamepad_info;
+        agg->info.uiNavigationInfo = &agg->ui_info;
 
         std::memcpy(agg->info.deviceId.value, "LEONIDA_AGGREGATE_DEVICE_ID\0\0\0\0", 32);
         agg->info.deviceId.value[28] = static_cast<uint8_t>(kind & 0xff);
         agg->info.deviceId.value[29] = static_cast<uint8_t>((kind >> 8) & 0xff);
+        agg->info.deviceRootId = agg->info.deviceId;
 
         g().devices.push_back(agg);
         agg->AddRef();
