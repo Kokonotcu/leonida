@@ -2995,6 +2995,7 @@ struct TitleTexture {
     bool copied = false;
     std::uint64_t hash = 0;    // of the title bytes at the last copy
     std::chrono::steady_clock::time_point watch_until{};
+    std::chrono::steady_clock::time_point next_check{};  // watched textures are hashed at most this often
 };
 
 std::mutex& title_texture_mutex() {
@@ -4073,7 +4074,21 @@ std::uint64_t title_hash(const std::uint8_t* p, std::size_t bytes) {
 }
 
 // How long after each copy a texture without render-target or UAV usage is hashed (see "Title-placed textures").
-constexpr auto kTitleTextureWatch = std::chrono::seconds(1);
+// Glyph caches (the UI font atlas) get new glyphs written by the CPU whenever a screen shows text it has not drawn
+// before, long after the first copy: one second dropped those letters (LEGAL NOTICES drew "C py ight"). So the watch
+// lasts for the texture's life by default, and each texture is hashed at most every kTitleTextureRecheck.
+// LEONIDA_TITLE_TEXTURE_WATCH=<seconds> sets a finite window again (0 = only the copy after each texture computer
+// write).
+std::chrono::steady_clock::duration title_texture_watch() {
+    static const std::chrono::steady_clock::duration watch = [] {
+        const char* v = std::getenv("LEONIDA_TITLE_TEXTURE_WATCH");
+        if (!v || !*v) return std::chrono::steady_clock::duration::max() / 2;
+        return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(std::strtod(v, nullptr)));
+    }();
+    return watch;
+}
+constexpr auto kTitleTextureRecheck = std::chrono::milliseconds(50);
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
 bool vertex_format(DXGI_FORMAT format, VkFormat& out, UINT& bytes) {
@@ -11284,8 +11299,9 @@ void sync_title_textures() {
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(title_texture_mutex());
     for (const auto& t : title_textures()) {
-        const bool watching = t->watch && t->copied && now < t->watch_until;
+        const bool watching = t->watch && t->copied && now < t->watch_until && now >= t->next_check;
         if (!t->dirty && !watching) continue;
+        t->next_check = now + kTitleTextureRecheck;
         if (!title_range_readable(t->title, t->bytes)) continue;  // reserved pages: a later submission copies it
         const std::uint64_t hash = title_hash(t->title, t->bytes);
         if (t->copied && hash == t->hash) {  // nothing new since the last copy
@@ -11301,7 +11317,7 @@ void sync_title_textures() {
         }
         t->copied = true;
         t->hash = hash;
-        t->watch_until = now + kTitleTextureWatch;
+        t->watch_until = now + title_texture_watch();
     }
 }
 
