@@ -6949,6 +6949,7 @@ public:
                                                                   info.conditional_rendering, info.ray_tracing,
                                                                   info.xdxr_acceleration_structures &&
                                                                       info.buffer_device_address);
+        state_.context->mesh_queries = info.mesh_shader_queries;
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -9688,35 +9689,34 @@ public:
             // The console asks with a larger structure (0x40 against the PC's 0x3C): the PC fields, then zeros for
             // the console's extra bytes. Smaller than the PC structure is E_INVALIDARG, as on the host.
             if (size < sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS)) return d3d12_trace::result(method, E_INVALIDARG);
-            D3D12_FEATURE_DATA_D3D12_OPTIONS answer{};
-            auto* opts = &answer;
+            D3D12_FEATURE_DATA_D3D12_OPTIONS pc_opts{};
             // Answer what the layer will actually honour, not what the GPU offers: docs/d3d12_vulkan.md 4.1 says a
             // false "supported" is worse than a false "unsupported" at boot, and the PSO paths refuse these same
             // features when they are missing (logic ops, per the mapping vkd3d-proton's
             // d3d12_device_caps_init_feature_options uses).
-            opts->DoublePrecisionFloatShaderOps = state_.info.features.shaderFloat64;
-            opts->OutputMergerLogicOp = state_.info.features.logicOp;
-            opts->MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_NONE;
-            opts->TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
-            opts->ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;  // Bindless descriptor indexing supported
+            pc_opts.DoublePrecisionFloatShaderOps = state_.info.features.shaderFloat64;
+            pc_opts.OutputMergerLogicOp = state_.info.features.logicOp;
+            pc_opts.MinPrecisionSupport = D3D12_SHADER_MIN_PRECISION_SUPPORT_NONE;
+            pc_opts.TiledResourcesTier = D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+            pc_opts.ResourceBindingTier = D3D12_RESOURCE_BINDING_TIER_3;  // Bindless descriptor indexing supported
             // No VK_EXT_shader_stencil_export is enabled and the translator emits no stencil-ref write, so a pixel
             // shader that writes the stencil ref would be refused: answer unsupported, the direction 4.1 prefers.
-            opts->PSSpecifiedStencilRefSupported = FALSE;
-            opts->TypedUAVLoadAdditionalFormats = TRUE;
+            pc_opts.PSSpecifiedStencilRefSupported = FALSE;
+            pc_opts.TypedUAVLoadAdditionalFormats = TRUE;
             // POPS: the translator only declares PixelInterlockOrderedEXT, enabled exactly when the GPU offers
             // VK_EXT_fragment_shader_interlock and its fragmentShaderPixelInterlock feature.
-            opts->ROVsSupported = state_.info.fragment_shader_interlock;
-            opts->ConservativeRasterizationTier = state_.conservative_raster_tier;
-            opts->MaxGPUVirtualAddressBitsPerResource = 40;
-            opts->StandardSwizzle64KBSupported = FALSE;
-            opts->CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
-            opts->CrossAdapterRowMajorTextureSupported = FALSE;
+            pc_opts.ROVsSupported = state_.info.fragment_shader_interlock;
+            pc_opts.ConservativeRasterizationTier = state_.conservative_raster_tier;
+            pc_opts.MaxGPUVirtualAddressBitsPerResource = 40;
+            pc_opts.StandardSwizzle64KBSupported = FALSE;
+            pc_opts.CrossNodeSharingTier = D3D12_CROSS_NODE_SHARING_TIER_NOT_SUPPORTED;
+            pc_opts.CrossAdapterRowMajorTextureSupported = FALSE;
             // A translated vertex shader writing a layer or viewport index needs both Vulkan 1.2 features enabled
             // (vkCreateShaderModule refuses the module without them, VUID-...-pCode-08740).
-            opts->VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation =
+            pc_opts.VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation =
                 state_.info.shader_output_layer && state_.info.shader_output_viewport_index;
-            opts->ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
-            rt::d3d12::store_with_console_tail(data, size, &answer, sizeof(answer));
+            pc_opts.ResourceHeapTier = D3D12_RESOURCE_HEAP_TIER_1;
+            rt::d3d12::store_with_console_tail(data, size, &pc_opts, sizeof(pc_opts));
             if (rt::d3d12::is_console_sized_feature_request(feature, size))
                 log_once("CheckFeatureSupport(D3D12_OPTIONS) asked for more bytes than the PC structure has (60), "
                          "extra bytes zeroed; size", int(size));
@@ -11762,6 +11762,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &mesh_features};
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.mesh_shader = mesh_features.meshShader == VK_TRUE;
+                info.mesh_shader_queries = mesh_features.meshShaderQueries == VK_TRUE;
             } else if (!std::strcmp(e.extensionName, VK_EXT_SHADER_OBJECT_EXTENSION_NAME) &&
                        environment_text(L"LEONIDA_SHADER_OBJECTS") == L"1") {
                 VkPhysicalDeviceShaderObjectFeaturesEXT so{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT};
@@ -11831,6 +11832,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // are not used.
     VkPhysicalDeviceMeshShaderFeaturesEXT enable_mesh{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
     enable_mesh.meshShader = VK_TRUE;
+    // The mesh-primitives query, which counts the primitives a mesh shader emits (D3D-MESH-CLIPPING-COUNTER).
+    enable_mesh.meshShaderQueries = info.mesh_shader_queries ? VK_TRUE : VK_FALSE;
 
     void* ext_chain = nullptr;
     if (info.mesh_shader) {

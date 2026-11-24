@@ -109,6 +109,55 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
   )
 
+  # Winsock2 for the mapped title. Default: ws2_32_offline.cpp, gta6rt owns ws2_32.dll outright (every socket and DNS
+  # call answered in-process, no host ws2_32 dependency). ON: upstream's ws2_offline.cpp, the host ws2_32.dll and
+  # wsock32.dll stay loaded and only the outbound entry points are wrapped to loopback. One of the two, never both:
+  # both register the same ws2_32.dll names and the shim table keeps whichever registers last.
+  option(LEONIDA_WS2_HOST_LOOPBACK "gta6rt uses the loopback-only wrapper over the host ws2_32.dll (ws2_offline.cpp)" OFF)
+  if(LEONIDA_WS2_HOST_LOOPBACK)
+    set(_leonida_ws2_shim shims/ws2_offline.cpp)
+  else()
+    set(_leonida_ws2_shim shims/ws2_32_offline.cpp)
+  endif()
+
+  # Rust XMA2 decoder (runtime/xma_decoder), built at configure time when cargo is on PATH.
+  # Without it (or if that build fails) the runtime still builds and XMA voices output silence.
+  option(LEONIDA_REQUIRE_XMA2_DECODER "Fail configure if the Rust XMA2 decoder is unavailable" OFF)
+  find_program(LEONIDA_CARGO cargo)
+  if(LEONIDA_CARGO)
+    # Cargo's host (or configured default target) can differ from the runtime's MSVC ABI.
+    set(_xma_target x86_64-pc-windows-msvc)
+    set(_xma_target_dir ${CMAKE_BINARY_DIR}/xma_decoder)
+    set(_xma_lib ${_xma_target_dir}/${_xma_target}/release/leonida_xma2_decoder.lib)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.lock
+      ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/src/lib.rs)
+    execute_process(
+      COMMAND ${LEONIDA_CARGO} build --release --locked --target ${_xma_target}
+              --manifest-path ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder/Cargo.toml
+              --target-dir ${_xma_target_dir}
+      TIMEOUT 120
+      RESULT_VARIABLE _xma_result)
+    if(_xma_result STREQUAL "0" AND EXISTS ${_xma_lib})
+      add_library(leonida_xma2_decoder STATIC IMPORTED)
+      # Link Rust's Windows SDK dependencies. CMake's C++ target selects its own CRT
+      # (/MD or /MDd); the C ABI keeps allocation and deallocation on the same side.
+      set_target_properties(leonida_xma2_decoder PROPERTIES
+        IMPORTED_LOCATION ${_xma_lib}
+        INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder
+        INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
+        INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp")
+    else()
+      message(WARNING "cargo build of runtime/xma_decoder failed: XMA voices will be silent")
+    endif()
+  else()
+    message(STATUS "cargo not found: runtime/xma_decoder not built, XMA voices will be silent")
+  endif()
+  if(LEONIDA_REQUIRE_XMA2_DECODER AND NOT TARGET leonida_xma2_decoder)
+    message(FATAL_ERROR "LEONIDA_REQUIRE_XMA2_DECODER is enabled, but the Rust XMA2 decoder is unavailable")
+  endif()
+
   add_executable(gta6rt
     src/main.cpp
     src/write_watch.cpp
@@ -117,7 +166,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/registry.cpp
     shims/file_system.cpp
     shims/winhttp_offline.cpp
-    shims/ws2_32_offline.cpp
+    ${_leonida_ws2_shim}
     shims/xmem.cpp
     shims/acphal.cpp
     shims/d3d12_xs.cpp
@@ -158,6 +207,10 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   set(GTA6RT_STACK 8388608)
   target_link_options(gta6rt PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE} /STACK:${GTA6RT_STACK})
   target_link_libraries(gta6rt PRIVATE gta6rt_d3d12_xs_rootsig gta6rt_xtaskqueue psapi)
+  if(LEONIDA_WS2_HOST_LOOPBACK)
+    # registry.cpp's owns_dll then leaves ws2_32.dll and wsock32.dll to the host loader.
+    target_compile_definitions(gta6rt PRIVATE LEONIDA_WS2_HOST_LOOPBACK=1)
+  endif()
 
   # Root-signature forwarding test: needs a real PC d3d12.lib to serialize the synthetic descriptors.
   # find_library searches %LIB% (a Developer Prompt), not the Windows SDK the Visual Studio generator links
@@ -310,6 +363,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(acphal_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(acphal_test PRIVATE /OPT:NOREF)
 
+  if(TARGET leonida_xma2_decoder)
+    target_link_libraries(gta6rt PRIVATE leonida_xma2_decoder)
+    target_link_libraries(acphal_test PRIVATE leonida_xma2_decoder)
+  endif()
+
   # Xbox DirectStorage (DStorageGetFactory under dstorage_xs.dll, xcrdapi.dll and dstorage.dll) over synthetic files:
   # GAME: paths through the file shims, queues, status arrays, fences and errors. No GPU, no game data.
   add_executable(dstorage_test
@@ -399,6 +457,20 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_definitions(ws2_32_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
   target_compile_options(ws2_32_offline_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(ws2_32_offline_test PRIVATE /OPT:NOREF)
+
+  # The loopback-only wrapper over the host ws2_32.dll (gta6rt's ws2 shim under LEONIDA_WS2_HOST_LOOPBACK); built and
+  # tested in either mode. No external network is touched.
+  add_executable(ws2_offline_test
+    test/ws2_offline_test.cpp
+    shims/ws2_offline.cpp
+    shims/registry.cpp
+  )
+  target_include_directories(ws2_offline_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+  target_compile_definitions(ws2_offline_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_WS2_HOST_LOOPBACK=1)
+  target_compile_options(ws2_offline_test PRIVATE /W4 /permissive- /utf-8)
+  target_link_options(ws2_offline_test PRIVATE /OPT:NOREF)
+  target_link_libraries(ws2_offline_test PRIVATE ws2_32)
+
   # COM lifecycle and helper shims for api-ms-win-core-com-l1-1-*.dll.
   add_executable(com_shim_test
     test/com_shim_test.cpp
@@ -655,6 +727,10 @@ if(BUILD_TESTING)
     target_link_options(loader_test PRIVATE /OPT:NOREF ${GTA6RT_HOST_BASE})
     add_dependencies(loader_test gta6rt_tls_host)
     add_test(NAME loader COMMAND loader_test)
+    # It takes about 10 s under Wine and under a minute on a desktop with a virus scanner. Before #239 it waited on
+    # a "Bad Image" box on the Windows runner until the job's own timeout cancelled the whole job (every Windows
+    # run from 24 Nov 00:37 to 03:32 UTC); a hang like that now fails this test instead.
+    set_tests_properties(loader PROPERTIES TIMEOUT 180)
     # PE loader tests use two locally built fixtures: a DLL with exports, imports and relocations, and an EXE that
     # imports it so Loader::load exercises recursive module loading. They contain no game data.
     set(TINY_FIXTURE_DIR "${CMAKE_CURRENT_BINARY_DIR}/fixtures/$<CONFIG>")
@@ -1333,6 +1409,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET acphal_test)
     add_test(NAME acphal COMMAND acphal_test)
+    add_test(NAME acphal_noncached_only COMMAND acphal_test --noncached-only)
   endif()
   if(WIN32 AND TARGET xapu_chad_test)
     add_test(NAME xapu_chad COMMAND xapu_chad_test)
@@ -1354,6 +1431,9 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET ws2_32_offline_test)
     add_test(NAME ws2_32_offline COMMAND ws2_32_offline_test)
+  endif()
+  if(WIN32 AND TARGET ws2_offline_test)
+    add_test(NAME ws2_offline COMMAND ws2_offline_test)
   endif()
   if(WIN32 AND TARGET com_shim_test)
     add_test(NAME com_shim COMMAND com_shim_test)

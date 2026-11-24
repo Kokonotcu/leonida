@@ -103,6 +103,11 @@ struct DeviceProxy {
     std::atomic<std::uint64_t> presentation_window{0};
     std::atomic<std::uint64_t> presentation_failed_ms{0};
     std::atomic<bool> presentation_logged{false};
+    // Upstream's presentation seam (set_presentation_handler / attach_xbox_presentation, guarded by
+    // presentation_lock). gta6rt attaches none; the factory sink above is the runtime's path. When a handler is
+    // attached (tests), it answers the slots it has a function for before the sink is asked.
+    SRWLOCK presentation_lock = SRWLOCK_INIT;
+    PresentationHandler presentation_handler{};
 };
 
 std::atomic<XboxPresentationFactory> g_presentation_factory{nullptr};
@@ -138,6 +143,20 @@ XboxPresentationSink* device_presentation(DeviceProxy* self) {
     }
     std::fprintf(stderr, "[rt] d3d12_xs: Xbox presentation attached (real PresentX to the title's window)\n");
     return sink;
+}
+
+// Runs f(handler) with the presentation lock held shared, so a detach cannot destroy the presentation mid-call. f
+// returns false, without calling the presentation, when it has no function for the slot; the result says whether
+// f handled the call.
+// ponytail: a presenter callback must not call set_presentation_handler (exclusive inside shared deadlocks), and a
+// detach waits for a WaitFrameEventX in flight up to its timeout.
+template <typename F>
+bool call_presentation(DeviceProxy* self, F&& f) {
+    if (!self) return false;
+    AcquireSRWLockShared(&self->presentation_lock);
+    const bool handled = f(static_cast<const PresentationHandler&>(self->presentation_handler));
+    ReleaseSRWLockShared(&self->presentation_lock);
+    return handled;
 }
 
 constexpr unsigned kHeapSlots = 11;  // IUnknown + ID3D12Object + DeviceChild + Pageable + GetDesc + 2 handles
@@ -445,24 +464,27 @@ struct XboxDeviceSlotRoutes {
     unsigned frame_interval = 78;  // SetFrameIntervalX(output, interval_us, latency, flags)
     unsigned schedule_event = 79;  // ScheduleFrameEventX(event, offset_us, reserved, flags)
     unsigned wait_event = 80;      // WaitFrameEventX(event, timeout_ms, reserved, flags, &token)
+    unsigned frame_statistics = 81;  // GetFrameStatisticsX(token, type_mask, count, out)
     unsigned queue_x = 48;         // CreateCommandQueueX(desc, riid, out)
     unsigned list_x = 73;          // CreateCommandListX(desc, allocator, initial_state, riid, out)
 };
 
-unsigned env_device_slot(const char* name, unsigned fallback) {
+// Reads a slot number in lo..hi from `name`: an unset variable gives `fallback`; a bad value is logged (`what` names
+// the kind of slot) and ignored.
+unsigned env_slot(const char* name, unsigned fallback, unsigned lo, unsigned hi, const char* what) {
     char value[32] = {};
     const DWORD length = GetEnvironmentVariableA(name, value, sizeof(value));
     if (length == 0) return fallback;
     if (length >= sizeof(value)) {
-        std::fprintf(stderr, "[rt] d3d12_xs: %s is too long for a device slot; the default is kept\n", name);
+        std::fprintf(stderr, "[rt] d3d12_xs: %s is too long for a %s; the default is kept\n", name, what);
         return fallback;
     }
     errno = 0;
     char* end = nullptr;
     const unsigned long slot = std::strtoul(value, &end, 0);
-    if (errno != 0 || end == value || *end != '\0' || slot < 3 || slot > 127) {
-        std::fprintf(stderr, "[rt] d3d12_xs: %s=%s is not a device slot in 3..127; the default is kept\n", name,
-                     value);
+    if (errno != 0 || end == value || *end != '\0' || slot < lo || slot > hi) {
+        std::fprintf(stderr, "[rt] d3d12_xs: %s=%s is not a %s in %u..%u; the default is kept\n", name, value, what,
+                     lo, hi);
         return fallback;
     }
     return static_cast<unsigned>(slot);
@@ -471,23 +493,29 @@ unsigned env_device_slot(const char* name, unsigned fallback) {
 const XboxDeviceSlotRoutes& xbox_device_slot_routes() {
     static const XboxDeviceSlotRoutes routes = [] {
         XboxDeviceSlotRoutes r;
-        const unsigned frame_interval = env_device_slot("LEONIDA_XS_FRAME_INTERVAL_SLOT", r.frame_interval);
-        const unsigned schedule_event = env_device_slot("LEONIDA_XS_SCHEDULE_EVENT_SLOT", r.schedule_event);
-        const unsigned wait_event = env_device_slot("LEONIDA_XS_WAIT_EVENT_SLOT", r.wait_event);
-        const unsigned queue_x = env_device_slot("LEONIDA_XS_QUEUE_X_SLOT", r.queue_x);
-        const unsigned list_x = env_device_slot("LEONIDA_XS_LIST_X_SLOT", r.list_x);
+        const unsigned frame_interval = env_slot("LEONIDA_XS_FRAME_INTERVAL_SLOT", r.frame_interval, 3, 127,
+                                                 "device slot");
+        const unsigned schedule_event = env_slot("LEONIDA_XS_SCHEDULE_EVENT_SLOT", r.schedule_event, 3, 127,
+                                                 "device slot");
+        const unsigned wait_event = env_slot("LEONIDA_XS_WAIT_EVENT_SLOT", r.wait_event, 3, 127, "device slot");
+        const unsigned frame_statistics = env_slot("LEONIDA_XS_FRAME_STATISTICS_SLOT", r.frame_statistics, 3, 127,
+                                                   "device slot");
+        const unsigned queue_x = env_slot("LEONIDA_XS_QUEUE_X_SLOT", r.queue_x, 3, 127, "device slot");
+        const unsigned list_x = env_slot("LEONIDA_XS_LIST_X_SLOT", r.list_x, 3, 127, "device slot");
         const bool moved = frame_interval != r.frame_interval || schedule_event != r.schedule_event ||
-                           wait_event != r.wait_event || queue_x != r.queue_x || list_x != r.list_x;
+                           wait_event != r.wait_event || frame_statistics != r.frame_statistics ||
+                           queue_x != r.queue_x || list_x != r.list_x;
         r.frame_interval = frame_interval;
         r.schedule_event = schedule_event;
         r.wait_event = wait_event;
+        r.frame_statistics = frame_statistics;
         r.queue_x = queue_x;
         r.list_x = list_x;
         if (moved)
             std::fprintf(stderr,
                          "[rt] d3d12_xs: Xbox device slots: SetFrameIntervalX=%u ScheduleFrameEventX=%u "
-                         "WaitFrameEventX=%u CreateCommandQueueX=%u CreateCommandListX=%u\n",
-                         r.frame_interval, r.schedule_event, r.wait_event, r.queue_x, r.list_x);
+                         "WaitFrameEventX=%u GetFrameStatisticsX=%u CreateCommandQueueX=%u CreateCommandListX=%u\n",
+                         r.frame_interval, r.schedule_event, r.wait_event, r.frame_statistics, r.queue_x, r.list_x);
         return r;
     }();
     return routes;
@@ -1564,6 +1592,10 @@ inline void note_list_slot(unsigned slot, std::uint64_t a1 = 0, std::uint64_t a2
                      static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
 }
 
+// Measured Xbox ID3D12GraphicsCommandListX IID passed to device slot 73 (CreateCommandListX).
+constexpr IID kXboxGraphicsCommandListXIid = {
+    0xc3827890, 0x4024, 0x474c, {0x98, 0xcf, 0x64, 0x5b, 0x51, 0xdc, 0x48, 0x74}};
+
 inline bool is_list_iid(const IID& iid) {
     return IsEqualIID(iid, __uuidof(IUnknown)) || IsEqualIID(iid, __uuidof(ID3D12Object)) ||
            IsEqualIID(iid, __uuidof(ID3D12DeviceChild)) || IsEqualIID(iid, __uuidof(ID3D12CommandList)) ||
@@ -1575,7 +1607,8 @@ inline bool is_list_iid(const IID& iid) {
            IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList5)) ||
            IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList6)) ||
            IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList7)) ||
-           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList8));
+           IsEqualIID(iid, __uuidof(ID3D12GraphicsCommandList8)) ||
+           IsEqualIID(iid, kXboxGraphicsCommandListXIid);
 }
 
 inline unsigned long list_add_ref(ListProxy* self) { return self->refs.fetch_add(1, std::memory_order_relaxed) + 1; }
@@ -1610,7 +1643,10 @@ inline HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out
         if (supports_iid(self->real, *riid)) log_refused_iid("list", *riid);
         return E_NOINTERFACE;
     }
-    if (!supports_iid(self->real, *riid)) return E_NOINTERFACE;
+    const IID real_iid = IsEqualIID(*riid, kXboxGraphicsCommandListXIid)
+                             ? __uuidof(ID3D12GraphicsCommandList)
+                             : *riid;
+    if (!supports_iid(self->real, real_iid)) return E_NOINTERFACE;
     *out = self;
     list_add_ref(self);
     return S_OK;
@@ -1831,6 +1867,40 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
     return EXCEPTION_CONTINUE_SEARCH;  // diagnostics only: the fault goes on to the title's handlers or the crash
 }
 
+// PresentX is at queue slot 30 in an older runtime layout and 32 in a newer one (public corroboration, XCL; see
+// docs/d3d12_vulkan.md). 30 is the default and LEONIDA_XS_PRESENT_X_SLOT sets the other. SuspendX and ResumeX have no
+// default: 0 means not routed, so they answer only when their variable is set.
+struct XboxQueueSlotRoutes {
+    unsigned present_x = 30;  // PresentX(plane_count, planes, params)
+    unsigned suspend_x = 0;   // SuspendX(flags)
+    unsigned resume_x = 0;    // ResumeX()
+};
+
+const XboxQueueSlotRoutes& xbox_queue_slot_routes() {
+    static const XboxQueueSlotRoutes routes = [] {
+        XboxQueueSlotRoutes r;
+        r.present_x = env_slot("LEONIDA_XS_PRESENT_X_SLOT", r.present_x, kQueuePublicSlots, kQueueSlots - 1,
+                               "queue slot");
+        r.suspend_x = env_slot("LEONIDA_XS_SUSPEND_X_SLOT", r.suspend_x, kQueuePublicSlots, kQueueSlots - 1,
+                               "queue slot");
+        r.resume_x = env_slot("LEONIDA_XS_RESUME_X_SLOT", r.resume_x, kQueuePublicSlots, kQueueSlots - 1,
+                              "queue slot");
+        // Two routes on one slot cannot both answer: PresentX keeps it, then SuspendX; the later route is unrouted.
+        if (r.suspend_x && r.suspend_x == r.present_x) {
+            std::fprintf(stderr, "[rt] d3d12_xs: SuspendX slot %u is PresentX's slot; SuspendX is not routed\n",
+                         r.suspend_x);
+            r.suspend_x = 0;
+        }
+        if (r.resume_x && (r.resume_x == r.present_x || r.resume_x == r.suspend_x)) {
+            std::fprintf(stderr, "[rt] d3d12_xs: ResumeX slot %u is already routed; ResumeX is not routed\n",
+                         r.resume_x);
+            r.resume_x = 0;
+        }
+        return r;
+    }();
+    return routes;
+}
+
 template <ChildKind K, unsigned Slot>
 std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -1926,6 +1996,31 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             return hr_to_u64(S_OK);
         }
         if constexpr (K == ChildKind::queue && Slot >= kQueuePublicSlots) {
+            // An attached PresentationHandler (upstream's attach_xbox_presentation seam; gta6rt attaches none) takes
+            // its PresentX/SuspendX/ResumeX slots (xbox_queue_slot_routes) first.
+            {
+                const XboxQueueSlotRoutes& qroutes = xbox_queue_slot_routes();
+                HRESULT hr = S_OK;
+                if (call_presentation(self->device, [&](const PresentationHandler& p) {
+                        if (Slot == qroutes.present_x && p.present_x) {
+                            hr = p.present_x(p.context, static_cast<UINT>(a1), reinterpret_cast<const void*>(a2),
+                                             reinterpret_cast<const void*>(a3));
+                            return true;
+                        }
+                        if (Slot == qroutes.suspend_x && p.suspend_x) {
+                            hr = p.suspend_x(p.context, static_cast<UINT>(a1));
+                            return true;
+                        }
+                        if (Slot == qroutes.resume_x && p.resume_x) {
+                            hr = p.resume_x(p.context);
+                            return true;
+                        }
+                        return false;
+                    })) {
+                    d3d12_trace::record(child_trace_name<K>(Slot));
+                    return hr_to_u64(hr);
+                }
+            }
             // The retail executable presents through queue slot 32 (0x100): PresentX(plane_count, planes, params),
             // measured at its frame loop (the plane layout is in d3d12_xs_device.h). When a real presenter exists,
             // that call goes to it before the capture/refusal paths below. An environment-named slot is also a
@@ -2313,6 +2408,17 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
 // 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
 HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std::uint64_t interval_us,
                                    std::uint64_t latency, std::uint64_t flags) {
+    {
+        HRESULT hr = S_OK;
+        if (call_presentation(self, [&](const PresentationHandler& p) {
+                if (!p.set_frame_interval) return false;
+                hr = p.set_frame_interval(p.context, reinterpret_cast<IUnknown*>(output),
+                                          static_cast<UINT>(interval_us), static_cast<UINT>(latency),
+                                          static_cast<UINT>(flags));
+                return true;
+            }))
+            return hr;
+    }
     self->frame_interval_us.store(static_cast<std::uint32_t>(interval_us), std::memory_order_relaxed);
     self->frame_latency.store(static_cast<std::uint32_t>(latency ? latency : 1), std::memory_order_relaxed);
     if (XboxPresentationSink* presentation = device_presentation(self))
@@ -2327,6 +2433,16 @@ HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std:
 // Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
 HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
                                      std::uint64_t flags) {
+    {
+        HRESULT hr = S_OK;
+        if (call_presentation(self, [&](const PresentationHandler& p) {
+                if (!p.schedule_frame_event) return false;
+                hr = p.schedule_frame_event(p.context, static_cast<UINT>(event), static_cast<UINT>(offset_us),
+                                            static_cast<UINT>(flags));
+                return true;
+            }))
+            return hr;
+    }
     self->frame_event_scheduled.store(true, std::memory_order_relaxed);
     if (XboxPresentationSink* presentation = device_presentation(self)) {
         const HRESULT hr = presentation->ScheduleFrameEventX(static_cast<std::uint32_t>(event),
@@ -2341,15 +2457,11 @@ HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std
                          static_cast<unsigned long>(hr));
         return S_OK;
     }
-    (void)event;
-    (void)offset_us;
-    (void)flags;
     return S_OK;
 }
 
-// Xbox device slot 80 (public HLE): WaitFrameEventX(event, timeout_ms, pEvent, flags, &token). It returns at once with
-// a fresh non-zero token (the first-frame choice): there is no vblank source behind the device before a presenter, and
-// a zero wait cannot stall the title. A null token pointer is E_POINTER, as a _Out_ parameter.
+// Xbox device slot 80 (public HLE): WaitFrameEventX(event, timeout_ms, pEvent, flags, &token). When a presenter is
+// attached, forwards directly to it; otherwise returns at once with a fresh non-zero token so boot tests cannot stall.
 HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t timeout_ms,
                                  std::uint64_t flags, std::uint64_t token_word) {
     {
@@ -2368,6 +2480,16 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
         }
     }
     auto* token = reinterpret_cast<std::uint64_t*>(token_word);
+    {
+        HRESULT hr = S_OK;
+        if (call_presentation(self, [&](const PresentationHandler& p) {
+                if (!p.wait_frame_event) return false;
+                hr = p.wait_frame_event(p.context, static_cast<UINT>(event), static_cast<DWORD>(timeout_ms),
+                                        static_cast<UINT>(flags), token);
+                return true;
+            }))
+            return hr;
+    }
     if (!token) return E_POINTER;
     // The real pacer hands out the token its PresentX checks; without a presenter the stand-in below keeps a fresh
     // non-zero token so the boot can continue (there is no vblank source to wait on yet).
@@ -2385,9 +2507,6 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
         *token = self->frame_tokens->issue();
         return S_OK;
     }
-    (void)event;
-    (void)timeout_ms;
-    (void)flags;
     *token = self->frame_tokens->issue();
     return S_OK;
 }
@@ -3723,6 +3842,21 @@ bool route_xbox_device_slot(DeviceProxy* self, unsigned slot, std::uint64_t a1, 
     } else if (slot == routes.wait_event) {
         log_xbox_route_once(slot, "WaitFrameEventX", a1, a2, a3, a4, a5);
         result = hr_to_u64(proxy_wait_frame_event_x(self, a1, a2, a4, a5));
+    } else if (slot == routes.frame_statistics) {
+        // GetFrameStatisticsX(token, type_mask, count, out): an attached PresentationHandler answers it; otherwise no
+        // statistics yet (S_FALSE with a zero count, the "not available yet" answer in docs/d3d12_vulkan.md), and
+        // never the PC slot 81 (ID3D12Device13::OpenExistingHeapFromAddress1).
+        log_xbox_route_once(slot, "GetFrameStatisticsX", a1, a2, a3, a4, a5);
+        HRESULT hr = S_FALSE;
+        if (!call_presentation(self, [&](const PresentationHandler& p) {
+                if (!p.get_frame_statistics) return false;
+                hr = p.get_frame_statistics(p.context, a1, static_cast<UINT>(a2), reinterpret_cast<UINT*>(a3),
+                                            reinterpret_cast<void*>(a4));
+                return true;
+            })) {
+            if (auto* count = reinterpret_cast<UINT*>(a3)) *count = 0;
+        }
+        result = hr_to_u64(hr);
     } else if (slot == routes.queue_x) {
         log_xbox_route_once(slot, "CreateCommandQueueX", a1, a2, a3, a4, a5);
         result = hr_to_u64(proxy_create_command_queue_xbox(self, reinterpret_cast<const std::uint32_t*>(a1),
@@ -4567,6 +4701,15 @@ void set_console_descriptor_heap_handler(ConsoleDescriptorHeapHandler handler) {
     g_console_heap.store(handler, std::memory_order_release);
 }
 
+bool set_presentation_handler(void* device, const PresentationHandler* handler) {
+    auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
+    if (!proxy) return false;
+    AcquireSRWLockExclusive(&proxy->presentation_lock);
+    proxy->presentation_handler = handler ? *handler : PresentationHandler{};
+    ReleaseSRWLockExclusive(&proxy->presentation_lock);
+    return true;
+}
+
 ID3D12Device* device_proxy_real_device(const void* device) {
     if (!is_device_proxy(device)) return nullptr;
     return static_cast<const DeviceProxy*>(device)->real;
@@ -4585,7 +4728,7 @@ bool device_slot_overridden(unsigned slot) {
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
     return slot == routes.frame_interval || slot == routes.schedule_event || slot == routes.wait_event ||
-           slot == routes.queue_x || slot == routes.list_x;
+           slot == routes.frame_statistics || slot == routes.queue_x || slot == routes.list_x;
 }
 
 bool is_queue_proxy(const void* queue) { return is_child_proxy<ChildKind::queue>(queue); }
