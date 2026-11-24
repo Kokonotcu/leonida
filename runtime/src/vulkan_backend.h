@@ -1131,6 +1131,7 @@ public:
             vk.vkDestroyFramebuffer(device_, framebuffer, nullptr);
         for (const auto& [key, pass] : resolve_passes_) vk.vkDestroyRenderPass(device_, pass, nullptr);
         for (const auto& [key, view] : views_) vk.vkDestroyImageView(device_, view, nullptr);
+        for (const auto& [key, view] : plane_views_) vk.vkDestroyImageView(device_, view, nullptr);
     }
 
     VulkanContext(const VulkanContext&) = delete;
@@ -1267,6 +1268,10 @@ public:
                 } else {
                     ++v;
                 }
+            }
+            for (auto v = plane_views_.lower_bound({img, VkFormat(0)}); v != plane_views_.end() && v->first.first == img;) {
+                defer_destroy(DeferredDeletionQueue::Kind::image_view, v->second);
+                v = plane_views_.erase(v);
             }
         }
         if (sparse_resource)
@@ -1903,6 +1908,24 @@ public:
         return view;
     }
 
+    // A 2D view of mip 0, layer 0 of `r` in r.format, to sample: a plane of a composed present. Made on first use and
+    // destroyed with the image (remove_resource), like view(); the presenter made two for every composed present
+    // (review I12).
+    VkImageView plane_view(const ResourceBinding& r) {
+        std::lock_guard lock(views_mutex_);
+        const auto key = std::make_pair(r.image, r.format);
+        if (const auto it = plane_views_.find(key); it != plane_views_.end()) return it->second;
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        info.image = r.image;
+        info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        info.format = r.format;
+        info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageView view = VK_NULL_HANDLE;
+        if (vk.vkCreateImageView(device_, &info, nullptr, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
+        plane_views_[key] = view;
+        return view;
+    }
+
 private:
     friend class VulkanQueue;
     friend class VulkanPresenter;
@@ -2071,6 +2094,7 @@ private:
     std::map<std::tuple<VkImage, VkImageAspectFlags, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, VkFormat>,
              VkImageView>
         views_;
+    std::map<std::pair<VkImage, VkFormat>, VkImageView> plane_views_;  // plane_view(), under views_mutex_
     // depth_resolve_framebuffer's caches, under views_mutex_ like views_.
     std::map<std::tuple<VkFormat, std::uint32_t, VkImageLayout, VkImageLayout, VkResolveModeFlagBits>, VkRenderPass>
         resolve_passes_;

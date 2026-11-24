@@ -110,6 +110,35 @@ inline bool blit_unsupported_format(VkFormat format) {
         return format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_BC7_SRGB_BLOCK;
     }
 }
+inline const char* present_mode_name(VkPresentModeKHR mode) {
+    switch (mode) {
+    case VK_PRESENT_MODE_IMMEDIATE_KHR: return "IMMEDIATE";
+    case VK_PRESENT_MODE_MAILBOX_KHR: return "MAILBOX";
+    case VK_PRESENT_MODE_FIFO_KHR: return "FIFO";
+    case VK_PRESENT_MODE_FIFO_RELAXED_KHR: return "FIFO_RELAXED";
+    default: return "other";
+    }
+}
+// The VkResults a present or a swapchain call can give, by name (review I12); others as "VkResult <n>" by the caller.
+inline const char* vk_result_name(VkResult result) {
+    switch (result) {
+    case VK_SUCCESS: return "VK_SUCCESS";
+    case VK_NOT_READY: return "VK_NOT_READY";
+    case VK_TIMEOUT: return "VK_TIMEOUT";
+    case VK_SUBOPTIMAL_KHR: return "VK_SUBOPTIMAL_KHR";
+    case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+    case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+    case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+    case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+    case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+    case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR: return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+    case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
+    case VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT: return "VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT";
+    case VK_ERROR_UNKNOWN: return "VK_ERROR_UNKNOWN";
+    default: return nullptr;
+    }
+}
 }  // namespace detail
 
 class VulkanPresenter {
@@ -318,6 +347,9 @@ public:
     }
     // The swapchain holds HDR10 (ST.2084) values: a plane asked for it and the surface has the format.
     bool hdr_active() const { return hdr_active_; }
+    // An HDR10 plane would reach the output as HDR10: the surface listed an ST.2084 format at the last swapchain
+    // (re)creation, or the encoding is forced (force_hdr_encoding). False: HDR10 planes are tone mapped to SDR.
+    bool hdr_output() const { return surface_hdr10_ || force_hdr_encoding_; }
     // Presents that went through the compose pass (present_planes); plain blits and blank frames are not counted.
     std::uint64_t composed_presents() const { return composed_; }
     // Tests, on surfaces without HDR10: compose as if the output were HDR10 but write the PQ values into the (8-bit,
@@ -395,6 +427,11 @@ public:
         if (source_rect) pending.rect = *source_rect;
         if (planes) pending.planes = *planes;
         deferred_.push_back(pending);
+        if (!logged_deferred_) {  // review I12: a frame shown late for a reason the log should say, once
+            logged_deferred_ = true;
+            std::fprintf(stderr, "[rt] d3d12: a Present is queued behind held work (a Wait whose Signal is not "
+                                 "submitted yet) and is shown once that work is released; logged once\n");
+        }
         last_tore_ = false;
         context_.holds().after_held(this, [this] { run_deferred(); });
         return VK_SUCCESS;
@@ -449,9 +486,11 @@ private:
         const VkResult result = submit_now(p.has_source ? &binding : nullptr, p.source, p.vsync,
                                            p.has_rect ? &p.rect : nullptr, p.srgb, p.tear,
                                            p.has_planes ? &p.planes : nullptr);
-        if (result != VK_SUCCESS)
-            std::fprintf(stderr, "[rt] d3d12: a Present held behind queued work failed when it was released (%d)\n",
-                         int(result));
+        if (result != VK_SUCCESS) {
+            const char* name = detail::vk_result_name(result);
+            std::fprintf(stderr, "[rt] d3d12: a Present held behind queued work failed when it was released (%s, %d)\n",
+                         name ? name : "VkResult", int(result));
+        }
     }
 
     VkResult submit_now(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
@@ -486,6 +525,13 @@ private:
             stale_ = true;
             captured_ = false;  // nothing was shown: read_back() must not hand out the frame before
             return VK_SUCCESS;
+        }
+        if (!logged_swapchain_) {  // review I12: what the window shows, said once, at the first present
+            logged_swapchain_ = true;
+            std::fprintf(stderr,
+                         "[rt] present: swapchain %ux%u, format %d, colour space %d, present mode %s, %zu images\n",
+                         extent_.width, extent_.height, int(format_), int(color_space_),
+                         detail::present_mode_name(present_mode_), images_.size());
         }
         if (binding && !presentable(source)) return VK_ERROR_UNKNOWN;  // checked before an image is acquired for it
         if ((binding || planes) && !(format_features(format_) & VK_FORMAT_FEATURE_BLIT_DST_BIT))
@@ -679,7 +725,7 @@ private:
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence done = VK_NULL_HANDLE;
         VkSemaphore acquired = VK_NULL_HANDLE;
-        std::array<VkImageView, 2> views{};  // the plane views of the last composed present, until the frame is reused
+        std::array<VkImageView, 2> views{};  // the plane views of the last composed present (the context's)
     };
 
     // Whether `source` is a colour texture the device knows, so present() can refuse it before acquiring an image.
@@ -803,11 +849,8 @@ private:
         VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     };
 
-    void drop_views(Frame& frame) {
-        for (VkImageView& view : frame.views)
-            if (view) context_.vk.vkDestroyImageView(context_.device(), view, nullptr);
-        frame.views = {};
-    }
+    // The views are the context's (plane_view), which destroys them with their images.
+    void drop_views(Frame& frame) { frame.views = {}; }
 
     // The compose pass and its target image, for the swapchain's current size.
     bool prepare_compose() {
@@ -840,12 +883,8 @@ private:
             return false;  // the target does not match the swapchain: nothing recorded
         drop_views(frame);
         for (std::uint32_t i = 0; i < planes.count; ++i) {
-            VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-            view_info.image = current[i].image;
-            view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            view_info.format = current[i].format;
-            view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            if (vk.vkCreateImageView(context_.device(), &view_info, nullptr, &frame.views[i]) != VK_SUCCESS) {
+            frame.views[i] = context_.plane_view(current[i]);  // cached with the image (review I12)
+            if (!frame.views[i]) {
                 drop_views(frame);
                 return false;
             }
@@ -1172,11 +1211,6 @@ private:
     bool recreate(bool vsync, bool srgb, bool hdr = false) {
         auto& vk = context_.vk;
         const VkDevice device = context_.device();
-        {
-            std::lock_guard lock(context_.submit_mutex());
-            vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
-        }
-        if (finish_pending_capture() != VK_SUCCESS) return false;
         stale_ = true;  // until this succeeds
         tear_mode_ = VK_PRESENT_MODE_MAX_ENUM_KHR;
         VkSurfaceCapabilitiesKHR caps{};
@@ -1195,7 +1229,17 @@ private:
                 extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
             }
         }
-        if (extent.width == 0 || extent.height == 0) {
+        // Review I12: still minimised with no swapchain, which every present while minimised checks: nothing is
+        // released or replaced, so nothing to wait for (it waited for the queue to idle every frame).
+        const bool minimised = extent.width == 0 || extent.height == 0;
+        if (swapchain_ || !ready_.empty() || !minimised) {
+            {
+                std::lock_guard lock(context_.submit_mutex());
+                vk.vkQueueWaitIdle(queue_);  // the old swapchain's images and semaphores may still be in use
+            }
+            if (finish_pending_capture() != VK_SUCCESS) return false;
+        }
+        if (minimised) {
             {
                 std::lock_guard lock(context_.submit_mutex());
                 release(swapchain_);
@@ -1226,6 +1270,10 @@ private:
         if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data()) != VK_SUCCESS || !count)
             return false;
         formats.resize(count);
+        surface_hdr10_ = std::any_of(formats.begin(), formats.end(), [](const VkSurfaceFormatKHR& f) {
+            return f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+                   (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+        });
         // An sRGB source wants an sRGB swapchain (the blit decodes and encodes, which cancel); any other source
         // wants UNORM (the bytes go through as they are). BGRA before RGBA, as the surface lists them.
         VkSurfaceFormatKHR chosen = formats[0];
@@ -1365,6 +1413,8 @@ private:
         swapchain_srgb_ = srgb;
         swapchain_hdr_req_ = hdr;
         stale_ = false;
+        color_space_ = chosen.colorSpace;
+        present_mode_ = mode;
         return true;
     }
 
@@ -1459,6 +1509,7 @@ private:
     bool swapchain_srgb_ = false;  // the swapchain format follows the source being presented (set once it exists)
     bool swapchain_hdr_req_ = false;  // the swapchain was built for an HDR10 request (it has the format only if hdr_active_)
     bool hdr_active_ = false;
+    std::atomic<bool> surface_hdr10_{false};  // the surface's formats include HDR10 (ST.2084), as of the last recreate
     std::atomic<std::uint64_t> composed_{0};
     std::atomic<bool> force_hdr_encoding_{false};
     bool warned_hdr_ = false;
@@ -1470,6 +1521,10 @@ private:
     std::mutex features_mutex_;  // features_ only; taken last, nothing is called under it but the format query
     std::map<VkFormat, VkFormatFeatureFlags> features_;
     bool warned_srgb_ = false;
+    bool logged_swapchain_ = false;  // the first present's swapchain format, colour space, extent and mode were printed
+    VkColorSpaceKHR color_space_ = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;  // the swapchain's, with format_
+    VkPresentModeKHR present_mode_ = VK_PRESENT_MODE_FIFO_KHR;
+    bool logged_deferred_ = false;   // the first Present queued behind held work was printed
     bool capture_ = false;
     VkBuffer capture_buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory capture_memory_ = VK_NULL_HANDLE;

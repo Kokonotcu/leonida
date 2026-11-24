@@ -219,10 +219,18 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     // the public HDR sample it is the GameDVR copy of the frame, and blending a plane we cannot tell apart from it risks
     // drawing the frame twice with an alpha that was never meant to be blended.
     const bool overlay = plane_count == 2 && (planes[1].Flags & xbox_plane_flag_overlay) != 0;
-    if (plane_count == 2 && !overlay)
+    // Review I13: an HDR10 plane 0 on an output that cannot show HDR10, with plane 1 an SDR plane of the same frame (no
+    // overlay flag: the title's own SDR copy, the GameDVR plane): plane 1 is shown as it is, the title's SDR look, and
+    // through the plain blit, instead of tone mapping plane 0 with a curve of ours in the compose pass.
+    const bool sdr_copy = plane_count == 2 && !overlay && hdr0 && !is_hdr10(planes[1]) && !presenter_->hdr_output();
+    if (sdr_copy)
+        log_once(logged_sdr_plane_, "PresentX with an HDR10 plane 0 on an SDR output: the title's SDR plane 1 is shown instead "
+                                    "of tone mapping plane 0");
+    else if (plane_count == 2 && !overlay)
         log_once(logged_planes_, "PresentX with 2 planes and no overlay flag on plane 1: only plane 0 is shown (plane 1 is taken "
                                  "as the GameDVR copy of the frame)");
-    const bool compose = hdr0 || placement(planes[0]) || filter_of(planes[0]) != xbox_scale_filter_default || overlay;
+    const XboxPresentPlaneParameters& shown = planes[sdr_copy ? 1 : 0];  // the plane shown alone or composed under plane 1
+    const bool compose = (hdr0 && !sdr_copy) || placement(shown) || filter_of(shown) != xbox_scale_filter_default || overlay;
 
     if (compose) {
         // Every shown plane: a 2D texture, a source rectangle inside it, a placement inside the output.
@@ -232,7 +240,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
         composed.sdr_eotf = sdr_eotf_;
         composed.hdr_peak_nits = hdr_peak_nits_;
         for (UINT i = 0; i < composed.count; ++i) {
-            const XboxPresentPlaneParameters& p = planes[i];
+            const XboxPresentPlaneParameters& p = i == 0 ? shown : planes[i];
             ID3D12Resource* source = p.ppResources[0];
             const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
             if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
@@ -272,7 +280,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
         return S_OK;
     }
 
-    const XboxPresentPlaneParameters& plane = planes[0];
+    const XboxPresentPlaneParameters& plane = shown;
     ID3D12Resource* resource = plane.ppResources[0];
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;

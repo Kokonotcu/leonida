@@ -1016,6 +1016,42 @@ int main() {
                 std::printf("compose: HDR10 swapchain: this surface/display lists no ST.2084 format, so only the SDR tone map and "
                             "the PQ encoder were run (HDR10 swapchain case skipped)\n");
 
+            // Review I13: an HDR10 plane 0 with the title's own SDR copy of the frame in plane 1 (no overlay flag, the
+            // GameDVR plane): on an SDR output plane 1 is shown as it is, by the plain blit, instead of tone mapping
+            // plane 0. On an HDR10 output plane 0 is composed as before.
+            if (!xbox.presenter().hdr_output()) {
+                pair[0] = parameters(hdr.source, nullptr, xbox_scale_filter_point, rt::d3d12::xbox_color_space_g2084_p2020);
+                pair[1] = plane_of(split, 0);
+                const std::uint64_t composed_before = xbox.presenter().composed_presents();
+                EXPECT(present_planes(pair, 2));
+                EXPECT(xbox.presenter().composed_presents() == composed_before);  // not composed: the blit
+                EXPECT(frame.bytes == blit_frame.bytes);                        // plane 1 exactly, as the blit shows it
+                one = parameters(hdr.source, nullptr, xbox_scale_filter_point, rt::d3d12::xbox_color_space_g2084_p2020);
+                EXPECT(present_planes(&one, 1) && composed_ok());  // plane 0 alone: tone mapped as before
+                // The cost of each way, 20 PresentX calls without read-back, the last one waited for.
+                const auto timed = [&](rt::d3d12::XboxPresentPlaneParameters* planes_, UINT count_) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int i = 0; i < 20; ++i) {
+                        clock.advance_us(4 * period);
+                        if (!next_token(token)) return -1.0;
+                        for (UINT p = 0; p < count_; ++p) planes_[p].Token = token;
+                        if (xbox.PresentX(count_, planes_, nullptr) != S_OK) return -1.0;
+                    }
+                    if (!grab(frame)) return -1.0;
+                    return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 20;
+                };
+                const double blit_us = timed(pair, 2);
+                const std::uint64_t composed_mid = xbox.presenter().composed_presents();
+                const double tone_us = timed(&one, 1);
+                EXPECT(blit_us > 0 && tone_us > 0);
+                composed_expected = xbox.presenter().composed_presents();
+                EXPECT(composed_mid == composed_expected - 20);
+                std::printf("HDR10 plane 0 + SDR plane 1 on an SDR output: plane 1 blitted, %.1f us per PresentX; plane 0 "
+                            "tone mapped alone: %.1f us per PresentX: ok\n", blit_us, tone_us);
+            } else {
+                std::printf("HDR10 output: the SDR-plane choice (I13) is not checked on it\n");
+            }
+
             // C2: linear-light blending and the SDR EOTF option. A 50% white overlay (premultiplied 128,128,128 alpha 128) over
             // black is half the light: byte 188 with piecewise sRGB, 186 with gamma 2.2 (blending the encoded values would give
             // 128), checked against the model and against these numbers.
@@ -1136,12 +1172,19 @@ int main() {
                             hdr_byte, int(frame.at(5, 5).r));
             }
 
-            // D: an SDR plane 1 next to an HDR10 plane 0 that is not flagged an overlay is the GameDVR copy: not shown.
+            // D: an SDR plane 1 next to an HDR10 plane 0 that is not flagged an overlay is the GameDVR copy: never blended.
+            // On an HDR10 output plane 0 alone is shown; on an SDR one plane 1 alone, the title's SDR look (review I13),
+            // here composed for its point filter.
             pair[0] = parameters(hdr.source, nullptr, xbox_scale_filter_point, rt::d3d12::xbox_color_space_g2084_p2020);
             pair[1] = parameters(second, nullptr, xbox_scale_filter_point, 0);
             EXPECT(present_planes(pair, 2) && composed_ok());
-            if (!surface_hdr) EXPECT(frame_matches(frame, &href, 1, false, 203.0, 2));
-            std::printf("compose: HDR10 plane 0 + unflagged SDR plane 1 (GameDVR copy) shows plane 0 only: ok\n");
+            if (!xbox.presenter().hdr_output()) {
+                EXPECT(region_is(frame, 0, 0, width, height, {0, 255, 0}, 1));
+                std::printf("compose: HDR10 plane 0 + unflagged SDR plane 1 on an SDR output shows plane 1 only: ok\n");
+            } else {
+                if (!surface_hdr) EXPECT(frame_matches(frame, &href, 1, false, 203.0, 2));
+                std::printf("compose: HDR10 plane 0 + unflagged SDR plane 1 (GameDVR copy) shows plane 0 only: ok\n");
+            }
 
             // E: a placement that is not a sub-rectangle of the output (empty, inverted, outside, NaN), an unknown filter and
             // extended descriptors are ignored (logged once): the plane is shown over the whole output, point filtered.

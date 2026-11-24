@@ -137,7 +137,7 @@ private:
     std::mutex present_mutex_;  // PresentX, SuspendX and ResumeX one at a time
     std::atomic<std::uint64_t> presents_{0};
     bool logged_planes_ = false, logged_threshold_ = false, logged_display_ = false, logged_color_space_ = false,
-         logged_extras_ = false, logged_resource_count_ = false;
+         logged_extras_ = false, logged_resource_count_ = false, logged_sdr_plane_ = false;
     std::atomic<float> sdr_white_override_{0.0f};  // > 0: set_sdr_white_nits
     std::atomic<leonida::PresentPlanes::SdrEotf> sdr_eotf_{leonida::PresentPlanes::SdrEotf::srgb};
     std::atomic<float> hdr_peak_nits_{1000.0f};
