@@ -127,6 +127,27 @@ HRESULT __stdcall linear_copy_into(Computer* c, std::uint8_t* base, std::uint32_
     return S_OK;
 }
 
+// Slot 6: UINT64 GetTexelElementOffsetBytes(plane, mip, x, y, z or slice, sample, UINT* bit offset): the byte offset of
+// one element from the resource start (x and y in elements: the caller divides by 4 for BC formats). Measured by
+// five-star-recomp (ThatRecompDev, docs/xg.md): the game adds the return to the resource base to address one element
+// (0x1455acdd0, inlined at five sites); E_NOTIMPL (0x80004001) came back as an offset and sent those writes 2 GiB away.
+// An element outside the layout gives 0, as the console's does for a plane, mip or slice that does not exist.
+std::uint64_t __stdcall linear_texel_offset(Computer* c, std::uint32_t plane, std::uint32_t mip, std::uint64_t x,
+                                            std::uint64_t y, std::uint64_t z, std::uint64_t /*sample*/,
+                                            std::uint32_t* bit_offset) {
+    if (bit_offset) *bit_offset = 0;
+    y &= 0xFFFFFFFFull;
+    z &= 0xFFFFFFFFull;
+    if (plane != 0 || mip >= c->layout.mip_levels) return 0;
+    const bool volume = c->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const std::uint32_t subresource = volume ? mip : mip + static_cast<std::uint32_t>(z) * c->layout.mip_levels;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT f{};
+    if (!rt::xg::footprint(c->desc, c->layout, subresource, f)) return 0;
+    const rt::xg::MipRecord& r = c->layout.plane[0].mip[mip];
+    return f.Offset + (volume ? z * r.slice2d_size_bytes : 0) + y * r.pitch_bytes +
+           x * c->layout.plane[0].bytes_per_element;
+}
+
 // Slot 10: GetResourceTiling's arguments (UINT* tiles, D3D12_PACKED_MIP_INFO*, D3D12_TILE_SHAPE*, UINT* count in/out,
 // UINT first, D3D12_SUBRESOURCE_TILING*). A linear layout has no standard tile shape: every mip is reported packed into
 // the resource's 64 KiB tiles.
@@ -152,6 +173,7 @@ constexpr auto make_linear_vtable(std::index_sequence<Slot...>) {
         (Slot == 0    ? reinterpret_cast<void*>(&linear_add_ref)
          : Slot == 1  ? reinterpret_cast<void*>(&linear_release)
          : Slot == 2  ? reinterpret_cast<void*>(&linear_get_resource_layout)
+         : Slot == 6  ? reinterpret_cast<void*>(&linear_texel_offset)
          : Slot == 8  ? reinterpret_cast<void*>(&linear_copy_into)
          : Slot == 10 ? reinterpret_cast<void*>(&linear_get_resource_tiling)
                       : reinterpret_cast<void*>(&computer_slot<Slot>))...};
