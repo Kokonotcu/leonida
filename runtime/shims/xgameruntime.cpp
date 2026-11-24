@@ -1389,6 +1389,83 @@ HRESULT STDMETHODCALLTYPE pkg_mount_with_ui_result(void*, XAsyncBlock* async, XP
     return XAsyncGetResult(async, &kMountWithUiIdentity, sizeof(*mount), mount, nullptr);
 }
 
+// ---- XPackageEnumeratePackages(kind, scope, context, callback) (IXPackageImpl 28, IXPackageImpl2 35, IXPackageImpl3 39)
+// The GDK's XPackageDetails, as XPackage.h lays it out. Offline the title's own package is the only one: a Game
+// enumeration calls the callback once with it, a Content (DLC) enumeration with none; both return S_OK. Retail boot 7
+// asked IXPackageImpl3's slot 39 and got E_NOTIMPL, then died reading a null out of a table it fills per package.
+struct PackageVersion {
+    uint16_t major, minor, build, revision;
+};
+struct PackageDetails {
+    const char* packageIdentifier;
+    PackageVersion version;
+    uint32_t kind;  // XPackageKind: 0 Game, 1 Content
+    const char* displayName;
+    const char* description;
+    const char* publisher;
+    const char* storeId;
+    bool installing;
+    uint32_t index;
+    uint32_t count;
+    bool ageRestricted;
+    const char* titleId;
+};
+using PackageEnumerationCallback = bool(CALLBACK*)(void* context, const PackageDetails* details);
+std::string package_config();
+bool package_title_id(uint32_t& out);
+
+HRESULT STDMETHODCALLTYPE pkg_enumerate_packages(void*, uint32_t kind, uint32_t scope, void* context,
+                                                 PackageEnumerationCallback callback) {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackageEnumeratePackages(kind %u, scope %u, context %p, callback %p): "
+                             "%s\n",
+                     kind, scope, context, reinterpret_cast<void*>(callback),
+                     kind == 0 ? "the title's own package" : "no content packages offline");
+    if (!callback) return E_INVALIDARG;
+    if (kind != 0) return S_OK;
+    static std::string identifier, title_id, publisher;
+    static PackageDetails details{};
+    static std::once_flag once;
+    std::call_once(once, [] {
+        char id[256] = {};
+        if (SUCCEEDED(XPackageGetCurrentProcessPackageIdentifier(sizeof(id), id))) identifier = id;
+        uint32_t tid = 0;
+        if (package_title_id(tid)) {
+            char text[16];
+            std::snprintf(text, sizeof(text), "%08X", tid);
+            title_id = text;
+        }
+        const std::string xml = package_config();
+        PackageVersion version{1, 0, 0, 0};
+        if (const size_t identity = xml.find("<Identity"); identity != std::string::npos) {
+            if (const size_t v = xml.find("Version=\"", identity); v != std::string::npos) {
+                unsigned a = 0, b = 0, c = 0, d = 0;
+                if (std::sscanf(xml.c_str() + v + 9, "%u.%u.%u.%u", &a, &b, &c, &d) >= 2)
+                    version = {uint16_t(a), uint16_t(b), uint16_t(c), uint16_t(d)};
+            }
+            if (const size_t p = xml.find("Publisher=\"", identity); p != std::string::npos) {
+                const size_t end = xml.find('"', p + 11);
+                if (end != std::string::npos) publisher = xml.substr(p + 11, end - p - 11);
+            }
+        }
+        details.packageIdentifier = identifier.c_str();
+        details.version = version;
+        details.kind = 0;
+        details.displayName = "";
+        details.description = "";
+        details.publisher = publisher.c_str();
+        details.storeId = "";
+        details.installing = false;
+        details.index = 0;
+        details.count = 1;
+        details.ageRestricted = false;
+        details.titleId = title_id.c_str();
+    });
+    callback(context, &details);
+    return S_OK;
+}
+
 #define PN(n) reinterpret_cast<const void*>(&package_not_implemented<n>)
 const void* const kPackageVtable[] = {
     reinterpret_cast<const void*>(&object_query_interface), reinterpret_cast<const void*>(&object_add_ref),
@@ -1416,14 +1493,15 @@ const void* const kPackageVtable[] = {
     reinterpret_cast<const void*>(&pkg_mount_path_size),  // 24 XPackageGetMountPathSize
     reinterpret_cast<const void*>(&pkg_mount_path),       // 25 XPackageGetMountPath
     reinterpret_cast<const void*>(&pkg_close_mount),      // 26 XPackageCloseMountHandle
-    PN(27), PN(28), PN(29), PN(30), PN(31),           // 27 _unknown_, 28 EnumeratePackages, 29 RegisterPackageInstalled,
+    PN(27), reinterpret_cast<const void*>(&pkg_enumerate_packages), PN(29), PN(30), PN(31),
+                                                      // 27 _unknown_, 28 EnumeratePackages, 29 RegisterPackageInstalled,
                                                       // 30 GetWriteStats, 31 _unknown_
     PN(32), PN(33),                                   // 32 UninstallUWPInstance, 33 EnumerateFeatures
     reinterpret_cast<const void*>(&pkg_uninstall_package),     // 34 XPackageUninstallPackage (bool)
-    PN(35), PN(36),                                   // IXPackageImpl2: EnumeratePackages, RegisterPackageInstalled,
+    reinterpret_cast<const void*>(&pkg_enumerate_packages), PN(36),  // IXPackageImpl2: EnumeratePackages, Register...,
     reinterpret_cast<const void*>(&pkg_mount_with_ui_async),   // 37 XPackageMountWithUiAsync
     reinterpret_cast<const void*>(&pkg_mount_with_ui_result),  // 38 XPackageMountWithUiResult
-    PN(39), PN(40),                                   // IXPackageImpl3: EnumeratePackages, RegisterPackageInstalled
+    reinterpret_cast<const void*>(&pkg_enumerate_packages), PN(40),  // IXPackageImpl3: EnumeratePackages, Register...
     PN(41),                                           // IXPackageImpl4: GetPackageKind
 };
 #undef PN

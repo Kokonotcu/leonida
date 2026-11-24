@@ -402,6 +402,7 @@ const char* slot_name(unsigned slot) {
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 48: return "Xbox CreateCommandQueueX (32-byte desc) -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+        case 55: return "Xbox derived pipeline state (answered with the base)";
         case 56: return "GetResourceAllocationInfo1 (C or PC form)";
         case 61: return "Xbox CreateSamplerX -> PC CreateSampler";
         case 62: return "Xbox CreateComputePipelineState";
@@ -3627,6 +3628,31 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
                                           std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
         return reinterpret_cast<Fn>(self->real_vtable[57])(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
                                                            a12, a13, a14);
+    } else if constexpr (Slot == 55) {
+        // Xbox derived pipeline state (measured in the title, game_scarlett_master.exe+0x2479f40): (base PSO, record
+        // count, records, riid, out). A record is 0x14c bytes, a u32 type then a D3D12 state struct: 0 =
+        // D3D12_DEPTH_STENCIL_DESC, 1 = D3D12_RASTERIZER_DESC, 2 = D3D12_BLEND_DESC, 5 = stencil masks only.
+        // Forwarding it reached PC slot 55 (CreateReservedResource1) and wrote through a stack word. Until the base's
+        // description is kept, the answer is the base itself: a stub base stays a stub (its draws are skipped), a real
+        // one draws with its own state instead of the overrides.
+        note_slot(55);
+        auto* base = reinterpret_cast<IUnknown*>(a1);
+        const auto count = static_cast<std::uint32_t>(a2);
+        const auto* records = reinterpret_cast<const std::uint8_t*>(a3);
+        void** out = reinterpret_cast<void**>(a5);
+        if (!out || !a4) return hr_to_u64(E_POINTER);
+        *out = nullptr;
+        if (!base) return hr_to_u64(E_INVALIDARG);
+        static std::atomic<bool> shown{false};
+        if (!shown.exchange(true, std::memory_order_relaxed)) {
+            std::uint32_t types[8] = {};
+            for (std::uint32_t i = 0; i < count && i < 8 && records; ++i)
+                std::memcpy(&types[i], records + std::size_t(i) * 0x14c, sizeof(std::uint32_t));
+            std::fprintf(stderr, "[rt] d3d12_xs: device slot 55 (Xbox derived PSO): base %p, %u override record(s), "
+                         "types %u %u %u %u; answered with the base (overrides not applied yet)\n",
+                         static_cast<void*>(base), count, types[0], types[1], types[2], types[3]);
+        }
+        return hr_to_u64(base->QueryInterface(*reinterpret_cast<const IID*>(a4), out));
     } else if constexpr (Slot == 48) {
         return hr_to_u64(proxy_create_command_queue_xbox(self, reinterpret_cast<const std::uint32_t*>(a1),
                                                          reinterpret_cast<const IID*>(a2),

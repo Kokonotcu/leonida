@@ -54,8 +54,37 @@ bool host_serializes_1_2(SerializeFn fn) {
     return supported;
 }
 
+HRESULT serialize_root_signature_unlogged(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc, ID3DBlob** blob,
+                                          ID3DBlob** error);
+
+// A refused description is reported with the host's message (the first few): the title treats a failed serialization
+// as a program that cannot be linked and leaves a null in its pass table.
 HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc,
                                         ID3DBlob** blob, ID3DBlob** error) {
+    ID3DBlob* local_error = nullptr;
+    ID3DBlob** error_out = error ? error : &local_error;
+    const HRESULT hr = serialize_root_signature_unlogged(desc, blob, error_out);
+    if (FAILED(hr)) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+            const char* text = *error_out ? static_cast<const char*>((*error_out)->GetBufferPointer()) : nullptr;
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: D3D12SerializeVersionedRootSignature (version %d, %u parameter(s), flags "
+                         "0x%x) failed 0x%08lx: %.300s\n",
+                         desc ? static_cast<int>(desc->Version) : -1,
+                         desc && desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_1 ? desc->Desc_1_1.NumParameters : 0u,
+                         desc && desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_1
+                             ? static_cast<unsigned>(desc->Desc_1_1.Flags)
+                             : 0u,
+                         static_cast<unsigned long>(hr), text ? text : "(no message)");
+        }
+    }
+    if (local_error) local_error->Release();
+    return hr;
+}
+
+HRESULT serialize_root_signature_unlogged(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc, ID3DBlob** blob,
+                                          ID3DBlob** error) {
     static auto fn = reinterpret_cast<SerializeFn>(host("D3D12SerializeVersionedRootSignature"));
     if (!fn) return E_NOTIMPL;
     if (!desc) return fn(desc, blob, error);
