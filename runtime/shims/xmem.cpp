@@ -414,6 +414,71 @@ PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
                                             PAGE_NOACCESS, parameter_count ? &parameter : nullptr, parameter_count);
 }
 
+// With g_phys_mutex held: [start, end) is no longer part of any window (it was committed); the rest of each window
+// it cut stays one.
+void forget_window_range(uintptr_t start, uintptr_t end) {
+    auto it = g_windows.lower_bound(start);
+    if (it != g_windows.begin() && std::prev(it)->first + std::prev(it)->second.size > start) it = std::prev(it);
+    while (it != g_windows.end() && it->first < end) {
+        const uintptr_t window_start = it->first, window_end = it->first + it->second.size;
+        const DWORD protect = it->second.protect;
+        it = g_windows.erase(it);
+        if (window_start < start) g_windows[window_start] = Window{start - window_start, protect};
+        if (window_end > end) it = g_windows.emplace(end, Window{window_end - end, protect}).first;
+    }
+}
+
+// Review B7: MEM_COMMIT without MEM_RESERVE into a range the shim reserved as placeholders (a 64 KiB-page window, a
+// MEM_RESERVE_PLACEHOLDER reservation) fails on the host: a placeholder cannot be committed (ERROR_INVALID_ADDRESS).
+// The console commits there, so each placeholder piece of the range is replaced by committed memory, and a piece that
+// is a plain reservation or already committed is committed in place. A piece with a physical page mapped, or free,
+// fails the call before anything changes. The committed range stops being a window.
+void* commit_over_placeholders(void* address, SIZE_T size, DWORD protect) {
+    const std::lock_guard lock(g_phys_mutex);
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address), end = start + size;
+    struct Piece {
+        uintptr_t at;
+        SIZE_T size;
+        bool reserved;
+    };
+    std::vector<Piece> pieces;
+    for (uintptr_t cursor = start; cursor < end;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info)) || info.State == MEM_FREE ||
+            info.Type == MEM_MAPPED || info.Type == MEM_IMAGE) {
+            SetLastError(ERROR_INVALID_ADDRESS);
+            return nullptr;
+        }
+        const uintptr_t region_end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+        const uintptr_t piece_end = region_end < end ? region_end : end;
+        pieces.push_back({cursor, SIZE_T(piece_end - cursor), info.State == MEM_RESERVE});
+        cursor = piece_end;
+    }
+    for (const Piece& piece : pieces) {
+        void* const at = reinterpret_cast<void*>(piece.at);
+        if (piece.reserved && isolate_placeholder(at, piece.size) &&
+            placeholder_api().virtual_alloc2(GetCurrentProcess(), at, piece.size,
+                                             MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0)) {
+            continue;
+        }
+        if (!VirtualAlloc(at, piece.size, MEM_COMMIT, protect)) return nullptr;
+    }
+    forget_window_range(start, end);
+    return address;
+}
+
+// VirtualAlloc, and for a commit the host refused with ERROR_INVALID_ADDRESS, the same commit over placeholders.
+void* host_virtual_alloc(void* address, SIZE_T size, DWORD type, DWORD protect) {
+    if (void* const result = VirtualAlloc(address, size, type, protect)) return result;
+    const DWORD error = GetLastError();
+    if (!address || (type & (MEM_COMMIT | MEM_RESERVE)) != MEM_COMMIT || error != ERROR_INVALID_ADDRESS ||
+        !placeholder_api().available()) {
+        SetLastError(error);
+        return nullptr;
+    }
+    return commit_over_placeholders(address, size, protect);
+}
+
 // gta6rt --trace FILE: the first XMemVirtualAlloc for each distinct (type, attributes, protect) goes to the startup
 // trace as an "xmem_virtual_alloc" event with the size and the caller, so a run records the words the title passes.
 void note_virtual_alloc(DWORD type, uint64_t attributes, DWORD protect, SIZE_T size, const void* caller) {
@@ -440,9 +505,16 @@ void note_virtual_alloc(DWORD type, uint64_t attributes, DWORD protect, SIZE_T s
 // XMemMapPhysicalPages. The guest page size sets the alignment and rounding of the region; the host's own pages stay
 // 4 KiB (host large pages need SeLockMemoryPrivilege). A 2 MiB region the host places is reserved 2 MiB-aligned through
 // VirtualAlloc2.
+void* virtual_alloc_paged(void* address, SIZE_T size, DWORD allocation_type, DWORD protect);
+
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
     note_virtual_alloc(allocation_type, attributes, protect, size, _ReturnAddress());
+    return virtual_alloc_paged(address, size, allocation_type, protect);
+}
+
+// XMemVirtualAlloc without the attribute word; TitleVirtualAlloc's path for the console page-size bits too.
+void* virtual_alloc_paged(void* address, SIZE_T size, DWORD allocation_type, DWORD protect) {
     if (size == 0) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -543,7 +615,7 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
         return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_prot,
                                                 &parameter, 1);
     }
-    return VirtualAlloc(address, size, host_type, host_prot);
+    return host_virtual_alloc(address, size, host_type, host_prot);
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
@@ -900,8 +972,15 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
 constexpr DWORD kMemGraphics = 0x10000000;
 constexpr DWORD kMemTitle = 0x40000000;
 
+// Review B8: the console's page-size bits are host flags with other meanings. MEM_LARGE_PAGES (2 MiB pages) needs
+// SeLockMemoryPrivilege on the host and 64 KiB pages (MEM_LARGE_PAGES | MEM_PHYSICAL) is invalid there, so both take
+// XMemVirtualAlloc's path: guest page size as alignment and rounding, 4 KiB host pages. MEM_PHYSICAL alone (AWE on
+// the host, which the title never set up) is dropped. A commit into a placeholder window is handled as there (B7).
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
+    DWORD type = allocation_type & ~(kMemGraphics | kMemTitle);
+    if (type & kXmemLargePages) return virtual_alloc_paged(address, size, type, protect);
+    type &= ~DWORD{MEM_PHYSICAL};
+    return host_virtual_alloc(address, size, type, host_protect(protect));
 }
 
 // XMemMakeTag packs a four-character code into the top 24 bits of an XMem flags word, six bits per character from the
