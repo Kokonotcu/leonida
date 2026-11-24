@@ -198,6 +198,27 @@ bool device_name(const std::wstring& part) {
     return (n >= L'1' && n <= L'9') || n == L'\u00b9' || n == L'\u00b2' || n == L'\u00b3';
 }
 
+// The overlay's folder names below the package root when the overlay lies inside the package (gta6rt's default is
+// <game>\overlay), else none. The title must neither list nor reach it through GAME: (review B4): a recursive walk
+// would descend into the overlay's copies and markers, and a write there would land in <overlay>\overlay.
+std::vector<std::wstring> overlay_in_package(const Roots& r) {
+    if (r.game.empty() || r.overlay.empty() || !lies_under(r.overlay.native(), r.game)) return {};
+    std::vector<std::wstring> rel;
+    for (const auto& c : r.overlay.lexically_relative(r.game)) {
+        if (c.native() == L"." || c.native() == L"..") return {};
+        rel.push_back(c.native());
+    }
+    return rel;
+}
+
+// True when `parts` (a console path below GAME:) is the overlay folder or lies below it.
+bool names_overlay(const std::vector<std::wstring>& rel, const std::vector<std::wstring>& parts) {
+    if (rel.empty() || parts.size() < rel.size()) return false;
+    for (size_t i = 0; i < rel.size(); ++i)
+        if (!same_name(parts[i].c_str(), rel[i].c_str())) return false;
+    return true;
+}
+
 Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
     size_t prefix_length = 0;
     const Drive drive = console_drive(path, prefix_length);
@@ -251,6 +272,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
     // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.
     if (drive == Drive::Game && !parts.empty() && internal_dir(parts.front().c_str())) return Parsed::Refused;
+    if (drive == Drive::Game && names_overlay(overlay_in_package(roots()), parts)) return Parsed::Refused;
     return Parsed::Console;
 }
 
@@ -650,6 +672,11 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
     std::set<std::wstring, NoCase> seen;
     for (const auto& e : out) seen.insert(e.cFileName);
 
+    // The overlay itself, when it sits inside the package (overlay_in_package): its folder is not a package entry.
+    const std::vector<std::wstring> overlay_rel = overlay_in_package(r);
+    bool lists_overlay_parent = !overlay_rel.empty() && dirs.size() + 1 == overlay_rel.size();
+    for (size_t i = 0; lists_overlay_parent && i < dirs.size(); ++i)
+        lists_overlay_parent = same_name(dirs[i].c_str(), overlay_rel[i].c_str());
     auto add_root = [&](const std::filesystem::path& root, bool overlay_root) {
         if (root.empty()) return;
         WIN32_FIND_DATAW found{};
@@ -657,6 +684,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         if (h == INVALID_HANDLE_VALUE) return;
         do {
             if (overlay_root && internal_dir(found.cFileName)) continue;
+            if (!overlay_root && lists_overlay_parent && same_name(found.cFileName, overlay_rel.back().c_str())) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
             if (!overlay_root && !dot && entry_deleted(found.cFileName)) continue;
             if (seen.insert(found.cFileName).second) out.push_back(found);

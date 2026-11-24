@@ -282,6 +282,26 @@ void run_checks(const std::filesystem::path& root) {
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
     }
 
+    // gta6rt's default overlay is <game>\overlay, inside the package: GAME: neither lists nor reaches it (review B4).
+    {
+        const std::filesystem::path inner = package / "overlay";
+        rt::fs::configure(package, inner);
+        HANDLE h = create_w(L"GAME:\\data\\made_here.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && std::filesystem::exists(inner / "data" / "made_here.txt"),
+              "with the overlay inside the package, a new console file still lands in the overlay");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(!contains(list(first_w, next_w, find_close, L"GAME:\\*"), L"overlay"),
+              "the overlay's own folder is not listed at GAME:\\");
+        h = create_w(L"GAME:\\overlay\\data\\made_here.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0,
+                     nullptr);
+        check(h == INVALID_HANDLE_VALUE, "and a path into it through GAME: is refused");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(delete_w(L"GAME:\\data\\made_here.txt"), "the console file is deleted again");
+        rt::fs::configure(package, overlay);
+        std::error_code remove_ec;
+        std::filesystem::remove_all(inner, remove_ec);
+    }
+
     // --trace: a failed open of a guest path is a "file_open_failed" event, a successful one is not, and with the
     // trace off nothing is written.
     {
