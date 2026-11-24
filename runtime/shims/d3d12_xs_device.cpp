@@ -3766,6 +3766,17 @@ void lease_title_resource_memory(DeviceProxy* self, void* created, const D3D12_R
     if (size == 0 || size == UINT64_MAX || size > (std::numeric_limits<std::size_t>::max)()) return;
     void* const memory = alloc_fn(static_cast<std::size_t>(size), kXmemCommittedResourceAttributes);
     if (!memory) return;
+    // The lease is the title's budget, not the resource's storage (the PC device owns that): nothing here reads or
+    // writes it. Its whole pages are released from RAM, kept committed so a title that touches them still can
+    // (MEM_RESET: the contents are not needed; VirtualUnlock of unlocked pages takes them out of the working set).
+    // A lease from a mapped section (xmem's physical pages) refuses MEM_RESET and stays as it is.
+    {
+        const auto begin = (reinterpret_cast<std::uintptr_t>(memory) + 0xFFF) & ~std::uintptr_t(0xFFF);
+        const auto end =
+            (reinterpret_cast<std::uintptr_t>(memory) + static_cast<std::size_t>(size)) & ~std::uintptr_t(0xFFF);
+        if (end > begin && VirtualAlloc(reinterpret_cast<void*>(begin), end - begin, MEM_RESET, PAGE_READWRITE))
+            VirtualUnlock(reinterpret_cast<void*>(begin), end - begin);
+    }
     ID3D12Object* object = nullptr;
     auto* const lease = new (std::nothrow) TitleMemoryLease(memory, free_fn);
     if (!lease || FAILED(static_cast<IUnknown*>(created)->QueryInterface(__uuidof(ID3D12Object),

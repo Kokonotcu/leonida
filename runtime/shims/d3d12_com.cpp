@@ -733,6 +733,7 @@ public:
         // LEONIDA_LOG_TSHARP=<GPU address>: the copies into the texture at that address (glyph atlas hunt).
         if (static const std::uint64_t want = [] {
                 const char* v = std::getenv("LEONIDA_LOG_TSHARP");
+                if (!v && std::getenv("LEONIDA_DUMP_TITLE_TEXTURE")) return 1ull;  // the glyph atlas hunt
                 return v ? std::strtoull(v, nullptr, 16) : 0ull;
             }();
             want && dst->pResource && [&] {
@@ -763,6 +764,17 @@ public:
     void STDMETHODCALLTYPE CopyResource(ID3D12Resource* dst, ID3D12Resource* src) override {
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyResource");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
+        // LEONIDA_DUMP_TITLE_TEXTURE (glyph atlas hunt): a whole-resource copy into a 2048x2048 8-bit texture.
+        if (static const bool hunt = std::getenv("LEONIDA_DUMP_TITLE_TEXTURE") != nullptr; hunt && dst && src) {
+            const D3D12_RESOURCE_DESC dd = dst->GetDesc();
+            static std::atomic<int> told{0};
+            if (dd.Width == 2048 && dd.Height == 2048 &&
+                (dd.Format == DXGI_FORMAT_R8_UNORM || dd.Format == DXGI_FORMAT_A8_UNORM) && told.fetch_add(1) < 16) {
+                const D3D12_RESOURCE_DESC sd = src->GetDesc();
+                std::fprintf(stderr, "[rt] d3d12: CopyResource into a 2048x2048 8-bit texture from dim %d %llux%u fmt %d\n",
+                             int(sd.Dimension), static_cast<unsigned long long>(sd.Width), sd.Height, int(sd.Format));
+            }
+        }
         if (dst && dst == src) {
             // A self-copy on a DEFAULT heap is a no-op, but an UPLOAD/READBACK resource still cannot
             // be both source and destination: native D3D12 rejects it at Close. Check this before

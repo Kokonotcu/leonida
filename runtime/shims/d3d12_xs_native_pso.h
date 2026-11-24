@@ -4,8 +4,8 @@
 // records (<shaders>/native_hashes.txt, written by tools/native_pso_hashes.py), and creates the pipeline on the
 // device behind the proxy from the game's own containers, as a PC title would, as one pipeline state stream
 // (VS/GS/PS or MS/PS) through the proxy's slot-86 path, which keeps the stream so slot 55 can derive from the
-// pipeline. Blob A (blend, raster, depth) is not decoded: blending and culling are off and a depth target is
-// written with ALWAYS.
+// pipeline. Blob A (blend, raster, depth context registers) is decoded into the description (native_state::apply);
+// a blob that does not decode keeps blending and culling off and depth ALWAYS.
 //
 // Header-only, so every target that compiles d3d12_xs_device.cpp gets it without a build change.
 //
@@ -195,6 +195,154 @@ inline void fill_fixed_state(const np::FixedState& s, D3D12_GRAPHICS_PIPELINE_ST
     for (unsigned i = 0; i < s.rt_count; ++i) pc.RTVFormats[i] = native_pc_format(s.rtv_formats[i]);
     pc.SampleDesc.Count = s.sample_count;
 }
+
+// Blob A's registers in D3D12 terms (field layouts from AMD's RDNA2 register reference / Mesa's gfx10 tables). Before
+// this every native pipeline drew with blending and culling off and depth ALWAYS: the Scaleform text pipelines wrote
+// each glyph quad's whole colour (letters as solid blocks, or gone where the quad's colour was cleared later), and
+// every translucent UI layer was opaque. LEONIDA_NATIVE_STATE=0 keeps the old fixed state; =blend applies only
+// blending and the write masks.
+namespace native_state {
+
+inline D3D12_BLEND blend_factor(std::uint32_t f, bool alpha) {
+    switch (f) {
+        case 0: return D3D12_BLEND_ZERO;
+        case 1: return D3D12_BLEND_ONE;
+        case 2: return alpha ? D3D12_BLEND_SRC_ALPHA : D3D12_BLEND_SRC_COLOR;
+        case 3: return alpha ? D3D12_BLEND_INV_SRC_ALPHA : D3D12_BLEND_INV_SRC_COLOR;
+        case 4: return D3D12_BLEND_SRC_ALPHA;
+        case 5: return D3D12_BLEND_INV_SRC_ALPHA;
+        case 6: return D3D12_BLEND_DEST_ALPHA;
+        case 7: return D3D12_BLEND_INV_DEST_ALPHA;
+        case 8: return alpha ? D3D12_BLEND_DEST_ALPHA : D3D12_BLEND_DEST_COLOR;
+        case 9: return alpha ? D3D12_BLEND_INV_DEST_ALPHA : D3D12_BLEND_INV_DEST_COLOR;
+        case 10: return D3D12_BLEND_SRC_ALPHA_SAT;
+        case 13: return alpha ? D3D12_BLEND_ALPHA_FACTOR : D3D12_BLEND_BLEND_FACTOR;
+        case 14: return alpha ? D3D12_BLEND_INV_ALPHA_FACTOR : D3D12_BLEND_INV_BLEND_FACTOR;
+        case 15: return alpha ? D3D12_BLEND_SRC1_ALPHA : D3D12_BLEND_SRC1_COLOR;
+        case 16: return alpha ? D3D12_BLEND_INV_SRC1_ALPHA : D3D12_BLEND_INV_SRC1_COLOR;
+        case 17: return D3D12_BLEND_SRC1_ALPHA;
+        case 18: return D3D12_BLEND_INV_SRC1_ALPHA;
+        case 19: return D3D12_BLEND_ALPHA_FACTOR;
+        case 20: return D3D12_BLEND_INV_ALPHA_FACTOR;
+        default: return D3D12_BLEND_ONE;
+    }
+}
+inline bool dual_source(std::uint32_t f) { return f >= 15 && f <= 18; }
+inline D3D12_BLEND_OP blend_op(std::uint32_t op) {
+    switch (op) {
+        case 1: return D3D12_BLEND_OP_SUBTRACT;      // COMB_SRC_MINUS_DST
+        case 2: return D3D12_BLEND_OP_MIN;
+        case 3: return D3D12_BLEND_OP_MAX;
+        case 4: return D3D12_BLEND_OP_REV_SUBTRACT;  // COMB_DST_MINUS_SRC
+        default: return D3D12_BLEND_OP_ADD;          // COMB_DST_PLUS_SRC
+    }
+}
+inline D3D12_STENCIL_OP stencil_op(std::uint32_t op) {
+    switch (op) {
+        case 1: return D3D12_STENCIL_OP_ZERO;
+        case 2: case 3: case 4: return D3D12_STENCIL_OP_REPLACE;  // ONES, REPLACE_TEST, REPLACE_OP
+        case 5: return D3D12_STENCIL_OP_INCR_SAT;                 // ADD_CLAMP
+        case 6: return D3D12_STENCIL_OP_DECR_SAT;                 // SUB_CLAMP
+        case 7: return D3D12_STENCIL_OP_INVERT;
+        case 8: return D3D12_STENCIL_OP_INCR;                     // ADD_WRAP
+        case 9: return D3D12_STENCIL_OP_DECR;                     // SUB_WRAP
+        default: return D3D12_STENCIL_OP_KEEP;
+    }
+}
+inline D3D12_COMPARISON_FUNC compare(std::uint32_t f) { return static_cast<D3D12_COMPARISON_FUNC>((f & 7) + 1); }
+
+inline const char* mode() {
+    static const char* const m = [] {
+        const char* v = std::getenv("LEONIDA_NATIVE_STATE");
+        return v ? v : "1";
+    }();
+    return m;
+}
+
+inline void apply(const np::StateA& a, D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc) {
+    const char* m = mode();
+    if (m[0] == '0') return;
+    // Blend and write masks, per target (CB_BLENDn_CONTROL: SRCBLEND 0-4, COMB_FCN 5-7, DESTBLEND 8-12, alpha
+    // 16-20 / 21-23 / 24-28, SEPARATE_ALPHA_BLEND 29, ENABLE 30; CB_TARGET_MASK: 4 bits a target, R G B A as D3D12).
+    D3D12_BLEND_DESC& bd = pc.BlendState;
+    bool differ = false;
+    for (unsigned i = 0; i < 8; ++i) {
+        D3D12_RENDER_TARGET_BLEND_DESC& rt = bd.RenderTarget[i];
+        const std::uint32_t c = a.blend[i];
+        rt.RenderTargetWriteMask = static_cast<UINT8>((a.target_mask >> (4 * i)) & 0xF);
+        rt.BlendEnable = (c >> 30) & 1;
+        rt.LogicOpEnable = FALSE;
+        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+        const bool separate = (c >> 29) & 1;
+        rt.SrcBlend = blend_factor(c & 0x1F, false);
+        rt.BlendOp = blend_op((c >> 5) & 7);
+        rt.DestBlend = blend_factor((c >> 8) & 0x1F, false);
+        rt.SrcBlendAlpha = blend_factor(separate ? (c >> 16) & 0x1F : c & 0x1F, true);
+        rt.BlendOpAlpha = blend_op(separate ? (c >> 21) & 7 : (c >> 5) & 7);
+        rt.DestBlendAlpha = blend_factor(separate ? (c >> 24) & 0x1F : (c >> 8) & 0x1F, true);
+        if (!rt.BlendEnable) {
+            rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+            rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+            rt.BlendOp = rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        }
+        if (i < pc.NumRenderTargets && i > 0 &&
+            std::memcmp(&rt, &bd.RenderTarget[0], sizeof(rt)) != 0)
+            differ = true;
+    }
+    // A dual-source factor on target 0: D3D12 then allows no independent blending; targets 1-7 take the default
+    // (five-star-recomp's DesktopStateRules).
+    const std::uint32_t c0 = a.blend[0];
+    const bool dual = ((c0 >> 30) & 1) && (dual_source(c0 & 0x1F) || dual_source((c0 >> 8) & 0x1F) ||
+                                          dual_source((c0 >> 16) & 0x1F) || dual_source((c0 >> 24) & 0x1F));
+    if (dual) {
+        for (unsigned i = 1; i < 8; ++i) bd.RenderTarget[i] = D3D12_RENDER_TARGET_BLEND_DESC{
+            FALSE, FALSE, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
+            D3D12_BLEND_OP_ADD, D3D12_LOGIC_OP_NOOP, bd.RenderTarget[i].RenderTargetWriteMask};
+        differ = false;
+    }
+    bd.IndependentBlendEnable = differ;
+    bd.AlphaToCoverageEnable = FALSE;
+    if (std::strcmp(m, "blend") == 0) return;
+
+    // Depth and stencil (DB_DEPTH_CONTROL: STENCIL_ENABLE 0, Z_ENABLE 1, Z_WRITE_ENABLE 2, ZFUNC 4-6, BACKFACE_ENABLE
+    // 7, STENCILFUNC 8-10, STENCILFUNC_BF 20-22; DB_STENCIL_CONTROL: FAIL 0-3, ZPASS 4-7, ZFAIL 8-11, then the back
+    // face's at 12-23; DB_STENCILREFMASK: MASK 8-15, WRITEMASK 16-23).
+    const bool has_depth = pc.DSVFormat != DXGI_FORMAT_UNKNOWN;
+    D3D12_DEPTH_STENCIL_DESC& ds = pc.DepthStencilState;
+    const std::uint32_t dc = a.depth_control;
+    ds.DepthEnable = has_depth && ((dc >> 1) & 1);
+    ds.DepthWriteMask = (dc >> 2) & 1 ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    ds.DepthFunc = compare(dc >> 4);
+    ds.StencilEnable = has_depth && (dc & 1);
+    ds.StencilReadMask = static_cast<UINT8>((a.stencil_ref >> 8) & 0xFF);
+    ds.StencilWriteMask = static_cast<UINT8>((a.stencil_ref >> 16) & 0xFF);
+    const std::uint32_t sc = a.stencil_control;
+    ds.FrontFace = {stencil_op(sc & 0xF), stencil_op((sc >> 8) & 0xF), stencil_op((sc >> 4) & 0xF), compare(dc >> 8)};
+    ds.BackFace = (dc >> 7) & 1 ? D3D12_DEPTH_STENCILOP_DESC{stencil_op((sc >> 12) & 0xF), stencil_op((sc >> 20) & 0xF),
+                                                             stencil_op((sc >> 16) & 0xF), compare(dc >> 20)}
+                                : ds.FrontFace;
+
+    // Rasterizer (PA_SU_SC_MODE_CNTL: CULL_FRONT 0, CULL_BACK 1, FACE 2 (1: clockwise is front), POLY_OFFSET_FRONT_ENABLE
+    // 11; PA_CL_CLIP_CNTL: ZCLIP_NEAR_DISABLE 26, ZCLIP_FAR_DISABLE 27). Depth bias in AMD's units: slope = scale / 16.
+    D3D12_RASTERIZER_DESC& rs = pc.RasterizerState;
+    const std::uint32_t su = a.su_sc_mode;
+    const bool cull_front = su & 1, cull_back = (su >> 1) & 1;
+    rs.CullMode = cull_front && !cull_back ? D3D12_CULL_MODE_FRONT
+                  : cull_back && !cull_front ? D3D12_CULL_MODE_BACK
+                                             : D3D12_CULL_MODE_NONE;
+    rs.FrontCounterClockwise = ((su >> 2) & 1) == 0;
+    rs.DepthClipEnable = ((a.clip_cntl >> 26) & 3) == 0;
+    if ((su >> 11) & 1) {
+        rs.DepthBias = static_cast<INT>(a.poly_offset);
+        rs.SlopeScaledDepthBias = a.poly_scale / 16.0f;
+        rs.DepthBiasClamp = a.poly_clamp;
+    }
+    // A NaN in a float field would make the device refuse the pipeline (five-star-recomp's rule): zero instead.
+    if (rs.SlopeScaledDepthBias != rs.SlopeScaledDepthBias) rs.SlopeScaledDepthBias = 0;
+    if (rs.DepthBiasClamp != rs.DepthBiasClamp) rs.DepthBiasClamp = 0;
+}
+
+}  // namespace native_state
 
 // A pipeline state stream: each subobject is a type word, then its payload at its own alignment, padded to 8 bytes
 // (d3dx12's alignas(void*) subobjects).
@@ -442,6 +590,17 @@ inline HRESULT create_native_graphics_pipeline(PipelineStreamCreator create, voi
     }
     pc.pRootSignature = static_cast<ID3D12RootSignature*>(const_cast<void*>(desc.root_signature));
     fill_fixed_state(plan.state, pc);
+    {
+        const char* why = nullptr;
+        if (const auto a = np::decode_state_a(np::bytes(desc.state_a), &why)) {
+            native_state::apply(*a, pc);
+        } else {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1) < 4)
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 57 blob A not decoded (%s): blending and culling off\n",
+                             why ? why : "?");
+        }
+    }
     std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
     for (const np::InputElement& e : plan.state.elements)
         elements.push_back({e.name.c_str(), e.semantic_index, static_cast<DXGI_FORMAT>(e.format), e.input_slot,

@@ -141,6 +141,57 @@ inline std::optional<FixedState> decode_state_b(std::span<const std::uint8_t> b,
     return s;
 }
 
+// State blob A: a fixed run of RDNA2 context register values (five-star-recomp, github.com/ThatRecompDev/five-star-recomp,
+// docs/pipeline-cache.md "Fixed-function state", measured over the title's 25,471 cached pipelines). A u32 version
+// (0x4005D8xx), then the layout kind: 4 for vertex pipelines, 6 for mesh pipelines, whose registers from 0x58 on sit
+// 0x54 bytes later (NGG registers ahead of the pixel-shader block). Only the registers below are read.
+struct StateA {
+    bool mesh = false;
+    std::uint32_t clip_cntl = 0;        // PA_CL_CLIP_CNTL (+0x9C)
+    std::uint32_t su_sc_mode = 0;       // PA_SU_SC_MODE_CNTL (+0xA0)
+    float poly_clamp = 0, poly_scale = 0, poly_offset = 0;  // PA_SU_POLY_OFFSET_CLAMP/FRONT_SCALE/FRONT_OFFSET (+0xAC)
+    std::uint32_t depth_control = 0;    // DB_DEPTH_CONTROL (+0xB8)
+    std::uint32_t stencil_control = 0;  // DB_STENCIL_CONTROL (+0xBC)
+    std::uint32_t stencil_ref = 0;      // DB_STENCILREFMASK (+0xC0)
+    std::uint32_t stencil_ref_bf = 0;   // DB_STENCILREFMASK_BF (+0xC4)
+    std::uint32_t target_mask = 0;      // CB_TARGET_MASK (+0xCC)
+    std::array<std::uint32_t, 8> blend{};  // CB_BLEND0..7_CONTROL (+0xD0)
+};
+
+inline std::optional<StateA> decode_state_a(std::span<const std::uint8_t> b, const char** why = nullptr) {
+    const auto fail = [&](const char* reason) {
+        if (why) *why = reason;
+        return std::nullopt;
+    };
+    if (b.size() < 0x100) return fail("blob A shorter than its registers");
+    if ((read_u32(b, 0x00) & 0xFFFFFF00u) != 0x4005D800u) return fail("blob A version not 0x4005D8xx");
+    const std::uint32_t kind = read_u32(b, 0x04);
+    if (kind != 4 && kind != 6) return fail("blob A layout kind neither 4 (vertex) nor 6 (mesh)");
+    StateA s;
+    s.mesh = kind == 6;
+    const std::size_t shift = s.mesh ? 0x54 : 0;
+    if (b.size() < 0xF0 + shift) return fail("blob A shorter than its blend registers");
+    const auto reg = [&](std::size_t at) { return read_u32(b, at + shift); };
+    const auto regf = [&](std::size_t at) {
+        float f;
+        const std::uint32_t v = reg(at);
+        std::memcpy(&f, &v, 4);
+        return f;
+    };
+    s.clip_cntl = reg(0x9C);
+    s.su_sc_mode = reg(0xA0);
+    s.poly_clamp = regf(0xAC);
+    s.poly_scale = regf(0xB0);
+    s.poly_offset = regf(0xB4);
+    s.depth_control = reg(0xB8);
+    s.stencil_control = reg(0xBC);
+    s.stencil_ref = reg(0xC0);
+    s.stencil_ref_bf = reg(0xC4);
+    s.target_mask = reg(0xCC);
+    for (unsigned i = 0; i < 8; ++i) s.blend[i] = reg(0xD0 + 4 * i);
+    return s;
+}
+
 using Digest = std::array<std::uint8_t, 16>;
 
 // Every 16 bytes that follow a 4-aligned 0x43 word, without duplicates. A register number can also read 0x43, so

@@ -20,6 +20,8 @@
 #include "d3d12_xs_native_pso.h"
 #include "dxgi_com.h"
 #include "log_seen.h"
+
+#include <psapi.h>  // K32QueryWorkingSetEx (title_range_touched)
 #include "xg_linear_layout.h"  // title-placed textures: the texture computer's layout
 #include "../src/arena_size.h"
 #include "../src/shader_module_cache.h"
@@ -4315,6 +4317,37 @@ private:
 
 // A title-placed texture to keep fed from the title's pages (see "Title-placed textures" above). False when its
 // description is not one the copies cover.
+// The resource the title places over [title, title + bytes) shares memory with an already registered title texture
+// (two resources over the same pages: on the console one's GPU writes are the other's texels; here each has its own
+// image). Logged, the first 40, with both descriptions. title_texture_mutex held.
+void report_title_overlap(const std::uint8_t* title, std::size_t bytes, const D3D12_RESOURCE_DESC& desc,
+                          const char* kind) {
+    static int told = 0;
+    if (told >= 40) return;
+    for (const auto& other : title_textures()) {
+        if (other->title >= title + bytes || title >= other->title + other->bytes) continue;
+        const D3D12_RESOURCE_DESC& o = other->resource->desc();
+        // Only pairs where one is GPU-written or atlas-sized: small textures whose computed layout spans past the
+        // title's spacing (17x17 tables 0x1B000 apart with 128 KiB layouts) overlap their neighbours by the hundred.
+        constexpr auto gpu = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (!((desc.Flags | o.Flags) & gpu) && desc.Width < 1024 && o.Width < 1024) continue;
+        std::fprintf(stderr, "[rt] d3d12: title %s at %p (%zu B, %llux%u fmt %d flags 0x%x) overlaps title texture at %p "
+                             "(%zu B, %llux%u fmt %d flags 0x%x%s)\n",
+                     kind, static_cast<const void*>(title), bytes, static_cast<unsigned long long>(desc.Width),
+                     desc.Height, int(desc.Format), unsigned(desc.Flags), static_cast<const void*>(other->title),
+                     other->bytes, static_cast<unsigned long long>(o.Width), o.Height, int(o.Format), unsigned(o.Flags),
+                     other->mapped ? ", mapped" : "");
+        if (++told >= 40) return;
+    }
+}
+
+// The same check for a title-placed buffer (create_at_host_address), with the lock taken here.
+void report_title_buffer_overlap(const void* address, const D3D12_RESOURCE_DESC& desc) {
+    if (!g_title_texture_count.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(title_texture_mutex());
+    report_title_overlap(static_cast<const std::uint8_t*>(address), static_cast<std::size_t>(desc.Width), desc, "buffer");
+}
+
 bool register_title_texture(Resource* texture, const void* address, const D3D12_RESOURCE_DESC& desc) {
     if (!texture || !address || desc.SampleDesc.Count > 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
         return false;
@@ -4327,6 +4360,7 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
     t->watch = !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
     rt::xg::g_write_listener.store(&title_texture_written, std::memory_order_release);
     std::lock_guard lock(title_texture_mutex());
+    report_title_overlap(t->title, t->bytes, desc, "texture");
     t->mapped = overlaps_mapped_range(t->title, t->bytes);  // pages the title already writes through a mapping
     title_textures().push_back(std::move(t));
     g_title_texture_count.store(title_textures().size(), std::memory_order_release);
@@ -4335,6 +4369,24 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
 
 // Every page of [p, p + bytes) committed and readable: the title's range may still be reserved (xmem commits pages as
 // they are touched), and a copy then waits for a later submission.
+// True when any page of [p, p + bytes) is in this process's working set (K32QueryWorkingSetEx, which reads no page).
+// A committed page that was never written is not: it reads as zeros, and reading it would make it resident.
+bool title_range_touched(const std::uint8_t* p, std::size_t bytes) {
+    const auto first = reinterpret_cast<std::uintptr_t>(p) & ~std::uintptr_t(0xFFF);
+    const auto end = reinterpret_cast<std::uintptr_t>(p) + bytes;
+    PSAPI_WORKING_SET_EX_INFORMATION info[512];
+    for (std::uintptr_t at = first; at < end;) {
+        std::size_t n = 0;
+        for (; n < std::size(info) && at + n * 0x1000 < end; ++n)
+            info[n].VirtualAddress = reinterpret_cast<void*>(at + n * 0x1000);
+        if (!K32QueryWorkingSetEx(GetCurrentProcess(), info, DWORD(n * sizeof(info[0])))) return true;  // unknown: read it
+        for (std::size_t i = 0; i < n; ++i)
+            if (info[i].VirtualAttributes.Valid) return true;
+        at += n * 0x1000;
+    }
+    return false;
+}
+
 bool title_range_readable(const std::uint8_t* p, std::size_t bytes) {
     const std::uint8_t* const end = p + bytes;
     while (p < end) {
@@ -6010,6 +6062,15 @@ public:
             }
             std::fprintf(stderr, "[rt] d3d12: graphics PSO %llx:%s, %s\n", static_cast<unsigned long long>(id()),
                          names.c_str(), blend);
+            // Text pipelines (glyph-cache letters hunt): the input layout, element by element.
+            if (names.find("Text_") != std::string::npos) {
+                for (UINT e = 0; e < desc.InputLayout.NumElements && desc.InputLayout.pInputElementDescs; ++e) {
+                    const D3D12_INPUT_ELEMENT_DESC& el = desc.InputLayout.pInputElementDescs[e];
+                    std::fprintf(stderr, "[rt]   input %u: %s%u format %d slot %u offset %u class %d step %u\n", e,
+                                 el.SemanticName ? el.SemanticName : "?", el.SemanticIndex, int(el.Format),
+                                 el.InputSlot, el.AlignedByteOffset, int(el.InputSlotClass), el.InstanceDataStepRate);
+                }
+            }
         }
         registered_ = true;
         is_graphics_ = true;
@@ -9999,6 +10060,7 @@ public:
         heap.Type = D3D12_HEAP_TYPE_CUSTOM;
         heap.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
         heap.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        report_title_buffer_overlap(address, desc);
         auto* resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
         resource->attach_device(identity());
         const HRESULT hr = resource->create_host_buffer(address);
@@ -11808,6 +11870,17 @@ HRESULT create_stub_pipeline_state(ID3D12Device* device, REFIID riid, void** out
     return d->create_stub_pipeline(riid, out);
 }
 
+// copy_from_title with the title's pages read under a guard, as the hashes are (guarded_title_hash): the title may
+// unmap a page between the readability check and the copy (retail 1.0.2.1, an access violation in the copy's pack).
+// False when the copy failed or faulted; a faulted copy's staging memory is not released (rare).
+bool guarded_copy_from_title(Resource* resource, const std::uint8_t* title, const rt::xg::ResourceLayout& layout) {
+    __try {
+        return resource->copy_from_title(title, layout);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
 void sync_title_textures() {
     if (!g_title_texture_count.load(std::memory_order_acquire)) return;  // one load when nothing is registered
     const auto now = std::chrono::steady_clock::now();
@@ -11850,9 +11923,13 @@ void sync_title_textures() {
             // Not every 33 ms: Bink decodes into one of two plane sets while the other is drawn, so a check that caught
             // a set mid-decode copied half a frame, and the next submission drawing that set fell inside the 33 ms and
             // drew the stale copy: the video jumped back and forth between frames.
+            // Once a second a full hash, copying only when the bytes changed: a plain copy put the title's bytes back
+            // over whatever the GPU had written into the image since. The glyph atlas's title bytes stay all zero
+            // while text is shown (measured on 1.0.2.1's LEGAL NOTICES: 0 of 4 MiB set over 35 copies), so the copy
+            // wiped the glyphs the GPU had put there: letters missing.
             if (now >= t->next_full) {
                 t->next_full = now + std::chrono::seconds(1);
-                check = Check::copy;
+                check = Check::full;
             } else {
                 check = Check::probe;
             }
@@ -11880,6 +11957,20 @@ void sync_title_textures() {
             }
         }
         if (check == Check::none) continue;
+        // A render target or UAV texture (not watched) the title placed but never wrote by CPU: its pages are not in the
+        // working set and read as zeros, which the image already holds. Hashing them made every page resident: the
+        // retail title's 4K targets kept about 1.2 GB of zero pages in RAM. It counts as copied; a later CPU write
+        // through a mapping makes it mapped and checked as such.
+        // Render targets only: a UAV texture may hold data the title wrote through its other window (the mirror view),
+        // whose pages are not in this view's working set until read.
+        if (!t->watch && !t->mapped && !t->copied &&
+            (t->resource->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+            !title_range_touched(t->title, t->bytes)) {
+            t->dirty = false;
+            t->copied = true;
+            t->hash = 0;
+            continue;
+        }
         // A mapped texture on physical pages xmem commits on first touch, written through another view of the same
         // pages (the game's mirrored window): commit them so this view shows what the other wrote.
         // VirtualQuery costs one call per 64 KiB view, and the mirrored window is all 64 KiB views: asked for every
@@ -11913,7 +12004,7 @@ void sync_title_textures() {
             }
         }
         t->dirty = false;
-        if (!t->resource->copy_from_title(t->title, *t->layout)) {
+        if (!guarded_copy_from_title(t->resource, t->title, *t->layout)) {
             log_once("a title-placed texture could not be copied from the title's pages; it keeps its texels; "
                      "dimension",
                      int(t->resource->desc().Dimension));

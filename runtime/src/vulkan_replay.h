@@ -5174,8 +5174,20 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     }
                     static std::set<std::uint64_t> seen_late;
                     std::lock_guard late_lock(mutex);
-                    if (seen_late.size() < 96 && seen_late.insert(key).second)
+                    if (seen_late.size() < 96 && seen_late.insert(key).second) {
                         debug_targets::log_user_data(graphics.debug_name.c_str(), data.s, draw->user_data.size());
+                        // The vertex streams the draw binds (slot, stride, size) and its first render target.
+                        if (draw->views) {
+                            for (std::size_t slot = 0; slot < draw->views->vertex_buffers.size(); ++slot) {
+                                const VertexBufferView& vb = draw->views->vertex_buffers[slot];
+                                if (vb.va)
+                                    std::fprintf(stderr, "[rt]   vertex slot %zu: va %#llx stride %u size %u\n", slot,
+                                                 static_cast<unsigned long long>(vb.va), vb.stride, vb.size);
+                            }
+                        }
+                        std::fprintf(stderr, "[rt]   draw: count %u instances %u topology %u\n", draw->count,
+                                     draw->instances, draw->topology);
+                    }
                     goto log_desc_done;
                 }
                 std::lock_guard lock(mutex);
