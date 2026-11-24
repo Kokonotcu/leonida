@@ -1510,8 +1510,10 @@ int check_xbox_client(const Backend& b) {
 
 // A queue the way the retail title makes and calls it (PR #8134, measured on the retail executable 1.0.2.1): device
 // slot 48 (CreateCommandQueueX, a PC description followed by four console words), then the console's queue slots:
-// 35 ExecuteCommandLists(count, lists, 1, 0x100000000) and 18 GetTimestampFrequency(UINT64*), which must write 8
-// bytes (PC slot 18, GetDesc, wrote 16 over the caller's saved RBX).
+// 35 ExecuteCommandLists(count, lists, 1, 0x100000000); 16..20 two past the PC's 14..18 (16 Signal, 17 Wait, 18
+// GetTimestampFrequency(UINT64*), which must write 8 bytes, 19 GetClockCalibration, 20 GetDesc); 14 and 15, not
+// measured, refused. Forwarded by number, slot 16 wrote the frequency over the fence proxy's vtable and slot 18 16
+// bytes over the caller's saved RBX.
 int check_console_queue(const Backend& b) {
     const char* label = b.label;
     void* device = b.device;
@@ -1541,17 +1543,47 @@ int check_console_queue(const Backend& b) {
     before = xs::queue_slot_hits(35);
     raw(queue.p, 35, 1, word(lists), 1, 0x100000000ull);
     EXPECT(xs::queue_slot_hits(35) == before + 1);
-    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 14, word(fence.p), 1))));
+    before = xs::queue_slot_hits(16);
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 16, word(fence.p), 1))));  // Signal(fence, 1), as the title signals
+    EXPECT(xs::queue_slot_hits(16) == before + 1);
     Event done;
     EXPECT(SUCCEEDED(as_hr(raw(fence.p, 9, 1, word(done.h)))) && done.set_within(5000));
+    EXPECT(xs::is_fence_proxy(fence.p));  // its vtable is intact
     if (b.vulkan) EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+
+    // 17 Wait holds the queue until the CPU signals; a Signal of another fence after it waits too.
+    Ref<ID3D12Fence> second;
+    EXPECT(SUCCEEDED(as_hr(raw(device, 36, 0, D3D12_FENCE_FLAG_NONE, word(&iid_fence), word(&second.p)))));
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 17, word(fence.p), 3))));
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 16, word(second.p), 1))));
+    Sleep(50);
+    EXPECT(raw(second.p, 8) == 0);
+    EXPECT(SUCCEEDED(as_hr(raw(fence.p, 10, 3))));
+    EXPECT(SUCCEEDED(as_hr(raw(second.p, 9, 1, word(done.h)))) && done.set_within(5000));
+
+    // 19 GetClockCalibration(gpu, cpu) and 20 GetDesc (the PC's struct return: the description through RDX).
+    std::uint64_t gpu = 0, cpu = 0;
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 19, word(&gpu), word(&cpu)))) && cpu > 0);
+    D3D12_COMMAND_QUEUE_DESC got{};
+    got.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    EXPECT(raw(queue.p, 20, word(&got)) == word(&got) && got.Type == D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+    // 14 and 15 are not sent to the PC Signal and Wait.
+    before = xs::queue_slot_hits(14);
+    EXPECT(as_hr(raw(queue.p, 14, word(second.p), 7)) == E_NOTIMPL);
+    EXPECT(as_hr(raw(queue.p, 15, word(second.p), 7)) == E_NOTIMPL);
+    EXPECT(xs::queue_slot_hits(14) == before + 1);
+    Sleep(20);
+    EXPECT(raw(second.p, 8) == 1);
+    EXPECT(raw(second.p, 2) == 0);
+    second.p = nullptr;
 
     EXPECT(raw(fence.p, 2) == 0);
     fence.p = nullptr;
     EXPECT(raw(queue.p, 2) == 0);
     queue.p = nullptr;
-    std::printf("%s: a slot-48 queue in the console layout: slot 35 executes lists, slot 18 is "
-                "GetTimestampFrequency\n", label);
+    std::printf("%s: a slot-48 queue in the console layout: 35 executes lists, 16..20 are PC 14..18 (Signal, Wait, "
+                "GetTimestampFrequency in 8 bytes, GetClockCalibration, GetDesc), 14/15 refused\n", label);
     return 0;
 }
 

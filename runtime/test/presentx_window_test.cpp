@@ -204,7 +204,11 @@ bool make_texture(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Command
     ID3D12CommandList* lists[] = {list};
     queue->ExecuteCommandLists(1, lists);
     ++signalled;
-    return SUCCEEDED(queue->Signal(fence, signalled)) &&
+    // The queue comes from device slot 48, so it is called in the console's slot layout (docs/d3d12_command_objects.md):
+    // Signal is its slot 16, as the retail title signals; PC slot 14 is refused there.
+    using SignalFn = HRESULT(WINAPI*)(ID3D12CommandQueue*, ID3D12Fence*, UINT64);
+    const auto console_signal = reinterpret_cast<SignalFn>((*reinterpret_cast<void***>(queue))[16]);
+    return SUCCEEDED(console_signal(queue, fence, signalled)) &&
            SUCCEEDED(fence->SetEventOnCompletion(signalled, nullptr));
 }
 

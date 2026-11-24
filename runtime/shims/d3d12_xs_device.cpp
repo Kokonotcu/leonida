@@ -891,11 +891,18 @@ struct ChildProxy {
 // Where a console-layout queue's slot goes on the PC queue (PR #8134, measured on the retail executable 1.0.2.1):
 //   - 35 is ExecuteCommandLists(count, lists, ...) (#7286): the first frame's lists go in with (1, lists, 1,
 //     0x100000000);
-//   - 18 is GetTimestampFrequency(UINT64*): an 8-byte out and an HRESULT, the value used as 1 / frequency. PC slot 18
-//     (GetDesc) wrote 16 bytes there, over the caller's saved RBX.
+//   - 16..20 sit two past the PC's 14..18: the title calls slot 16 with (fence, 1) and (fence, 2) where it signals,
+//     so 16 Signal, 17 Wait, 18 GetTimestampFrequency (an 8-byte out and an HRESULT, the value used as 1 / frequency),
+//     19 GetClockCalibration, 20 GetDesc. Forwarded by number, PC slot 16 wrote the frequency over the fence proxy's
+//     vtable, and PC slot 18 (GetDesc) 16 bytes over the caller's saved RBX.
+//   - 14 and 15 are console methods that are not measured: refused (kNoPcSlot), not sent to PC Signal/Wait.
 // Every other slot keeps its PC number.
+constexpr unsigned kNoPcSlot = ~0u;
 constexpr unsigned console_queue_slot(unsigned slot) {
-    return slot == 35 ? 10u : slot == 18 ? 16u : slot;
+    return slot == 35                 ? 10u
+           : slot >= 16 && slot <= 20 ? slot - 2u
+           : slot == 14 || slot == 15 ? kNoPcSlot
+                                      : slot;
 }
 
 template <ChildKind K>
@@ -1753,12 +1760,20 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             bool expected = false;
             if (ChildStats<K>::beyond_warned[Slot].compare_exchange_strong(expected, true,
                                                                             std::memory_order_relaxed)) {
-                std::fprintf(stderr,
-                             "[rt] d3d12_xs: %s slot %u is beyond the PC %s vtable (%u slots); returning E_NOTIMPL "
-                             "(args 0x%llx 0x%llx 0x%llx 0x%llx)\n",
-                             child_kind_name<K>(), Slot, child_kind_name<K>(), self->slot_count,
-                             static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
-                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+                if (fwd == kNoPcSlot)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: %s slot %u is an unmeasured console method; returning E_NOTIMPL "
+                                 "(args 0x%llx 0x%llx 0x%llx 0x%llx)\n",
+                                 child_kind_name<K>(), Slot, static_cast<unsigned long long>(a1),
+                                 static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3),
+                                 static_cast<unsigned long long>(a4));
+                else
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: %s slot %u is beyond the PC %s vtable (%u slots); returning E_NOTIMPL "
+                                 "(args 0x%llx 0x%llx 0x%llx 0x%llx)\n",
+                                 child_kind_name<K>(), Slot, child_kind_name<K>(), self->slot_count,
+                                 static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                                 static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
             }
             d3d12_trace::record(child_trace_name<K>(Slot), "unsupported");
             return hr_to_u64(E_NOTIMPL);
