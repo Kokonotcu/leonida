@@ -2622,7 +2622,28 @@ HRESULT proxy_check_feature_support(DeviceProxy* self, std::uint64_t feature, st
                          bytes, static_cast<unsigned>(sizeof(pc)));
         return hr;
     }
-    return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<13>(self, feature, data, size, a4, a5)));
+    const auto hr =
+        static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<13>(self, feature, data, size, a4, a5)));
+    // What the title asks and is told, once per format (FORMAT_SUPPORT) or per feature: a title picks formats and
+    // paths from these answers, and one the console never gives can take it down a path the console never runs
+    // (retail boot 15's RGBA32F gradient written into a narrower image).
+    static std::atomic<std::uint64_t> formats_seen[4];
+    static std::atomic<std::uint64_t> features_seen;
+    if (requested == D3D12_FEATURE_FORMAT_SUPPORT && bytes == sizeof(D3D12_FEATURE_DATA_FORMAT_SUPPORT) && data) {
+        const auto* fs = reinterpret_cast<const D3D12_FEATURE_DATA_FORMAT_SUPPORT*>(data);
+        const auto f = static_cast<unsigned>(fs->Format) & 255u;
+        if (!(formats_seen[f / 64].fetch_or(1ull << (f % 64), std::memory_order_relaxed) & (1ull << (f % 64))))
+            std::fprintf(stderr, "[rt] d3d12_xs: CheckFeatureSupport(FORMAT_SUPPORT, format %u) -> 0x%08lx support1 "
+                                 "0x%08x support2 0x%08x\n",
+                         static_cast<unsigned>(fs->Format), static_cast<unsigned long>(hr),
+                         static_cast<unsigned>(fs->Support1), static_cast<unsigned>(fs->Support2));
+    } else if (static_cast<unsigned>(requested) < 64 &&
+               !(features_seen.fetch_or(1ull << static_cast<unsigned>(requested), std::memory_order_relaxed) &
+                 (1ull << static_cast<unsigned>(requested)))) {
+        std::fprintf(stderr, "[rt] d3d12_xs: CheckFeatureSupport(feature %u, %u bytes) -> 0x%08lx\n",
+                     static_cast<unsigned>(requested), bytes, static_cast<unsigned long>(hr));
+    }
+    return hr;
 }
 
 std::atomic<ConsoleDescriptorHeapHandler> g_console_heap{nullptr};  // set_console_descriptor_heap_handler

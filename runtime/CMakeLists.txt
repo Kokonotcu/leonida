@@ -111,6 +111,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   add_executable(gta6rt
     src/main.cpp
+    src/write_watch.cpp
     src/host_cpu.cpp
     src/pe_loader.cpp
     shims/registry.cpp

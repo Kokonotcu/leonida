@@ -29,6 +29,9 @@
 #include <system_error>
 #include <vector>
 
+namespace rt::write_watch {
+void start_from_environment();
+}
 #include "base_reservation.h"
 #include "code_hooks.h"
 #include "cpu_emulation.h"
@@ -172,6 +175,40 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
             std::fprintf(stderr, "\n");
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             std::fprintf(stderr, "[rt] crash-stack-raw: unreadable\n");
+        }
+        // Diagnostic: the memory around each general register that points at readable memory, with its region, so a
+        // corrupted object can be told apart from an overrun leading into it (retail boot 15: an object whose vtable
+        // word read 0x3F8000003F800000, two floats of 1.0).
+        const struct {
+            const char* name;
+            DWORD64 value;
+        } regs[] = {{"rax", c.Rax}, {"rbx", c.Rbx}, {"rcx", c.Rcx}, {"rdx", c.Rdx}, {"rsi", c.Rsi}, {"rdi", c.Rdi},
+                    {"r8", c.R8},   {"r9", c.R9},   {"r12", c.R12}, {"r13", c.R13}, {"r14", c.R14}, {"r15", c.R15}};
+        for (const auto& reg : regs) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (reg.value < 0x10000 ||
+                VirtualQuery(reinterpret_cast<void*>(reg.value), &info, sizeof(info)) != sizeof(info) ||
+                info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                continue;
+            const auto region_begin = reinterpret_cast<DWORD64>(info.BaseAddress);
+            const DWORD64 region_end = region_begin + info.RegionSize;
+            const DWORD64 at_reg = reg.value & ~DWORD64(7);
+            const DWORD64 from = at_reg - region_begin >= 0x80 ? at_reg - 0x80 : region_begin;
+            const DWORD64 to = region_end - at_reg >= 0x80 ? at_reg + 0x80 : region_end;
+            std::fprintf(stderr, "[rt] crash-mem %s=%p region base=%p size=0x%llx alloc=%p type=0x%lx", reg.name,
+                         reinterpret_cast<void*>(reg.value), info.BaseAddress,
+                         static_cast<unsigned long long>(info.RegionSize), info.AllocationBase, info.Type);
+            __try {
+                for (DWORD64 at = from; at < to; at += 8) {
+                    if (((at - from) & 0x3f) == 0)
+                        std::fprintf(stderr, "\n[rt] crash-mem   %+05lld:",
+                                     static_cast<long long>(at) - static_cast<long long>(at_reg));
+                    std::fprintf(stderr, " %016llx", *reinterpret_cast<const unsigned long long*>(at));
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                std::fprintf(stderr, " (unreadable)");
+            }
+            std::fprintf(stderr, "\n");
         }
     }
     // Diagnostic: the retail frame path reads through 0x100000000 (the synthetic-VA base). Commit one guard page
@@ -423,6 +460,7 @@ int wmain(int argc, wchar_t** argv) {
     }
     rt::d3d12_trace::set_enabled(trace_d3d12);
     AddVectoredExceptionHandler(1, &crash_logger);
+    rt::write_watch::start_from_environment();  // LEONIDA_WATCH_WRITE (src/write_watch.cpp), added after: runs first
     // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
     if (int trace_error = 0; !trace_file.empty() && !rt::startup_trace::open(trace_file.c_str(), &trace_error)) {

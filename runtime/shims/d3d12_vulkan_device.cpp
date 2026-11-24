@@ -3445,6 +3445,22 @@ public:
     // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
     // WriteToSubresource/ReadFromSubresource.
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
+        // A texture the title placed on its own pages (Xbox slot 133, set_title_address) maps to those pages, as on the
+        // console: the subresource's place in the layout the texture computer gave the title (shims/xg_linear_layout.h),
+        // which is also how the pages are read into the image at each submission. The PC refusal (E_INVALIDARG) sent
+        // the retail title down a path that sized a CPU copy at 0 bytes and wrote a 256x1 RGBA32F row through it into
+        // the next heap block (boots 15-25, game_scarlett_master.exe+0x550e2d0).
+        if (image_ && va_ && data) {
+            rt::xg::ResourceLayout layout;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT f{};
+            if (subresource == leonida::all_subresources || !rt::xg::linear_layout(desc_, layout) ||
+                !rt::xg::footprint(desc_, layout, subresource, f)) {
+                *data = nullptr;
+                return E_INVALIDARG;
+            }
+            *data = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(va_)) + f.Offset;
+            return S_OK;
+        }
         if (image_) {
             VkImageSubresourceRange range{};
             return !data && cpu_visible() && subresource != leonida::all_subresources &&

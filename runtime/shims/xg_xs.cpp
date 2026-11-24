@@ -177,7 +177,12 @@ HRESULT __stdcall XGCreateTextureComputer(const D3D12_RESOURCE_DESC* desc, void*
     c->desc = *desc;
     c->layout = layout;
     static std::atomic<unsigned> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+    // Also every mip chain of 16-byte texels (the first 64): retail boot 15 died on an R32G32B32A32 mip chain the title
+    // wrote past its memory, and whether this layout sized it is the question.
+    static std::atomic<unsigned> wide_chains{0};
+    const bool wide_chain = layout.mip_levels > 1 && layout.plane[0].bytes_per_element >= 16 &&
+                            wide_chains.fetch_add(1, std::memory_order_relaxed) < 64;
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 4 || wide_chain)
         std::fprintf(stderr, "[rt] xg_xs: texture computer: dimension %d %llux%ux%u, %u mip(s), format %u -> %llu "
                              "bytes (linear)\n",
                      static_cast<int>(desc->Dimension), static_cast<unsigned long long>(desc->Width), desc->Height,
