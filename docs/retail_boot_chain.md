@@ -97,10 +97,11 @@ that heap is not backed by the title's memory, so it is off by default.
 Xbox device slot 133 is `(va, const D3D12_RESOURCE_DESC*, state, clear, riid, out)` with `riid = IID_ID3D12Resource`
 and `state = 0xFFFFFFFF`, which isn't a valid PC state. At the first call, `va` is the start of a physical-page
 range the title had just reserved, and `desc` is a buffer of that range's size with Xbox bits in `Flags` above
-the PC flags. The shape matches the console `CreatePlacedResourceX`. The local stand-in creates a committed
-DEFAULT-heap buffer from the desc, with `Flags` limited to the PC bits and `D3D12_RESOURCE_STATE_COMMON`. It is
-not tied to the VA, so what the title writes there doesn't reach the GPU. A real implementation needs the page
-mapper (#5378) or an imported host allocation.
+the PC flags. The shape matches the console `CreatePlacedResourceX`. On the Vulkan layer the slot makes a buffer on
+the title's own pages (`create_buffer_at_host_address`: the range is committed first, then imported with
+VK_EXT_external_memory_host), so what the title writes there is what the GPU reads; a texture gets an ordinary
+committed texture. With a PC D3D12 device behind the proxy (no handler registered) the earlier stand-in remains: a
+committed DEFAULT-heap resource from the desc, `Flags` limited to the PC bits, not tied to the VA.
 
 The proxy's slot table must also be longer than the title's highest slot. A shorter table leaves a null pointer,
 not an `E_NOTIMPL`.
