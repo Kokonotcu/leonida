@@ -347,6 +347,9 @@ public:
     }
     // The swapchain holds HDR10 (ST.2084) values: a plane asked for it and the surface has the format.
     bool hdr_active() const { return hdr_active_; }
+    // An HDR10 plane would reach the output as HDR10: the surface listed an ST.2084 format at the last swapchain
+    // (re)creation, or the encoding is forced (force_hdr_encoding). False: HDR10 planes are tone mapped to SDR.
+    bool hdr_output() const { return surface_hdr10_ || force_hdr_encoding_; }
     // Presents that went through the compose pass (present_planes); plain blits and blank frames are not counted.
     std::uint64_t composed_presents() const { return composed_; }
     // Tests, on surfaces without HDR10: compose as if the output were HDR10 but write the PQ values into the (8-bit,
@@ -1267,6 +1270,10 @@ private:
         if (vkGetPhysicalDeviceSurfaceFormatsKHR_(physical_, surface_, &count, formats.data()) != VK_SUCCESS || !count)
             return false;
         formats.resize(count);
+        surface_hdr10_ = std::any_of(formats.begin(), formats.end(), [](const VkSurfaceFormatKHR& f) {
+            return f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+                   (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32);
+        });
         // An sRGB source wants an sRGB swapchain (the blit decodes and encodes, which cancel); any other source
         // wants UNORM (the bytes go through as they are). BGRA before RGBA, as the surface lists them.
         VkSurfaceFormatKHR chosen = formats[0];
@@ -1502,6 +1509,7 @@ private:
     bool swapchain_srgb_ = false;  // the swapchain format follows the source being presented (set once it exists)
     bool swapchain_hdr_req_ = false;  // the swapchain was built for an HDR10 request (it has the format only if hdr_active_)
     bool hdr_active_ = false;
+    std::atomic<bool> surface_hdr10_{false};  // the surface's formats include HDR10 (ST.2084), as of the last recreate
     std::atomic<std::uint64_t> composed_{0};
     std::atomic<bool> force_hdr_encoding_{false};
     bool warned_hdr_ = false;

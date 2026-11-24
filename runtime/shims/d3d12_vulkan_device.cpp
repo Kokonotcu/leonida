@@ -10554,6 +10554,7 @@ HRESULT WindowPresenter::present_planes(const leonida::PresentPlanes& planes, UI
 
 bool WindowPresenter::hdr_active() const { return presenter_->hdr_active(); }
 void WindowPresenter::force_hdr_encoding(bool on) { presenter_->force_hdr_encoding(on); }
+bool WindowPresenter::hdr_output() const { return presenter_->hdr_output(); }
 std::uint64_t WindowPresenter::composed_presents() const { return presenter_->composed_presents(); }
 
 // DISPLAYCONFIG_SDR_WHITE_LEVEL.SDRWhiteLevel is the white level in units of 80/1000 nits: 1000 is 80 nits (the scRGB 1.0),

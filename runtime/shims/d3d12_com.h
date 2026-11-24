@@ -450,6 +450,8 @@ public:
     // The swapchain holds HDR10 (ST.2084) values; and a test hook (VulkanPresenter::force_hdr_encoding).
     bool hdr_active() const;
     void force_hdr_encoding(bool on);
+    // An HDR10 plane would reach the output as HDR10 (VulkanPresenter::hdr_output); false: it is tone mapped to SDR.
+    bool hdr_output() const;
     std::uint64_t composed_presents() const;  // presents that went through the compose pass
     // Nits of SDR white the user set in Windows for the output the window is on (DISPLAYCONFIG_SDR_WHITE_LEVEL), or 0 when
     // it cannot be read (no window, no display config, not Windows). Only meaningful while hdr_active().
