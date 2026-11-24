@@ -5139,8 +5139,28 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 for (std::size_t i = 0; i < draw->user_data.size() && i < 16; ++i)
                     key = (key ^ data.s[i]) * 0x100000001b3ull;
                 std::lock_guard lock(mutex);
-                if (seen.size() < 48 && seen.insert(key).second)
+                // The s8 tables logged, re-read 3000 matching draws later: a slot still zero then was never written
+                // (not just written after the draw was recorded).
+                static std::vector<std::pair<std::uint64_t, std::uint64_t>> later;  // (va, due draw)
+                static std::uint64_t draws = 0;
+                ++draws;
+                for (auto it = later.begin(); it != later.end();) {
+                    if (draws < it->second || !debug_targets::arena_mapped) {
+                        ++it;
+                        continue;
+                    }
+                    const auto* w = reinterpret_cast<const std::uint32_t*>(debug_targets::arena_mapped + it->first);
+                    std::fprintf(stderr, "[rt]   later: arena %#llx+00: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                 static_cast<unsigned long long>(it->first), w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+                                 w[7]);
+                    it = later.erase(it);
+                }
+                if (seen.size() < 48 && seen.insert(key).second) {
                     debug_targets::log_user_data(graphics.debug_name.c_str(), data.s, draw->user_data.size());
+                    if (draw->user_data.size() > 8 && data.s[8] >= 0x10000 &&
+                        data.s[8] + 64 <= debug_targets::arena_size)
+                        later.emplace_back(data.s[8], draws + 3000);
+                }
             }
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;

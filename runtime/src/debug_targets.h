@@ -64,10 +64,12 @@ inline void log_user_data(const char* what, const std::uint32_t* s, std::size_t 
     if (!arena_mapped) return;
     for (std::size_t i = 0; i < n && i < 16; ++i) {
         const std::uint64_t va = s[i];
-        if (va < 0x10000 || va + 64 > arena_size || (va & 3)) continue;
+        if (va < 0x10000 || va + 128 > arena_size || (va & 3)) continue;
         const auto* w = reinterpret_cast<const std::uint32_t*>(arena_mapped + va);
-        std::fprintf(stderr, "[rt]   s%zu -> arena %#llx: %08x %08x %08x %08x %08x %08x %08x %08x\n", i,
-                     static_cast<unsigned long long>(va), w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        for (int row = 0; row < 4; ++row)
+            std::fprintf(stderr, "[rt]   s%zu -> arena %#llx+%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n", i,
+                         static_cast<unsigned long long>(va), row * 32, w[8 * row], w[8 * row + 1], w[8 * row + 2],
+                         w[8 * row + 3], w[8 * row + 4], w[8 * row + 5], w[8 * row + 6], w[8 * row + 7]);
     }
 }
 
