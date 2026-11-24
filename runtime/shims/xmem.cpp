@@ -72,7 +72,36 @@ void note_attributes(const char* api, uint64_t attributes, size_t size, const vo
     rt::startup_trace::event("xmem_attributes", fields);
 }
 
-void* allocate_block(size_t size) { return _aligned_malloc(size ? size : 1, kAlign); }
+// Blocks of 64 KiB or more come from VirtualAlloc, so they start on a 64 KiB boundary and their pages are their own:
+// the attribute word's alignment field is not decoded yet (see the top), and GPU-visible data (a buffer the title
+// places on its own pages, slot 133's host-pointer import) needs page alignment that a 64-byte heap block lacks
+// (review M7, interim). Smaller blocks stay on the 64-byte aligned heap. free_block tells them apart by the set of
+// large blocks, which only large allocations and frees touch.
+constexpr size_t kLargeBlock = 64 * 1024;
+std::mutex g_large_mutex;
+std::set<void*>* g_large_blocks = new std::set<void*>;  // immortal: a block may be freed during shutdown
+
+void* allocate_block(size_t size) {
+    if (size < kLargeBlock) return _aligned_malloc(size ? size : 1, kAlign);
+    void* p = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (p) {
+        std::lock_guard lock(g_large_mutex);
+        g_large_blocks->insert(p);
+    }
+    return p;
+}
+
+void free_block(void* p) {
+    if (!p) return;
+    if (!(reinterpret_cast<uintptr_t>(p) & (kLargeBlock - 1))) {  // only a 64 KiB-aligned pointer can be a large one
+        std::lock_guard lock(g_large_mutex);
+        if (g_large_blocks->erase(p)) {
+            VirtualFree(p, 0, MEM_RELEASE);
+            return;
+        }
+    }
+    _aligned_free(p);
+}
 
 // XMemAllocDefault / XMemFreeDefault: the GDK's own allocator behind XMemAlloc and XMemFree, which a title that hooks
 // XMemAlloc forwards to. The measured title reaches each through one wrapper that is a bare tail jump to the import,
@@ -85,7 +114,7 @@ void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
 
 void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
     note_attributes(kApiFreeDefault, attributes, kNoSize, _ReturnAddress());
-    _aligned_free(p);
+    free_block(p);
 }
 
 // XMemSetAllocationHooks replaces the routines XMemAlloc and XMemFree call. Titles install them once at startup, before
@@ -109,7 +138,7 @@ void __stdcall XMemFree(void* p, uint64_t attributes) {
     if (hook)
         hook(p, attributes);
     else
-        _aligned_free(p);  // as above, without a second XMemFreeDefault event
+        free_block(p);  // as above, without a second XMemFreeDefault event
 }
 
 // Both routines or neither: the GDK documents hooking only one of them as an error, and a lone hook would hand out
