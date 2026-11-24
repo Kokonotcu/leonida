@@ -23,6 +23,7 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "title_memory.h"
 
 namespace {
 
@@ -1115,6 +1116,13 @@ void test_console_mode_registry() {
     const auto query =
         reinterpret_cast<RegQueryValueExWFn>(rt::shims::find("api-ms-win-core-registry-l1-1-0.dll", "RegQueryValueExW"));
     const auto close = reinterpret_cast<RegCloseKeyFn>(rt::shims::find("api-ms-win-core-registry-l1-1-0.dll", "RegCloseKey"));
+
+    // XSystemGetAppMemoryUsageLimit answers the title budget (title_memory.h), not the host's whole RAM.
+    using MemoryLimitFn = uint64_t(__stdcall*)();
+    check(get<MemoryLimitFn>("XSystemGetAppMemoryUsageLimit")() == rt::title_memory::limit(),
+          "XSystemGetAppMemoryUsageLimit answers the title budget");
+    check(rt::title_memory::limit() <= rt::title_memory::kConsoleTitleBudget,
+          "the title budget is at most the console's 13.5 GiB");
 
     SetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", nullptr);
     const uint32_t shim_type = get<DeviceTypeFn>("XSystemGetDeviceType")();
