@@ -43,8 +43,73 @@
 
 #include "shims.h"
 #include "xg_linear_layout.h"
+#include "../src/xg_console_layout.h"
 
 namespace {
+
+namespace xc = leonida::xg_console;
+
+// A description whose layout word names a tiled console swizzle mode (0x100 + mode, mode not 0): the console layout
+// (five-star-recomp's XG, ported in src/xg_console_layout.h). Textures streamed from the game's archives are stored
+// in it, so the computer answers the same layout for them, or the title's own fills (slot 8) and the device's
+// detiling of the pages would disagree.
+std::optional<xc::Layout> console_layout(const D3D12_RESOURCE_DESC& d) {
+    const auto word = static_cast<std::uint32_t>(d.Layout);
+    if (!xc::is_console_tiled(word) || xc::swizzle_mode(word) == xc::mode_linear) return std::nullopt;
+    if (d.Dimension < D3D12_RESOURCE_DIMENSION_TEXTURE1D || d.Dimension > D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        return std::nullopt;
+    xc::Desc x;
+    x.dimension = static_cast<std::uint32_t>(d.Dimension);
+    x.width = d.Width;
+    x.height = d.Height;
+    x.depth_or_array_size = d.DepthOrArraySize;
+    x.mip_levels = d.MipLevels;
+    x.format = static_cast<std::uint32_t>(d.Format);
+    x.sample_count = std::max<std::uint32_t>(d.SampleDesc.Count, 1);
+    x.layout = word;
+    return xc::compute_layout(x);
+}
+
+// Slot 2's records of a console layout, in the order five-star-recomp measured the game reading them (docs/xg.md):
+// plane +0x08 size, +0x10 array slice stride (the game addresses a slice as slice x stride + mip offset), +0x18 base
+// offset, +0x20 alignment, +0x28 bytes per element; each mip its size, offset from the resource start, 2D slice size,
+// pitch in pixels and bytes, alignment, padded and real extents in elements.
+void console_records(const xc::Layout& l, rt::xg::ResourceLayout& out) {
+    std::memset(&out, 0, sizeof(out));
+    out.size_bytes = l.size;
+    out.base_alignment_bytes = l.alignment;
+    out.mip_levels = l.planes[0].mip_count;
+    out.planes = l.plane_count;
+    for (std::uint32_t p = 0; p < l.plane_count && p < 4; ++p) {
+        const xc::Plane& plane = l.planes[p];
+        auto* raw = reinterpret_cast<std::uint8_t*>(&out.plane[p]);
+        const auto put64 = [&](std::size_t at, std::uint64_t v) { std::memcpy(raw + at, &v, 8); };
+        const auto put32 = [&](std::size_t at, std::uint32_t v) { std::memcpy(raw + at, &v, 4); };
+        put64(0x08, plane.size);
+        put64(0x10, plane.slice_stride);
+        put64(0x18, plane.offset);
+        put64(0x20, plane.alignment);
+        put32(0x28, plane.bytes_per_element);
+        for (std::uint32_t m = 0; m < plane.mip_count && m < rt::xg::kMaxMips; ++m) {
+            const xc::Mip& mip = plane.mips[m];
+            rt::xg::MipRecord& r = out.plane[p].mip[m];
+            r.size_bytes = mip.size;
+            r.offset_bytes = xc::mip_offset(l, p, m);
+            r.slice2d_size_bytes = mip.slice_2d_size;
+            r.pitch_pixels = mip.pitch_elements * plane.block_dimension;
+            r.pitch_bytes = mip.pitch_bytes;
+            r.alignment_bytes = plane.block_bytes ? plane.block_bytes : xc::linear_mip_alignment;
+            r.padded_width = mip.pitch_elements;
+            r.padded_height = mip.padded_height_elements;
+            r.padded_depth = mip.depth_elements;
+            r.width_elements = mip.width_elements;
+            r.height_elements = mip.height_elements;
+            r.depth_or_array = mip.depth_elements;
+            r.sample_count = 1;
+            r.tile_mode = l.swizzle_mode;
+        }
+    }
+}
 
 constexpr HRESULT kNotImpl = static_cast<HRESULT>(rt::shims::kENotImpl);
 constexpr size_t kSlots = 32;
@@ -64,6 +129,7 @@ struct Computer {
     std::atomic<long> refs{1};
     D3D12_RESOURCE_DESC desc{};
     rt::xg::ResourceLayout layout{};
+    xc::Layout console{};  // the console computer's layout (console_vtable)
 };
 
 // ---- The static computer: a description the layout does not cover. ----
@@ -181,8 +247,89 @@ constexpr auto make_linear_vtable(std::index_sequence<Slot...>) {
 
 const auto kLinearVtable = make_linear_vtable(std::make_index_sequence<kSlots>{});
 
+// ---- The console computer: a tiled layout word (console_layout). ----
+
+// Slot 6 in the console layout: x and y in elements; z the depth of a 3D texture, else the array slice.
+std::uint64_t __stdcall console_texel_offset(Computer* c, std::uint32_t plane, std::uint32_t mip, std::uint64_t x,
+                                             std::uint64_t y, std::uint64_t z, std::uint64_t /*sample*/,
+                                             std::uint32_t* bit_offset) {
+    if (bit_offset) *bit_offset = 0;
+    const bool volume = c->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const auto layer = static_cast<std::uint32_t>(z & 0xFFFFFFFFull);
+    return xc::element_offset(c->console, plane, mip, volume ? 0 : layer, x, static_cast<std::uint32_t>(y),
+                              volume ? layer : 0);
+}
+
+// Slot 8 in the console layout: the subresource's rows from `linear` tiled into the resource at `base`.
+HRESULT __stdcall console_copy_into(Computer* c, std::uint8_t* base, std::uint32_t plane, std::uint32_t subresource,
+                                    const std::uint8_t* linear, std::uint32_t row_pitch, std::uint32_t slice_pitch) {
+    const std::uint32_t mips = c->console.planes[0].mip_count;
+    if (!base || !linear || !mips) return E_INVALIDARG;
+    const bool volume = c->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const std::uint32_t mip = subresource % mips, slice = volume ? 0 : subresource / mips;
+    if (!xc::tile_subresource(c->console, plane, mip, slice, reinterpret_cast<const std::byte*>(linear), row_pitch,
+                              slice_pitch,
+                              {reinterpret_cast<std::byte*>(base), static_cast<std::size_t>(c->console.size)}))
+        return E_INVALIDARG;
+    rt::xg::note_write(base, static_cast<std::size_t>(c->console.size));
+    return S_OK;
+}
+
+// Slot 9, CopyFromSubresource(linear, plane, subresource, a UINT the game passes as 0, resource base, row pitch,
+// slice pitch) (five-star-recomp docs/xg.md): the subresource detiled into rows.
+HRESULT __stdcall console_copy_from(Computer* c, std::uint8_t* linear, std::uint32_t plane, std::uint32_t subresource,
+                                    std::uint32_t /*unknown*/, const std::uint8_t* base, std::uint32_t row_pitch,
+                                    std::uint32_t slice_pitch) {
+    const std::uint32_t mips = c->console.planes[0].mip_count;
+    if (!base || !linear || !mips) return E_INVALIDARG;
+    const bool volume = c->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    const std::uint32_t mip = subresource % mips, slice = volume ? 0 : subresource / mips;
+    return xc::detile_subresource(c->console, plane, mip, slice,
+                                  {reinterpret_cast<const std::byte*>(base), static_cast<std::size_t>(c->console.size)},
+                                  reinterpret_cast<std::byte*>(linear), row_pitch, slice_pitch)
+               ? S_OK
+               : E_INVALIDARG;
+}
+
+template <size_t... Slot>
+constexpr auto make_console_vtable(std::index_sequence<Slot...>) {
+    return std::array<void*, sizeof...(Slot)>{
+        (Slot == 0    ? reinterpret_cast<void*>(&linear_add_ref)
+         : Slot == 1  ? reinterpret_cast<void*>(&linear_release)
+         : Slot == 2  ? reinterpret_cast<void*>(&linear_get_resource_layout)
+         : Slot == 6  ? reinterpret_cast<void*>(&console_texel_offset)
+         : Slot == 8  ? reinterpret_cast<void*>(&console_copy_into)
+         : Slot == 9  ? reinterpret_cast<void*>(&console_copy_from)
+         : Slot == 10 ? reinterpret_cast<void*>(&linear_get_resource_tiling)
+                      : reinterpret_cast<void*>(&computer_slot<Slot>))...};
+}
+
+const auto kConsoleVtable = make_console_vtable(std::make_index_sequence<kSlots>{});
+
 HRESULT __stdcall XGCreateTextureComputer(const D3D12_RESOURCE_DESC* desc, void** out) {
     if (!out) return E_POINTER;
+    if (desc) {
+        if (const auto console = console_layout(*desc)) {
+            auto* c = new (std::nothrow) Computer{kConsoleVtable.data()};
+            if (!c) {
+                *out = &g_static;
+                return E_OUTOFMEMORY;
+            }
+            c->desc = *desc;
+            c->console = *console;
+            console_records(*console, c->layout);
+            static std::atomic<unsigned> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                std::fprintf(stderr, "[rt] xg_xs: texture computer: dimension %d %llux%ux%u, %u mip(s), format %u, "
+                                     "layout %#x -> %llu bytes (console tiled)\n",
+                             static_cast<int>(desc->Dimension), static_cast<unsigned long long>(desc->Width),
+                             desc->Height, static_cast<unsigned>(desc->DepthOrArraySize), console->planes[0].mip_count,
+                             static_cast<unsigned>(desc->Format), static_cast<unsigned>(desc->Layout),
+                             static_cast<unsigned long long>(console->size));
+            *out = c;
+            return S_OK;
+        }
+    }
     rt::xg::ResourceLayout layout{};
     if (!desc || !rt::xg::linear_layout(*desc, layout)) {
         static std::atomic<bool> warned{false};
@@ -214,10 +361,21 @@ HRESULT __stdcall XGCreateTextureComputer(const D3D12_RESOURCE_DESC* desc, void*
     return S_OK;
 }
 
-HRESULT __stdcall XGSuggestSwizzleMode(const void* /*desc*/, uint32_t /*flags*/, uint32_t* /*mode*/) {
-    static std::atomic<bool> warned{false};
-    warn_once(warned, "XGSuggestSwizzleMode", -1, _ReturnAddress());
-    return kNotImpl;
+// XGSuggestSwizzleMode(desc, flags, UINT32* layout): the game asks it for an asset whose mode byte is 0xFF and writes
+// the answer into the desc's Layout (five-star-recomp docs/xg.md): 0x100 + 27 (64 KB blocks) when mip 0 holds 1 MiB or
+// more, else 0x100 + 23 (4 KB), the split the shipped textures show. E_NOTIMPL left the layout unwritten.
+HRESULT __stdcall XGSuggestSwizzleMode(const D3D12_RESOURCE_DESC* desc, uint32_t /*flags*/, uint32_t* layout) {
+    if (!desc || !layout) return E_POINTER;
+    xc::Desc x;
+    x.dimension = static_cast<std::uint32_t>(desc->Dimension);
+    x.width = desc->Width;
+    x.height = desc->Height;
+    x.depth_or_array_size = desc->DepthOrArraySize;
+    x.mip_levels = desc->MipLevels;
+    x.format = static_cast<std::uint32_t>(desc->Format);
+    x.sample_count = std::max<std::uint32_t>(desc->SampleDesc.Count, 1);
+    *layout = xc::suggest_layout(x);
+    return S_OK;
 }
 
 }  // namespace

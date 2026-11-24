@@ -247,6 +247,10 @@ void set_device_presentation_window(void* device, std::uint64_t window);
 using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t layout, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
+// The console layout word of the slot-133 resource the handler is creating (D3D12_RESOURCE_DESC::Layout as the title
+// wrote it: 0x100 + swizzle mode for a texture, five-star-recomp docs/xg.md); the handler's desc has the PC layout.
+// Set on the calling thread for the duration of the handler call only.
+inline thread_local std::uint32_t g_placed_console_layout = 0;
 
 // Device slot 57: the title's native graphics pipeline creation (desc, riid, out), from an Xbox native PSO
 // description that names its stages by DXBC HASH digest (not implemented yet: see the RT-SLOT57 work upstream). With

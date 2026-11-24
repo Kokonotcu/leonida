@@ -2929,7 +2929,9 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
         if (texture && vd.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
             static std::atomic<int> told{0};
             const bool tell = told.fetch_add(1, std::memory_order_relaxed) < 8;
+            g_placed_console_layout = static_cast<std::uint32_t>(rd.Layout);  // the view's texture, if one is made
             ID3D12Resource* resource = va && self->texture_provider ? self->texture_provider(self->real, va, &rd) : nullptr;
+            g_placed_console_layout = 0;
             if (tell)
                 std::fprintf(stderr, "[rt] d3d12_xs: slot 70 texture view at 0x%llx: %llux%u x%u, %u mips, format %d "
                                      "(view format %d, dimension %d) -> %s\n",
@@ -4295,7 +4297,9 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                          va, static_cast<unsigned long long>(pc_desc.Width), GetLastError());
         }
     }
+    g_placed_console_layout = static_cast<std::uint32_t>(xbox_desc->Layout);
     const HRESULT hr = handler(self->real, va, pc_desc, state, *riid, out);
+    g_placed_console_layout = 0;
     // The description of the first refusals (PR #8134 logged them on its retail runs): which kind of placement the
     // title needs that the handler does not make.
     if (FAILED(hr)) {

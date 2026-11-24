@@ -2555,6 +2555,7 @@ public:
         std::size_t command = none;
         const char* kind = nullptr;  // command_name of that command
         VkResult vk_result = VK_SUCCESS;
+        const char* reason = nullptr;  // a whole-submission failure's step (query pools, bindless flush, ...)
     };
     Failure last_failure() {
         std::lock_guard state(state_mutex_);
@@ -2571,6 +2572,11 @@ public:
         else
             std::snprintf(text, sizeof text, "no single command");
         std::string out = text;
+        if (f.reason) {
+            out += " (";
+            out += f.reason;
+            out += ")";
+        }
         if (f.vk_result != VK_SUCCESS) {
             std::snprintf(text, sizeof text, ", vkQueueSubmit returned %d", static_cast<int>(f.vk_result));
             out += text;
@@ -3072,8 +3078,10 @@ private:
                 return result;
             }
             if (prepared[i].segment_count > UINT32_MAX - segments ||
-                prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
+                prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments) {
+                failure_.reason = "query segment count overflow";
                 return ReplayResult::unsupported;
+            }
             segments += prepared[i].segment_count;
             statistics_segments += prepared[i].statistics_segment_count;
             has_queries = has_queries || !prepared[i].queries.empty();
@@ -3093,12 +3101,17 @@ private:
             return vk.vkCreateQueryPool(out->device, &info, nullptr, &out->pool) == VK_SUCCESS;
         };
         std::shared_ptr<OcclusionSegmentPool> physical, statistics;
-        if (segments && !segment_pool(VK_QUERY_TYPE_OCCLUSION, segments, physical)) return ReplayResult::unsupported;
+        if (segments && !segment_pool(VK_QUERY_TYPE_OCCLUSION, segments, physical)) {
+            failure_.reason = "occlusion query pool";
+            return ReplayResult::unsupported;
+        }
         // Without the compute helper a split query could not be summed: leave statistics queries whole, as before
         // (QueryReplay::plan refuses a list whose statistics query holds a mesh draw then).
         if (statistics_segments && can_resolve_occlusion) {
-            if (!segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics))
+            if (!segment_pool(VK_QUERY_TYPE_PIPELINE_STATISTICS, statistics_segments, statistics)) {
+                failure_.reason = "statistics query pool";
                 return ReplayResult::unsupported;
+            }
             for (const auto& list : prepared)
                 statistics->mesh.insert(statistics->mesh.end(), list.statistics_mesh.begin(),
                                         list.statistics_mesh.end());
@@ -3136,23 +3149,35 @@ private:
         for (std::size_t i = 0; i < lists.size(); ++i) {
             auto& list = prepared[i];
             const auto result = queries.plan(list, physical, base, can_resolve_occlusion, statistics, statistics_base);
-            if (result != ReplayResult::success) return result;
+            if (result != ReplayResult::success) {
+                failure_.list = i;
+                failure_.reason = "query plan";
+                return result;
+            }
             base += list.segment_count;
             statistics_base += list.statistics_segment_count;
         }
         if (queries.needs_sum || queries.needs_binary || queries.needs_statistics_sum || queries.needs_sum_binary) {
             if (!occlusion_resolve_) {
                 auto helper = std::make_unique<OcclusionResolve>(context_.vk, context_.device());
-                if (!helper->initialize(occlusion_memory)) return ReplayResult::unsupported;
+                if (!helper->initialize(occlusion_memory)) {
+                    failure_.reason = "occlusion resolve helper";
+                    return ReplayResult::unsupported;
+                }
                 occlusion_resolve_ = std::move(helper);
             }
             if (!occlusion_resolve_->prepare(queries.needs_sum, queries.needs_binary, queries.needs_statistics_sum,
-                                             queries.needs_sum_binary))
+                                             queries.needs_sum_binary)) {
+                failure_.reason = "occlusion resolve prepare";
                 return ReplayResult::unsupported;
+            }
         }
 
         CommandSlot* slot = acquire();
-        if (!slot) return ReplayResult::unsupported;
+        if (!slot) {
+            failure_.reason = "no command slot";
+            return ReplayResult::unsupported;
+        }
         slot->khr_instances = std::move(khr_guard.stages);  // freed when this slot is reused
         khr_guard.stages.clear();
         slot->khr_as_queries = std::move(khr_guard.as_queries);
@@ -3183,6 +3208,7 @@ private:
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         if (context_.vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
             discard();
+            failure_.reason = "vkBeginCommandBuffer";
             return ReplayResult::unsupported;
         }
         // D3D12 ends every ExecuteCommandLists with all its work done and its writes visible to the next one on the
@@ -3221,6 +3247,7 @@ private:
             }
             if (bindless_commit) bindless_commit(submitted);
             tracker_lock.unlock();
+            failure_.reason = "bindless table flush";
             return ReplayResult::unsupported;
         }
         replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
@@ -3348,6 +3375,7 @@ private:
             wait_values_.push_back(submitted_);
         }
         const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
+        if (!submitted) failure_.reason = ended ? "vkQueueSubmit" : "vkEndCommandBuffer";
         if (!submitted && (!storage_images.empty() || !zero_buffers.empty())) {
             // not initialized after all: try again with the next submission
             std::lock_guard lock(context_.storage_mutex_);

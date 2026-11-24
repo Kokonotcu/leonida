@@ -2126,7 +2126,9 @@ public:
             // repeats the same failing call every frame.
             const leonida::VulkanQueue::Failure failure = queue_.last_failure();
             if (reported_failures_
-                    .emplace(int(last_result_), failure.kind ? failure.kind : "", int(failure.vk_result))
+                    .emplace(int(last_result_),
+                             failure.kind ? failure.kind : failure.reason ? failure.reason : "",
+                             int(failure.vk_result))
                     .second)
                 std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s at %s; nothing was submitted "
                                      "(reported once per cause)\n",

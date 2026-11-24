@@ -22,6 +22,8 @@
 #include "log_seen.h"
 
 #include <psapi.h>  // K32QueryWorkingSetEx (title_range_touched)
+
+#include "../src/xg_console_layout.h"  // title textures in the console's tiled layout
 #include "xg_linear_layout.h"  // title-placed textures: the texture computer's layout
 #include "../src/arena_size.h"
 #include "../src/shader_module_cache.h"
@@ -3135,6 +3137,12 @@ struct TitleTexture {
     const std::uint8_t* title;
     std::size_t bytes;
     std::unique_ptr<rt::xg::ResourceLayout> layout;
+    // The title's console layout word (0x100 + swizzle mode; 0 when unknown): textures streamed from the game's
+    // archives sit in the console's tiled layout whatever the texture computer answered (five-star-recomp docs/xg.md).
+    std::uint32_t console_layout = 0;
+    // A tiled console layout word (swizzle mode not 0): the layout its bytes are in (src/xg_console_layout.h), and
+    // what copy_from_console detiles. Null: the title's bytes follow `layout` (the computer's linear answer).
+    std::shared_ptr<const leonida::xg_console::Layout> console;
     bool watch = false;        // hashed during its watch window (no render-target or UAV usage)
     bool dirty = true;         // never copied, or written through the texture computer since
     bool copied = false;
@@ -4017,6 +4025,34 @@ public:
 
     // A title-placed texture's texels from the title's pages, laid out as `layout` (sync_title_textures): every
     // subresource, each a D3D12 placed footprint at its offset from `title`.
+    // The same from the console's tiled layout (src/xg_console_layout.h, five-star-recomp's XG): each subresource is
+    // detiled into tight rows of elements (block rows for BC formats) and written as WriteToSubresource would.
+    bool copy_from_console(const std::uint8_t* title, const leonida::xg_console::Layout& layout) {
+        namespace xc = leonida::xg_console;
+        const xc::Plane& plane = layout.planes[0];
+        const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const std::uint32_t mips = plane.mip_count;
+        const std::uint32_t slices = volume ? 1u : desc_.DepthOrArraySize;
+        const std::span<const std::byte> memory{reinterpret_cast<const std::byte*>(title),
+                                                static_cast<std::size_t>(layout.size)};
+        std::vector<std::byte> rows;
+        for (std::uint32_t slice = 0; slice < slices; ++slice) {
+            for (std::uint32_t mip = 0; mip < mips; ++mip) {
+                const xc::Mip& m = plane.mips[mip];
+                const std::uint64_t row_pitch = std::uint64_t{m.width_elements} * plane.bytes_per_element;
+                const std::uint64_t depth_pitch = row_pitch * m.height_elements;
+                const std::uint32_t depth = volume ? std::max(1u, static_cast<std::uint32_t>(desc_.DepthOrArraySize) >> mip) : 1u;
+                rows.resize(static_cast<std::size_t>(depth_pitch * depth));
+                if (!xc::detile_subresource(layout, 0, mip, slice, memory, rows.data(), row_pitch, depth_pitch))
+                    return false;
+                if (FAILED(cpu_copy(true, mip + slice * mips, nullptr, rows.data(), static_cast<UINT>(row_pitch),
+                                    static_cast<UINT>(depth_pitch), /*quiet=*/true)))
+                    return false;
+            }
+        }
+        return true;
+    }
+
     bool copy_from_title(const std::uint8_t* title, const rt::xg::ResourceLayout& layout) {
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT count = layout.mip_levels * (volume ? 1u : desc_.DepthOrArraySize);
@@ -4357,6 +4393,37 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
     t->resource = texture;
     t->title = static_cast<const std::uint8_t*>(address);
     t->bytes = static_cast<std::size_t>(t->layout->size_bytes);
+    t->console_layout = rt::d3d12_xs::g_placed_console_layout;
+    namespace xc = leonida::xg_console;
+    static const bool detile = [] {
+        const char* v = std::getenv("LEONIDA_CONSOLE_DETILE");  // =0: the title's bytes are read as linear, as before
+        return !(v && v[0] == '0');
+    }();
+    if (detile && xc::is_console_tiled(t->console_layout) && xc::swizzle_mode(t->console_layout) != xc::mode_linear) {
+        xc::Desc x;
+        x.dimension = static_cast<std::uint32_t>(desc.Dimension);
+        x.width = desc.Width;
+        x.height = desc.Height;
+        x.depth_or_array_size = desc.DepthOrArraySize;
+        x.mip_levels = desc.MipLevels;
+        x.format = static_cast<std::uint32_t>(desc.Format);
+        x.sample_count = std::max<std::uint32_t>(desc.SampleDesc.Count, 1);
+        x.layout = t->console_layout;
+        if (auto l = xc::compute_layout(x)) {
+            t->console = std::make_shared<const xc::Layout>(*l);
+            t->bytes = static_cast<std::size_t>(l->size);  // what is hashed and read: the console layout's span
+        }
+    }
+    {
+        // The layout words the title's textures come with (the first of each, with a texture that has it).
+        static std::mutex m;
+        static std::set<std::uint32_t> seen;
+        std::lock_guard lock(m);
+        if (seen.size() < 32 && seen.insert(t->console_layout).second)
+            std::fprintf(stderr, "[rt] d3d12: title texture layout word %#x first on %llux%u x%u, %u mips, format %d\n",
+                         t->console_layout, static_cast<unsigned long long>(desc.Width), desc.Height,
+                         unsigned(desc.DepthOrArraySize), unsigned(desc.MipLevels), int(desc.Format));
+    }
     t->watch = !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
     rt::xg::g_write_listener.store(&title_texture_written, std::memory_order_release);
     std::lock_guard lock(title_texture_mutex());
@@ -11873,9 +11940,10 @@ HRESULT create_stub_pipeline_state(ID3D12Device* device, REFIID riid, void** out
 // copy_from_title with the title's pages read under a guard, as the hashes are (guarded_title_hash): the title may
 // unmap a page between the readability check and the copy (retail 1.0.2.1, an access violation in the copy's pack).
 // False when the copy failed or faulted; a faulted copy's staging memory is not released (rare).
-bool guarded_copy_from_title(Resource* resource, const std::uint8_t* title, const rt::xg::ResourceLayout& layout) {
+bool guarded_copy_from_title(Resource* resource, const std::uint8_t* title, const rt::xg::ResourceLayout& layout,
+                             const leonida::xg_console::Layout* console) {
     __try {
-        return resource->copy_from_title(title, layout);
+        return console ? resource->copy_from_console(title, *console) : resource->copy_from_title(title, layout);
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         return false;
     }
@@ -12035,7 +12103,7 @@ void sync_title_textures() {
             }
         }
         t->dirty = false;
-        if (!guarded_copy_from_title(t->resource, t->title, *t->layout)) {
+        if (!guarded_copy_from_title(t->resource, t->title, *t->layout, t->console.get())) {
             faulted();
             log_once("a title-placed texture could not be copied from the title's pages; it keeps its texels; "
                      "dimension",
