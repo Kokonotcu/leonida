@@ -21,6 +21,7 @@
 #pragma once
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <set>
 
 #include <atomic>
@@ -29,8 +30,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "shims.h"
 
@@ -163,6 +166,73 @@ inline std::string debug_text(const EXCEPTION_RECORD& r) {
     return utf8_from_ansi(a, static_cast<int>(n ? n - 1 : strlen(a)));
 }
 
+// One "thread" event per other thread of this process: its id and stack. Every context is taken first, each thread
+// suspended only for GetThreadContext, with nothing allocated meanwhile (a suspended thread may hold the heap lock);
+// the stacks are walked after all are resumed.
+inline void log_all_threads() {
+    struct Captured {
+        DWORD id;
+        CONTEXT context;
+    };
+    std::vector<Captured> captured;
+    captured.reserve(512);
+    const DWORD self = GetCurrentThreadId();
+    const DWORD pid = GetCurrentProcessId();
+    const HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL more = Thread32First(snap, &entry); more && captured.size() < captured.capacity();
+         more = Thread32Next(snap, &entry)) {
+        if (entry.th32OwnerProcessID != pid || entry.th32ThreadID == self) continue;
+        const HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE,
+                                    entry.th32ThreadID);
+        if (!t) continue;
+        if (SuspendThread(t) != static_cast<DWORD>(-1)) {
+            Captured c{entry.th32ThreadID, {}};
+            c.context.ContextFlags = CONTEXT_FULL;
+            const bool got = GetThreadContext(t, &c.context) != FALSE;
+            ResumeThread(t);
+            if (got) captured.push_back(c);  // within the reserved capacity: no allocation
+        }
+        CloseHandle(t);
+    }
+    CloseHandle(snap);
+    for (const Captured& c : captured)
+        event("thread", "\"id\":" + std::to_string(c.id) + ",\"stack\":" + stack_from(c.context));
+}
+
+// The retail watchdog (1.0.2.1, the store at RVA 0x2215c35) scans 64 records of 0x48 bytes at RVA 0x6844a20: a word,
+// a count at +4 and up to 8 QPC start times at +8 (read by PR #8134). The busy ones are logged with their ages.
+// Nothing happens unless the fault address is that store, so another build of the executable is not misread.
+inline void log_watchdog_table(std::uint64_t fault_address) {
+    constexpr std::uint64_t kStore = 0x2215c35, kTable = 0x6844a20;
+    if (where(fault_address).find("+0x2215c35") == std::string::npos) return;
+    const auto* table = reinterpret_cast<const std::uint8_t*>(fault_address - kStore + kTable);
+    LARGE_INTEGER now{}, freq{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    for (int i = 0; i < 64; ++i) {
+        std::uint8_t rec[0x48];
+        SIZE_T got = 0;
+        if (!ReadProcessMemory(GetCurrentProcess(), table + i * 0x48, rec, sizeof(rec), &got) || got != sizeof(rec))
+            break;
+        std::uint32_t word = 0, count = 0;
+        std::memcpy(&word, rec, 4);
+        std::memcpy(&count, rec + 4, 4);
+        if (!count) continue;
+        std::string ages;
+        for (std::uint32_t k = 0; k < count && k < 8; ++k) {
+            std::int64_t ts = 0;
+            std::memcpy(&ts, rec + 8 + k * 8, 8);
+            if (!ages.empty()) ages += ",";
+            ages += ts && freq.QuadPart ? std::to_string((now.QuadPart - ts) * 1000 / freq.QuadPart) : "0";
+        }
+        event("watchdog", "\"record\":" + std::to_string(i) + ",\"word\":" + quote(hex(word)) +
+                              ",\"count\":" + std::to_string(count) + ",\"age_ms\":[" + ages + "]");
+    }
+}
+
 inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
@@ -195,6 +265,14 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
+            // A write to address 0 is how the retail title's watchdog stops the process when a thread stops making
+            // progress (PR #8134's boot runs: the store at RVA 0x2215c35 of 1.0.2.1). That thread's stack names only
+            // the watchdog, so every other thread's is logged, and the watchdog's own table when the address matches.
+            if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r.NumberParameters >= 2 &&
+                r.ExceptionInformation[0] == 1 && r.ExceptionInformation[1] == 0) {
+                log_all_threads();
+                log_watchdog_table(reinterpret_cast<std::uint64_t>(r.ExceptionAddress));
+            }
         }
     } catch (...) {
         // Out of memory while formatting: drop the event rather than disturb the process.
