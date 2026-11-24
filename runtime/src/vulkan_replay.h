@@ -2319,11 +2319,13 @@ bool regions_cover(const ResourceBinding& resource, const VkImageSubresourceRang
 }
 
 // `overwritten`: the copy writes every texel of `range` (a destination it covers whole), so a never-used piece is
-// not zero-filled first (I5).
+// not zero-filled first (I5). `order` false: the caller knows no transfer since the last ordering barrier touched
+// this resource (a run of copies between distinct resources, I10), so a piece already in the transfer layout needs
+// no barrier before this one.
 inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer command_buffer,
                                  const ResourceBinding& resource, ResourceId id, const VkImageSubresourceRange& range,
                                  VkImageLayout wanted, VkAccessFlags access, LayoutTracker* tracker,
-                                 bool overwritten = false) {
+                                 bool overwritten = false, bool order = true) {
     const VkImageLayout transfer = image_layout(resource, wanted);
     auto pieces = current(tracker, id, range, transfer);
     bool promoted = false;
@@ -2336,6 +2338,7 @@ inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer comm
     // transition, so an earlier transfer write to it is ordered here instead (write-after-write and read-after-write,
     // which synchronization validation reports otherwise).
     const auto after_transfer_writes = [&] {
+        if (!order) return;
         memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, access,
                        VK_PIPELINE_STAGE_TRANSFER_BIT);
     };
@@ -4015,10 +4018,17 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         scope.open = false;
     };
 
+    // I10: the run of copy commands since the last transfer -> transfer barrier, and what they wrote and read. Any
+    // other command ends the run: the next copy records the barrier again.
+    bool copy_run = false;
+    std::vector<ResourceId> copy_written, copy_read;
     for (std::size_t i = 0; i < commands.size(); ++i) {
         if (op_markers) mark_ops_before(i);
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        if (!std::holds_alternative<CopyBuffer>(command) && !std::holds_alternative<CopyTexture>(command) &&
+            !std::holds_alternative<CopyResource>(command))
+            copy_run = false;
         // Only a draw with nothing to do between it and the previous one may join that draw's open scope.
         if (scope.open) {
             const auto* ind = std::get_if<ExecuteIndirect>(&command);
@@ -4318,7 +4328,29 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (std::holds_alternative<CopyBuffer>(command) || std::holds_alternative<CopyTexture>(command) ||
                    std::holds_alternative<CopyResource>(command)) {
             const auto [dst_id, src_id] = copy_ids(command);
-            if (!p.predicated_copy.empty()) {
+            // I10: D3D12 orders back-to-back copies; Vulkan needs a transfer -> transfer barrier for that. One is
+            // recorded where the run of copies starts and before a copy that touches what an earlier copy of the run
+            // wrote (or writes what one read), not before every copy: uploads into distinct textures then overlap.
+            const auto touched = [](const std::vector<ResourceId>& ids, ResourceId id) {
+                return id && std::find(ids.begin(), ids.end(), id) != ids.end();
+            };
+            const bool predicated_copy = !p.predicated_copy.empty();
+            // Buffer-to-buffer copies record no barrier of their own, as before; they only join the run's sets.
+            const bool buffer_copy = !predicated_copy && !p.buffer_copies.empty();
+            const bool dependent = !copy_run || touched(copy_written, dst_id) || touched(copy_written, src_id) ||
+                                   touched(copy_read, dst_id);
+            if (!predicated_copy && !buffer_copy && dependent) {
+                detail::memory_barrier(vk, command_buffer, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT);
+                copy_written.clear();
+                copy_read.clear();
+                copy_run = true;  // the run starts at a barrier
+            }
+            if (predicated_copy) copy_run = false;
+            copy_written.push_back(dst_id);
+            copy_read.push_back(src_id);
+            if (predicated_copy) {
                 end_statistics();
                 vk.emit_predicated_copy(command_buffer, p.predicated_copy);
                 begin_statistics();
@@ -4345,17 +4377,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             } else if (!p.image_copies.empty()) {
                 // A subresource can be both the source and destination only in a shared layout.
                 const bool self = p.same_copy_subresource;
+                // The run's barrier above orders earlier transfers (I10): no second one per side.
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
                     self ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     self ? VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT,
-                    tracker);
+                    tracker, false, false);
                 const auto dst_range = detail::planes_for_layout(p.binding, p.range, separate);
                 const VkImageLayout dst_layout =
                     self ? src_layout
                          : detail::copy_layout(vk, command_buffer, p.binding, dst_id, dst_range,
                                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
-                                               tracker, detail::regions_cover(p.binding, dst_range, p.image_copies));
+                                               tracker, detail::regions_cover(p.binding, dst_range, p.image_copies),
+                                               false);
                 const auto count = std::uint32_t(p.image_copies.size());
                 const auto depth_stencil = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
                 if (std::holds_alternative<CopyResource>(command) &&
@@ -4407,13 +4441,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 const auto dst_range = detail::planes_for_layout(p.binding, p.range, separate);
                 const VkImageLayout dst_layout = detail::copy_layout(
                     vk, command_buffer, p.binding, dst_id, dst_range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, tracker, detail::regions_cover(p.binding, dst_range, *regions));
+                    VK_ACCESS_TRANSFER_WRITE_BIT, tracker, detail::regions_cover(p.binding, dst_range, *regions),
+                    false);
                 vk.copy_buffer_to_image(command_buffer, source, p.binding.image, dst_layout,
                                         std::uint32_t(regions->size()), regions->data());
             } else {
                 const VkImageLayout src_layout = detail::copy_layout(
                     vk, command_buffer, p.source, src_id, detail::planes_for_layout(p.source, p.source_range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker);
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT, tracker, false, false);
                 if (!p.has_depth24) {
                     const auto target = p.tile_scratch ? p.tile_scratch : p.binding.buffer;
                     vk.copy_image_to_buffer(command_buffer, p.source.image, src_layout, target,
