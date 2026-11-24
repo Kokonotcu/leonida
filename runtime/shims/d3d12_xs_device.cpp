@@ -35,6 +35,7 @@
 #include "presentx_capture.h"
 #include "xg_linear_layout.h"  // slots 25 and 108 cover the texture computer's layout
 #include "../src/frame_pacer.h"     // leonida::FrameTokenSource: the tokens slots 78/79/80 and PresentX share
+#include "d3d12_xs_desc_clean.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
 #include <windows.h>
@@ -3294,7 +3295,9 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
         alloc_fn = g_heap_alloc;
         free_fn = g_heap_free;
     }
-    if (alloc_fn && requested && requested->NumDescriptors > 0) {
+    // A heap the console-extended handler made already sits at the address the title named: the hook-backed address
+    // is for a heap made from a plain PC description only. The backing is the size the title asked for, uncapped.
+    if (!console_extended && alloc_fn && requested && requested->NumDescriptors > 0) {
         const UINT inc = self->real->GetDescriptorHandleIncrementSize(requested->Type);
         if (inc > 0 && requested->NumDescriptors <= (std::numeric_limits<SIZE_T>::max)() / inc) {
             const SIZE_T byte_size = static_cast<SIZE_T>(requested->NumDescriptors) * static_cast<SIZE_T>(inc);
@@ -4296,6 +4299,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                          static_cast<unsigned>(pc_desc.Format), pc_desc.SampleDesc.Count,
                          static_cast<unsigned>(xbox_desc->Layout), xbox_flags);
     }
+
     return hr;
 }
 
@@ -4655,8 +4659,7 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     if (descs && desc_count) {
         clean.reset(new (std::nothrow) D3D12_RESOURCE_DESC[desc_count]);
         if (!clean) {
-            *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = {UINT64_MAX,
-                                                                       D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
+            *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = {UINT64_MAX, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT};
             return call.ret;
         }
         for (UINT i = 0; i < desc_count; ++i) {
@@ -4667,8 +4670,11 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     }
     const UINT mask = static_cast<UINT>(visible_mask);
     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
-    apply_console_placement(descs, desc_count, info, nullptr,
-                            [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+    // The console tile sizes are the title's: a call in the console form gets them. A PC-form caller (the runtime's
+    // own code and tests, which compare with the PC device) gets the PC device's answer unchanged.
+    if (call.console_abi)
+        apply_console_placement(descs, desc_count, info, nullptr,
+                                [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
     // A format the PC layer cannot map comes back as UINT64_MAX. The console still has a size for it; answer the
     // console caller (the title's C-ABI call) one it accepts (alignment 0x10000, below 4 GiB) instead of its int3 on
     // a >32-bit size. A PC-ABI caller keeps the host's refusal, as the PC runtime gives it.
@@ -4731,7 +4737,7 @@ void* WINAPI proxy_get_resource_allocation_info1(std::uint64_t a0, std::uint64_t
     }
     void* const returned = reinterpret_cast<Fn>(self->real_vtable[56])(
         self->real, call.ret, static_cast<UINT>(visible_mask), n, descs, each);
-    if (each) {
+    if (each && call.console_abi) {  // console sizes for the console form only, as slot 25
         auto& info = *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret);
         apply_console_placement(descs, n, info, each, [&](UINT i) {
             return D3D12_RESOURCE_ALLOCATION_INFO{each[i].SizeInBytes, each[i].Alignment};

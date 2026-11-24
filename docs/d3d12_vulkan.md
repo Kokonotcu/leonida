@@ -2438,6 +2438,14 @@ The trace will enumerate them.
   budgets its first full-screen render targets with such a hook: it bump-allocates the allocations whose XALLOC
   page-size field is 2 out of a range it reserved and asserts that less than 2 MiB is left (RT-5 stop 17); two
   3840 x 2160 RGBA8 targets are 2 x 510 tiles of a 64 MiB range, and AMD's 513 x 64 KiB answer would overrun it. The
+  ones). For console-form calls or descriptors explicitly using layout `0x101`, the proxy strips Xbox-only flags and
+  translates layout `0x101` to ROW_MAJOR for buffers or UNKNOWN for textures. Other PC-form descriptors reach the host
+  unchanged for validation (`d3d12_xs_desc_clean.h`; #6982 section 3.7).
+  A committed resource made through slots 76 and 127 also allocates that size through the title's
+  `__XMemAllocationHooks__`, as the console runtime's `XMemAlloc` for the resource does, and frees it when the
+  resource is destroyed (a lease kept with `SetPrivateDataInterface`; the bytes are not used). The retail title
+  budgets its first full-screen render targets with such a hook: it bump-allocates the allocations whose XALLOC
+  page-size field is 2 out of a range it reserved and asserts that less than 2 MiB is left (RT-5 stop 17). The
   lease's attribute word (allocator ID 0x80, page-size field 2, object type 0) is an **assumption**; the measured
   hook reads only the page-size field.
 - `GetAdapterLuid` (implemented): `VkPhysicalDeviceIDProperties::deviceLUID`, which on Windows is the DXGI
@@ -2456,8 +2464,9 @@ The trace will enumerate them.
   RDX, node mask in R8 and heap type in R9: three calls right after device creation, node mask 1 and types 1, 2
   and 3 (measured under `gta6rt --run` with a register probe in the slot's thunk). A PC C++ method has the device
   in RCX and the buffer in RDX, so the Xbox-ABI proxy takes the console form when RDX holds the proxy
-  (`d3d12_xs_device.cpp`; `xs_proxy_mock_test`, `device_proxy_test`). Slots 25 and 43 return structs too; the
-  executable has not been seen calling them yet, so the proxy still forwards them in the PC form.
+  (`d3d12_xs_device.cpp`; `xs_proxy_mock_test`, `device_proxy_test`). Slot 43 returns a struct too and the
+  proxy still forwards it in the PC form: no call of slot 43 has been seen. Slots 25 and 56 take the same form by the
+  same rule (reported later in the boot, #6982; not measured), as #6973 first did for slot 25.
 - Residency and power (D3D-33) are no-ops that still check their arguments (`d3d12_vulkan_device.cpp`, tested in
   `d3d12_vulkan_device_test`). Vulkan has no residency API: memory from `vkAllocateMemory` stays usable until
   `vkFreeMemory`, and paging under pressure is the kernel driver's job, so every pageable object is always resident.

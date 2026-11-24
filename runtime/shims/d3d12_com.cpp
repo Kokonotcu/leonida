@@ -513,7 +513,7 @@ public:
         }
         if (!rects) return;
         // WARP still closes a list after RSSetScissorRects(17) (d3d12_close_parity), so the call is not an error:
-        // the rectangles past the 16 a pipeline can have are dropped (as upstream 4ff9a77f1).
+        // the rectangles past the 16 a pipeline can have are dropped.
         if (count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) {
             stub("ID3D12GraphicsCommandList::RSSetScissorRects(more than 16 rectangles; the first 16 are used)");
             count = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;

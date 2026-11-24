@@ -442,6 +442,16 @@ struct SrwLockGuard {
     SrwLockGuard& operator=(const SrwLockGuard&) = delete;
 };
 
+std::mutex& xmem_hooks_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<XMemHooksEntry>& xmem_hooks_entries() {
+    static auto* v = new std::vector<XMemHooksEntry>;
+    return *v;
+}
+
 std::vector<BundledLoaderEntry> snapshot_bundled_loaders() {
     SrwLockGuard lock(g_bundled_lock);
     return g_bundled_loaders ? *g_bundled_loaders : std::vector<BundledLoaderEntry>{};
