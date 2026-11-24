@@ -231,6 +231,14 @@ using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_
                                       std::uint32_t layout, REFIID riid, void** out);
 void set_placed_at_va_handler(PlacedAtVaHandler handler);
 
+// Device slot 57: the title's native graphics pipeline creation (desc, riid, out), from an Xbox native PSO
+// description that names its stages by DXBC HASH digest (not implemented yet: see the RT-SLOT57 work upstream). With
+// LEONIDA_MISSING_SHADER_STUB=1 and a handler registered, the slot answers a pipeline state that draws nothing (its
+// draws are skipped) instead of forwarding to PC slot 57, CreateLifetimeTracker, whose refusal the title read through
+// as a null pipeline (retail boot 6).
+using StubPipelineHandler = HRESULT (*)(ID3D12Device* real, REFIID riid, void** out);
+void set_stub_pipeline_handler(StubPipelineHandler handler);
+
 // Called by slot 133 for a buffer, before the handler, with the buffer's range [va, va + width). gta6rt registers
 // rt::xmem::commit_physical_range: xmem commits physical pages on first touch, so a range the title has mapped but
 // not written yet is still reserved, and the handler's import refuses reserved pages (it would answer with its

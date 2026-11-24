@@ -2220,8 +2220,46 @@ std::uint64_t WINAPI console_list_slot139(void* self, std::uint64_t a1, std::uin
     return hr_to_u64(S_OK);
 }
 
-// Give a real PC list the console entry the title calls. The copy is private to the object and never freed; lists
-// are long-lived and there are a handful, so the leak is bounded. Entries 0..79 are the object's own PC prefix.
+// Console list slot 146 on a real PC list: Barrier(group count, D3D12_BARRIER_GROUP*), PC slot 80
+// (ID3D12GraphicsCommandList7; console_to_pc_list_slot). Retail boot 3 died calling it through a null entry.
+std::uint64_t WINAPI console_list_slot146(void* self, std::uint64_t a1, std::uint64_t a2) {
+    // The object's (extended) table: its entry 80 is the PC Barrier when the list is an ID3D12GraphicsCommandList7,
+    // else null (extend_console_list_slots copies it only then).
+    void** const table = *reinterpret_cast<void***>(self);
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr, "[rt] d3d12_xs: real command list %p: console slot 146 (Barrier, %llu groups) -> PC slot 80%s\n",
+                     self, static_cast<unsigned long long>(a1), table[80] ? "" : " (none: ignored)");
+    if (!table[80]) return 0;
+    using BarrierFn = void(WINAPI*)(void*, UINT32, const void*);
+    reinterpret_cast<BarrierFn>(table[80])(self, static_cast<UINT32>(a1), reinterpret_cast<const void*>(a2));
+    return 0;
+}
+
+// The other console tail slots of a real PC list (not measured): logged once per slot, S_OK, nothing touched. Before
+// this they were null entries, and the crash handler's null-call skip (16 at most) was all that kept a run alive.
+template <unsigned Slot>
+std::uint64_t WINAPI console_list_tail_stub(void* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3) {
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: real command list %p: console slot %u not implemented, S_OK (args 0x%llx 0x%llx "
+                     "0x%llx)\n",
+                     self, Slot, static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                     static_cast<unsigned long long>(a3));
+    return 0;
+}
+
+template <std::size_t... I>
+void fill_console_list_tail(void** copy, std::size_t from, std::index_sequence<I...>) {
+    ((I >= from && !copy[I] ? (copy[I] = reinterpret_cast<void*>(&console_list_tail_stub<static_cast<unsigned>(I)>))
+                            : nullptr),
+     ...);
+}
+
+// Give a real PC list the console entries the title calls. The copy is private to the object and never freed; lists
+// are long-lived and there are a handful, so the leak is bounded. Entries 0..79 are the object's own PC prefix, 80 too
+// when it is an ID3D12GraphicsCommandList7 (Barrier); index 159 keeps the original table.
 void extend_console_list_slots(void* list) {
     if (!list) return;
     void** original = *reinterpret_cast<void***>(list);
@@ -2230,13 +2268,24 @@ void extend_console_list_slots(void* list) {
     auto** copy = static_cast<void**>(std::calloc(160, sizeof(void*)));
     if (!copy) return;
     std::memcpy(copy, original, 80 * sizeof(void*));
+    unsigned pc_slots = 80;
+    void* list7 = nullptr;
+    if (SUCCEEDED(static_cast<IUnknown*>(list)->QueryInterface(__uuidof(ID3D12GraphicsCommandList7), &list7)) && list7) {
+        static_cast<IUnknown*>(list7)->Release();
+        copy[80] = original[80];
+        pc_slots = 81;
+    }
     copy[kConsoleListReset] = reinterpret_cast<void*>(&console_list_slot139);
+    copy[146] = reinterpret_cast<void*>(&console_list_slot146);
+    fill_console_list_tail(copy, pc_slots, std::make_index_sequence<159>{});
     copy[159] = original;
     *reinterpret_cast<void***>(list) = copy;
     static std::atomic<bool> logged{false};
     if (first_call(logged))
-        std::fprintf(stderr, "[rt] d3d12_xs: real command list %p vtable %p extended with console slot 139\n", list,
-                     static_cast<void*>(original));
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: real command list %p vtable %p extended with console slots 139 (Reset), 146 "
+                     "(Barrier%s) and logging stubs for the rest of the tail\n",
+                     list, static_cast<void*>(original), pc_slots > 80 ? "" : ": no PC Barrier, ignored");
 }
 
 // Xbox device slot 73 (public HLE): CreateCommandListX(desc, allocator, initial_state, riid, out). The console call is
@@ -3470,6 +3519,7 @@ std::uint64_t proxy_slot74(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3)
 // device behind the proxy registered (set_placed_at_va_handler), with the PC flags kept and the layout made
 // ROW_MAJOR, as slot 76 does.
 std::atomic<PlacedAtVaHandler> g_placed_at_va{nullptr};
+std::atomic<StubPipelineHandler> g_stub_pipeline{nullptr};  // set_stub_pipeline_handler (device slot 57)
 std::atomic<PlacedAtVaPagesHook> g_placed_at_va_pages{nullptr};
 
 HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_RESOURCE_DESC* xbox_desc,
@@ -3555,6 +3605,28 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
         return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
                                                     reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3),
                                                     /*console_route=*/false, /*console_layout=*/from_title));
+    } else if constexpr (Slot == 57) {
+        // The title's native graphics PSO (desc, riid, out): a stub pipeline state when one is registered and
+        // LEONIDA_MISSING_SHADER_STUB=1 (set_stub_pipeline_handler); else the PC slot as before (CreateLifetimeTracker).
+        const StubPipelineHandler stub = g_stub_pipeline.load(std::memory_order_acquire);
+        const char* enabled = std::getenv("LEONIDA_MISSING_SHADER_STUB");
+        if (stub && enabled && enabled[0] == '1' && a2 && a3) {
+            note_slot(57);
+            static std::atomic<unsigned> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
+                std::fprintf(stderr,
+                             "[rt] d3d12_xs: device slot 57 (native graphics PSO, desc %p): a stub pipeline state that "
+                             "draws nothing (LEONIDA_MISSING_SHADER_STUB)\n",
+                             reinterpret_cast<void*>(a1));
+            void** out = reinterpret_cast<void**>(a3);
+            *out = nullptr;
+            return hr_to_u64(stub(self->real, *reinterpret_cast<const IID*>(a2), out));
+        }
+        using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                          std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
+                                          std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
+        return reinterpret_cast<Fn>(self->real_vtable[57])(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
+                                                           a12, a13, a14);
     } else if constexpr (Slot == 48) {
         return hr_to_u64(proxy_create_command_queue_xbox(self, reinterpret_cast<const std::uint32_t*>(a1),
                                                          reinterpret_cast<const IID*>(a2),
@@ -4096,6 +4168,10 @@ unsigned device_proxy_slot_count(const void* device) {
 
 void set_placed_at_va_handler(PlacedAtVaHandler handler) {
     g_placed_at_va.store(handler, std::memory_order_release);
+}
+
+void set_stub_pipeline_handler(StubPipelineHandler handler) {
+    g_stub_pipeline.store(handler, std::memory_order_release);
 }
 
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {

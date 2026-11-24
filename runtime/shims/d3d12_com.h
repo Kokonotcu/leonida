@@ -332,6 +332,9 @@ bool device_supports_ray_tracing(ID3D12Device* device);
 // layer.
 HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
                                       std::uint32_t layout, REFIID riid, void** out);
+// Xbox device slot 57's stub (LEONIDA_MISSING_SHADER_STUB): a pipeline state whose draws are skipped. E_NOTIMPL on a
+// device that is not the Vulkan layer.
+HRESULT create_stub_pipeline_state(ID3D12Device* device, REFIID riid, void** out);
 // Copies what the title wrote at its slot-133 textures' addresses into their images, for the textures that need it
 // (new ones, ones the texture computer wrote, and changed ones within a second of their last copy; the ASSUMPTION is
 // at "Title-placed textures" in d3d12_vulkan_device.cpp). Every ExecuteCommandLists calls it before the lists.

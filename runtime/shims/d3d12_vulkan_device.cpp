@@ -4335,6 +4335,16 @@ bool async_pso_enabled() {
     return enabled;
 }
 
+// LEONIDA_MISSING_SHADER_STUB=1: a PSO whose shader the translation lacks is still made, registered pending, so
+// its draws or dispatches are skipped (logged per shader) instead of CreatePipelineState failing.
+bool missing_shader_stub_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("LEONIDA_MISSING_SHADER_STUB");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
 bool console_stream_enum_enabled() {
     static const bool enabled = [] {
         char value[8] = {};
@@ -4789,6 +4799,16 @@ public:
             });
             if (!stage.entry) {
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                if (missing_shader_stub_enabled()) {
+                    // A graphics PSO without that shader: registered pending, so its draws are skipped
+                    // (GraphicsPipeline::pending), instead of a failure the title reads through as null.
+                    graphics_.pending = true;
+                    graphics_.mesh = ms != nullptr && ms->pShaderBytecode != nullptr;
+                    device_.context->add_graphics_pipeline(id(), graphics_);
+                    registered_ = true;
+                    is_graphics_ = true;
+                    return S_OK;
+                }
                 return E_INVALIDARG;
             }
             if (stage.entry->binding_count) {
@@ -5306,6 +5326,16 @@ public:
         return S_OK;
     }
 
+    // A graphics pipeline state that draws nothing (LEONIDA_MISSING_SHADER_STUB): registered pending, so replay skips
+    // its draws. For the title's native PSOs (device slot 57) until their description is implemented.
+    HRESULT make_stub() {
+        graphics_.pending = true;
+        device_.context->add_graphics_pipeline(id(), graphics_);
+        registered_ = true;
+        is_graphics_ = true;
+        return S_OK;
+    }
+
     HRESULT create_compute(const D3D12_COMPUTE_PIPELINE_STATE_DESC& desc) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
@@ -5342,6 +5372,14 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
                              fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
                              leonida::sha256_hex(program.bytes).c_str());
+            if (missing_shader_stub_enabled()) {
+                // A PSO that never gets a pipeline: registered pending, so its dispatches are skipped, and the title
+                // keeps an object rather than a failure it would read through (retail boot 5 died on such a null).
+                pipeline_.pending = true;
+                device_.context->add_pipeline(id(), pipeline_);
+                registered_ = true;
+                return S_OK;
+            }
             return E_INVALIDARG;
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
@@ -6563,6 +6601,7 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        rt::d3d12_xs::set_stub_pipeline_handler(&create_stub_pipeline_state);
         // LEONIDA_TITLE_HEAP_SYNC: sampler-heap slots the title (or a sync) filled get their S#s' samplers.
         rt::d3d12_xs::set_title_sampler_slots_handler(&title_sampler_slots);
         // Opt-in: the console-addressed descriptor heap reports the title's VA but does not back it (d3d12_xs_device.h).
@@ -8918,6 +8957,14 @@ public:
         return hand_out(heap, riid, out);
     }
 
+    // Device slot 57's stub (create_stub_pipeline_state): a pipeline state whose draws are skipped.
+    HRESULT create_stub_pipeline(REFIID riid, void** out) {
+        auto* pipeline = new PipelineState(state_);
+        pipeline->attach_device(identity());
+        pipeline->make_stub();
+        return hand_out(pipeline, riid, out);
+    }
+
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,
                                    void** out) {
         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
@@ -10741,6 +10788,15 @@ HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_NOTIMPL;
     return d->create_at_host_address(address, desc, layout, riid, out);
+}
+
+HRESULT create_stub_pipeline_state(ID3D12Device* device, REFIID riid, void** out) {
+    if (out) *out = nullptr;
+    if (!device || !out) return E_POINTER;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    auto* d = Device::from<Device>(real ? real : device);
+    if (!d) return E_NOTIMPL;
+    return d->create_stub_pipeline(riid, out);
 }
 
 void sync_title_textures() {

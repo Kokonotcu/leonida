@@ -836,6 +836,9 @@ inline void bind_compute(const ComputePipeline& p, VkCommandBuffer cb, BindPipel
 struct GraphicsPipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
+    // A PSO made without a shader the translation lacks (LEONIDA_MISSING_SHADER_STUB): its draws are skipped, so the
+    // title keeps the PSO object it asked for instead of a failure it would read through as null.
+    bool pending = false;
     VkShaderStageFlags push_stages = 0;   // the layout's push-constant range; vkCmdPushConstants must name the same
     std::uint64_t code_base = 0;
     bool uses_set0 = false;  // the layout has set 0: the device's current one (ReplayFunctions::bindless_set) is bound at every draw
@@ -3652,7 +3655,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (ind->kind != IndirectKind::dispatch && !ind->state && !ind->raw) return ReplayResult::unsupported;
             // A draw with the list's graphics state: prepared as a Draw is (the argument and count buffers stay in
             // p.binding and p.source). Recording uses p.draw, as for a Draw.
-            if (ind->state) {
+            if (ind->state && vk.graphics_pipeline && ind->state->pipeline &&
+                vk.graphics_pipeline(ind->state->pipeline) && vk.graphics_pipeline(ind->state->pipeline)->pending) {
+                p.skip = true;  // its PSO has no shader to draw with (LEONIDA_MISSING_SHADER_STUB)
+            } else if (ind->state) {
                 if (out.draw_count == out.draws.size()) out.draws.emplace_back();
                 auto& prepared_draw = out.draws[out.draw_count];
                 prepared_draw.reset();
@@ -3794,7 +3800,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
             }
-        } else if (const auto* draw = std::get_if<Draw>(&command)) {
+        } else if (const auto* draw = std::get_if<Draw>(&command);
+                   draw && vk.graphics_pipeline && draw->pipeline && vk.graphics_pipeline(draw->pipeline) &&
+                   vk.graphics_pipeline(draw->pipeline)->pending) {
+            p.skip = true;  // its PSO has no shader to draw with (LEONIDA_MISSING_SHADER_STUB): the draw is left out
+        } else if (draw) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
             prepared_draw.reset();
