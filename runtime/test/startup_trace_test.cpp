@@ -277,6 +277,40 @@ void test_trace(const fs::path& dir) {
     check(find_line(lines, "exit") == &lines.back(), "exit comes last");
 }
 
+// #8134 port: the watchdog's write to 0 logs every other thread's stack. A thread parked on an event shows up once,
+// with a stack; the watchdog table is read only at the 1.0.2.1 store address, so any other address logs nothing.
+void test_all_threads(const fs::path& dir) {
+    const fs::path trace = dir / "threads.jsonl";
+    check(rt::startup_trace::open(trace.c_str()), "open the thread trace");
+    const HANDLE release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    const HANDLE parked = CreateThread(
+        nullptr, 0, [](void* e) -> DWORD { return WaitForSingleObject(static_cast<HANDLE>(e), INFINITE); }, release, 0,
+        nullptr);
+    Sleep(50);
+    rt::startup_trace::detail::log_all_threads();
+    rt::startup_trace::detail::log_watchdog_table(reinterpret_cast<std::uint64_t>(&test_all_threads));
+    SetEvent(release);
+    WaitForSingleObject(parked, INFINITE);
+    const DWORD id = GetThreadId(parked);
+    CloseHandle(parked);
+    CloseHandle(release);
+    rt::startup_trace::close();
+
+    const auto lines = read_lines(trace);
+    int mine = 0, own = 0, watchdog = 0;
+    for (auto& l : lines) {
+        if (l.find("\"kind\":\"thread\"") != std::string::npos) {
+            mine += l.find("\"id\":" + std::to_string(id) + ",") != std::string::npos &&
+                    l.find("\"stack\":[\"") != std::string::npos;
+            own += l.find("\"id\":" + std::to_string(GetCurrentThreadId()) + ",") != std::string::npos;
+        }
+        watchdog += l.find("\"kind\":\"watchdog\"") != std::string::npos;
+    }
+    check(mine == 1, "the parked thread is logged once, with a stack");
+    check(own == 0, "the logging thread is not in the list");
+    check(watchdog == 0, "no watchdog records away from the retail store address");
+}
+
 }  // namespace
 
 int wmain() {
@@ -285,6 +319,7 @@ int wmain() {
         test_disabled_is_silent();
         test_existing_file_is_kept(dir);
         test_trace(dir);
+        test_all_threads(dir);
         std::error_code ec;
         fs::remove_all(dir, ec);
     } catch (const std::exception& e) {
