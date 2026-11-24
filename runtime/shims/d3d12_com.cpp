@@ -10,6 +10,7 @@
 #include "../src/gfx10_descriptors.h"
 
 #include <algorithm>
+#include <intrin.h>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -276,6 +277,17 @@ public:
         if (render_pass_open_) invalid_ = true;  // a render pass must end before Close
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         stop_recording();
+        {
+            static std::atomic<int> told{0};
+            std::size_t draws = 0;
+            for (const auto& command : list_.commands())
+                if (std::holds_alternative<leonida::Draw>(command)) ++draws;
+            if (draws && told.fetch_add(1, std::memory_order_relaxed) < 16)
+                std::fprintf(stderr, "[rt] d3d12: list %p (as ID3D12CommandList %p) closed with %zu commands, %zu "
+                                     "draws, from %p\n",
+                             static_cast<void*>(this), static_cast<void*>(static_cast<ID3D12CommandList*>(this)),
+                             list_.commands().size(), draws, _ReturnAddress());
+        }
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
     }
 
@@ -1181,7 +1193,24 @@ private:
     }
 
     void check(bool ok) {
-        if (!ok) invalid_ = true;
+        if (ok) return;
+        // LEONIDA_LENIENT_LISTS=1: a refused command is left out and the list stays executable. The retail title's
+        // every draw list holds at least one command this layer refuses, and D3D12's rule (an invalid list never
+        // executes) dropped all of its draws (boots 50-61). The first refusals are named by their caller (RVA in the
+        // runtime image, for sym.exe), so the refused commands themselves can be fixed.
+        static const bool lenient = [] {
+            const char* v = std::getenv("LEONIDA_LENIENT_LISTS");
+            return v && v[0] == '1';
+        }();
+        if (lenient) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 24)
+                std::fprintf(stderr, "[rt] d3d12: a list command was refused and left out (caller gta6rt+0x%llx)\n",
+                             static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(_ReturnAddress()) -
+                                                             reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))));
+            return;
+        }
+        invalid_ = true;
     }
 
     // A RESOLVE ending access of BeginRenderPass, one entry per subresource it names, for EndRenderPass (M3). The
@@ -1696,10 +1725,31 @@ private:
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
     void record_draw(bool indexed, UINT count, UINT instances, UINT first, INT base_vertex, UINT first_instance) {
-        if (!graphics_pipeline_ || !graphics_.layout || !topology_) return check(false);
+        static std::atomic<int> told{0};
+        if (!graphics_pipeline_ || !graphics_.layout || !topology_) {
+            if (told.fetch_add(1, std::memory_order_relaxed) < 6)
+                std::fprintf(stderr, "[rt] d3d12: draw not recorded: pipeline %llx layout %p topology %u\n",
+                             static_cast<unsigned long long>(graphics_pipeline_),
+                             static_cast<const void*>(graphics_.layout), unsigned(topology_));
+            return check(false);
+        }
         note_direct_heap_indexing(graphics_.layout);
-        if (!rasterizes()) return;
-        check(list_.draw(make_draw(indexed, count, instances, first, base_vertex, first_instance)));
+        if (!rasterizes()) {
+            if (told.fetch_add(1, std::memory_order_relaxed) < 6)
+                std::fprintf(stderr, "[rt] d3d12: draw left out: no viewport with an area (count %u, first %gx%g at "
+                                     "%g,%g depth %g..%g)\n",
+                             viewport_count_, viewport_.width, viewport_.height, viewport_.x, viewport_.y,
+                             viewport_.min_depth, viewport_.max_depth);
+            return;
+        }
+        const bool ok = list_.draw(make_draw(indexed, count, instances, first, base_vertex, first_instance));
+        static std::atomic<std::uint64_t> recorded_ok{0}, recorded_bad{0};
+        const std::uint64_t n = (ok ? recorded_ok : recorded_bad).fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12: draws recorded %llu, refused by the list %llu\n",
+                         static_cast<unsigned long long>(recorded_ok.load()),
+                         static_cast<unsigned long long>(recorded_bad.load()));
+        check(ok);
     }
 
     // The list's graphics state as a mesh draw: no vertex input or input assembly; the group counts go in
@@ -1963,8 +2013,33 @@ public:
         rt::d3d12_xs::sync_title_heaps();
         // What the title wrote into the pages of its slot-133 textures reaches their images before the lists run.
         sync_title_textures();
+        std::uint64_t in_batch = 0;  // draws in this batch, counted before execute can consume the lists
+        for (const auto* commands : recorded)
+            for (const auto& command : commands->commands())
+                if (std::holds_alternative<leonida::Draw>(command)) ++in_batch;
+        {
+            static std::atomic<int> order{0};
+            if (count > 1 || order.fetch_add(1, std::memory_order_relaxed) < 24)
+                for (UINT i = 0; i < count; ++i)
+                    std::fprintf(stderr, "[rt] d3d12_xs: list order: execute list %p with %zu commands\n",
+                                 static_cast<void*>(lists[i]), recorded[i]->commands().size());
+        }
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
+        {
+            // Submission counters, printed at powers of two: batches, lists, recorded draws, and failed batches.
+            static std::atomic<std::uint64_t> batches{0}, total_lists{0}, draws{0}, failures{0};
+            total_lists.fetch_add(count, std::memory_order_relaxed);
+            draws.fetch_add(in_batch, std::memory_order_relaxed);
+            if (last_result_ != leonida::ReplayResult::success) failures.fetch_add(1, std::memory_order_relaxed);
+            const std::uint64_t n = batches.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: submitted batches %llu, lists %llu, recorded draws %llu, failed "
+                                     "batches %llu (last: %s)\n",
+                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(total_lists.load()),
+                             static_cast<unsigned long long>(draws.load()),
+                             static_cast<unsigned long long>(failures.load()), name(last_result_));
+        }
         if (last_result_ != leonida::ReplayResult::success) {
             // Which list and command, of which kind, and the VkResult (I4); once per distinct cause, as a title
             // repeats the same failing call every frame.

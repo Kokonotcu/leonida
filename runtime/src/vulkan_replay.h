@@ -2478,6 +2478,23 @@ inline bool same_target_view(const TargetView& a, const TargetView& b) {
 // attachments, area limits and vertex buffers, and with the same index buffer view its index buffer, instead of
 // resolving them again (I6). Within one prepare() the resources resolve the same way every time, so the result is
 // the same.
+// Draw outcomes across the process, printed when a count reaches a power of two (from 1): how many draws replay,
+// how many a stub or pending pipeline leaves out, and why the rest fail their list (ReplayResult value).
+enum class DrawOutcome { prepared, stub, failed };
+inline void count_draw(DrawOutcome outcome, int result = 0) {
+    static std::atomic<std::uint64_t> prepared{0}, stub{0}, failed[16]{};
+    std::atomic<std::uint64_t>& c = outcome == DrawOutcome::prepared ? prepared
+                                    : outcome == DrawOutcome::stub   ? stub
+                                                                     : failed[result & 15];
+    const std::uint64_t n = c.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((n & (n - 1)) == 0)
+        std::fprintf(stderr, "[rt] replay: draws %s%s = %llu (prepared %llu, stub/pending %llu)\n",
+                     outcome == DrawOutcome::prepared ? "prepared" : outcome == DrawOutcome::stub ? "left out" : "failed",
+                     outcome == DrawOutcome::failed ? (" with ReplayResult " + std::to_string(result)).c_str() : "",
+                     static_cast<unsigned long long>(n), static_cast<unsigned long long>(prepared.load()),
+                     static_cast<unsigned long long>(stub.load()));
+}
+
 template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p,
                           const Draw* previous_draw = nullptr, const PreparedDraw* previous = nullptr) {
@@ -3152,6 +3169,16 @@ template<typename Resolve>
 ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFunctions& vk, PreparedList& out,
                      bool statistics_helpers = false) {
     out.failed_command = PreparedList::no_command;
+    {
+        // Lists prepared, and lists already reopened (reset) by the time they are prepared, at powers of two.
+        static std::atomic<std::uint64_t> calls{0}, reopened{0};
+        if (!list.closed()) reopened.fetch_add(1, std::memory_order_relaxed);
+        const std::uint64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] replay: lists prepared %llu, found reopened %llu, this one %zu commands\n",
+                         static_cast<unsigned long long>(n), static_cast<unsigned long long>(reopened.load()),
+                         list.commands().size());
+    }
     if (!list.closed()) return ReplayResult::list_open;
     if (list.queries_open()) return ReplayResult::invalid_query;  // a Vulkan query must end in its command buffer
     const auto commands = list.commands();
@@ -3823,6 +3850,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                    draw && vk.graphics_pipeline && draw->pipeline && vk.graphics_pipeline(draw->pipeline) &&
                    vk.graphics_pipeline(draw->pipeline)->pending) {
             p.skip = true;  // its PSO has no shader to draw with (LEONIDA_MISSING_SHADER_STUB): the draw is left out
+            detail::count_draw(detail::DrawOutcome::stub);
         } else if (draw) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
@@ -3831,8 +3859,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // The draw before it in this list, for what the two share (I6).
             const detail::PreparedDraw* previous = previous_draw ? &out.draws[previous_draw_slot] : nullptr;
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw, previous_draw, previous);
-                r != ReplayResult::success)
+                r != ReplayResult::success) {
+                detail::count_draw(detail::DrawOutcome::failed, int(r));
                 return r;
+            }
+            detail::count_draw(detail::DrawOutcome::prepared);
             previous_draw = draw;
             previous_draw_slot = p.draw;
         }
@@ -4158,6 +4189,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         if (op_markers) mark_ops_before(i);
         const auto& command = commands[i];
         const auto& p = prepared.commands[i];
+        // A draw or dispatch prepare left out (a pending or stub pipeline) has no prepared draw: nothing to emit.
+        // Before this a left-out draw read prepared.draws[0] and its null pipeline (retail boot 63).
+        if (p.skip && (detail::draw_of(command) || std::holds_alternative<Dispatch>(command))) continue;
         if (!std::holds_alternative<CopyBuffer>(command) && !std::holds_alternative<CopyTexture>(command) &&
             !std::holds_alternative<CopyResource>(command))
             copy_run = false;

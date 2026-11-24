@@ -1405,6 +1405,81 @@ constexpr unsigned kConsoleSetDescriptorHeaps = 32;
 constexpr unsigned kConsoleExecuteBundle = 31;
 constexpr unsigned kConsoleBarrier = 146;
 
+// Closed console lists waiting for the title's next execute on a queue of their type.
+//
+// The retail title never passes the lists it records draws into to the queue's execute (console queue slot 35):
+// each such list is chained through console list slot 139 with tokens shared with the list before and after it,
+// closed, and the execute names only the title's (empty) primary list, from the submission thread at
+// game_scarlett_master.exe+0x2481e90 (boots 50-53: 512+ draws recorded, 0 in any executed list). The console runs the
+// chained buffers behind that primary list. Here every list closed through a list proxy is queued, and the next
+// console execute on a queue of the same type runs the queued lists first, in close order, then the lists it names.
+// The title reuses a list only after its own fences, signalled after that execute, say the work is done.
+struct ClosedLists {
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::vector<std::pair<D3D12_COMMAND_LIST_TYPE, ID3D12CommandList*>> lists;  // AddRef'd
+};
+ClosedLists& closed_lists() {
+    static ClosedLists queue;
+    return queue;
+}
+bool chained_submission_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("LEONIDA_CHAIN_SUBMIT");
+        return !(v && v[0] == '0');  // on unless LEONIDA_CHAIN_SUBMIT=0
+    }();
+    return enabled;
+}
+// The real queue of each list type the title last executed on through a console queue (DIRECT 0 .. COPY 3).
+std::atomic<ID3D12CommandQueue*> g_console_queue[4]{};
+
+void queue_closed_list(ID3D12CommandList* list) {
+    if (!list || !chained_submission_enabled()) return;
+    // The title resets a list (console slot 139) right after closing it, before any execute names it: the console's
+    // chained segments outlive that, a PC list's commands do not. So a list runs at its Close on the console queue of
+    // its type, once one is known; D3D12 allows the Reset after that. Before the first console execute it waits.
+    const auto type = list->GetType();
+    {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 40)
+            std::fprintf(stderr, "[rt] d3d12_xs: closed list %p type %d: %s\n", static_cast<void*>(list), int(type),
+                         static_cast<unsigned>(type) < 4 && g_console_queue[type].load() ? "runs now" : "queued");
+    }
+    if (static_cast<unsigned>(type) < 4) {
+        if (ID3D12CommandQueue* queue = g_console_queue[type].load(std::memory_order_acquire)) {
+            static std::atomic<int> shown{0};
+            if (shown.fetch_add(1, std::memory_order_relaxed) < 6)
+                std::fprintf(stderr, "[rt] d3d12_xs: run at Close: list %p on queue %p\n", static_cast<void*>(list),
+                             static_cast<void*>(queue));
+            queue->ExecuteCommandLists(1, &list);
+            static std::atomic<std::uint64_t> runs{0};
+            const std::uint64_t n = runs.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12_xs: %llu console list(s) run at their Close\n",
+                             static_cast<unsigned long long>(n));
+            return;
+        }
+    }
+    list->AddRef();
+    ClosedLists& q = closed_lists();
+    AcquireSRWLockExclusive(&q.lock);
+    q.lists.emplace_back(list->GetType(), list);
+    ReleaseSRWLockExclusive(&q.lock);
+}
+// Takes the queued lists of `type`, in close order; the caller releases them.
+std::vector<ID3D12CommandList*> take_closed_lists(D3D12_COMMAND_LIST_TYPE type) {
+    std::vector<ID3D12CommandList*> out;
+    ClosedLists& q = closed_lists();
+    AcquireSRWLockExclusive(&q.lock);
+    auto keep = q.lists.begin();
+    for (auto& entry : q.lists) {
+        if (entry.first == type) out.push_back(entry.second);
+        else *keep++ = entry;
+    }
+    q.lists.erase(keep, q.lists.end());
+    ReleaseSRWLockExclusive(&q.lock);
+    return out;
+}
+
 struct ListProxy {
     void** vtable;                      // +0x00
     ID3D12GraphicsCommandList* real;    // +0x08
@@ -1607,7 +1682,27 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                      std::uint64_t, std::uint64_t);
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
             UnwrappedArray heaps;
-            if constexpr (Slot == 10) {
+            if constexpr (Slot == 9 || Slot == 10 || Slot == 139) {
+                static std::atomic<int> order{0};
+                if (order.fetch_add(1, std::memory_order_relaxed) < 24)
+                    std::fprintf(stderr, "[rt] d3d12_xs: list order: slot %u on real list %p (args 0x%llx 0x%llx)\n",
+                                 Slot, static_cast<void*>(self->real), static_cast<unsigned long long>(a1),
+                                 static_cast<unsigned long long>(a2));
+            }
+            if constexpr (Slot == 139) {
+                // The retail title never closes its draw lists through slot 9: each is begun by slot 139 and ended by
+                // the next slot 139 on it (with the allocator token the following list then begins with), and our
+                // Reset dropped what the list had recorded (boots 50-59: lists "closed" with 3 draws, none ever
+                // executed). So a list that is still recording is closed here and goes to the chained submission
+                // (ClosedLists: it runs on the title's console queue) before it is reset.
+                auto* real_list = static_cast<ID3D12GraphicsCommandList*>(self->real);
+                if (SUCCEEDED(real_list->Close())) queue_closed_list(real_list);
+            }
+            if constexpr (Slot == 10 || Slot == 139) {
+                // Reset (PC slot 10; the retail title calls console slot 139): the real list takes the real
+                // allocator, and the inline cursor goes back to its limit so every command after it reaches the
+                // vtable. Without this the title's list state never reached the real list and every draw was
+                // recorded with no pipeline, root signature or topology (boot 46).
                 a1 = unwrap_object(a1);
                 self->pin_cursor_at_limit();
             } else if constexpr (Slot == kConsoleExecuteBundle) {
@@ -1616,8 +1711,13 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 if (!heaps.fill(a2, a1)) return 0;
                 if (heaps.data()) a2 = heaps.data();
             }
-            return reinterpret_cast<ForwardFn>(real_vtable[pc])(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9,
-                                                              a10, a11, a12, a13, a14);
+            const std::uint64_t result = reinterpret_cast<ForwardFn>(real_vtable[pc])(
+                self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
+            // Close: the list waits for the next console execute on its queue type (ClosedLists).
+            if constexpr (Slot == 9) {
+                if (SUCCEEDED(static_cast<HRESULT>(static_cast<std::uint32_t>(result)))) queue_closed_list(self->real);
+            }
+            return result;
         }
     }
 }
@@ -1921,10 +2021,39 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
         UnwrappedArray unwrapped_lists;
+        std::vector<ID3D12CommandList*> chained, combined;  // console execute: queued closed lists (released below)
+        struct ReleaseChained {
+            std::vector<ID3D12CommandList*>& lists;
+            ~ReleaseChained() {
+                for (ID3D12CommandList* l : lists) l->Release();
+            }
+        } release_chained{chained};
         if constexpr (K == ChildKind::queue) {
             if (fwd == kQueueSignal || fwd == kQueueWait) a1 = unwrap_object(a1);
             // ExecuteCommandLists takes an array of lists; unwrap any list proxy before the PC queue sees it.
             if (fwd == 10) {
+                // Each distinct caller of the console execute, the first time it calls (the retail title has a
+                // single-list kick at +0x248268f and a batch of collected lists at +0x24821e3).
+                static std::atomic<std::uintptr_t> callers[8]{};
+                const auto from = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
+                bool seen = false;
+                for (auto& c : callers) {
+                    std::uintptr_t expected = 0;
+                    if (c.load(std::memory_order_relaxed) == from) { seen = true; break; }
+                    if (c.compare_exchange_strong(expected, from)) break;
+                }
+                if (!seen)
+                    std::fprintf(stderr, "[rt] d3d12_xs: queue execute: first call from %p (count %llu)\n",
+                                 reinterpret_cast<void*>(from), static_cast<unsigned long long>(a1));
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 6) {
+                    const auto* arr = reinterpret_cast<const std::uint64_t*>(a2);
+                    std::fprintf(stderr, "[rt] d3d12_xs: queue execute from %p: count %llu lists %p [0]=%llx extra "
+                                         "0x%llx 0x%llx\n",
+                                 _ReturnAddress(), static_cast<unsigned long long>(a1), reinterpret_cast<void*>(a2),
+                                 arr ? static_cast<unsigned long long>(arr[0]) : 0ull,
+                                 static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+                }
                 if (!unwrapped_lists.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
                 if (unwrapped_lists.data()) a2 = unwrapped_lists.data();
                 // The console's slot 35 passes two more words (1, 0x100000000 in the retail title's first frame),
@@ -1933,6 +2062,34 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                     a1 = static_cast<std::uint32_t>(a1);
                     a3 = 0;
                     a4 = 0;
+                    // The title's chained lists (ClosedLists) run first, in close order, then the named ones.
+                    if (chained_submission_enabled()) {
+                        auto* real_queue = reinterpret_cast<ID3D12CommandQueue*>(self->real);
+                        const D3D12_COMMAND_LIST_TYPE type = real_queue->GetDesc().Type;
+                        if (static_cast<unsigned>(type) < 4) {
+                            // The first queue of a type keeps the role; the proxy holds it for the process.
+                            ID3D12CommandQueue* none = nullptr;
+                            if (g_console_queue[type].compare_exchange_strong(none, real_queue)) real_queue->AddRef();
+                        }
+                        chained = take_closed_lists(type);
+                        if (!chained.empty()) {
+                            const auto* named = reinterpret_cast<ID3D12CommandList* const*>(a2);
+                            combined = chained;
+                            for (std::uint64_t i = 0; named && i < a1; ++i)
+                                if (std::find(chained.begin(), chained.end(), named[i]) == chained.end())
+                                    combined.push_back(named[i]);
+                            a1 = combined.size();
+                            a2 = reinterpret_cast<std::uint64_t>(combined.data());
+                            static std::atomic<std::uint64_t> runs{0}, lists{0};
+                            lists.fetch_add(chained.size(), std::memory_order_relaxed);
+                            const std::uint64_t n = runs.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if ((n & (n - 1)) == 0)
+                                std::fprintf(stderr, "[rt] d3d12_xs: chained submission %llu: %llu closed lists so far "
+                                                     "(this one %zu)\n",
+                                             static_cast<unsigned long long>(n),
+                                             static_cast<unsigned long long>(lists.load()), chained.size());
+                        }
+                    }
                 }
             }
         }

@@ -3369,6 +3369,19 @@ private:
             wait_values_.clear();
             wait_pins_.clear();
         }
+        {
+            // Held work per queue at powers of two, with what the oldest held operation waits for: work that is held
+            // forever never reaches replay (retail boots 50-58: draw lists executed, none prepared).
+            const std::size_t n = held_.size() + 1;
+            if ((n & (n - 1)) == 0 && n >= 4) {
+                const Deferred& oldest = held_.empty() ? op : held_.front();
+                std::fprintf(stderr, "[rt] d3d12: queue %p holds %zu operations; the oldest waits on %zu fence(s), "
+                                     "first value %llu\n",
+                             static_cast<void*>(this), n, oldest.waits.size(),
+                             oldest.wait_values.empty() ? 0ull
+                                                        : static_cast<unsigned long long>(oldest.wait_values.front()));
+            }
+        }
         held_.push_back(std::move(op));
         context_.holds().held_changed(1);
     }

@@ -634,6 +634,26 @@ struct TextureCreateInfo {
             format_list.viewFormatCount = 2;
             format_list.pViewFormats = view_formats.data();
             info.pNext = &format_list;
+        } else if (const VkFormat pair = srgb_pair(format.format); pair != VK_FORMAT_UNDEFINED && !format.typeless) {
+            // A typed 8-bit RGBA/BGRA texture also takes views in its UNORM/SRGB counterpart, as on the console: the
+            // retail title makes its 3840x2160 R8G8B8A8_UNORM_SRGB back buffers and renders into them through an
+            // R8G8B8A8_UNORM RTV, which was refused (boot 42), so the final pass drew nowhere.
+            info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+            view_formats = {format.format, pair};
+            format_list.viewFormatCount = 2;
+            format_list.pViewFormats = view_formats.data();
+            info.pNext = &format_list;
+        }
+    }
+
+    // The UNORM <-> SRGB counterpart of an 8-bit RGBA or BGRA format, or UNDEFINED.
+    static VkFormat srgb_pair(VkFormat f) {
+        switch (f) {
+            case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB;
+            case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+            case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB;
+            case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+            default: return VK_FORMAT_UNDEFINED;
         }
     }
 
@@ -8277,9 +8297,25 @@ public:
                         }
                     }
                 } else if (requested != rd.Format) {
-                    view = {}; // No typed-resource format casting is advertised by this backend.
+                    // Typed textures cast only between UNORM and SRGB of 8-bit RGBA/BGRA, which their images are
+                    // created mutable for (TextureCreateInfo::srgb_pair); any other cast is refused.
+                    const VkFormat asked_vk = vulkan_format(requested, false).format;
+                    const VkFormat own_vk = vulkan_format(rd.Format, false).format;
+                    if (asked_vk != VK_FORMAT_UNDEFINED && TextureCreateInfo::srgb_pair(own_vk) == asked_vk)
+                        view.format = static_cast<leonida::ColorViewFormat>(asked_vk);
+                    else
+                        view = {};
                 }
-                if (!view.resource) log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
+                if (!view.resource) {
+                    log_once("unsupported typeless or RGBA8 RTV format/subresource:", int(requested));
+                    static std::atomic<int> detailed{0};
+                    if (detailed.fetch_add(1, std::memory_order_relaxed) < 8)
+                        std::fprintf(stderr, "[rt] d3d12: RTV refused: view format %d dimension %d on a resource of "
+                                             "format %d dimension %d %llux%u flags 0x%x\n",
+                                     int(requested), desc ? int(desc->ViewDimension) : -1, int(rd.Format),
+                                     int(rd.Dimension), static_cast<unsigned long long>(rd.Width), rd.Height,
+                                     unsigned(rd.Flags));
+                }
             }
         } else if (resource) {
             stub("ID3D12Device::CreateRenderTargetView(resource from another device)");

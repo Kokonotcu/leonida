@@ -332,6 +332,7 @@ inline constexpr unsigned console_to_pc_list_slot(unsigned slot) {
     if (slot == 61) return 59;                 // ExecuteIndirect (Package)
     if (slot == 85) return 16;                 // CopyTextureRegionX -> CopyTextureRegion
     if (slot == 146) return 80;                // D3D12_BARRIER_GROUP (Package; PC GCL7)
+    if (slot == 139) return 10;                // Reset(allocator, pso): measured on the retail title after Close
     return kListNotForwarded;
 }
 
