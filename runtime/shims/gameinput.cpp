@@ -837,6 +837,7 @@ struct State {
     uint64_t last_order = 0;  // Reading::order of the newest reading
     int dispatchers = 0;
     HANDLE wait_event = nullptr;  // auto-reset, signalled when a dispatcher has work
+    HANDLE first_poll = nullptr;  // manual-reset, set once the first poll has opened the pads present at start
     rt::gameinput::Config config;
     bool config_read = false;
     bool sdl_ready = false, sdl_failed = false;
@@ -2023,7 +2024,10 @@ bool init_sdl() {
 void poll_once() {
     State& s = g();
     std::lock_guard pl(s.poll_mu);
-    if (!init_sdl()) return;
+    if (!init_sdl()) {
+        if (s.first_poll) SetEvent(s.first_poll);  // no pads will come: nobody waits for them
+        return;
+    }
     apply_prompt_config();
     update_keyboard_pad();
     SDL_UpdateGamepads();
@@ -2086,6 +2090,7 @@ void poll_once() {
         refresh_battery(d, now);
         apply_output(d, now);
     }
+    if (s.first_poll) SetEvent(s.first_poll);  // the pads present at start are open (blocking enumeration waits)
 }
 
 void poll_and_deliver() {
@@ -2122,6 +2127,7 @@ void ensure_started() {
         s.config = read_config();
         s.config_read = true;
         s.wait_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        s.first_poll = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     }
     if (s.config.background_thread && !s.thread_started) {
         s.thread_started = true;
@@ -2551,6 +2557,17 @@ public:
         if (!fn) return E_INVALIDARG;
         if (device && as_device(device)->info.deviceFamily == GameInputFamilyAggregate) return E_NOTIMPL;
         State& s = g();
+        // Blocking enumeration right after GameInputCreate: SDL starts on the poll thread, so the pads already plugged
+        // in are opened by its first poll. Wait for that poll (bounded) so they are reported now, not as later
+        // connects (review B14). Without the poll thread (tests poll by hand) there is nothing to wait for.
+        if (enumeration == GameInputBlockingEnumeration) {
+            HANDLE first = nullptr;
+            {
+                std::lock_guard lock(s.mu);
+                if (s.thread_started) first = s.first_poll;
+            }
+            if (first) WaitForSingleObject(first, 2000);
+        }
         GameInputCallbackToken t;
         std::vector<Event> now;
         {
