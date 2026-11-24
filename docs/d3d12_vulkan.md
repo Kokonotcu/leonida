@@ -2142,6 +2142,12 @@ or leaves with an AS and no MS, again with the console numbering (a type from 23
 takes that reading when it holds an MS and no AS; a stream the PC reading accepts is never read differently.
 `LEONIDA_XS_STREAM_ENUM=pc` turns it off (docs/retail_boot_intel_host.md section 3 has the measurement).
 
+Several vertex shaders can share that payload and fit the same D3D input layout while assigning its semantics
+to different registers. When the supplied DXBC has an ISG1 chunk, the runtime first selects candidates whose
+recorded input signature matches the chunk, including the registers, component types and masks. The usual
+layout and binding preferences still apply within that group. Bare programs and older indexes with incomplete
+signatures retain the layout-based lookup.
+
 Pipeline creation:
 
 - `D3D12_GRAPHICS_PIPELINE_STATE_DESC` is supported today (`CreateGraphicsPipelineState`), as is the compute desc. The
