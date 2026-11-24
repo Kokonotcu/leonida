@@ -12533,8 +12533,11 @@ class Gen:
         single_special = (n == 1 and d["k"] == "special" and d["t"] in ("vcc_lo", "vcc", "m0", "vcc_hi")) or \
             (n == 2 and d["k"] == "special" and d["t"] == "vcc")
         slist_dst = d["k"] == "slist" and len(d["r"]) == n
+        # The base pair may also be vcc (s106:s107 holding a 64-bit pointer): s_load_dwordx4 s[24:27], vcc, 0xf60 in
+        # 2,570 loads of the 1.0.2.1 pipeline library (79 programs refused before).
         base_slots = (list(range(base["r"], base["r"] + base.get("n", 1))) if base["k"] == "sgpr"
-                      else list(base["r"]) if base["k"] == "slist" else None)
+                      else list(base["r"]) if base["k"] == "slist"
+                      else ["vcc_lo", "vcc_hi"] if base["k"] == "special" and base["t"] == "vcc" else None)
         if (d["k"] != "sgpr" and not single_special and not slist_dst) or base_slots is None:
             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
 
