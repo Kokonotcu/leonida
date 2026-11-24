@@ -377,8 +377,9 @@ bool check_unlisted_rtvs(ID3D12Device* device) {
 // ClearDepthStencilView values at the edge of what D3D12 accepts: on a D32_FLOAT target a depth outside [0, 1] and a
 // NaN are stored exactly as given, and flags that name no plane clear nothing (the target keeps the value of the clear
 // before it). WARP shows both in the read-back, and the layer must show the same texels; a call the layer refuses fails
-// Close() inside clear_depth_and_read.
-bool check_depth_clear_edge_values(ID3D12Device* host, ID3D12Device* ours) {
+// Close() inside clear_depth_and_read. The layer can store such values only with VK_EXT_depth_range_unrestricted
+// (VUID-VkClearDepthStencilValue-depth-00022, which validation reported when the layer passed them without it): without the extension those two cases are not compared (the layer clamps).
+bool check_depth_clear_edge_values(ID3D12Device* host, ID3D12Device* ours, bool unrestricted) {
     constexpr UINT width = 5, height = 3;
     const auto read = [](ID3D12Device* device, FLOAT depth_full, FLOAT depth_part, bool part_no_flags,
                          std::vector<unsigned char>& depth) {
@@ -415,10 +416,14 @@ bool check_depth_clear_edge_values(ID3D12Device* host, ID3D12Device* ours) {
         std::printf("%s: %ux%u depth texels match WARP\n", what, width, height);
         return true;
     };
-    if (!compare("depth 1.5 and -0.5 are stored as given", 1.5f, -0.5f, false, 1.5f, -0.5f)) return false;
-    // NaN is likewise not clamped away; WARP stores the quiet NaN it was given.
-    const FLOAT nan = std::numeric_limits<float>::quiet_NaN();
-    if (!compare("a NaN depth stays NaN", nan, nan, false, nan, nan)) return false;
+    if (unrestricted) {
+        if (!compare("depth 1.5 and -0.5 are stored as given", 1.5f, -0.5f, false, 1.5f, -0.5f)) return false;
+        // NaN is likewise not clamped away; WARP stores the quiet NaN it was given.
+        const FLOAT nan = std::numeric_limits<float>::quiet_NaN();
+        if (!compare("a NaN depth stays NaN", nan, nan, false, nan, nan)) return false;
+    } else {
+        std::printf("depth outside 0..1 and NaN: no VK_EXT_depth_range_unrestricted, clamped, not compared\n");
+    }
     return compare("flags 0 leaves the target alone", 0.25f, 0.75f, true, 0.25f, 0.25f);
 }
 
@@ -444,6 +449,7 @@ int main(int argc, char** argv) {
         info.device = vk.device;
         info.queue = vk.queue;
         info.queue_family = vk.family;
+        info.depth_range_unrestricted = vk.depth_range_unrestricted;
         if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p)))) return 1;
         if (rgb9e5_only) {
             D3D12_FEATURE_DATA_FORMAT_SUPPORT fs{DXGI_FORMAT_R9G9B9E5_SHAREDEXP};
@@ -473,7 +479,7 @@ int main(int argc, char** argv) {
         if (!check_volume_rtvs(host.p, ours.p)) return 1;
         if (volume_only) return 0;
         if (!check_unlisted_rtvs(ours.p)) return 1;
-        if (!check_depth_clear_edge_values(host.p, ours.p)) return 1;
+        if (!check_depth_clear_edge_values(host.p, ours.p, vk.depth_range_unrestricted)) return 1;
         const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
         // Integer-format values: negatives, fractions, NaN and overflow exercise the numeric float->int conversion.
         const std::array<float, 4> int_values[] = {

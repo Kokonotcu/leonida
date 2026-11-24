@@ -6571,6 +6571,7 @@ public:
         state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count,
                                               info.max_draw_indirect_count ? info.max_draw_indirect_count : UINT32_MAX);
         state_.context->set_max_viewports(info.max_viewports);
+        state_.context->set_depth_range_unrestricted(info.depth_range_unrestricted);
         if (info.indirect_commands && info.buffer_device_address)
             state_.context->enable_indirect_commands(get_device, info.indirect_properties,
                                                      [this](const VkMemoryRequirements& requirements) {
@@ -11531,6 +11532,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.conservative_rasterization = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0;
     });
+    info.depth_range_unrestricted = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+        return std::strcmp(e.extensionName, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME) == 0;
+    });
     const bool has_host_image_copy = std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
         return std::strcmp(e.extensionName, VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) == 0;
     });
@@ -11818,6 +11822,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     std::vector<const char*> device_extensions;
     v13.add_extensions(device_extensions);
     if (info.conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
+    if (info.depth_range_unrestricted) device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
