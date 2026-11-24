@@ -143,11 +143,13 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
       add_library(leonida_xma2_decoder STATIC IMPORTED)
       # Link Rust's Windows SDK dependencies. CMake's C++ target selects its own CRT
       # (/MD or /MDd); the C ABI keeps allocation and deallocation on the same side.
+      # synchronization: Rust's std imports WaitOnAddress and WakeByAddress*, which MSVC's
+      # default libraries cover but clang-cl with an xwin SDK does not (lld-link: undefined symbol).
       set_target_properties(leonida_xma2_decoder PROPERTIES
         IMPORTED_LOCATION ${_xma_lib}
         INTERFACE_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/xma_decoder
         INTERFACE_COMPILE_DEFINITIONS LEONIDA_HAVE_XMA2_DECODER=1
-        INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp")
+        INTERFACE_LINK_LIBRARIES "kernel32;ntdll;userenv;ws2_32;dbghelp;synchronization")
     else()
       message(WARNING "cargo build of runtime/xma_decoder failed: XMA voices will be silent")
     endif()
