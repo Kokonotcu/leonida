@@ -11,7 +11,7 @@
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 
 #include <atomic>
 #include <cstdint>
@@ -487,9 +487,18 @@ int main() {
                 REQUIRE(warp_dev->GetDeviceRemovedReason() == S_OK);
                 warp_ran = true;
             }
+            // The high-performance adapter first (the discrete GPU of a hybrid laptop, the one the layer's Vulkan device
+            // runs on): the integrated Intel UHD this PC lists first removes its device during the bundle cases
+            // (DXGI_ERROR_DEVICE_REMOVED from the next CreateCommandAllocator), which failed the test for the host's sake.
+            Ref<IDXGIFactory6> factory6;
+            factory->QueryInterface(IID_PPV_ARGS(&factory6.p));
             for (UINT i = 0;; ++i) {
                 Ref<IDXGIAdapter1> adapter;
-                if (factory->EnumAdapters1(i, &adapter.p) == DXGI_ERROR_NOT_FOUND) break;
+                const HRESULT found =
+                    factory6.p ? factory6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                                      IID_PPV_ARGS(&adapter.p))
+                               : factory->EnumAdapters1(i, &adapter.p);
+                if (found == DXGI_ERROR_NOT_FOUND) break;
                 DXGI_ADAPTER_DESC1 desc{};
                 adapter->GetDesc1(&desc);
                 if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
