@@ -18,11 +18,21 @@
 #include <d3d12.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 
 namespace rt::xg {
+
+// Who is told that the texture computer wrote [address, address + bytes) (CopyIntoSubresource): the D3D12 layer's
+// title-placed textures (d3d12_vulkan_device.cpp, "Title-placed textures"), set when it registers the first one.
+using WriteListener = void (*)(const void* address, std::size_t bytes);
+inline std::atomic<WriteListener> g_write_listener{nullptr};
+
+inline void note_write(const void* address, std::size_t bytes) {
+    if (const WriteListener listener = g_write_listener.load(std::memory_order_acquire)) listener(address, bytes);
+}
 
 #pragma pack(push, 1)
 struct MipRecord {  // 0x70 bytes

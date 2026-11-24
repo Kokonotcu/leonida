@@ -10,6 +10,7 @@
 #include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/xg_linear_layout.h"
 #include <dxgi1_4.h>
 #include <cstring>
 #include <string>
@@ -172,8 +173,8 @@ int check_import(ID3D12Device* device, bool supported) {
 // Its GPU VA is the address itself, and what the CPU writes there is what a GPU copy reads, with no upload: the
 // pattern is written after the buffer exists and read back through a READBACK buffer. Checked on a VirtualAlloc range
 // and on a view of a pagefile-backed section, the form xmem's physical pages are mapped in. A texture gets a committed
-// texture whose GPU VA is the same title address (its pixels do not alias the pages yet); an address off the import
-// alignment E_INVALIDARG.
+// texture whose GPU VA is the same title address (fed from the pages at submissions: check_title_texture); an address
+// off the import alignment E_INVALIDARG.
 // `may_refuse`: the driver is allowed to refuse importing these pages, and the layer then answers with its fallback.
 // RADV imports host memory through amdgpu userptr, which takes anonymous memory only, so it refuses a view of a
 // pagefile-backed section with EPERM (measured on an RX 9060 XT under Wine, found in review), while NVIDIA and
@@ -321,6 +322,127 @@ int check_title_placed_all(ID3D12Device* device) {
     return failures;
 }
 
+// A texture Xbox slot 133 placed at the title's address is fed from the title's pages ("Title-placed textures" in
+// d3d12_vulkan_device.cpp): what the title wrote there in the texture computer's layout (rt::xg, shims/
+// xg_linear_layout.h) is in the image when its next command list runs. A 2D array of 2 slices and 2 mips (four
+// subresources, each a placed footprint in the title range), read back subresource by subresource:
+//   1. the bytes the title wrote before its first submission;
+//   2. new bytes written through the texture computer (rt::xg::note_write, what CopyIntoSubresource reports);
+//   3. new bytes the title writes itself, within the second after the last copy (the watch window).
+// Before, the image was a committed texture nothing wrote into: it read back zeros.
+int check_title_texture(ID3D12Device* device) {
+    const char* who = "vulkan slot-133 texture";
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = 40;
+    desc.Height = 24;
+    desc.DepthOrArraySize = 2;
+    desc.MipLevels = 2;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    rt::xg::ResourceLayout layout{};
+    EXPECT(rt::xg::linear_layout(desc, layout));
+    const auto bytes = static_cast<SIZE_T>(layout.size_bytes);
+    auto* title = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(title != nullptr);
+    constexpr UINT kSubresources = 4;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT title_fp[kSubresources]{};
+    for (UINT s = 0; s < kSubresources; ++s) EXPECT(rt::xg::footprint(desc, layout, s, title_fp[s]));
+    // Each texel's 4 bytes from (round, subresource, x, y).
+    const auto texel = [](UINT round, UINT s, UINT x, UINT y, UINT c) {
+        return static_cast<std::uint8_t>(round * 61 + s * 37 + x * 5 + y * 11 + c);
+    };
+    const auto fill = [&](UINT round) {
+        for (UINT s = 0; s < kSubresources; ++s)
+            for (UINT y = 0; y < title_fp[s].Footprint.Height; ++y)
+                for (UINT x = 0; x < title_fp[s].Footprint.Width; ++x)
+                    for (UINT c = 0; c < 4; ++c)
+                        title[title_fp[s].Offset + std::uint64_t{y} * title_fp[s].Footprint.RowPitch + x * 4 + c] =
+                            texel(round, s, x, y, c);
+    };
+    fill(1);
+
+    Ref<ID3D12Resource> texture;
+    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, title, desc, 0x6u, IID_PPV_ARGS(&texture.p)), S_OK);
+    EXPECT(texture->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(title));
+
+    // The readback footprints, as GetCopyableFootprints lays them out.
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT read_fp[kSubresources]{};
+    UINT64 read_bytes = 0;
+    device->GetCopyableFootprints(&desc, 0, kSubresources, 0, read_fp, nullptr, nullptr, &read_bytes);
+    D3D12_RESOURCE_DESC buffer{};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = read_bytes;
+    buffer.Height = buffer.DepthOrArraySize = buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> readback;
+    EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &buffer,
+                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&readback.p))));
+    D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    Ref<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                               IID_PPV_ARGS(&list.p))));
+    EXPECT(SUCCEEDED(list->Close()));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
+    UINT64 signalled = 0;
+    // One submission that copies every subresource to the readback buffer, waited for, then compared with `round`.
+    const auto read_and_compare = [&](UINT round) -> int {
+        EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        for (UINT s = 0; s < kSubresources; ++s) {
+            D3D12_TEXTURE_COPY_LOCATION dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            dst.PlacedFootprint = read_fp[s];
+            D3D12_TEXTURE_COPY_LOCATION src{texture.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            src.SubresourceIndex = s;
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        EXPECT(SUCCEEDED(list->Close()));
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        EXPECT(SUCCEEDED(queue->Signal(fence.p, ++signalled)));
+        HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(signalled, done)));
+        EXPECT(WaitForSingleObject(done, 10000) == WAIT_OBJECT_0);
+        CloseHandle(done);
+        void* mapped = nullptr;
+        EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        unsigned mismatches = 0;
+        for (UINT s = 0; s < kSubresources; ++s)
+            for (UINT y = 0; y < read_fp[s].Footprint.Height; ++y)
+                for (UINT x = 0; x < read_fp[s].Footprint.Width; ++x)
+                    for (UINT c = 0; c < 4; ++c) {
+                        const std::uint8_t got = static_cast<const std::uint8_t*>(mapped)[
+                            read_fp[s].Offset + std::uint64_t{y} * read_fp[s].Footprint.RowPitch + x * 4 + c];
+                        if (got != texel(round, s, x, y, c) && mismatches++ < 4)
+                            std::fprintf(stderr, "%s: round %u subresource %u (%u, %u) byte %u: got %u want %u\n", who,
+                                         round, s, x, y, c, got, texel(round, s, x, y, c));
+                    }
+        readback->Unmap(0, nullptr);
+        EXPECT(mismatches == 0);
+        return 0;
+    };
+    if (read_and_compare(1)) return 1;  // what the title wrote before its first submission
+    fill(2);
+    rt::xg::note_write(title, bytes);  // as the texture computer's CopyIntoSubresource reports a write
+    if (read_and_compare(2)) return 1;
+    fill(3);  // the title's own write, within the second after the last copy
+    if (read_and_compare(3)) return 1;
+    texture.p->Release();
+    texture.p = nullptr;
+    VirtualFree(title, 0, MEM_RELEASE);  // after the texture: nothing reads the pages once it is gone
+    std::printf("%s: what the title writes at the address in the computer's layout reaches the image at each "
+                "submission (first fill, a texture-computer write, the title's own write)\n",
+                who);
+    return 0;
+}
+
 void print_cases(const std::vector<Case>& cases, const char* who) {
     for (const Case& c : cases)
         std::printf("%s: %-44s hr=0x%08lX size=%llu align=%llu type=%d cpu=%d pool=%d flags=0x%x\n", who, c.name,
@@ -353,6 +475,7 @@ int main() {
         print_cases(vulkan_cases, "vulkan");
         failures += check_import(ours.p, vk.host_pointer_alignment != 0);
         if (vk.host_pointer_alignment) failures += check_title_placed_all(ours.p);
+        failures += check_title_texture(ours.p);
         Ref<IDXGIFactory4> factory;
         if (!hostwine::host_is_wine() && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p)))) {
             for (const bool warp : {false, true}) {
