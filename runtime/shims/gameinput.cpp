@@ -843,6 +843,7 @@ struct State {
     bool sdl_ready = false, sdl_failed = false;
     bool thread_started = false;
     std::atomic<DWORD> delivering_thread{0};  // written by the delivering thread, read unlocked by UnregisterCallback
+    std::atomic<GameInputCallbackToken> running_token{0};  // the callback running now; UnregisterCallback waits on it
 };
 
 // Never destroyed: the poll thread may still run while the process exits.
@@ -932,11 +933,17 @@ void deliver_event(const Event& e) {
     for (const Callback& c : targets) {
         bool still = false;
         {
+            // Marked running under the same lock UnregisterCallback removes it under: either the removal comes first
+            // and it is not called, or UnregisterCallback sees it running and waits for it.
             std::lock_guard lock(s.mu);
             for (const Callback& now : s.callbacks)
                 if (now.token == c.token) still = now.active;
+            if (still) s.running_token.store(c.token, std::memory_order_release);
         }
-        if (still) call(c, e);
+        if (still) {
+            call(c, e);
+            s.running_token.store(0, std::memory_order_release);
+        }
     }
     if (e.device) e.device->Release();
     if (e.reading) e.reading->Release();
@@ -2617,21 +2624,29 @@ public:
             if (c.token == token) c.active = false;
     }
 
-    // Removes the callback and, unless called from inside a callback, waits for one that is running to return.
-    // VERIFY: the timeout is not honoured; the wait is for at most one callback.
-    bool STDMETHODCALLTYPE UnregisterCallback(GameInputCallbackToken token, uint64_t) override {
+    // Removes the callback; it is never called again. If that very callback is running on another thread, waits for it
+    // to return, for at most timeoutInMicroseconds, and returns false when the wait ran out (review B14: the whole
+    // delivery batch was waited for without a limit, so a title thread holding a lock a running callback wanted
+    // deadlocked). Called from inside a callback, it does not wait.
+    bool STDMETHODCALLTYPE UnregisterCallback(GameInputCallbackToken token, uint64_t timeout_us) override {
         State& s = g();
-        bool found = false;
+        bool found = false, running = false;
         {
             std::lock_guard lock(s.mu);
             auto it = std::find_if(s.callbacks.begin(), s.callbacks.end(), [token](const Callback& c) { return c.token == token; });
             if (it != s.callbacks.end()) {
                 s.callbacks.erase(it);
                 found = true;
+                running = s.running_token.load(std::memory_order_acquire) == token;
             }
         }
-        if (found && s.delivering_thread != GetCurrentThreadId()) std::lock_guard wait(s.deliver_mu);
-        return found;
+        if (!found || !running || s.delivering_thread == GetCurrentThreadId()) return found;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timeout_us);
+        while (s.running_token.load(std::memory_order_acquire) == token) {
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            SwitchToThread();
+        }
+        return true;
     }
 
     HRESULT STDMETHODCALLTYPE CreateDispatcher(IGameInputDispatcher** out) override {

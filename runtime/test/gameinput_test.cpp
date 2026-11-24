@@ -2145,6 +2145,36 @@ int main() {
     for (size_t i = before.size(); i < g_device_events.size(); ++i) async_events += g_device_events[i].token == async_token;
     check(async_events == 2, "async enumeration reports both connected pads to the new callback only");
 
+    // Review B14: unregistering a callback that is running on another thread waits for it at most the timeout. A
+    // title thread that holds a lock the running callback waits for would otherwise deadlock.
+    {
+        static HANDLE s_entered = nullptr, s_release = nullptr;
+        s_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        s_release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        GameInputReadingCallback blocking = [](GameInputCallbackToken, void*, IGameInputReading*, bool) {
+            SetEvent(s_entered);
+            WaitForSingleObject(s_release, 10000);  // stands for a lock the unregistering thread holds
+        };
+        GameInputCallbackToken blocking_token = 0;
+        check(input->RegisterReadingCallback(nullptr, GameInputKindGamepad, 0.0f, nullptr, blocking, &blocking_token) ==
+                  S_OK,
+              "register a callback that blocks");
+        SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_NORTH, true);
+        std::thread poller([] { rt::gameinput::poll(); });  // delivers on this thread: no dispatcher
+        const bool entered = WaitForSingleObject(s_entered, 5000) == WAIT_OBJECT_0;
+        const auto start = std::chrono::steady_clock::now();
+        const bool unregistered = input->UnregisterCallback(blocking_token, 50'000);
+        const auto waited = std::chrono::steady_clock::now() - start;
+        SetEvent(s_release);
+        poller.join();
+        check(entered && !unregistered && waited < std::chrono::seconds(2),
+              "UnregisterCallback of a running callback returns false once its timeout has passed, instead of waiting");
+        check(!input->UnregisterCallback(blocking_token, 0), "and the callback is gone all the same");
+        SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_NORTH, false);
+        rt::gameinput::poll();
+        CloseHandle(s_entered);
+        CloseHandle(s_release);
+    }
     check(input->UnregisterCallback(reading_token, 0), "UnregisterCallback");
     check(!input->UnregisterCallback(reading_token, 0), "a second UnregisterCallback returns false");
     const int after_unregister = g_reading_events;
