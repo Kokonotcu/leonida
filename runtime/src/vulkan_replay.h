@@ -818,6 +818,10 @@ struct ComputePipeline {
     // compute stage. Null on the pipeline path.
     std::function<void(VkCommandBuffer)> bind_shader;
     VkShaderEXT shader_object = VK_NULL_HANDLE;  // the shader bind_shader binds (generated commands name it)
+    // Still being compiled on a background thread (LEONIDA_ASYNC_PSO): its dispatches are skipped until the compiled
+    // pipeline replaces this entry, so the title never waits on the driver's compiler (its watchdog ends a run where
+    // a thread makes no progress for ~30 s, and one wave64-emulated compute shader can take longer than that).
+    bool pending = false;
 };
 
 // Binds a compute pipeline or, with shader objects, its shader.
@@ -3635,9 +3639,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
                 if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
-                if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shader)) return ReplayResult::unresolved_resource;
-                if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set)) return ReplayResult::unsupported;
-                p.pipeline = *pipeline;
+                if (pipeline && pipeline->pending) {
+                    p.skip = true;  // still compiling (LEONIDA_ASYNC_PSO)
+                } else {
+                    if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shader))
+                        return ReplayResult::unresolved_resource;
+                    if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set))
+                        return ReplayResult::unsupported;
+                    p.pipeline = *pipeline;
+                }
             }
             if (ind->kind != IndirectKind::dispatch && !ind->state && !ind->raw) return ReplayResult::unsupported;
             // A draw with the list's graphics state: prepared as a Draw is (the argument and count buffers stay in
@@ -3775,9 +3785,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.bind_pipeline || !vk.push_constants || !vk.dispatch || !vk.compute_pipeline)
                 return ReplayResult::unsupported;
             const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
-            if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shader)) return ReplayResult::unresolved_resource;
-            if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set)) return ReplayResult::unsupported;
-            p.pipeline = *pipeline;
+            if (pipeline && pipeline->pending) {
+                p.skip = true;  // still compiling (LEONIDA_ASYNC_PSO)
+            } else {
+                if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shader))
+                    return ReplayResult::unresolved_resource;
+                if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set))
+                    return ReplayResult::unsupported;
+                p.pipeline = *pipeline;
+            }
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];

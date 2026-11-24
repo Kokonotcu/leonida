@@ -1675,6 +1675,9 @@ int main(int argc, char** argv) {
                         cpi.layout = layout_for(meta);
                     }
                     cpi.flags = capture;
+                    // VK_PIPELINE_CHECK_NO_OPT=1: compile as the runtime's fast first build does (driver optimizer off).
+                    static const bool no_opt = [] { const char* v = std::getenv("VK_PIPELINE_CHECK_NO_OPT"); return v && v[0] == '1'; }();
+                    if (no_opt) cpi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
                     // Only whole-pipeline feedback is reported.
                     VkPipelineCreationFeedback fb{};
                     VkPipelineCreationFeedbackCreateInfo fci{

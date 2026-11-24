@@ -1544,6 +1544,56 @@ struct DeviceState {
         gpl_worker_wake.notify_one();
     }
 
+    // LEONIDA_ASYNC_PSO=1: compute pipelines are compiled on these workers (below normal priority, made on first use,
+    // hardware threads less four) instead of on the title's thread. The title's watchdog ends a run in which a thread
+    // makes no progress for about 30 s, and the driver can take longer than that for one wave64-emulated compute
+    // shader (the first retail boot died on it while nvgpucomp64 compiled). A job holds a reference to its PSO.
+    std::mutex compile_mutex;
+    std::condition_variable compile_wake;
+    std::deque<std::function<void()>> compile_jobs;
+    bool compile_stop = false;
+    std::vector<std::thread> compile_workers;
+
+    void compile_enqueue(std::function<void()> job) {
+        std::lock_guard lock(compile_mutex);
+        if (compile_stop) return;
+        compile_jobs.push_back(std::move(job));
+        if (compile_workers.empty()) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            const unsigned count = hw > 6 ? hw - 4 : 2;
+            for (unsigned i = 0; i < count; ++i)
+                compile_workers.emplace_back([this] {
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                    std::unique_lock lock(compile_mutex);
+                    for (;;) {
+                        compile_wake.wait(lock, [this] { return compile_stop || !compile_jobs.empty(); });
+                        if (compile_jobs.empty()) return;  // stopping, nothing left
+                        std::function<void()> next = std::move(compile_jobs.front());
+                        compile_jobs.pop_front();
+                        lock.unlock();
+                        next();
+                        next = nullptr;  // releases the job's PSO reference outside the lock
+                        lock.lock();
+                    }
+                });
+        }
+        compile_wake.notify_one();
+    }
+
+    // At teardown: jobs not started are dropped (their PSO references go with them), running ones finish.
+    void stop_compile_workers() {
+        std::deque<std::function<void()>> dropped;
+        {
+            std::lock_guard lock(compile_mutex);
+            compile_stop = true;
+            dropped.swap(compile_jobs);
+        }
+        compile_wake.notify_all();
+        for (auto& worker : compile_workers)
+            if (worker.joinable()) worker.join();
+        compile_workers.clear();
+    }
+
     bool gpl_wait_idle(std::chrono::milliseconds timeout) {
         std::unique_lock lock(gpl_worker_mutex);
         return gpl_worker_idle.wait_for(lock, timeout, [this] { return gpl_jobs.empty() && !gpl_worker_busy; });
@@ -1584,6 +1634,7 @@ struct DeviceState {
 
     // At teardown, once no PSO links with them.
     void destroy_gpl_libraries() {
+        stop_compile_workers();
         stop_gpl_worker();
         std::lock_guard lock(gpl_mutex);
         if (context)
@@ -4270,6 +4321,20 @@ struct PipelineStream {
 };
 
 // LEONIDA_XS_STREAM_ENUM=pc: never read a stream with the console's numbering (below).
+// LEONIDA_ASYNC_PSO=1: compute PSOs compile on background workers and their dispatches are skipped until they are
+// ready (DeviceState::compile_enqueue). Off by default: a dispatch right after CreateComputePipelineState then runs.
+bool async_pso_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("LEONIDA_ASYNC_PSO");
+        const bool on = v && v[0] == '1';
+        if (on)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ASYNC_PSO=1: compute pipelines compile in the background; their "
+                                 "dispatches are skipped until ready\n");
+        return on;
+    }();
+    return enabled;
+}
+
 bool console_stream_enum_enabled() {
     static const bool enabled = [] {
         char value[8] = {};
@@ -5365,6 +5430,15 @@ public:
                 const VkShaderStageFlagBits stage = VK_SHADER_STAGE_COMPUTE_BIT;
                 fn->vkCmdBindShadersEXT(cb, 1, &stage, &shader);
             };
+        } else if (async_pso_enabled()) {
+            // LEONIDA_ASYNC_PSO: registered as pending below, compiled on DeviceState's compile workers, and swapped
+            // in when done; replay skips its dispatches until then.
+            async_compute_ = std::make_unique<AsyncCompute>();
+            async_compute_->info = pipeline_info;
+            async_compute_->required = required_size;
+            async_compute_->has_required = pipeline_info.stage.pNext != nullptr;
+            async_compute_->info.stage.pNext = nullptr;
+            pipeline_.pending = true;
         } else {
             if (device_.create_pipeline(
                     [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
@@ -5386,6 +5460,33 @@ public:
         pipeline_.code_base = offset;
         device_.context->add_pipeline(id(), pipeline_);
         registered_ = true;
+        if (async_compute_) {
+            // After the pending entry is registered, so the compiled one the job registers is the one that stays.
+            AddRef();
+            device_.compile_enqueue([this] {
+                auto& vkf = device_.context->vk;
+                VkComputePipelineCreateInfo info = async_compute_->info;
+                if (async_compute_->has_required) info.stage.pNext = &async_compute_->required;
+                VkPipeline made = VK_NULL_HANDLE;
+                const VkResult r = device_.create_pipeline(
+                    [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
+                        return vkf.vkCreateComputePipelines(device_.info.device, cache, 1, &create, nullptr, &made);
+                    },
+                    info);
+                if (r == VK_SUCCESS) {
+                    leonida::ComputePipeline ready = pipeline_;
+                    ready.pipeline = made;
+                    ready.pending = false;
+                    pipeline_ = ready;  // only this job writes pipeline_ while the PSO is compiling
+                    device_.context->add_pipeline(id(), ready);
+                    device_.pipeline_created();
+                } else {
+                    log_once("a background compute pipeline compile failed (its dispatches stay skipped); VkResult",
+                             int(r));
+                }
+                Release();
+            });
+        }
         return S_OK;
     }
 
@@ -5611,6 +5712,13 @@ private:
     std::vector<VkPipeline> gpl_outputs_;
     std::shared_ptr<GplUpgrade> gpl_upgrade_;  // null unless the base pipeline is a fast link with an upgrade pending
     VkShaderModule module_ = VK_NULL_HANDLE;
+    // LEONIDA_ASYNC_PSO: what the background compile of a compute PSO needs (module_ stays alive with the PSO).
+    struct AsyncCompute {
+        VkComputePipelineCreateInfo info{};
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required{};
+        bool has_required = false;
+    };
+    std::unique_ptr<AsyncCompute> async_compute_;
     std::vector<VkShaderModule> modules_;
     VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;

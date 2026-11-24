@@ -2060,8 +2060,12 @@ HRESULT refuse_beyond_device(unsigned slot, unsigned slot_count) {
 // Device slot 8: CreateCommandQueue(desc, riid, out). Without an output it is the device's own capability answer
 // (S_FALSE for a valid description on the PC), as #558 does for slot 14. `console_route` is true only for the Xbox
 // slot 48: the retail exe's descriptor there carries console values in the PC fields.
+// `console_layout`: the queue is called in the console's slot layout (console_queue_slot). Slot 48 always; slot 8 when
+// the title's own code calls it (the retail exe makes a queue through slot 8 too and calls its slot 18 as
+// GetTimestampFrequency: in the PC layout that is GetDesc, whose 16 bytes overwrote the caller's saved RBX with the
+// desc's flags/node mask, 0x100000000, and the boot then died on that "pointer").
 HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_DESC* desc, const IID* riid,
-                                   void** out, bool console_route) {
+                                   void** out, bool console_route, bool console_layout) {
     note_slot(8);
     if (out) *out = nullptr;  // _COM_Outptr_: NULL on every failure, as slots 14/62/76
     if (!riid) return E_POINTER;
@@ -2105,8 +2109,8 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
-    // A console-route queue (slot 48) is called in the console's slot layout (console_queue_slot).
-    return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out, console_route);
+    // A queue the title made (slot 48, or slot 8 from its own code) is called in the console's slot layout.
+    return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out, console_layout);
 }
 
 // Device slot 41 is handled in the early dispatch chain: it maps the console signature IID and, for a console
@@ -2308,7 +2312,7 @@ HRESULT proxy_create_command_queue_xbox(DeviceProxy* self, const std::uint32_t* 
         std::fprintf(stderr,
                      "[rt] d3d12_xs: slot 48 queue: flags=0x%x extra words=0x%x 0x%x 0x%x 0x%x\n",
                      static_cast<unsigned>(desc[2]), desc[4], desc[5], desc[6], desc[7]);
-    return proxy_create_command_queue(self, &pc, riid, out, /*console_route=*/true);
+    return proxy_create_command_queue(self, &pc, riid, out, /*console_route=*/true, /*console_layout=*/true);
 }
 
 // Xbox device slot 70: (texture_words, view_desc, destination), no return value. The retail executable's SRV writer
@@ -3541,9 +3545,16 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 2) {
         return proxy_release(self);
     } else if constexpr (Slot == 8) {
+        // Called from the title's code: console queue layout; from the runtime or the tests (host modules, d3d12.h):
+        // the PC layout. The title's images are mapped by the runtime's own loader, so Windows knows no module at
+        // their addresses, while every host caller is in one.
+        HMODULE host = nullptr;
+        const bool from_title =
+            !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                reinterpret_cast<LPCWSTR>(_ReturnAddress()), &host);
         return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
                                                     reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3),
-                                                    /*console_route=*/false));
+                                                    /*console_route=*/false, /*console_layout=*/from_title));
     } else if constexpr (Slot == 48) {
         return hr_to_u64(proxy_create_command_queue_xbox(self, reinterpret_cast<const std::uint32_t*>(a1),
                                                          reinterpret_cast<const IID*>(a2),
