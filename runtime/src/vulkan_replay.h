@@ -876,6 +876,8 @@ struct GraphicsPipeline {
     // rectangle's fourth corner (src/rect_list_gs.h).
     static constexpr std::uint32_t rect_list = 1u << 9;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
+    // LEONIDA_LOG_PSOS: the shader names, so prepared draws of a named kind (Bink movies) can be told.
+    std::string debug_name;
     // LEONIDA_DEFER_GRAPHICS=1: `pipeline` stays null and variant() builds the draw's attachment configuration on
     // first use (from danekbiglike's frame-on-demand-graphics patch: the retail title creates ~25,000 native PSOs at
     // start, and building them all at creation took memory at ~130 MB/s).
@@ -3924,6 +3926,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return r;
             }
             detail::count_draw(detail::DrawOutcome::prepared);
+            if (const GraphicsPipeline* named = vk.graphics_pipeline ? vk.graphics_pipeline(draw->pipeline) : nullptr;
+                named && named->debug_name.find("Bink") != std::string::npos) {
+                static std::atomic<std::uint64_t> bink{0};
+                const std::uint64_t n = bink.fetch_add(1, std::memory_order_relaxed) + 1;
+                if ((n & (n - 1)) == 0)
+                    std::fprintf(stderr, "[rt] replay: Bink draws prepared %llu (%s)\n",
+                                 static_cast<unsigned long long>(n), named->debug_name.c_str());
+            }
             previous_draw = draw;
             previous_draw_slot = p.draw;
         }

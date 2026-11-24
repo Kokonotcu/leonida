@@ -5644,15 +5644,27 @@ public:
             code_base_ = offset;
             graphics_.code_base = offset;
         }
-        device_.context->add_graphics_pipeline(id(), graphics_);
-        if (std::getenv("LEONIDA_LOG_PSOS")) {
-            // Which shaders a PSO id stands for, so a draw named by its pipeline (record_draw's log, DRED) can be
-            // traced to its program.
-            std::string names;
+        static const bool log_psos = std::getenv("LEONIDA_LOG_PSOS") != nullptr;
+        std::string names;
+        if (log_psos) {
             for (const Stage& stage : stages)
                 if (stage.entry) names += std::string(" ") + stage.name + "=" + stage.entry->name;
-            std::fprintf(stderr, "[rt] d3d12: graphics PSO %llx:%s\n", static_cast<unsigned long long>(id()),
-                         names.c_str());
+            graphics_.debug_name = names;
+        }
+        device_.context->add_graphics_pipeline(id(), graphics_);
+        if (log_psos) {
+            // Which shaders a PSO id stands for, so a draw named by its pipeline (record_draw's log, DRED) can be
+            // traced to its program.
+            char blend[96] = "no colour target";
+            if (!recipe_.blends.empty()) {
+                const VkPipelineColorBlendAttachmentState& b = recipe_.blends[0];
+                std::snprintf(blend, sizeof blend, "rt0 mask 0x%x blend %u (src %d dst %d op %d, a: %d %d %d), %zu rt",
+                              unsigned(b.colorWriteMask), unsigned(b.blendEnable), int(b.srcColorBlendFactor),
+                              int(b.dstColorBlendFactor), int(b.colorBlendOp), int(b.srcAlphaBlendFactor),
+                              int(b.dstAlphaBlendFactor), int(b.alphaBlendOp), recipe_.blends.size());
+            }
+            std::fprintf(stderr, "[rt] d3d12: graphics PSO %llx:%s, %s\n", static_cast<unsigned long long>(id()),
+                         names.c_str(), blend);
         }
         registered_ = true;
         is_graphics_ = true;

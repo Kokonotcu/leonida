@@ -806,6 +806,20 @@ private:
         // zero-filled first, as any committed resource is.
         const VkImageLayout common = image_layout(binding, VK_IMAGE_LAYOUT_GENERAL);
         auto pieces = detail::current(&context_.tracker_, source, range, common);
+        {
+            // A source the tracker still has as UNDEFINED is zero-filled by initialize() below: told for the first
+            // presents, so a black screen from a back buffer the replay's writes never reached the tracker for shows.
+            static std::atomic<int> told{0};
+            if (told.load(std::memory_order_relaxed) < 6) {
+                int undefined = 0;
+                for (const auto& piece : pieces) undefined += piece.layout == VK_IMAGE_LAYOUT_UNDEFINED;
+                told.fetch_add(1, std::memory_order_relaxed);
+                std::fprintf(stderr, "[rt] present: source %llx image %p, %zu piece(s), %d UNDEFINED (zero-filled), "
+                                     "first layout %d\n",
+                             static_cast<unsigned long long>(source), reinterpret_cast<void*>(binding.image),
+                             pieces.size(), undefined, pieces.empty() ? -1 : int(pieces[0].layout));
+            }
+        }
         detail::initialize(fn, commands, binding, source, pieces, common, &context_.tracker_);
         for (const auto& piece : pieces)
             detail::image_barrier(fn, commands, binding, piece.range, piece.layout,

@@ -3390,6 +3390,25 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const 
         std::uint64_t kind7_size;             // +0x40: records size in bytes
     };
     const auto* xbox_desc = static_cast<const XboxNativeComputePipelineStateDesc*>(desc);
+    // LEONIDA_DUMP_KIND6=<dir> (diagnostic): every distinct kind-6 program passed here, as <fnv64>.kind6, with the
+    // caller's address in the log, so programs no translated corpus has can be traced to the module that owns them.
+    if (static const std::string dump_dir = [] {
+            const char* v = std::getenv("LEONIDA_DUMP_KIND6");
+            return std::string(v ? v : "");
+        }();
+        !dump_dir.empty() && xbox_desc->kind6 && xbox_desc->kind6_size && xbox_desc->kind6_size < (16u << 20)) {
+        std::uint64_t h = 0xcbf29ce484222325ull;
+        const auto* bytes = static_cast<const std::uint8_t*>(xbox_desc->kind6);
+        for (std::uint64_t i = 0; i < xbox_desc->kind6_size; ++i) h = (h ^ bytes[i]) * 0x100000001b3ull;
+        char path[512];
+        std::snprintf(path, sizeof path, "%s\\%016llx.kind6", dump_dir.c_str(), static_cast<unsigned long long>(h));
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
+            if (std::FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(bytes, 1, static_cast<std::size_t>(xbox_desc->kind6_size), f);
+                std::fclose(f);
+            }
+        }
+    }
 
     D3D12_COMPUTE_PIPELINE_STATE_DESC pc_desc{};
     pc_desc.pRootSignature = xbox_desc->root_signature;
