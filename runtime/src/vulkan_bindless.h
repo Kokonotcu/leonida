@@ -400,9 +400,11 @@ public:
 
     // The fallback images are created with undefined contents: record this once, in a command buffer that executes
     // before anything uses the set. It moves them to GENERAL, the layout their descriptors name, and zeroes them.
-    bool fallbacks_ready() const { return fallbacks_ready_; }
+    // Ready once the submission that carries the initialization reached the queue (table_upload_result(true)); until
+    // that is known, the recorded one counts, so it is not recorded twice (B17).
+    bool fallbacks_ready() const { return fallbacks_ready_ || fallbacks_recorded_; }
     void record_fallback_init(VkCommandBuffer command_buffer) {
-        fallbacks_ready_ = true;
+        fallbacks_recorded_ = true;
         fallback_init_unflushed_ = true;  // reported by the next flush's last_flush_uploaded()
         std::vector<VkImageMemoryBarrier> barriers;
         for (const auto& image : fallback_images_) {
@@ -513,6 +515,11 @@ public:
     // obligation, and the next flush() rebuilds the whole table (the changed-slot list was consumed when the copy
     // was recorded). A failed vkQueueSubmit is the caller's signal, not ours.
     void table_upload_result(bool submitted) {
+        // The fallback images' initialization went with the same command buffer: ready, or recorded again (B17).
+        if (fallbacks_recorded_) {
+            fallbacks_recorded_ = false;
+            fallbacks_ready_ = submitted;
+        }
         if (!upload_in_flight_) return;
         upload_in_flight_ = false;
         if (submitted) return;
@@ -1135,6 +1142,7 @@ private:
     std::array<VkImageView, bindless::bindings.size()> fallback_by_binding_{};
     VkSampler fallback_sampler_ = VK_NULL_HANDLE;
     bool fallbacks_ready_ = false;
+    bool fallbacks_recorded_ = false;  // recorded, its submission not yet known to have reached the queue
     std::array<std::vector<std::uint8_t>, dimensions> image_used_;
     std::vector<std::uint8_t> sampler_used_;
     std::vector<Pending> pending_;

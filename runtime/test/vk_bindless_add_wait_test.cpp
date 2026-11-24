@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <mutex>
 #include <string_view>
+#include <utility>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -33,11 +34,13 @@ PFN_vkGetDeviceProcAddr real_get_device = nullptr;
 PFN_vkQueueSubmit real_submit = nullptr;
 std::mutex mutex;
 std::uint32_t last_wait_count = 0;
+bool fail_next = false;  // the next submission fails with VK_ERROR_OUT_OF_HOST_MEMORY, not reaching the driver
 
 VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits,
                                             VkFence fence) {
     {
         std::lock_guard lock(mutex);
+        if (std::exchange(fail_next, false)) return VK_ERROR_OUT_OF_HOST_MEMORY;
         last_wait_count = 0;
         for (std::uint32_t i = 0; i < count; ++i) last_wait_count += submits[i].waitSemaphoreCount;
     }
@@ -103,8 +106,19 @@ int main() {
         VulkanQueue b(context, d.queue, d.family);
         EXPECT(a.ok() && b.ok());
 
+        // 0. B17: the submission that carries the fallback images' first initialization fails: they are not ready, and
+        //    the next submission records the initialization again.
+        {
+            std::lock_guard lock(driver::mutex);
+            driver::fail_next = true;
+        }
+        EXPECT(a.execute(lists) != ReplayResult::success);
+        EXPECT(!set.fallbacks_ready());
+        std::printf("0 a failed first submission leaves the fallback images to initialize again\n");
+
         // 1. The first flush: the fallback images' initialization and the first upload of the table.
         EXPECT(a.execute(lists) == ReplayResult::success);
+        EXPECT(set.fallbacks_ready());
         EXPECT(uploaded);
         EXPECT(b.execute(lists) == ReplayResult::success);
         EXPECT(driver::waits() == 1);
