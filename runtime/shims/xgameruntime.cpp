@@ -36,6 +36,7 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "title_memory.h"
 
 namespace rt::shims {
 bool xgameruntime_user_query(const GUID& class_id, REFIID interface_id, void** out, HRESULT* hr);
@@ -797,11 +798,10 @@ HRESULT __stdcall XSystemGetConsoleId(size_t size, char* out, size_t* used) {
     return S_OK;
 }
 
-// uint64_t XSystemGetAppMemoryUsageLimit(). Reports total physical RAM, or 12 GB fallback for Series X.
+// uint64_t XSystemGetAppMemoryUsageLimit(). The title's memory budget: the console's 13.5 GiB, capped by what this host
+// can back, or LEONIDA_TITLE_MEMORY_MB (title_memory.h). It was the host's total RAM, which a title sizes pools from.
 uint64_t __stdcall XSystemGetAppMemoryUsageLimit() {
-    MEMORYSTATUSEX ms{sizeof(ms)};
-    if (GlobalMemoryStatusEx(&ms)) return ms.ullTotalPhys;
-    return 12ULL * 1024 * 1024 * 1024;
+    return rt::title_memory::limit();
 }
 
 // uint64_t XSystemGetAppMemoryUsage()
