@@ -3703,7 +3703,7 @@ public:
     // LEONIDA_LOG_TSHARP: CPU access to the glyph atlas's description (2048x2048 R8, retail 1.0.2.1), first 32 calls.
     void log_atlas_access(const char* what, UINT subresource, const D3D12_BOX* box) const {
         static const bool on = std::getenv("LEONIDA_LOG_TSHARP") != nullptr;
-        if (!on || !image_ || desc_.Width != 2048 || desc_.Height != 2048 || desc_.Format != DXGI_FORMAT_R8_UNORM)
+        if (!on || !image_ || desc_.Width != 2048 || desc_.Height != 2048 || (desc_.Format != DXGI_FORMAT_R8_UNORM && desc_.Format != DXGI_FORMAT_A8_UNORM))
             return;
         static std::atomic<int> told{0};
         if (told.fetch_add(1) >= 32) return;
@@ -11370,6 +11370,15 @@ void sync_title_textures() {
     const std::size_t count = textures.size();
     for (std::size_t n = 0; n < count; ++n) {
         const auto& t = textures[(cursor + n) % count];
+        // LEONIDA_DUMP_TARGETS with LEONIDA_DUMP_TITLE_TEXTURE: the glyph atlas's image is dumped with the targets.
+        static const bool note_atlas =
+            leonida::debug_targets::dump_at() && std::getenv("LEONIDA_DUMP_TITLE_TEXTURE") != nullptr;
+        if (note_atlas) {
+            const D3D12_RESOURCE_DESC& d = t->resource->desc();
+            if (d.Width == 2048 && d.Height == 2048 &&
+                (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM))
+                leonida::debug_targets::note(t->resource->id());
+        }
         bool watching = false;
         if (!t->dirty && t->watch && t->copied && now < t->watch_until) {
             if (now < t->first_watch_until) {
@@ -11399,6 +11408,24 @@ void sync_title_textures() {
         t->hash = hash;
         t->first_watch_until = now + kTitleTextureFirstWatch;
         t->watch_until = now + title_texture_watch();
+        // LEONIDA_DUMP_TITLE_TEXTURE=<dir>: the title bytes of each copied 2048x2048 A8/R8 texture (the glyph atlas),
+        // as <dir>/<title address>_<copy n>.bin, the first 24 copies.
+        if (static const char* dir = std::getenv("LEONIDA_DUMP_TITLE_TEXTURE"); dir && *dir) {
+            const D3D12_RESOURCE_DESC& d = t->resource->desc();
+            static int dumped = 0;
+            if (d.Width == 2048 && d.Height == 2048 &&
+                (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM) && dumped < 24) {
+                char path[512];
+                std::snprintf(path, sizeof path, "%s\\%p_%02d.bin", dir, static_cast<const void*>(t->title), dumped++);
+                CreateDirectoryA(dir, nullptr);
+                if (FILE* f = std::fopen(path, "wb")) {
+                    std::fwrite(t->title, 1, t->bytes, f);
+                    std::fclose(f);
+                }
+                std::fprintf(stderr, "[rt] d3d12: title texture %p copied (%zu bytes) -> %s\n",
+                             static_cast<const void*>(t->title), t->bytes, path);
+            }
+        }
     }
 }
 

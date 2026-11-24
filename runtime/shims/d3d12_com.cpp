@@ -728,7 +728,7 @@ public:
                 // A texture's T# address is the runtime's own key (Resource::image_address), not its VA: matched
                 // by the glyph atlas's description instead (2048x2048 R8, retail 1.0.2.1).
                 const D3D12_RESOURCE_DESC dd = dst->pResource->GetDesc();
-                return dd.Width == 2048 && dd.Height == 2048 && dd.Format == DXGI_FORMAT_R8_UNORM;
+                return dd.Width == 2048 && dd.Height == 2048 && (dd.Format == DXGI_FORMAT_R8_UNORM || dd.Format == DXGI_FORMAT_A8_UNORM);
             }()) {
             static std::atomic<int> told{0};
             if (told.fetch_add(1) < 64) {
