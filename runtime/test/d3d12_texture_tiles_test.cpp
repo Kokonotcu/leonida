@@ -1,7 +1,7 @@
 // D3D-285: compare synthetic sparse RGBA8 texture tiles on the Vulkan shim and native D3D12.
 #include "../shims/d3d12_com.h"
 
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -248,12 +248,20 @@ bool run(ID3D12Device& device, UINT width, UINT height, UINT64 tile_copy_offset,
     return true;
 }
 
+// The high-performance adapter first (the discrete GPU of a hybrid laptop, the one the layer's Vulkan device runs on).
+// The integrated Intel UHD this PC lists first copies CopyTiles at a byte-unaligned linear offset one byte off (the
+// 256 x 240, offset 1 case), so the reference itself was wrong there.
 ComPtr<ID3D12Device> native_device() {
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return {};
+    ComPtr<IDXGIFactory6> factory6;
+    factory.As(&factory6);
     for (UINT i = 0;; ++i) {
         ComPtr<IDXGIAdapter1> adapter;
-        if (factory->EnumAdapters1(i, &adapter) != S_OK) return {};
+        const HRESULT found = factory6 ? factory6->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                                             IID_PPV_ARGS(&adapter))
+                                       : factory->EnumAdapters1(i, &adapter);
+        if (found != S_OK) return {};
         DXGI_ADAPTER_DESC1 desc{};
         if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
         ComPtr<ID3D12Device> device;
