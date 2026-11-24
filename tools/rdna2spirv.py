@@ -1584,8 +1584,20 @@ class Gen:
         self.emit(f"{r} = OpSelect %uint {self.active_b()} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
         return r
 
+    def lane_bit_on(self, val, rel):
+        """Whether bit (rel mod 32) of `val` is set: this lane's bit of a value written to EXEC. Exact for both
+        representations: a lane-mask value holds 0 or ~0 in each invocation (bit L is its non-zero test), and a scalar
+        word computed by SALU code (s_lshl_b32 exec_lo, ...; s_bfm_b32; s_not_b32 of data) gives each lane its own
+        bit, where a non-zero test turned on the whole half (SHADER-1264)."""
+        r31, shr, bit, on = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{r31} = OpBitwiseAnd %uint {rel} {self.cu(31)}")
+        self.emit(f"{shr} = OpShiftRightLogical %uint {val} {r31}")
+        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+        self.emit(f"{on} = OpINotEqual %bool {bit} {self.cu(0)}")
+        return on
+
     def set_exec(self, mask_u):
-        self.emit(f"OpStore %active {self.tmp_bool_nz(mask_u)}")
+        self.emit(f"OpStore %active {self.lane_bit_on(mask_u, self.wave_lane())}")
         self.uses_active = True
 
     def vcc_half_keeps_mask(self):
@@ -5894,7 +5906,7 @@ class Gen:
             self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
             self.emit(f"{on} = OpINotEqual %bool {bit} {self.cu(0)}")
         else:
-            self.emit(f"{on} = OpINotEqual %bool {val} {self.cu(0)}")
+            on = self.lane_bit_on(val, rel)   # its own bit: a mask value (0 / ~0) and a computed word alike
         self.emit(f"{cur} = OpLoad %bool %active")
         self.emit(f"{new} = OpSelect %bool {inh} {on} {cur}")
         self.emit(f"OpStore %active {new}")
