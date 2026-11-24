@@ -306,6 +306,9 @@ void* make_common_stub() {
     if (!RtlAddFunctionTable(rf, 1, reinterpret_cast<DWORD64>(region)))
         std::fprintf(stderr, "[rt] RtlAddFunctionTable failed for the unimplemented-import stub (error %lu): "
                              "stack walks cannot pass through it\n", GetLastError());
+    // Executable, never writable again (review D4): a stray write must not change where unimplemented calls go.
+    DWORD old = 0;
+    VirtualProtect(region, kRegionSize, PAGE_EXECUTE_READ, &old);
     FlushInstructionCache(GetCurrentProcess(), region, kRegionSize);
     return region;
 }
@@ -604,7 +607,7 @@ void* make_unimplemented_thunk(const std::string& dll, const std::string& name) 
     if (!g_stub) return nullptr;
     if (!g_pool || g_pool_used + kThunkSize > g_pool_size) {
         g_pool_size = 1 << 20;
-        g_pool = static_cast<uint8_t*>(VirtualAlloc(nullptr, g_pool_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));
+        g_pool = static_cast<uint8_t*>(VirtualAlloc(nullptr, g_pool_size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READ));
         g_pool_used = 0;
         if (!g_pool) return nullptr;
     }
@@ -620,7 +623,15 @@ void* make_unimplemented_thunk(const std::string& dll, const std::string& name) 
     code[20] = 0xFF;
     code[21] = 0xE0;
     std::memset(code + 22, 0xCC, kThunkSize - 22);
+    // The pool is execute-read (review D4); its page is writable only while this thunk is written, and stays
+    // executable meanwhile, since another thread may be running an earlier thunk on the same page. kThunkSize divides
+    // the page size, so a thunk never straddles two pages. Thunks are made under g_pool_mutex, one at a time.
+    static_assert(4096 % kThunkSize == 0);
+    uint8_t* const page = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(t) & ~uintptr_t{4095});
+    DWORD old = 0;
+    if (!VirtualProtect(page, 4096, PAGE_EXECUTE_READWRITE, &old)) return nullptr;
     std::memcpy(t, code, kThunkSize);
+    VirtualProtect(page, 4096, PAGE_EXECUTE_READ, &old);
     FlushInstructionCache(GetCurrentProcess(), t, kThunkSize);
     thunks.emplace(key, t);
     return t;

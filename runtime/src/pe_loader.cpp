@@ -2010,6 +2010,13 @@ bool Loader::resolve_compat(const std::string& key, const std::string& dll, cons
     return true;
 }
 
+// The unimplemented-import thunk for dll!sym; when none can be made (out of memory) the load fails naming the import,
+// instead of a null import slot whose first call jumps to 0 with no name (review I7).
+void* unimplemented_thunk_or_throw(const Module& m, const std::string& dll, const std::string& sym) {
+    if (void* t = shims::make_unimplemented_thunk(dll, sym)) return t;
+    throw std::runtime_error(m.name + ": no thunk could be made for the unimplemented import " + dll + "!" + sym);
+}
+
 void* Loader::resolve(Module& m, const std::string& dll, const std::string& name, uint16_t ordinal, bool by_ordinal) {
     std::string key = dll_key(dll);
     std::string sym = by_ordinal ? "#" + std::to_string(ordinal) : name;
@@ -2018,7 +2025,7 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
     // console module is never served half by a shim and half by the drop-in (they would not share state).
     if (void* p = nullptr; resolve_compat(key, dll, name, ordinal, by_ordinal, p)) {
         m.imports.push_back({dll, sym, p ? Binding::Host : Binding::Unimplemented});
-        return p ? p : shims::make_unimplemented_thunk(dll, sym);
+        return p ? p : unimplemented_thunk_or_throw(m, dll, sym);
     }
 
     if (void* p = shims::find(key, sym)) {
@@ -2057,7 +2064,7 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
         }
     }
     m.imports.push_back({dll, sym, Binding::Unimplemented});
-    return shims::make_unimplemented_thunk(dll, sym);
+    return unimplemented_thunk_or_throw(m, dll, sym);
 }
 
 void Loader::bind_imports(Module& m) {
