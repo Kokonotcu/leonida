@@ -854,6 +854,10 @@ struct GraphicsPipeline {
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
+    // LEONIDA_DEFER_GRAPHICS=1: `pipeline` stays null and variant() builds the draw's attachment configuration on
+    // first use (from danekbiglike's frame-on-demand-graphics patch: the retail title creates ~25,000 native PSOs at
+    // start, and building them all at creation took memory at ~130 MB/s).
+    bool deferred = false;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
     // Shader objects instead of `pipeline` (LEONIDA_SHADER_OBJECTS=1, docs/aot_pipelines.md): binds the PSO's
     // shaders and sets every state the pipeline would have baked in, the viewport and scissor (with count), and the
@@ -2488,7 +2492,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         return finish_draw(draw, vk, p, previous_draw, previous);
     }
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
-    if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shaders)) return ReplayResult::unresolved_resource;
+    if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shaders && !pipeline->deferred))
+        return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set)) return ReplayResult::unsupported;
@@ -2549,7 +2554,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
     // Shader objects bake no attachment formats: an unbound slot is just an attachment without a view.
-    if (unbound && !pipeline->bind_shaders) {
+    if ((unbound || pipeline->deferred) && !pipeline->bind_shaders) {
         p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
         if (!p.pipeline) return ReplayResult::unsupported;
     } else if (pipeline->upgrade) {

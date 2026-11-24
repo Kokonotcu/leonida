@@ -5350,8 +5350,17 @@ public:
                 const leonida::pso::LibraryState::Functions* fn = &device_.gpl_fn;
                 graphics_.set_state = [fn, state](VkCommandBuffer cb) { state.emit(*fn, cb); };
             }
-            graphics_.pipeline = build(0);
-            if (!graphics_.pipeline) return E_FAIL;
+            // LEONIDA_DEFER_GRAPHICS=1: nothing is built here; the first draw builds its configuration through
+            // variant() (vulkan_replay.h, GraphicsPipeline::deferred).
+            static const bool defer = [] {
+                const char* v = std::getenv("LEONIDA_DEFER_GRAPHICS");
+                return v && v[0] == '1';
+            }();
+            graphics_.deferred = defer;
+            if (!defer) {
+                graphics_.pipeline = build(0);
+                if (!graphics_.pipeline) return E_FAIL;
+            }
             graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
         }
 
