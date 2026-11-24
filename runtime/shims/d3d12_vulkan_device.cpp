@@ -7736,6 +7736,9 @@ public:
                 const D3D12_RESOURCE_DESC& have = t->resource->desc();
                 if (have.Width != desc.Width || have.Height != desc.Height || have.Dimension != desc.Dimension)
                     continue;
+                // A view is where the title's new bytes are taken: it makes a texture's view once its data has
+                // arrived (five-star-recomp, docs/gpu-resources.md, "Refresh points").
+                t->dirty = true;
                 t->resource->AddRef();
                 return t->resource;
             }
