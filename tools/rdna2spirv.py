@@ -114,6 +114,17 @@ HEAP_BASE_ENTRY = ["%heap_base_lo = OpLoad %uint %ud_base_lo_p",
                    "%heap_base_hi_sh = OpShiftLeftLogical %ulong %heap_base_hi64 %c64_32",
                    "%heap_base = OpBitwiseOr %ulong %heap_base_hi_sh %heap_base_lo64"]
 
+# The title-memory page table (Gen.host_addr) at fixed offsets of the GPU address arena, which the runtime reserves
+# (runtime/shims/d3d12_vulkan_device.cpp, kPageTable*: keep the two in step). Arena layout from offset 0: the zero
+# page (64 KiB), a writable scratch page for VAs no entry maps (128 KiB), the directory (65536 x u32: a 1-based
+# chunk number per 4 GiB of the 48-bit space), then PAGE_TABLE_CHUNKS chunks of 65536 x u64 page device addresses.
+PAGE_TABLE = True                      # --no-page-table: every VA is heap_base + VA, as before
+PAGE_TABLE_SCRATCH = 0x10000
+PAGE_TABLE_DIR = 0x30000
+PAGE_TABLE_DIR_BYTES = 0x40000
+PAGE_TABLE_CHUNK_BYTES = 0x80000
+PAGE_TABLE_CHUNKS = 64
+
 
 def pc_tail_chain(name, member, c):
     """`name` = pointer to push-constant tail member `member`, numbered as in %UserData (1-2 heap base, 3-4 code base,
@@ -1553,13 +1564,66 @@ class Gen:
         return self.tof(self.modify(self.tou(f), a))
 
     def host_addr(self, xbox_va):
-        """Xbox GPU virtual address (ulong id) -> host buffer device address: heap base (push constant
-        dwords 32..33) + VA. The runtime maps the console's GPU address window into one host buffer. The base is
-        %heap_base, built once in the entry block (HEAP_BASE_ENTRY): it was six instructions at every access."""
-        r = self.tmp()
-        self.emit(f"{r} = OpIAdd %ulong %heap_base {xbox_va}")
+        """Xbox GPU virtual address (ulong id) -> host buffer device address. A VA below 4 GiB is an offset in the
+        runtime's GPU address arena: heap base (push constant dwords 32..33) + VA. The base is %heap_base, built
+        once in the entry block (HEAP_BASE_ENTRY): it was six instructions at every access.
+
+        A VA at or above 4 GiB is the title's own memory (its CPU address: the console has one address space), which
+        the runtime imports and lists in a page table at the start of the arena (PAGE_TABLE_*; the two-level layout
+        of GTA6-BootTest's gpumem.h, with device addresses as entries): dir[(va >> 32) & 0xffff] is a 1-based chunk
+        number, chunk[(va >> 16) & 0xffff] the device address of that 64 KiB page. An address with no entry reads
+        and writes a scratch page instead of faulting (a wild pointer hangs an NVIDIA queue for good).
+        Branch-free: both table loads always run (the table is small and stays cached)."""
         self.uses_heap = True
         self.cu(1), self.cu(2)        # member indices of the push-constant block, declared before assembly
+        direct = self.tmp()
+        self.emit(f"{direct} = OpIAdd %ulong %heap_base {xbox_va}")
+        if not PAGE_TABLE:
+            return direct
+        t = self.tmp
+
+        def load_u32(addr):
+            p, v = t(), t()
+            self.emit(f"{p} = OpConvertUToPtr %_ptr_PSB_uint {addr}")
+            self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
+            return v
+
+        def add(a, b):
+            r = t()
+            self.emit(f"{r} = OpIAdd %ulong {a} {b}")
+            return r
+
+        hi, hi32, arena, idx, idx64, doff = (t() for _ in range(6))
+        self.emit(f"{hi} = OpShiftRightLogical %ulong {xbox_va} %c64_32")
+        self.emit(f"{hi32} = OpUConvert %uint {hi}")
+        self.emit(f"{arena} = OpIEqual %bool {hi32} {self.cu(0)}")
+        self.emit(f"{idx} = OpBitwiseAnd %uint {hi32} {self.cu(0xFFFF)}")
+        self.emit(f"{idx64} = OpUConvert %ulong {idx}")
+        self.emit(f"{doff} = OpShiftLeftLogical %ulong {idx64} {self.cl(2)}")
+        slot = load_u32(add(add("%heap_base", self.cl(PAGE_TABLE_DIR)), doff))
+        has, slot1, chunk, chunk64, coff, page, page_idx, poff = (t() for _ in range(8))
+        self.emit(f"{has} = OpINotEqual %bool {slot} {self.cu(0)}")
+        self.emit(f"{slot1} = OpISub %uint {slot} {self.cu(1)}")
+        self.emit(f"{chunk} = OpSelect %uint {has} {slot1} {self.cu(0)}")
+        self.emit(f"{chunk64} = OpUConvert %ulong {chunk}")
+        self.emit(f"{coff} = OpIMul %ulong {chunk64} {self.cl(PAGE_TABLE_CHUNK_BYTES)}")
+        self.emit(f"{page} = OpShiftRightLogical %ulong {xbox_va} {self.cl(16)}")
+        self.emit(f"{page_idx} = OpBitwiseAnd %ulong {page} {self.cl(0xFFFF)}")
+        self.emit(f"{poff} = OpShiftLeftLogical %ulong {page_idx} {self.cl(3)}")
+        eaddr = add(add(add("%heap_base", self.cl(PAGE_TABLE_DIR + PAGE_TABLE_DIR_BYTES)), coff), poff)
+        lo, hi_word = load_u32(eaddr), load_u32(add(eaddr, self.cl(4)))
+        lo64, hi64, hish, entry, mapped_ok, ok, low, mapped, r = (t() for _ in range(9))
+        self.emit(f"{lo64} = OpUConvert %ulong {lo}")
+        self.emit(f"{hi64} = OpUConvert %ulong {hi_word}")
+        self.emit(f"{hish} = OpShiftLeftLogical %ulong {hi64} %c64_32")
+        self.emit(f"{entry} = OpBitwiseOr %ulong {hish} {lo64}")
+        self.emit(f"{mapped_ok} = OpINotEqual %bool {entry} {self.cl(0)}")
+        self.emit(f"{ok} = OpLogicalAnd %bool {has} {mapped_ok}")
+        self.emit(f"{low} = OpBitwiseAnd %ulong {xbox_va} {self.cl(0xFFFF)}")
+        paged = add(entry, low)
+        null = add(add("%heap_base", self.cl(PAGE_TABLE_SCRATCH)), low)
+        self.emit(f"{mapped} = OpSelect %ulong {ok} {paged} {null}")
+        self.emit(f"{r} = OpSelect %ulong {arena} {direct} {mapped}")
         return r
 
     def tof(self, u):

@@ -90,6 +90,15 @@ constexpr std::uint32_t kConstantBufferRow = 16;  // a CBV's V# STRIDE: the row 
 // The first 64 KiB of the GPU address arena are never handed out: VA 0 stays invalid, and the page is kept zero
 // for unbound vertex and index buffers to read (D3D12 reads zeros there).
 constexpr VkDeviceSize kArenaReserved = 64 * 1024;
+// The title-memory page table after it (tools/rdna2spirv.py PAGE_TABLE_*, Gen.host_addr: keep the two in step): a
+// VA at or above 4 GiB is the title's own memory, found through dir[(va >> 32) & 0xffff] (a 1-based chunk number)
+// and chunk[(va >> 16) & 0xffff] (the device address of that 64 KiB page, imported). Unmapped VAs use the scratch.
+constexpr VkDeviceSize kPageTableScratch = 0x10000;     // 128 KiB, written by stray accesses
+constexpr VkDeviceSize kPageTableDir = 0x30000;         // 65536 x u32
+constexpr VkDeviceSize kPageTableDirBytes = 0x40000;
+constexpr VkDeviceSize kPageTableChunkBytes = 0x80000;  // 65536 x u64
+constexpr std::uint32_t kPageTableChunks = 64;          // 256 GiB of distinct title memory windows
+constexpr VkDeviceSize kArenaPrefix = kPageTableDir + kPageTableDirBytes + kPageTableChunks * kPageTableChunkBytes;
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 
 // The shader model and root signature version this layer can honour. Nothing in the runtime compiles DXIL: the
@@ -907,6 +916,136 @@ struct DeviceState {
         VkDeviceSize use_in_use[4] = {}, use_peak[4] = {};
         std::uint64_t allocations = 0, failures = 0;
     } arena;
+
+    // The title-memory page table (kPageTable*, at the start of the arena): the title's own memory, addressed by
+    // its CPU address (the console has one address space), imported with VK_EXT_external_memory_host in runs of
+    // 64 KiB pages that the table owns for the process, each page's device address in its chunk entry. Translated
+    // shaders look every VA at or above 4 GiB up there (tools/rdna2spirv.py Gen.host_addr): the title's own V#s,
+    // fetch-shader tables and root pointers into its memory then reach it, where heap_base + VA was a wild pointer
+    // that hung the GPU queue (retail boot, 2026-11-24). The layout follows GTA6-BootTest's gpumem.h.
+    struct TitlePages {
+        std::mutex mutex;
+        std::uint32_t chunks = 0;                  // chunks handed out (1-based numbers in the directory)
+        std::unordered_set<std::uint64_t> mapped;  // 64 KiB page VAs with an entry
+        std::vector<std::pair<VkBuffer, VkDeviceMemory>> imports;
+        std::uint64_t pages = 0, refused = 0;
+    } title_pages;
+
+    // Gives every committed 64 KiB page of [address, address + bytes) a page-table entry, importing the pages that
+    // have none in runs of at most 64 MiB. A page that is not committed (or write-combined) stays unmapped: the
+    // shader reads the scratch page there instead of faulting. False when nothing could be mapped.
+    bool map_title_memory(std::uintptr_t address, std::uint64_t bytes) {
+        constexpr std::uint64_t page = 0x10000, max_run = 64ull << 20;
+        if (!arena.mapped || !get_host_pointer_properties || !bytes || address >> 48) return false;
+        auto& vk = context->vk;
+        const VkDevice device = info.device;
+        std::lock_guard lock(title_pages.mutex);
+        const std::uint64_t first = address & ~(page - 1), end = (address + bytes + page - 1) & ~(page - 1);
+        bool any = false;
+        for (std::uint64_t p = first; p < end;) {
+            if (title_pages.mapped.count(p)) {
+                p += page;
+                any = true;
+                continue;
+            }
+            // The run of unmapped, committed pages from p.
+            std::uint64_t q = p;
+            while (q < end && q - p < max_run && !title_pages.mapped.count(q)) {
+                MEMORY_BASIC_INFORMATION region{};
+                if (!VirtualQuery(reinterpret_cast<const void*>(q), &region, sizeof(region)) ||
+                    region.State != MEM_COMMIT || (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_NOACCESS)))
+                    break;
+                q += page;
+            }
+            if (q == p) {  // not committed: left unmapped
+                ++title_pages.refused;
+                p += page;
+                continue;
+            }
+            const VkDeviceSize run = q - p;
+            VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+            external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+            create.size = run;
+            create.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+            share(create);
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory imported = VK_NULL_HANDLE;
+            VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+            VkMemoryRequirements requirements{};
+            bool ok = vk.vkCreateBuffer(device, &create, nullptr, &buffer) == VK_SUCCESS;
+            if (ok) {
+                vk.vkGetBufferMemoryRequirements(device, buffer, &requirements);
+                ok = get_host_pointer_properties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                                 reinterpret_cast<void*>(p), &host) == VK_SUCCESS;
+            }
+            const std::uint32_t types = ok ? host.memoryTypeBits & requirements.memoryTypeBits : 0;
+            if (types) {
+                VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+                import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+                import.pHostPointer = reinterpret_cast<void*>(p);
+                VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
+                flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+                for (std::uint32_t i = 0; i < memory.memoryTypeCount && !imported; ++i) {
+                    if (!(types & (1u << i))) continue;
+                    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+                    allocate.allocationSize = run;
+                    allocate.memoryTypeIndex = i;
+                    if (vk.vkAllocateMemory(device, &allocate, nullptr, &imported) != VK_SUCCESS)
+                        imported = VK_NULL_HANDLE;
+                }
+            }
+            VkDeviceAddress device_address = 0;
+            if (imported && vk.vkBindBufferMemory(device, buffer, imported, 0) == VK_SUCCESS) {
+                VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+                bda.buffer = buffer;
+                device_address = vk.vkGetBufferDeviceAddress(device, &bda);
+            }
+            if (!device_address) {
+                if (buffer) vk.vkDestroyBuffer(device, buffer, nullptr);
+                if (imported) vk.vkFreeMemory(device, imported, nullptr);
+                if (!title_pages.refused)
+                    std::fprintf(stderr, "[rt] d3d12: title memory %#llx + %#llx could not be imported for the page "
+                                         "table (memory types 0x%x)\n",
+                                 static_cast<unsigned long long>(p), static_cast<unsigned long long>(run), types);
+                title_pages.refused += run / page;
+                p = q;
+                continue;
+            }
+            title_pages.imports.emplace_back(buffer, imported);
+            auto* dir = reinterpret_cast<volatile std::uint32_t*>(arena.mapped + kPageTableDir);
+            for (std::uint64_t v = p; v < q; v += page) {
+                const std::uint32_t d = static_cast<std::uint32_t>((v >> 32) & 0xFFFF);
+                std::uint32_t slot = dir[d];
+                if (!slot) {
+                    if (title_pages.chunks == kPageTableChunks) {
+                        std::fprintf(stderr, "[rt] d3d12: title page table full (%u chunks); %#llx stays unmapped\n",
+                                     kPageTableChunks, static_cast<unsigned long long>(v));
+                        break;
+                    }
+                    slot = ++title_pages.chunks;
+                }
+                auto* entries = reinterpret_cast<volatile std::uint64_t*>(arena.mapped + kPageTableDir +
+                                                                           kPageTableDirBytes +
+                                                                           (slot - 1) * kPageTableChunkBytes);
+                entries[(v >> 16) & 0xFFFF] = device_address + (v - p);
+                dir[d] = slot;  // after the entry: a shader that sees the chunk sees its page
+                title_pages.mapped.insert(v);
+                ++title_pages.pages;
+            }
+            const std::uint64_t n = title_pages.imports.size();
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: title page table: %llu imports, %llu pages (%llu MiB) mapped, %u "
+                                     "chunks, %llu pages refused\n",
+                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(title_pages.pages),
+                             static_cast<unsigned long long>(title_pages.pages / 16), title_pages.chunks,
+                             static_cast<unsigned long long>(title_pages.refused));
+            any = true;
+            p = q;
+        }
+        return any;
+    }
 
     std::uint32_t sparse_buffer_memory_types = 0;
     bool sparse_image_tiles = false;
@@ -3097,14 +3236,15 @@ public:
     // with VK_EXT_external_memory_host and the buffer bound to it at offset 0, so the CPU's writes there are the GPU's
     // reads with no copy. Its console VA is `address` itself, the VA the title chose, so vertex, index and immediate
     // writes the title names by that VA find this buffer (VulkanContext::buffer_at). A shader that adds heap_base to
-    // that VA does not reach it: the title's own V#s into these pages need the single address space of
-    // docs/d3d12_vulkan.md section 3.3, which this does not decide. The pages stay the caller's: nothing is zeroed.
+    // that VA reaches it through the title-memory page table (DeviceState::map_title_memory, which this fills for the
+    // buffer's pages): the title's own V#s into these pages work too. The pages stay the caller's: nothing is zeroed.
     HRESULT create_host_buffer(void* address) {
         auto& vk = device_.context->vk;
         const VkDeviceSize alignment = device_.info.host_pointer_alignment;
         if (!device_.get_host_pointer_properties || !alignment) return E_NOTIMPL;
         const auto start = reinterpret_cast<std::uintptr_t>(address);
         if (!address || !desc_.Width || desc_.Width > UINT64_MAX - 2 * alignment) return E_INVALIDARG;
+        device_.map_title_memory(start, desc_.Width);
         // The import starts at the page that holds `address`, and the buffer is bound at the offset inside it: the
         // title places small buffers inside a page too (a 16-byte UAV at a 64-byte-aligned address on an RTX 5090,
         // found in review), which an import of `address` itself would refuse.
@@ -3231,7 +3371,6 @@ public:
         binding.host = static_cast<const std::uint8_t*>(address);
         binding.host_readable = true;
         binding.va = va_;
-        binding.device_address = buffer_va_;  // replay passes root arguments into it as buffer_va_ - heap_base
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -7269,7 +7408,7 @@ public:
         state_.share(info);
         VkMemoryRequirements requirements{};
         const auto create_buffer = [&] {
-            if (info.size <= kArenaReserved ||
+            if (info.size <= kArenaPrefix ||
                 vk.vkCreateBuffer(state_.info.device, &info, nullptr, &arena.buffer) != VK_SUCCESS) {
                 arena.buffer = VK_NULL_HANDLE;
                 return false;
@@ -7316,8 +7455,10 @@ public:
         address.buffer = arena.buffer;
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
-        arena.free[kArenaReserved] = arena.size - kArenaReserved;
-        arena.peak_end = kArenaReserved;
+        // The page table (kPageTable*) follows the zero page: zero, so every title VA starts unmapped.
+        std::memset(arena.mapped + kArenaReserved, 0, kArenaPrefix - kArenaReserved);
+        arena.free[kArenaPrefix] = arena.size - kArenaPrefix;
+        arena.peak_end = kArenaPrefix;
         char log[4] = {};
         length = 0;
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
@@ -8451,7 +8592,7 @@ public:
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
         leonida::gfx10::Buffer buffer{};
-        buffer.address = state_.context->shader_address(desc->BufferLocation);
+        buffer.address = desc->BufferLocation;
         buffer.stride = kConstantBufferRow;
         buffer.num_records = desc->SizeInBytes;
         buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
@@ -8498,7 +8639,7 @@ public:
                 const UINT64 byte_off = desc->Buffer.FirstElement * 4;
                 const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
                 if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
-                buffer.address = state_.context->shader_address(base_va + byte_off);
+                buffer.address = base_va + byte_off;
                 buffer.stride = 0;
                 buffer.num_records = std::uint32_t(byte_size);
                 buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
@@ -8510,7 +8651,7 @@ public:
                 const UINT64 byte_off = desc->Buffer.FirstElement * stride;
                 const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
                 if (byte_size > width - byte_off) return;
-                buffer.address = state_.context->shader_address(base_va + byte_off);
+                buffer.address = base_va + byte_off;
                 buffer.stride = std::uint32_t(stride);
                 buffer.num_records = desc->Buffer.NumElements;
                 buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
@@ -8533,7 +8674,7 @@ public:
                 const UINT64 byte_off = desc->Buffer.FirstElement * stride;
                 const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
                 if (byte_size > width - byte_off) return;
-                buffer.address = state_.context->shader_address(base_va + byte_off);
+                buffer.address = base_va + byte_off;
                 buffer.stride = std::uint32_t(stride);
                 buffer.num_records = desc->Buffer.NumElements;
                 buffer.format = code;
@@ -8697,7 +8838,7 @@ public:
         const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
         if (!va || (counter && !counter_va)) return;
         g::Buffer buffer{};
-        buffer.address = state_.context->shader_address(va + view.FirstElement * unit);
+        buffer.address = va + view.FirstElement * unit;
         buffer.stride = structured || typed ? std::uint32_t(unit) : 0;
         buffer.num_records = std::uint32_t(structured || typed ? view.NumElements : UINT64(view.NumElements) * 4);
         buffer.format = format_code;
@@ -8708,7 +8849,7 @@ public:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         if (counter) {
             g::Buffer counter_buffer{};
-            counter_buffer.address = state_.context->shader_address(counter_va + view.CounterOffsetInBytes);
+            counter_buffer.address = counter_va + view.CounterOffsetInBytes;
             counter_buffer.num_records = 4;
             counter_buffer.oob_select = g::OobSelect::raw;
             const g::BufferWords counter_words = g::encode(counter_buffer);

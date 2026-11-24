@@ -1120,15 +1120,6 @@ public:
             size = std::min<std::uint64_t>(size, b->size - (va - b->va));
             return true;
         };
-        replay_.rebase_outside_arena = [this](std::uint64_t va, std::uint64_t& rebased) {
-            BufferVaIndex<ResourceId>::Hit hit{};
-            std::uint64_t size = 1;
-            if (!buffer_vas_.find(va, hit, size)) return false;
-            const ResourceBinding* b = resolve(hit.id);
-            if (!b || !b->device_address || va < b->va || va - b->va >= b->size) return false;
-            rebased = b->device_address + (va - b->va) - replay_.heap_base;
-            return true;
-        };
         // Host reads of small CPU-written inputs. Unlike buffer_at, the whole range must be in one CPU-writable
         // mapping: a partial read would see bytes the application has not written through the D3D12 API. The
         // binding's host pointer is null on DEFAULT and READBACK heaps, whose mapped bytes the GPU can write.
@@ -1446,14 +1437,6 @@ public:
     std::uint64_t heap_base() {
         std::shared_lock lock(resource_mutex_);
         return replay_.heap_base;
-    }
-    // The address a shader must be given for `va` so that heap_base + it is the memory: `va` itself for the arena,
-    // device_address - heap_base for a buffer outside it (a title-placed host import). For V# bases the layer writes.
-    std::uint64_t shader_address(std::uint64_t va) {
-        if (va >> 32 == 0) return va;  // arena VAs are offsets below 4 GiB
-        std::shared_lock lock(resource_mutex_);
-        std::uint64_t rebased = 0;
-        return replay_.rebase_outside_arena && replay_.rebase_outside_arena(va, rebased) ? rebased : va;
     }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
