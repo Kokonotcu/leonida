@@ -96,8 +96,20 @@ Windows drivers, which have no `VK_EXT_shader_object`.
 - Every part and every PSO uses one layout shape: a push-constant range over every graphics stage the device has
   (as the shader objects', step 2) and set 0 whenever the device has it, because the two shader parts of a link
   must have identically defined layouts (VUID-VkGraphicsPipelineCreateInfo-pLibraries-06613).
-- The PSO links its four parts without `LINK_TIME_OPTIMIZATION` (`LinkCreateInfo`). No optimised link is queued
-  in the background yet: the fast-linked pipeline is the one that draws.
+- The PSO links its four parts without `LINK_TIME_OPTIMIZATION` first (`LinkCreateInfo`, `Link::fast`): that is
+  cheap, but a fast-linked pipeline can cost GPU time. So its first draw (`prepare_draw`, `GraphicsPipeline::Upgrade`)
+  queues the same parts' optimised link (`Link::optimized`; the parts are made with
+  `RETAIN_LINK_TIME_OPTIMIZATION_INFO`) on the device's one background worker, below normal priority. The link goes
+  through the pipeline cache, and `VulkanContext::replace_graphics_pipeline` swaps it in under `resource_mutex_` and
+  `tracker_mutex_`, which together cover every list from choosing its pipeline to its submit: each list either
+  recorded the fast pipeline and is submitted (the fast one goes to the deferred deletion queue, which waits for that
+  work) or prepares after the swap and draws the optimised one. A PSO released while its link runs waits for it; one
+  whose link has not started cancels it. The next run's PSO asks the cache for its optimised link first
+  (`Link::cached`: `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`, with `pipelineCreationCacheControl`)
+  and takes it at creation, with no fast link and no background work; only when the cache does not have it
+  (`VK_PIPELINE_COMPILE_REQUIRED`) does it fast-link. Variants for unbound attachment slots stay fast-linked.
+  `LEONIDA_GPL_CACHED_LINK=0` skips that question (always fast-link, then optimise in the background); the test uses
+  it because NVIDIA's own disk cache answers it too once the same shaders have run on the machine before.
 - `gta6rt --prebuild-shaders` on a device without shader objects (or with `LEONIDA_SHADER_OBJECTS=0`) makes every
   translated vertex shader's pre-rasterization part (depth clipped and depth clamped) and every pixel shader's
   fragment part through the device's pipeline cache and saves the cache (`prebuild_pipeline_libraries`). What it
@@ -111,7 +123,9 @@ Checked on the RTX 3080 Laptop (NVIDIA 617.42, `graphicsPipelineLibraryFastLinki
 PSOs that differ in exactly the state the libraries make dynamic (depth test and write, depth bias, cull mode) and in
 blending draw the same pixels linked as whole (`LEONIDA_GPL=0`); after `--prebuild-shaders` on an empty cache
 directory, a new device's PSOs make 2 of 2 shared shader parts from the pipeline cache (0 compiled) and link 3 PSOs;
-0 validation errors with `LEONIDA_VK_VALIDATION=1`. Not measured on AMD or Intel hardware here.
+their first draws get 3 optimised links made in the background and swapped in, which draw the same pixels; the next
+device's 3 PSOs take their optimised links from the pipeline cache at creation (0 fast links, 0 background links) and
+draw the same pixels; 0 validation errors with `LEONIDA_VK_VALIDATION=1`. Not measured on AMD or Intel hardware here.
 
 ## 4. The game's own pipeline list
 

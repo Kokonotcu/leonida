@@ -38,6 +38,10 @@ public:
     bool subgroup_size_control = false;
     bool compute_full_subgroups = false;
     bool extended_dynamic_state = false;  // core on 1.3; on 1.2 both VK_EXT_extended_dynamic_state(2) extensions
+    // pipelineCreationCacheControl (1.3 core): a pipeline creation may ask to fail rather than compile
+    // (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT), which the optimised pipeline-library link uses to
+    // take a cached pipeline without compiling one (docs/aot_pipelines.md step 3). Only on a 1.3 device.
+    bool pipeline_creation_cache_control = false;
 
     bool usable() const { return dynamic_rendering && synchronization2; }
 
@@ -47,7 +51,7 @@ public:
         const bool standard_variant = VK_API_VERSION_VARIANT(api_version) == 0;
         core = standard_variant && api_version >= VK_API_VERSION_1_3;
         dynamic_rendering = synchronization2 = subgroup_size_control = compute_full_subgroups = false;
-        extended_dynamic_state = false;
+        extended_dynamic_state = pipeline_creation_cache_control = false;
         if (!standard_variant || !features2) return;
         if (core) {
             VkPhysicalDeviceVulkan13Features f13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
@@ -58,6 +62,7 @@ public:
             subgroup_size_control = f13.subgroupSizeControl == VK_TRUE;
             compute_full_subgroups = f13.computeFullSubgroups == VK_TRUE;
             extended_dynamic_state = true;  // core in 1.3, no feature bit
+            pipeline_creation_cache_control = f13.pipelineCreationCacheControl == VK_TRUE;
             return;
         }
         if (api_version < VK_API_VERSION_1_2 || !enumerate_extensions) return;
@@ -116,6 +121,7 @@ public:
         subgroup_size_control = from.subgroup_size_control;
         compute_full_subgroups = from.compute_full_subgroups;
         extended_dynamic_state = from.extended_dynamic_state;
+        pipeline_creation_cache_control = from.pipeline_creation_cache_control;
     }
 
     // The structs that enable both features, ahead of `chain`; returns their head for VkPhysicalDeviceVulkan12Features'
@@ -127,6 +133,7 @@ public:
             enable13_.synchronization2 = synchronization2 ? VK_TRUE : VK_FALSE;
             enable13_.subgroupSizeControl = subgroup_size_control ? VK_TRUE : VK_FALSE;
             enable13_.computeFullSubgroups = compute_full_subgroups ? VK_TRUE : VK_FALSE;
+            enable13_.pipelineCreationCacheControl = pipeline_creation_cache_control ? VK_TRUE : VK_FALSE;
             return &enable13_;
         }
         if (subgroup_size_control) {

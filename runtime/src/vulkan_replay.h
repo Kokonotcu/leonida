@@ -860,6 +860,16 @@ struct GraphicsPipeline {
     // A pipeline linked from pipeline libraries (docs/aot_pipelines.md step 3, src/pso_library.h): sets, after the
     // pipeline is bound, the state the libraries leave dynamic that a whole pipeline bakes in. Null otherwise.
     std::function<void(VkCommandBuffer)> set_state;
+    // A fast-linked `pipeline` that an optimised link will replace: the first draw that prepares it calls `request`
+    // (which queues the link on the device's background worker), and once `pipeline` in here is set (by the backend,
+    // under the locks that keep it from changing between a list's prepare and its submit) draws use it instead. Null
+    // when `pipeline` is already the optimised one, or not linked from libraries.
+    struct Upgrade {
+        std::atomic<VkPipeline> pipeline{VK_NULL_HANDLE};
+        std::atomic<bool> requested{false};
+        std::function<void()> request;
+    };
+    std::shared_ptr<Upgrade> upgrade;
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -2406,6 +2416,13 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     if (unbound && !pipeline->bind_shaders) {
         p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
         if (!p.pipeline) return ReplayResult::unsupported;
+    } else if (pipeline->upgrade) {
+        // A fast-linked pipeline: its optimised link once ready, else asked for at this first draw.
+        GraphicsPipeline::Upgrade& upgrade = *pipeline->upgrade;
+        if (const VkPipeline optimized = upgrade.pipeline.load(std::memory_order_acquire))
+            p.pipeline = optimized;
+        else if (!upgrade.requested.exchange(true, std::memory_order_acq_rel) && upgrade.request)
+            upgrade.request();
     }
 
     // An unbound vertex-buffer slot reads zeros, as in D3D12: the zero page with stride 0. Per-instance slots with
