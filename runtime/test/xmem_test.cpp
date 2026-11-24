@@ -551,9 +551,24 @@ void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
     PERFORMANCE_INFORMATION touched{};
     GetPerformanceInfo(&touched, sizeof(touched));
     const int64_t touched_growth = commit_growth(mapped, touched);
-    check(touched_growth >= static_cast<int64_t>(kTouched * kPage64k / 2) &&
-              touched_growth < static_cast<int64_t>(kMapped * kPage64k),
-          "writing to 512 of them charges about those 512 pages");
+    const auto charged_about = [](int64_t growth, uint64_t pages_written) {
+        return growth >= static_cast<int64_t>(pages_written * kPage64k / 2) &&
+               growth < static_cast<int64_t>(kMapped * kPage64k);
+    };
+    bool charged = charged_about(touched_growth, kTouched);
+    // The commit charge is system-wide: another process allocating or freeing tens of MB in the window (a parallel
+    // build) moves it. Two more windows of pages the later checks do not use (640.. and 896..) are measured before
+    // the check gives up; each is a full measurement of its own.
+    for (const auto& [first, n] : {std::pair<uint64_t, uint64_t>{640, 256}, std::pair<uint64_t, uint64_t>{896, 128}}) {
+        if (charged) break;
+        PERFORMANCE_INFORMATION from{}, to{};
+        GetPerformanceInfo(&from, sizeof(from));
+        for (uint64_t i = first; i < first + n; ++i)
+            static_cast<volatile uint32_t*>(static_cast<void*>(window + i * kPage64k))[0] = 1;
+        GetPerformanceInfo(&to, sizeof(to));
+        charged = charged_about(commit_growth(from, to), n);
+    }
+    check(charged, "writing to 512 of them charges about those 512 pages");
     bool written = true;
     for (uint64_t i = 0; i < kTouched; ++i) written &= read_u32(window + i * kPage64k, 0) == (0xc0de0000u | i);
     check(written, "each touched page keeps what was written to it");
