@@ -282,6 +282,19 @@ void run_checks(const std::filesystem::path& root) {
         if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
     }
 
+    // GetDiskFreeSpaceEx on a console path answers for the overlay's volume (review M9); the host would refuse it.
+    {
+        using FreeSpaceFn = BOOL(WINAPI*)(LPCWSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER);
+        const auto free_space = resolve<FreeSpaceFn>("api-ms-win-core-file-l1-1-0.dll", "GetDiskFreeSpaceExW");
+        ULARGE_INTEGER avail{}, total{}, free_total{}, host_total{};
+        const BOOL game_ok = free_space && free_space(L"GAME:\\", &avail, &total, &free_total);
+        const BOOL host_ok = ::GetDiskFreeSpaceExW(root.c_str(), nullptr, &host_total, nullptr);
+        check(game_ok && total.QuadPart > 0 && host_ok && total.QuadPart == host_total.QuadPart,
+              "GetDiskFreeSpaceExW(GAME:\\) answers for the overlay's volume");
+        const BOOL scratch_ok = free_space && free_space(L"T:\\", &avail, nullptr, nullptr);
+        check(scratch_ok && avail.QuadPart > 0, "and T:\\ too");
+    }
+
     // gta6rt's default overlay is <game>\overlay, inside the package: GAME: neither lists nor reaches it (review B4).
     {
         const std::filesystem::path inner = package / "overlay";

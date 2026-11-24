@@ -1444,6 +1444,36 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
     return set_file_attributes_w(wide.c_str(), attributes);
 }
 
+// GetDiskFreeSpaceEx (review M9): the title checks free space before it writes. A console path (GAME:, G:, T:) has no
+// host volume of its own; every write to it lands in the overlay, so the answer is the overlay's volume. A null name
+// and host paths are the host's answer.
+BOOL WINAPI get_disk_free_space_ex_w(LPCWSTR name, PULARGE_INTEGER available, PULARGE_INTEGER total,
+                                     PULARGE_INTEGER free_total) {
+    if (!name) return ::GetDiskFreeSpaceExW(name, available, total, free_total);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts);
+    if (parsed == Parsed::Host) return ::GetDiskFreeSpaceExW(name, available, total, free_total);
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    const Roots r = roots();
+    const std::filesystem::path& volume_of = r.overlay.empty() ? r.game : r.overlay;
+    if (volume_of.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
+    // The overlay folder may not exist before the first write; its nearest existing parent is on the same volume.
+    std::filesystem::path probe = volume_of;
+    std::error_code ec;
+    while (!probe.empty() && !std::filesystem::exists(probe, ec) && probe.has_parent_path() && probe != probe.parent_path())
+        probe = probe.parent_path();
+    std::wstring dir = probe.native();
+    if (dir.empty() || (dir.back() != L'\\' && dir.back() != L'/')) dir += L'\\';
+    return ::GetDiskFreeSpaceExW(dir.c_str(), available, total, free_total);
+}
+
+BOOL WINAPI get_disk_free_space_ex_a(LPCSTR name, PULARGE_INTEGER available, PULARGE_INTEGER total,
+                                     PULARGE_INTEGER free_total) {
+    if (!name) return ::GetDiskFreeSpaceExA(name, available, total, free_total);
+    const std::wstring wide = widen_ansi(name);
+    return get_disk_free_space_ex_w(wide.c_str(), available, total, free_total);
+}
+
 }  // namespace rt::fs
 
 namespace {
@@ -1485,7 +1515,9 @@ using namespace rt::fs;
         {dll, "CopyFileExW", reinterpret_cast<void*>(&copy_file_ex_w)},                                  \
         {dll, "CopyFile2", reinterpret_cast<void*>(&copy_file2)},                                        \
         {dll, "SetFileAttributesA", reinterpret_cast<void*>(&set_file_attributes_a)},                    \
-        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)}
+        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)},                    \
+        {dll, "GetDiskFreeSpaceExA", reinterpret_cast<void*>(&get_disk_free_space_ex_a)},                \
+        {dll, "GetDiskFreeSpaceExW", reinterpret_cast<void*>(&get_disk_free_space_ex_w)}
 }  // namespace
 
 SHIM_TABLE(file_system,
