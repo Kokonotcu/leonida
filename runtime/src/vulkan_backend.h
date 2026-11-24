@@ -102,7 +102,8 @@ struct VulkanDeviceFunctions {
     X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateShaderModule) X(vkDestroyShaderModule)      \
     X(vkCreateComputePipelines) X(vkDestroyPipeline) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)            \
     X(vkCmdPushConstants) X(vkCmdDispatch)                                                                     \
-    X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount) \
+    X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdSetViewport) X(vkCmdSetScissor)                  \
+    X(vkCmdSetViewportWithCount) X(vkCmdSetScissorWithCount)                                                   \
     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
@@ -136,7 +137,7 @@ struct VulkanDeviceFunctions {
                vkCmdUpdateBuffer && vkCmdBindPipeline && vkCmdPushConstants && vkCmdDispatch &&
                vkCreateShaderModule && vkDestroyShaderModule && vkCreatePipelineLayout &&
                vkDestroyPipelineLayout && vkCreateComputePipelines && vkDestroyPipeline &&
-               vkGetBufferDeviceAddress && vkCmdBindIndexBuffer &&
+               vkGetBufferDeviceAddress && vkCmdBindIndexBuffer && vkCmdSetViewport && vkCmdSetScissor &&
                vkCmdSetStencilReference && vkCmdSetBlendConstants && vkCmdDraw && vkCmdDrawIndexed &&
                vkCreateGraphicsPipelines;
     }
@@ -1102,8 +1103,10 @@ public:
         };
         replay_.bind_vertex_buffers2 = vk.vkCmdBindVertexBuffers2;
         replay_.bind_index_buffer = vk.vkCmdBindIndexBuffer;
-        replay_.set_viewport = vk.vkCmdSetViewportWithCount;  // the pipelines' counts are dynamic too
-        replay_.set_scissor = vk.vkCmdSetScissorWithCount;
+        replay_.set_viewport = vk.vkCmdSetViewport;
+        replay_.set_scissor = vk.vkCmdSetScissor;
+        replay_.set_viewport_with_count = vk.vkCmdSetViewportWithCount;
+        replay_.set_scissor_with_count = vk.vkCmdSetScissorWithCount;
         replay_.set_primitive_topology = vk.vkCmdSetPrimitiveTopology;
         replay_.set_primitive_restart_enable = vk.vkCmdSetPrimitiveRestartEnable;
         replay_.set_stencil_reference = vk.vkCmdSetStencilReference;
@@ -1416,8 +1419,6 @@ public:
     // The device address of the GPU address arena: console VAs are offsets from it (docs section 3.3).
     // execute() copies replay_ under a shared resource_mutex_, so writers hold it uniquely.
     // The indirect-draw features enabled on the device (VulkanDeviceInfo::multi_draw_indirect / draw_indirect_count).
-    // multiViewport: how many viewports a draw may bind (ReplayFunctions::max_viewports); 1 without the feature.
-    void set_max_viewports(std::uint32_t count) { replay_.max_viewports = std::max(1u, count); }
     void set_indirect_features(bool multi_draw, bool draw_count, std::uint32_t max_draw_count = UINT32_MAX) {
         replay_.multi_draw_indirect = multi_draw;
         replay_.max_draw_indirect_count = max_draw_count;

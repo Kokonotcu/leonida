@@ -252,9 +252,6 @@ struct VulkanDeviceInfo {
     // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).
     bool shader_output_layer = false;
     bool shader_output_viewport_index = false;
-    // multiViewport enabled: the viewports a draw may bind for SV_ViewportArrayIndex (maxViewports, at most D3D12's
-    // 16). 1 without it: a draw after RSSetViewports with more uses the first, as before M4.
-    std::uint32_t max_viewports = 1;
     // The translator's output folder for pipeline creation. An empty value uses LEONIDA_SHADERS or the packaged path.
     std::string shader_dir;
     // VK_EXT_custom_border_color (with customBorderColors and customBorderColorWithoutFormat) is enabled on

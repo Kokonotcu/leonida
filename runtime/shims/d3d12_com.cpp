@@ -478,23 +478,26 @@ public:
         set_index_buffer(view);
     }
 
-    // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw). More than one go to the draws
-    // as a ViewportArray, for SV_ViewportArrayIndex (M4).
+    // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw). More than one (or more than
+    // one scissor) go to the draws as DrawViewports, for SV_ViewportArrayIndex.
     void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
-        viewport_array_stale_ = true;
         if (!count) {
             viewport_ = {};
+            viewports_.fill({});
             viewport_count_ = 0;
+            draw_viewports_stale_ = true;
             return;
         }
         if (!viewports || count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return check(false);
+        viewports_.fill({});
         for (UINT i = 0; i < count; ++i) {
             const D3D12_VIEWPORT& v = viewports[i];
             viewports_[i] = {v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth};
         }
-        viewport_ = viewports_[0];
         viewport_count_ = count;
+        viewport_ = viewports_[0];
+        draw_viewports_stale_ = true;
     }
 
     void STDMETHODCALLTYPE RSSetScissorRects(UINT count, const D3D12_RECT* rects) override {
@@ -503,17 +506,25 @@ public:
         // With no scissor bound, the rasterizer clips every fragment, as on native D3D12.
         if (!count) {
             scissor_ = {};
+            scissors_.fill({});
             scissor_count_ = 0;
-            viewport_array_stale_ = true;
+            draw_viewports_stale_ = true;
             return;
         }
         if (!rects) return;
-        // D3D12 takes at most 16; the debug layer reports more, and the rest are ignored here.
-        count = std::min<UINT>(count, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE);
-        for (UINT i = 0; i < count; ++i) scissors_[i] = {rects[i].left, rects[i].top, rects[i].right, rects[i].bottom};
-        scissor_ = scissors_[0];
+        // WARP still closes a list after RSSetScissorRects(17) (d3d12_close_parity), so the call is not an error:
+        // the rectangles past the 16 a pipeline can have are dropped (as upstream 4ff9a77f1).
+        if (count > D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) {
+            stub("ID3D12GraphicsCommandList::RSSetScissorRects(more than 16 rectangles; the first 16 are used)");
+            count = D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        }
+        scissors_.fill({});
+        for (UINT i = 0; i < count; ++i) {
+            scissors_[i] = {rects[i].left, rects[i].top, rects[i].right, rects[i].bottom};
+        }
         scissor_count_ = count;
-        viewport_array_stale_ = true;
+        scissor_ = scissors_[0];
+        draw_viewports_stale_ = true;
     }
 
     // D3D12 reads render-target and depth descriptors here, so their views are copied now.
@@ -571,14 +582,14 @@ public:
         if (x > 65535 || y > 65535 || z > 65535 || std::uint64_t(x) * y * z > (1u << 22)) return check(false);
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
         note_direct_heap_indexing(graphics_.layout);
-        if (!rasterizes()) return;  // as record_draw: nothing is rasterized
+        if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
         UserData data;
         if (!graphics_user_data(true, data))
             return stub("DispatchMesh(root arguments past s16: the mesh and pixel windows overlap)");
         leonida::Draw draw{graphics_pipeline_, data, draw_views(), depth_, {}, 0, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         draw.mesh = true;
-        draw.viewports = viewport_array();
+        draw.viewports = draw_viewports();
         check(list_.draw(std::move(draw)));
     }
 
@@ -1017,20 +1028,29 @@ public:
             return check(false);
         }
         // The record size is checked for every call: D3D12 rejects a signature whose stride cannot hold a record
-        // even when no command runs. The argument span is what the signature can walk, max_command_count * stride:
-        // the host refuses a range that ends past the buffer (`240` with stride `20` in a `256`-byte buffer), and
-        // it checks the offset itself when max_command_count is 0, where the required bytes are none.
+        // even when no command runs.
         const UINT64 record_size =
             kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
             : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
             : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
             : kind == leonida::IndirectKind::dispatch_mesh ? sizeof(D3D12_DISPATCH_MESH_ARGUMENTS)
             : 0;
+        // A record is the signature's leading root arguments (arguments_offset bytes) and then the draw or dispatch
+        // arguments.
         if (!record_size || stride < arguments_offset + record_size || stride % 4 != 0)
             return check(false);
-        if (argument_buffer_offset > arg_desc.Width ||
-            UINT64(max_command_count) > (arg_desc.Width - argument_buffer_offset) / stride)
-            return check(false);
+        // The argument range is the bytes the commands read: (max_command_count - 1) * stride plus one record, and
+        // nothing when max_command_count is 0. PC D3D12 runtimes do not agree here. Some bound max_command_count *
+        // stride and check the offset at a zero count; others (D3D12Core 10.0.26100.9818, WARP and NVIDIA alike)
+        // accept a last record that fits while its stride runs past the buffer, and any aligned offset at a zero
+        // count. The layer takes the wider rule: it is the one Vulkan's own indirect draws use, no byte outside the
+        // buffer is read, and refusing here drops the whole command list for a call a real runtime runs.
+        // d3d12_execute_indirect_validation_test lists the five cases the runtimes split on.
+        if (max_command_count) {
+            const UINT64 required = UINT64(max_command_count - 1) * stride + arguments_offset + record_size;
+            if (argument_buffer_offset > arg_desc.Width || arg_desc.Width - argument_buffer_offset < required)
+                return check(false);
+        }
         leonida::ExecuteIndirect cmd{};
         // Root arguments and views per record: replayed by device-generated commands where the device has them, and
         // otherwise skipped (the draw or dispatch then runs with the list's state; the replay logs it once).
@@ -1042,7 +1062,7 @@ public:
         const bool mesh = kind == leonida::IndirectKind::dispatch_mesh;
         if (kind != leonida::IndirectKind::dispatch && max_command_count && graphics_pipeline_ && graphics_.layout &&
             (topology_ || mesh)) {
-            if (!rasterizes()) return;
+            if (!any_nonempty_viewport()) return;
             cmd.state = std::make_shared<const leonida::Draw>(
                 mesh ? make_mesh_draw(0, 0, 0) : make_draw(kind == leonida::IndirectKind::draw_indexed, 0, 0, 0, 0, 0));
         }
@@ -1512,15 +1532,14 @@ private:
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
-    leonida::Viewport viewport_{};  // viewports_[0], or empty with none bound
-    leonida::Rect scissor_{};       // scissors_[0], or empty with none bound
-    std::array<leonida::Viewport, leonida::ViewportArray::max> viewports_{};
-    std::array<leonida::Rect, leonida::ViewportArray::max> scissors_{};
+    leonida::Viewport viewport_{};
+    leonida::Rect scissor_{};
+    std::array<leonida::Viewport, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports_{};
     UINT viewport_count_ = 0;
+    std::array<leonida::Rect, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> scissors_{};
     UINT scissor_count_ = 0;
-    // The draws' ViewportArray while more than one viewport is bound, rebuilt when either set changes.
-    std::shared_ptr<const leonida::ViewportArray> viewport_array_;
-    bool viewport_array_stale_ = true;
+    std::shared_ptr<const leonida::DrawViewports> draw_viewports_;
+    bool draw_viewports_stale_ = true;
     std::array<leonida::TargetView, D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT> render_targets_{};
     UINT render_target_count_ = 0;
     // One block shared by every draw that keeps the same targets and buffers, rebuilt when either changes, so a
@@ -1669,9 +1688,12 @@ private:
         index_ = {};
         viewport_ = {};
         scissor_ = {};
-        viewport_count_ = scissor_count_ = 0;
-        viewport_array_.reset();
-        viewport_array_stale_ = true;
+        viewports_.fill({});
+        viewport_count_ = 0;
+        scissors_.fill({});
+        scissor_count_ = 0;
+        draw_viewports_.reset();
+        draw_viewports_stale_ = true;
         render_targets_.fill({});
         render_target_count_ = 0;
         draw_views_stale_ = true;
@@ -1714,39 +1736,34 @@ private:
         return draw_views_;
     }
 
-    // Whether a bound viewport has an area. With none (never set, or unbound with RSSetViewports(0)) or only empty
-    // ones, D3D12 rasterizes nothing, and Vulkan forbids a 0x0 viewport, so the draw is not recorded. An empty one
-    // among others is replayed as a 1x1 viewport with an empty scissor (prepare_draw).
-    bool rasterizes() const {
-        const UINT count = std::max<UINT>(viewport_count_, 1);
-        for (UINT i = 0; i < count; ++i) {
-            const leonida::Viewport& v = i ? viewports_[i] : viewport_;
-            if (v.width > 0 && v.height > 0) return true;
-        }
-        return false;
-    }
-
-    // The ViewportArray the draws take while more than one viewport is bound, else null.
-    const std::shared_ptr<const leonida::ViewportArray>& viewport_array() {
-        if (viewport_array_stale_) {
-            viewport_array_.reset();
-            if (viewport_count_ > 1) {
-                auto array = std::make_shared<leonida::ViewportArray>();
-                array->count = viewport_count_;
-                array->viewports = viewports_;
-                std::copy_n(scissors_.begin(), scissor_count_, array->scissors.begin());
-                viewport_array_ = std::move(array);
-            }
-            viewport_array_stale_ = false;
-        }
-        return viewport_array_;
-    }
-
     // A mesh draw needs a graphics pipeline and a graphics root signature; it has no topology or vertex input.
     void record_mesh_draw(UINT x, UINT y, UINT z) {
         if (!graphics_pipeline_ || !graphics_.layout) return check(false);
-        if (!rasterizes()) return;  // as record_draw: nothing is rasterized
+        if (!any_nonempty_viewport()) return;  // as record_draw: nothing is rasterized
         check(list_.draw(make_mesh_draw(x, y, z)));
+    }
+
+    // Whether a bound viewport has an area. With none (never set, or unbound with RSSetViewports(0)) or only empty
+    // ones, D3D12 rasterizes nothing, and Vulkan forbids a 0x0 viewport, so the draw is not recorded. An empty one
+    // among others is replayed as a 1x1 viewport with an empty scissor.
+    bool any_nonempty_viewport() const {
+        for (UINT i = 0; i < viewport_count_; ++i)
+            if (viewports_[i].width > 0.0f && viewports_[i].height > 0.0f) return true;
+        return false;
+    }
+
+    std::shared_ptr<const leonida::DrawViewports> draw_viewports() {
+        if (viewport_count_ <= 1 && scissor_count_ <= 1) return nullptr;
+        if (draw_viewports_stale_) {
+            auto block = std::make_shared<leonida::DrawViewports>();
+            block->viewports = viewports_;
+            block->viewport_count = viewport_count_;
+            block->scissors = scissors_;
+            block->scissor_count = scissor_count_;
+            draw_viewports_ = std::move(block);
+            draw_viewports_stale_ = false;
+        }
+        return draw_viewports_;
     }
 
     // A draw needs a graphics pipeline, a graphics root signature and a topology.
@@ -1760,7 +1777,7 @@ private:
             return check(false);
         }
         note_direct_heap_indexing(graphics_.layout);
-        if (!rasterizes()) {
+        if (!any_nonempty_viewport()) {
             if (told.fetch_add(1, std::memory_order_relaxed) < 6)
                 std::fprintf(stderr, "[rt] d3d12: draw left out: no viewport with an area (count %u, first %gx%g at "
                                      "%g,%g depth %g..%g)\n",
@@ -1814,7 +1831,7 @@ private:
         leonida::Draw draw{graphics_pipeline_, data, draw_views(), depth_, {}, 0, viewport_, scissor_,
                            blend_factor_, front_stencil_ref_, back_stencil_ref_, false, x, y, z, 0, 0};
         draw.mesh = true;
-        draw.viewports = viewport_array();
+        draw.viewports = draw_viewports();
         return draw;
     }
 
@@ -1825,7 +1842,7 @@ private:
         graphics_user_data(false, data);  // the vertex window alone always fits
         return {graphics_pipeline_, data, draw_views(), depth_, index_, topology_, viewport_, scissor_,
                 blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances, first, base_vertex,
-                first_instance, false, viewport_array()};
+                first_instance, false, draw_viewports()};
     }
 };
 

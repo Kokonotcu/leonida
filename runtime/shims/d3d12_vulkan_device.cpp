@@ -1484,6 +1484,15 @@ struct DeviceState {
             backed.uint_backed = VK_FORMAT_A1R5G5B5_UNORM_PACK16;
             return backed;
         }
+        // A B4G4R4A4 render target where no 4444 format is a colour attachment (NVIDIA has none, sampled only): an
+        // RGBA8 image, which holds every 4-bit value exactly. RTVs and PSOs follow the image's format; the 4_4_4_4 T#s
+        // read it with the 4444 view's channels (bind_image). Not covered: a copy between it and a buffer footprint
+        // moves 4-byte RGBA8 texels, not packed 16-bit ones (replay's footprint bounds checks still hold).
+        if (desc.Format == DXGI_FORMAT_B4G4R4A4_UNORM && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+            !color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16) && color_attachment_usable(VK_FORMAT_R8G8B8A8_UNORM)) {
+            log_once("B4G4R4A4_UNORM render targets unavailable natively, using RGBA8; format", desc.Format);
+            return Format{VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT};
+        }
         // An 8-bit sRGB UAV texture where the sRGB format has no storage support: the host runtime makes it (RTX 4090
         // and WARP; a retail title sizes a 2048x2048 R8G8B8A8_UNORM_SRGB render target with unordered access), but no
         // typed UAV is sRGB in D3D12, so shaders write the raw bytes. A mutable image of the UNORM format of the same
@@ -2049,6 +2058,14 @@ struct DeviceState {
         VkFormat view_format =
             stencil ? image_format : g::vulkan_view_format(logical_format, image.format, allow_channel_cast);
         VkFormat channels_format = view_format;  // whose channels the T#'s swizzle selects from
+        // A B4G4R4A4 render target stored as RGBA8 (no 4444 format renders on this device): a 16-bit view of the
+        // 32-bit image is not allowed, so its 4_4_4_4 T# reads the RGBA8 image (which holds the logical R, G, B, A)
+        // with the channels of A4R4G4B4, the format the texture has (DXGI_FORMAT_B4G4R4A4_UNORM).
+        if (!stencil && image_format == VK_FORMAT_R8G8B8A8_UNORM &&
+            (view_format == VK_FORMAT_A4B4G4R4_UNORM_PACK16 || view_format == VK_FORMAT_A4R4G4B4_UNORM_PACK16)) {
+            view_format = VK_FORMAT_R8G8B8A8_UNORM;
+            channels_format = VK_FORMAT_A4R4G4B4_UNORM_PACK16;
+        }
         if (view_format == VK_FORMAT_UNDEFINED) {  // a 96-bit texture's T# names RGB32; its image is RGBA32
             view_format = rgb96_view_format(image_format, image.format);
             channels_format = rgb96_named_format(view_format);
@@ -4808,8 +4825,17 @@ public:
 // subobject that is absent takes the runtime's default (the CD3DX12 defaults: depth test on with LESS, back-face
 // culling, no blending, sample mask 0xFFFFFFFF, one sample). A type given twice, a truncated stream or an unknown
 // type is E_INVALIDARG, as on the PC runtime; state this layer cannot honour yet is E_NOTIMPL with a log.
+// The back face's stencil masks of a DEPTH_STENCIL2 subobject. D3D12_DEPTH_STENCIL_DESC has one read and one write
+// mask for both faces, so the face masks travel beside the description.
+struct StencilFaceMasks {
+    UINT8 read = D3D12_DEFAULT_STENCIL_READ_MASK;
+    UINT8 write = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+};
+
 struct PipelineStream {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics{};
+    bool back_masks = false;  // DEPTH_STENCIL2: back_stencil holds the back face's masks
+    StencilFaceMasks back_stencil;
     D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
     D3D12_SHADER_BYTECODE ms{};
     D3D12_SHADER_BYTECODE as{};
@@ -5007,12 +5033,10 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
                 log_once("depth-bounds tests are not supported yet; stream subobject", int(type));
                 return E_NOTIMPL;
             }
-            // Separate front and back stencil masks are not modelled (one read and one write mask per PSO).
-            if (d.StencilEnable && (d.FrontFace.StencilReadMask != d.BackFace.StencilReadMask ||
-                                    d.FrontFace.StencilWriteMask != d.BackFace.StencilWriteMask)) {
-                log_once("separate front and back stencil masks are not supported yet; stream subobject", int(type));
-                return E_NOTIMPL;
-            }
+            // Each face has its own read and write mask (OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported):
+            // the description takes the front face's, back_stencil the back face's.
+            out.back_masks = true;
+            out.back_stencil = {UINT8(d.BackFace.StencilReadMask), UINT8(d.BackFace.StencilWriteMask)};
             const auto face = [](const D3D12_DEPTH_STENCILOP_DESC1& f) {
                 return D3D12_DEPTH_STENCILOP_DESC{f.StencilFailOp, f.StencilDepthFailOp, f.StencilPassOp, f.StencilFunc};
             };
@@ -5170,8 +5194,10 @@ public:
     // With `ms` (a pipeline state stream's MS subobject) it is an MS (+ PS) pipeline on VK_EXT_mesh_shader instead:
     // no VS, no vertex input or input assembly (the input layout, topology type and strip cut are ignored, as D3D12
     // does for mesh PSOs), drawn by DispatchMesh. An AS (amplification shader) is refused: the game has none.
+    // `back_masks`, from a DEPTH_STENCIL2 subobject, are the back face's stencil masks; without it both faces take
+    // the description's.
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
-                            const D3D12_SHADER_BYTECODE* as = nullptr) {
+                            const D3D12_SHADER_BYTECODE* as = nullptr, const StencilFaceMasks* back_masks = nullptr) {
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
@@ -5595,7 +5621,8 @@ public:
         depth.depthCompareOp = compare_op(ds.DepthFunc);
         depth.stencilTestEnable = ds.StencilEnable;
         depth.front = stencil_face(ds.FrontFace, ds.StencilReadMask, ds.StencilWriteMask);
-        depth.back = stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
+        depth.back = back_masks ? stencil_face(ds.BackFace, back_masks->read, back_masks->write)
+                                : stencil_face(ds.BackFace, ds.StencilReadMask, ds.StencilWriteMask);
 
         std::vector<VkPipelineColorBlendAttachmentState> blends(desc.NumRenderTargets);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
@@ -5667,10 +5694,19 @@ public:
         if (raster.depthClampEnable && !features.depthClamp)
             return refuse("DepthClipEnable = FALSE needs depthClamp, which the device lacks; flag", 0);
 
+        // With multiViewport, VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT let a draw bind 1..16 viewports and scissors
+        // (pso::Recipe::viewport_with_count; shader objects always set the counts, one without the feature).
+        graphics_.viewport_with_count = features.multiViewport && device_.context->vk.vkCmdSetViewportWithCount &&
+                                        device_.context->vk.vkCmdSetScissorWithCount;
+
         graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
             graphics_.color_formats[i] = vulkan_format(desc.RTVFormats[i], false).format;
+            // B4G4R4A4 targets are RGBA8 images where no 4444 format renders (DeviceState's texture format choice).
+            if (graphics_.color_formats[i] == VK_FORMAT_A4R4G4B4_UNORM_PACK16 &&
+                !device_.color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16))
+                graphics_.color_formats[i] = VK_FORMAT_R8G8B8A8_UNORM;
             if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
                 return E_INVALIDARG;
@@ -6205,6 +6241,7 @@ private:
         out.push_stages = layout_push_stages_;
         out.push_size = layout_push_size_;
         out.bindless = layout_bindless_;
+        out.viewport_with_count = graphics_.viewport_with_count;
         return out;
     }
 
@@ -6915,6 +6952,10 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     const VkFormat resource_format = resource.uint_backed() ? resource.uint_backed() : resource.format();
     VkFormat named = resource_format;
+    // A B4G4R4A4 render target stored as an RGBA8 image (no 4444 colour attachment on the device): its T# names
+    // 4_4_4_4 as on the console, and bind_image views the RGBA8 image with the 4444 view's channels.
+    const bool rgba8_4444 = desc.Format == DXGI_FORMAT_B4G4R4A4_UNORM && resource.format() == VK_FORMAT_R8G8B8A8_UNORM;
+    if (rgba8_4444) named = VK_FORMAT_A4R4G4B4_UNORM_PACK16;
     if (volume) {
         const bool compatible = vulkan_format(desc.Format, false).typeless
             ? desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
@@ -6984,7 +7025,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         }
         if (rgb96) named = rgb96_named_format(named);
     }
-    if (named == VK_FORMAT_UNDEFINED || !resource.allows_view_format(named)) {
+    if (named == VK_FORMAT_UNDEFINED ||
+        (rgba8_4444 ? named != VK_FORMAT_A4R4G4B4_UNORM_PACK16 : !resource.allows_view_format(named))) {
         log_once("view format not in the resource's castable list:", int(view.format));
         return false;
     }
@@ -6994,6 +7036,8 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
         view_format = resource.format();
     } else if (code && rgb96) {
         view_format = named;
+    } else if (code && rgba8_4444) {
+        view_format = resource.format();
     } else if (code) {
         view_format = g::vulkan_view_format(resource_format, code, resource.has_view_format_list());
     }
@@ -7405,7 +7449,6 @@ public:
         }
         state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count,
                                               info.max_draw_indirect_count ? info.max_draw_indirect_count : UINT32_MAX);
-        state_.context->set_max_viewports(info.max_viewports);
         if (info.indirect_commands && info.buffer_device_address)
             state_.context->enable_indirect_commands(get_device, info.indirect_properties,
                                                      [this](const VkMemoryRequirements& requirements) {
@@ -8803,7 +8846,8 @@ public:
         auto* pipeline = new PipelineState(state_);
         pipeline->attach_device(identity());
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
-                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as);
+                                         : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as,
+                                                                     stream.back_masks ? &stream.back_stencil : nullptr);
         if (FAILED(hr)) {
             pipeline->Release();
             return d3d12_trace::result(method, hr);
@@ -8880,9 +8924,11 @@ public:
                                             r->has_castable_formats();
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
                 view = {};
-            } else if (rd.Format == DXGI_FORMAT_B4G4R4A4_UNORM &&
+            } else if (rd.Format == DXGI_FORMAT_B4G4R4A4_UNORM && (!r || r->format() != VK_FORMAT_R8G8B8A8_UNORM) &&
                        !state_.color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16)) {
-                // The texture has no attachment usage here (TextureCreateInfo): a null view, so its draws are dropped.
+                // Usually the texture is an RGBA8 image (DeviceState's texture format choice) and its RTVs follow
+                // the image. Without that (no RGBA8 attachment either) it has no attachment usage
+                // (TextureCreateInfo): a null view, so its draws are dropped.
                 log_once("render-target view of a B4G4R4A4 texture: the GPU cannot render that format; a null "
                          "view, format",
                          int(rd.Format));
@@ -10458,7 +10504,9 @@ public:
             *opts = {};
             opts->AdvancedTextureOpsSupported = FALSE;
             opts->WriteableMSAATexturesSupported = FALSE;
-            opts->IndependentFrontAndBackStencilRefMaskSupported = FALSE;
+            // DEPTH_STENCIL2's per-face masks go to VkStencilOpState, and OMSetFrontAndBackStencilRef sets each
+            // face's reference (VK_DYNAMIC_STATE_STENCIL_REFERENCE with a face mask).
+            opts->IndependentFrontAndBackStencilRefMaskSupported = TRUE;
             return d3d12_trace::result(method, S_OK);
         }
         case D3D12_FEATURE_D3D12_OPTIONS15: {
@@ -12915,13 +12963,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.dualSrcBlend = chosen_features.dualSrcBlend;
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
-    enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
-    // M4: up to D3D12's 16 viewports per draw, picked by SV_ViewportArrayIndex (cascaded shadow maps).
+    // Up to D3D12's 16 viewports per draw, picked by SV_ViewportArrayIndex (cascaded shadow maps): pipelines take
+    // the counts as dynamic state where this is on (GraphicsPipeline::viewport_with_count).
     enable.multiViewport = chosen_features.multiViewport;
-    info.max_viewports = chosen_features.multiViewport
-                             ? std::min<std::uint32_t>(chosen.limits.maxViewports,
-                                                       D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
-                             : 1;
+    enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, image stores
     // without a format (StorageImageWriteWithoutFormat), gather offsets (ImageGatherExtended) and LOD-clamped samples
@@ -13331,6 +13376,8 @@ static int prebuild_pipeline_libraries(DeviceState& s, unsigned threads) {
         r.push_stages = s.gpl_push_stages();
         r.push_size = sizeof(leonida::ShaderUserData);
         r.bindless = s.bindless != nullptr;
+        r.viewport_with_count =
+            s.info.features.multiViewport && vk.vkCmdSetViewportWithCount && vk.vkCmdSetScissorWithCount;
         return r;
     };
     s.gpl_library(Part::fragment, base_recipe(), {});  // a PSO without a pixel shader (depth only)

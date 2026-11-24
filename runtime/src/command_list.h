@@ -393,16 +393,6 @@ struct Viewport {
     float max_depth;
 };
 
-// RSSetViewports / RSSetScissorRects with more than one: D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE
-// of each. A draw uses `count` viewports (the RSSetViewports count); a scissor past the RSSetScissorRects count is
-// empty, so a primitive sent there is clipped, as with no scissor bound. SV_ViewportArrayIndex picks one.
-struct ViewportArray {
-    static constexpr std::uint32_t max = 16;
-    std::uint32_t count = 0;
-    std::array<Viewport, max> viewports{};
-    std::array<Rect, max> scissors{};
-};
-
 // D3D12_VERTEX_BUFFER_VIEW / D3D12_INDEX_BUFFER_VIEW: console VAs, resolved to buffers at replay.
 struct VertexBufferView {
     std::uint64_t va;
@@ -423,6 +413,15 @@ struct DrawViews {
     std::array<TargetView, 8> render_targets{};
     std::array<VertexBufferView, 32> vertex_buffers{};  // by input slot
     std::uint32_t render_target_count = 8;
+};
+
+// Shared across draws that keep the same multi-viewport / multi-scissor state (null for the common 1-viewport case).
+struct DrawViewports {
+    static constexpr std::uint32_t max_count = 16;
+    std::array<Viewport, max_count> viewports{};
+    std::uint32_t viewport_count = 0;
+    std::array<Rect, max_count> scissors{};
+    std::uint32_t scissor_count = 0;
 };
 
 // DrawInstanced / DrawIndexedInstanced / DispatchMesh, with everything they use captured when they are recorded:
@@ -451,9 +450,7 @@ struct Draw {
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
     bool mesh = false;
-    // Set when RSSetViewports bound more than one (the first is also in viewport and scissor); shared by the draws
-    // that keep the same set, as views is.
-    std::shared_ptr<const ViewportArray> viewports;
+    std::shared_ptr<const DrawViewports> viewports;  // non-null when >1 viewport or >1 scissor was bound
 };
 
 // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT and D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT.
