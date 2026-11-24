@@ -28,6 +28,9 @@
 #include <string>
 #include <system_error>
 #include <vector>
+#include <algorithm>
+#include <cstring>
+#include <mutex>
 
 namespace rt::write_watch {
 void start_from_environment();
@@ -118,9 +121,41 @@ int prebuild_pipelines_command(int argc, wchar_t** argv) {
 
 namespace {
 
+// An int 3 in the title's own code (no host module holds the address) is one of its soft asserts: the code after it
+// resumes normally (e.g. exe+0x4ffd879: int 3; jmp back into the function), which a dev kit's debugger or
+// GTA6-BootTest's harness (-skip) steps over. Stepped over here too, each address named once; LEONIDA_ASSERTS=stop
+// keeps them fatal. True when the exception was handled.
+bool step_over_title_assert(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD& r = *info->ExceptionRecord;
+    if (r.ExceptionCode != 0x80000003 || !info->ContextRecord) return false;
+    static const bool stop = [] {
+        char v[8] = {};
+        return GetEnvironmentVariableA("LEONIDA_ASSERTS", v, sizeof v) && std::strcmp(v, "stop") == 0;
+    }();
+    HMODULE owner = nullptr;
+    const bool host_code = GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                  GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                              static_cast<LPCSTR>(r.ExceptionAddress), &owner) && owner;
+    const auto* at = static_cast<const unsigned char*>(r.ExceptionAddress);
+    if (stop || host_code || !at || *at != 0xCC) return false;
+    static std::mutex m;
+    static std::vector<const void*> seen;
+    {
+        std::lock_guard lock(m);
+        if (std::find(seen.begin(), seen.end(), r.ExceptionAddress) == seen.end() && seen.size() < 64) {
+            seen.push_back(r.ExceptionAddress);
+            std::fprintf(stderr, "[rt] title assert (int 3) at %p stepped over (tid %lu)\n", r.ExceptionAddress,
+                         GetCurrentThreadId());
+        }
+    }
+    info->ContextRecord->Rip += 1;
+    return true;
+}
+
 LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
     if (!info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     const EXCEPTION_RECORD& r = *info->ExceptionRecord;
+    if (step_over_title_assert(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (r.ExceptionCode != 0xC0000005 && r.ExceptionCode != 0xC0000374 && r.ExceptionCode != 0x80000003 &&
         r.ExceptionCode != 0xC0000409 && r.ExceptionCode != 0xC00000FD)
         return EXCEPTION_CONTINUE_SEARCH;

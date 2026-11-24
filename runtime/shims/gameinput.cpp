@@ -2070,6 +2070,78 @@ void update_keyboard_pad() {
     SDL_SetJoystickVirtualAxis(g_keyboard.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, fire ? 32767 : -32768);
 }
 
+// LEONIDA_INPUT_SCRIPT="<ms>:<button>[:<hold ms>],..." (test driving, no window input): an SDL virtual gamepad presses
+// each button at its time from the first poll, for <hold> ms (200 by default). Buttons: A B X Y Menu View Up Down Left
+// Right LB RB LS RS. Lets a run get past a screen that waits for a press (the retail boot's account picker) unattended.
+struct ScriptPress {
+    std::uint64_t at_ms, hold_ms;
+    SDL_GamepadButton button;
+};
+struct ScriptPad {
+    bool parsed = false;
+    std::vector<ScriptPress> presses;
+    SDL_JoystickID id = 0;
+    SDL_Joystick* js = nullptr;
+    std::uint64_t start_us = 0;
+    int logged = -1;
+} g_script;
+
+void update_script_pad() {
+    if (!g_script.parsed) {
+        g_script.parsed = true;
+        char text[1024] = {};
+        if (!GetEnvironmentVariableA("LEONIDA_INPUT_SCRIPT", text, sizeof text)) return;
+        static const struct { const char* name; SDL_GamepadButton button; } kNames[] = {
+            {"A", SDL_GAMEPAD_BUTTON_SOUTH}, {"B", SDL_GAMEPAD_BUTTON_EAST}, {"X", SDL_GAMEPAD_BUTTON_WEST},
+            {"Y", SDL_GAMEPAD_BUTTON_NORTH}, {"Menu", SDL_GAMEPAD_BUTTON_START}, {"View", SDL_GAMEPAD_BUTTON_BACK},
+            {"Up", SDL_GAMEPAD_BUTTON_DPAD_UP}, {"Down", SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+            {"Left", SDL_GAMEPAD_BUTTON_DPAD_LEFT}, {"Right", SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
+            {"LB", SDL_GAMEPAD_BUTTON_LEFT_SHOULDER}, {"RB", SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+            {"LS", SDL_GAMEPAD_BUTTON_LEFT_STICK}, {"RS", SDL_GAMEPAD_BUTTON_RIGHT_STICK}};
+        for (char* item = std::strtok(text, ","); item; item = std::strtok(nullptr, ",")) {
+            char name[16] = {};
+            unsigned long long at = 0, hold = 200;
+            if (std::sscanf(item, "%llu:%15[A-Za-z]:%llu", &at, name, &hold) < 2) continue;
+            for (const auto& n : kNames)
+                if (_stricmp(n.name, name) == 0) g_script.presses.push_back({at, hold, n.button});
+        }
+        if (g_script.presses.empty()) return;
+        SDL_VirtualJoystickDesc d;
+        SDL_INIT_INTERFACE(&d);
+        d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+        d.naxes = SDL_GAMEPAD_AXIS_COUNT;
+        d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+        d.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1;
+        d.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
+        d.name = "Script pad (Leonida)";
+        g_script.id = SDL_AttachVirtualJoystick(&d);
+        g_script.js = g_script.id ? SDL_OpenJoystick(g_script.id) : nullptr;
+        g_script.start_us = now_us();
+        std::fprintf(stderr, "[rt] gameinput: LEONIDA_INPUT_SCRIPT: %zu press(es) on a virtual pad%s\n",
+                     g_script.presses.size(), g_script.js ? "" : " (cannot attach it)");
+        if (g_script.js) {
+            // Triggers at rest (SDL maps a full-range virtual axis to the trigger: -32768 is released).
+            SDL_SetJoystickVirtualAxis(g_script.js, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, -32768);
+            SDL_SetJoystickVirtualAxis(g_script.js, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, -32768);
+        }
+    }
+    if (!g_script.js) return;
+    const std::uint64_t t = (now_us() - g_script.start_us) / 1000;
+    bool down[SDL_GAMEPAD_BUTTON_COUNT] = {};
+    for (std::size_t i = 0; i < g_script.presses.size(); ++i) {
+        const ScriptPress& p = g_script.presses[i];
+        if (t >= p.at_ms && t < p.at_ms + p.hold_ms) {
+            down[p.button] = true;
+            if (g_script.logged < int(i)) {
+                g_script.logged = int(i);
+                std::fprintf(stderr, "[rt] gameinput: script press %zu (button %d) at %llu ms\n", i, int(p.button),
+                             static_cast<unsigned long long>(t));
+            }
+        }
+    }
+    for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; ++b) SDL_SetJoystickVirtualButton(g_script.js, b, down[b]);
+}
+
 bool init_sdl() {
     State& s = g();
     if (s.sdl_ready) return true;
@@ -2104,6 +2176,7 @@ void poll_once() {
     }
     apply_prompt_config();
     update_keyboard_pad();
+    update_script_pad();
     SDL_UpdateGamepads();
     const uint64_t now = now_us();
 
