@@ -119,7 +119,9 @@ implemented (**this repo**, `runtime/shims/xmem.cpp`): `XMemAlloc`/`XMemFree` on
 aligned CRT heap, `XMemVirtualQuery(process, address, out64)` filling the
 `MEMORY_BASIC_INFORMATION` prefix and zeroing the rest of the measured 64-byte output, and
 `XMemGetWorkingSetStatistics(kind, out)` writing the process working set at +8 of the measured
-output. All four names are exactly the set the package's DLLs import
+output. Its +0 (the title's memory limit) and `XSystemGetAppMemoryUsageLimit` answer one title budget
+(`runtime/shims/title_memory.h`): the console's 13.5 GiB, capped at the host's RAM minus max(4 GiB, a quarter),
+never below 2 GiB; `LEONIDA_TITLE_MEMORY_MB=<n>` overrides it. All four names are exactly the set the package's DLLs import
 ([runtime_imports.md](runtime_imports.md)).
 
 A sibling layer additionally measured a title's physical-page calls on this module: 64 KiB pages,

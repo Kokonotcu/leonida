@@ -3009,12 +3009,11 @@ if(TARGET Vulkan::Headers)
                 LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_MA_DIR} vs_ma ps_ma cs_ma
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_ma.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_ma.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_ma.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_ma, ps_ma and cs_ma for the multi-argument ExecuteIndirect test"
         VERBATIM)
       add_executable(d3d12_indirect_multiarg_test test/d3d12_indirect_multiarg_test.cpp shims/d3d12_xs_device.cpp
@@ -3072,11 +3071,10 @@ if(TARGET Vulkan::Headers)
                 LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_UAV3D_DIR} cs_uav3d_store cs_uav3d_load
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_uav3d_store.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_uav3d_load.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating cs_uav3d_store and cs_uav3d_load for the 3D UAV test"
         VERBATIM)
       add_executable(d3d12_uav3d_test test/d3d12_uav3d_test.cpp ${LEONIDA_UAV3D_FILES})
@@ -3098,10 +3096,9 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_VIEWPORTS_DIR} vs_vpindex ps_m5_flat
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_vpindex.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_flat.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_vpindex and ps_m5_flat for the viewport-array test"
         VERBATIM)
       add_executable(d3d12_viewports_test test/d3d12_viewports_test.cpp ${LEONIDA_VIEWPORTS_FILES})
@@ -3123,10 +3120,9 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_SPILL_DIR} cs_spill
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_spill.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating cs_spill for the root spill test"
         VERBATIM)
       add_executable(d3d12_root_spill_test test/d3d12_root_spill_test.cpp ${LEONIDA_SPILL_FILES})
@@ -3149,10 +3145,9 @@ if(TARGET Vulkan::Headers)
                 LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_UPLOAD_DIR} cs_upload_read
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_upload_read.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating cs_upload_read for the upload-arena test"
         VERBATIM)
       add_executable(d3d12_upload_arena_test test/d3d12_upload_arena_test.cpp ${LEONIDA_UPLOAD_FILES})
@@ -3206,7 +3201,7 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M5_DIR} vs_m5 ps_m5_inst vs_m3 ps_m5_flat vs_m2 ps_m5_tex
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m5.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_inst.asm
@@ -3214,7 +3209,6 @@ if(TARGET Vulkan::Headers)
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_flat.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_tex.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating vs_m5, ps_m5_inst, vs_m3, ps_m5_flat, vs_m2 and ps_m5_tex for the M5 world test"
         VERBATIM)
       add_executable(d3d12_m5_world_test test/d3d12_m5_world_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M5_FILES})
@@ -3237,13 +3231,12 @@ if(TARGET Vulkan::Headers)
         COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_M5_MESH_DIR} ms_m5 ps_m5_mesh vs_m3 ps_m5_flat
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ms_m5.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_mesh.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m3.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_flat.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating ms_m5, ps_m5_mesh, vs_m3 and ps_m5_flat for the M5 mesh test"
         VERBATIM)
       add_executable(d3d12_m5_mesh_test test/d3d12_m5_mesh_test.cpp shims/d3d12_xs_device.cpp ${LEONIDA_M5_MESH_FILES})
@@ -3272,12 +3265,11 @@ if(TARGET Vulkan::Headers)
                 LEONIDA_USER_DATA_SHIFT=4
                 $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
                 ${LEONIDA_HEAP_INDEX_DIR} cs_heap_index vs_m2 ps_heap_index
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_heap_index.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_m2.asm
                 ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_heap_index.asm
-                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
         COMMENT "Translating cs_heap_index, vs_m2 and ps_heap_index for the heap index test"
         VERBATIM)
       add_executable(d3d12_heap_index_test test/d3d12_heap_index_test.cpp ${LEONIDA_HEAP_INDEX_FILES})

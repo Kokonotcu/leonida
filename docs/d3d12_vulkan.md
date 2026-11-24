@@ -2130,6 +2130,12 @@ build emits that hash for every translation; the runtime extracts the FSSM chunk
 way `tools/fssm_unpack.py` does. The current `spirv/index.json` is keyed by carve name, which the runtime may not
 have; add the content hash to the index.
 
+The console's pipeline-state stream numbers its subobjects without the PC's gap at 23 (console: AS 23, MS 24; PC:
+AS 24, MS 25), so a title stream's mesh shader is 24. `CreatePipelineState` reads a stream the PC numbering refuses,
+or leaves with an AS and no MS, again with the console numbering (a type from 23 on is the PC type one above it) and
+takes that reading when it holds an MS and no AS; a stream the PC reading accepts is never read differently.
+`LEONIDA_XS_STREAM_ENUM=pc` turns it off (docs/retail_boot_intel_host.md section 3 has the measurement).
+
 Pipeline creation:
 
 - `D3D12_GRAPHICS_PIPELINE_STATE_DESC` is supported today (`CreateGraphicsPipelineState`), as is the compute desc. The
