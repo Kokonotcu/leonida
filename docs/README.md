@@ -16,6 +16,7 @@ method, scope and caveats. No game data is included.
 | [gpu_test_results.md](gpu_test_results.md) | Published GPU test results by hardware, driver and commit, with pass, skip and failure counts. |
 | [modding.md](modding.md) | The mod format: `mods/<folder>/mod.json`, checked and loaded in name order by `gta6rt`; a swap takes effect once the game's archetype lookup is hooked (needs the executable, RT-5). A mod names game models and holds no game data. |
 | [progress_dashboard.md](progress_dashboard.md) | A local page of what works, what changed since it last passed and what blocks next: unit and runtime tests, the translator contract by confirmation method, measured imports, corpus counts and, with `--github`, CI and the D3D- items (`tools/progress_dashboard.py`). |
+| [dev-tools.md](dev-tools.md) | The development CLI `scripts/dev.py`: `discover` (text or `--json`, schema version 1) lists the boot-trace analyzer and the guest-scene runner with their help commands and prerequisites, without running them; live attach, pause, step and screenshots are not available through it. |
 
 ## Archives and assets
 
@@ -89,6 +90,7 @@ method, scope and caveats. No game data is included.
 | [multi_gpu_validation.md](multi_gpu_validation.md) | Running disjoint shards on eight identical RDNA1/RADV GPUs: PCI-BDF pinning, base controls, per-card logs, the V540 farm's aggregate results and its known driver limitations. |
 | [shader_validation.md](shader_validation.md) | Differential CPU/GPU validation design and the current CPU interpreter prototype. |
 | [isa_coverage.md](isa_coverage.md) | RDNA2 ISA coverage of the translator against AMD's machine-readable XML: which of its 1,153 instructions have a rule, and which matched names are not RDNA2. |
+| [cpu_features.md](cpu_features.md) | CPU instructions in `game_scarlett_master.exe` that a host lacking the feature or privilege level faults on (SSE4a, CLZERO, MONITORX and others): counts per feature and how many sites lie inside `.pdata` function ranges, measured with `tools/cpu_feature_scan.py` on 1.0.2.1. Counts only. |
 | [buffer_bounds.md](buffer_bounds.md) | V# `OOB_SELECT` bounds measured natively: RDNA2 (gfx1036) follows Mesa's GFX11 column (729/732 cases), not GFX10; raw mode also counts `soffset`. |
 | [buffer_formats.md](buffer_formats.md) | Every GFX10 buffer data format a V# or MTBUF can name, loaded and stored, measured on a Radeon 880M (RDNA3.5, not RDNA2): 1.33 million validated elements, 0 mismatches; SCALED stores convert as NORM, float stores round toward zero. |
 | [fssm_crosscheck.md](fssm_crosscheck.md) | FSSM/RDNA2 facts cross-checked against SCARAB; code starts at `code_off + 0x28`. |

@@ -32,7 +32,7 @@ class MergeCheckTest(unittest.TestCase):
         self.addCleanup(td.cleanup)
         self.repo = td.name
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-        env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"})
+        env.update({"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "XDG_CONFIG_HOME": td.name})
         patcher = mock.patch.dict(os.environ, env, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
