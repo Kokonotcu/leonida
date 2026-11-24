@@ -31,6 +31,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
 #include "presentx_capture.h"
+#include "xg_linear_layout.h"  // slots 25 and 108 cover the texture computer's layout
 #include "../src/frame_pacer.h"     // leonida::FrameTokenSource: the tokens slots 78/79/80 and PresentX share
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -3012,6 +3013,14 @@ HRESULT proxy_create_state_object(DeviceProxy* self, const D3D12_STATE_OBJECT_DE
 // The retail executable calls struct-returning device methods with the C ABI (return buffer in RCX, device proxy in
 D3D12_RESOURCE_ALLOCATION_INFO fallback_allocation(const D3D12_RESOURCE_DESC& d);  // defined below slot 25's helper
 
+// A console caller's texture is sized at least as xg_xs's texture computer lays it out (xg_linear_layout.h), so
+// memory the title sizes with slots 25 and 108 holds what the computer's CopyIntoSubresource writes into it.
+void cover_linear_layout(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_ALLOCATION_INFO& info) {
+    if (info.SizeInBytes == UINT64_MAX) return;
+    rt::xg::ResourceLayout layout;
+    if (rt::xg::linear_layout(desc, layout) && layout.size_bytes > info.SizeInBytes) info.SizeInBytes = layout.size_bytes;
+}
+
 // RDX); a PC C++ caller passes the proxy in RCX and the return buffer in RDX. Both orders are accepted. Each resource
 // description's Xbox layout word (e.g. 0x101, 0x105) and console flag bits above the PC D3D12_RESOURCE_FLAGS are
 // normalized on a copy before the PC call, with SamplerFeedbackMipRegion zeroed so 56-byte D3D12_RESOURCE_DESC inputs
@@ -3047,11 +3056,14 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
 
     std::vector<D3D12_RESOURCE_DESC1> cleaned;
     const D3D12_RESOURCE_DESC1* descs_to_pass = raw_descs;
+    // The title's descriptions are the console's 0x38-byte D3D12_RESOURCE_DESC, one after another (PR #8134, measured
+    // at the retail executable's call); a PC caller passes D3D12_RESOURCE_DESC1, 0x50 bytes apart.
+    const std::size_t stride = console_abi ? sizeof(D3D12_RESOURCE_DESC) : sizeof(D3D12_RESOURCE_DESC1);
     if (raw_descs && count > 0 && count <= 1024) {
         cleaned.resize(count);
         for (UINT i = 0; i < count; ++i) {
             D3D12_RESOURCE_DESC1 d{};
-            std::memcpy(&d, reinterpret_cast<const std::uint8_t*>(raw_descs) + i * sizeof(D3D12_RESOURCE_DESC1),
+            std::memcpy(&d, reinterpret_cast<const std::uint8_t*>(raw_descs) + i * stride,
                         sizeof(D3D12_RESOURCE_DESC));
             d.SamplerFeedbackMipRegion = {};
             if (static_cast<std::uint32_t>(d.Layout) >
@@ -3075,6 +3087,12 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
         D3D12_RESOURCE_DESC base{};
         std::memcpy(&base, reinterpret_cast<const std::uint8_t*>(descs_to_pass), sizeof(base));
         *ret = fallback_allocation(base);
+    }
+    if (console_abi && descs_to_pass && count == 1) {
+        D3D12_RESOURCE_DESC base{};
+        std::memcpy(&base, reinterpret_cast<const std::uint8_t*>(descs_to_pass), sizeof(base));
+        cover_linear_layout(base, *ret);
+        if (info1 && info1->SizeInBytes < ret->SizeInBytes) info1->SizeInBytes = ret->SizeInBytes;
     }
     return reinterpret_cast<std::uint64_t>(ret);
 }
@@ -3611,6 +3629,7 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     // a >32-bit size. A PC-ABI caller keeps the host's refusal, as the PC runtime gives it.
     if (call.console_abi && info.SizeInBytes == UINT64_MAX && descs && desc_count)
         info = fallback_allocation(descs[0]);
+    if (call.console_abi && descs && desc_count == 1) cover_linear_layout(descs[0], info);
     static std::atomic<unsigned> alloc_logs{0};
     const unsigned alloc_call = alloc_logs.fetch_add(1, std::memory_order_relaxed);
     if (alloc_call < 40 || (info.SizeInBytes >> 32) != 0 || info.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {

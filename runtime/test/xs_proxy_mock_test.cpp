@@ -1227,8 +1227,11 @@ int check_xbox_slots() {
     D3D12_RESOURCE_ALLOCATION_INFO ret_info{};
     D3D12_RESOURCE_ALLOCATION_INFO1 detail_info{};
     EXPECT(call_slot108_c_abi(&ret_info, device, 1, 1, &xbox_rt_desc, &detail_info) == &ret_info);
-    EXPECT(ret_info.SizeInBytes == 0x40000 && ret_info.Alignment == 0x10000);
-    EXPECT(detail_info.SizeInBytes == 0x40000 && detail_info.Alignment == 0x10000);
+    // The mock answers 0x40000; a console caller's texture is sized at least as xg_xs's texture computer lays it out
+    // (xg_linear_layout.h: 3840 * 4 bytes * 2160 rows, in 64 KiB), so the title's memory holds what it writes.
+    constexpr std::uint64_t kLinear4k = (3840ull * 4 * 2160 + 0xffff) & ~0xffffull;
+    EXPECT(ret_info.SizeInBytes == kLinear4k && ret_info.Alignment == 0x10000);
+    EXPECT(detail_info.SizeInBytes == kLinear4k && detail_info.Alignment == 0x10000);
     EXPECT(mock->calls[108] == 0 && mock->calls[68] == 1 && xs::device_slot_hits(108) == 1);
     EXPECT(mock->array[68][0] == static_cast<std::uint64_t>(D3D12_TEXTURE_LAYOUT_UNKNOWN));
     EXPECT(mock->array[68][1] == static_cast<std::uint64_t>(

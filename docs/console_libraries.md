@@ -60,7 +60,7 @@ list below.
 | `gameinput.dll` | GameInput v0, controller input | `GameInputCreate` registered (SDL3 build) | shimmed |
 | `xaudio2_9.dll` | Console XAudio2 2.9 | no table; host binds it by ordinal | classified only |
 | `dstorage_xs.dll` | Console DirectStorage | no table; `DStorageGetFactory` classified | classified only |
-| `xg_xs.dll` | Texture layout helpers | nothing | unhandled |
+| `xg_xs.dll` | Texture layout helpers | both measured imports registered; a linear texture computer | shimmed |
 | `AcpHal.dll` | Audio co-processor HAL | nothing | unhandled |
 | `chad`, `xapu`, `xcrdapi`, `*legacy` | DSP, APU and card-API modules; names only | nothing | unhandled |
 
@@ -165,9 +165,10 @@ under both `dstorage.dll` and `dstorage_xs.dll` (**this repo**, `registry.cpp`).
 Texture layout helpers. The sibling export inventory names `XGCreateTexture2DComputer` and
 `XGComputeOptimalSwizzleMode` (**sibling-layer measurement**); prior-art text folded into
 [d3d12_vulkan.md](d3d12_vulkan.md#35-root-signature-to-user-sgprs) also names
-`XGComputeTexture2DLayout` as the module's untiling reference. Leonida has no table and no
-classification (`xg_xs.dll!XGCreateTexture2DComputer` is pinned as Other in
-`unimplemented_policy_test`; **this repo**). Nothing in the package imports it.
+`XGComputeTexture2DLayout` as the module's untiling reference. The game executable imports
+`XGCreateTextureComputer` and `XGSuggestSwizzleMode`; the shim gives textures a linear layout
+([runtime_imports.md](runtime_imports.md), `runtime/shims/xg_xs.cpp`; **this repo**, ported from PR #8134).
+`xg_xs.dll!XGCreateTexture2DComputer` stays pinned as Other in `unimplemented_policy_test`.
 
 ### `AcpHal.dll`
 
