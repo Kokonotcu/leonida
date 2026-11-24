@@ -8351,6 +8351,19 @@ public:
             std::fprintf(stderr, "[rt] d3d12: root signature usable for compute only: %s\n", packed.error.c_str());
         else if (!compute.ok)
             std::fprintf(stderr, "[rt] d3d12: root signature usable for graphics only: %s\n", compute.error.c_str());
+        // Root parameters visible to one stage only: on the console such a parameter takes no user SGPR in the other
+        // stages, which this layout does not model (src/root_signature.h). Logged for the first 12 signatures.
+        if (std::any_of(parsed.sig.params.begin(), parsed.sig.params.end(),
+                        [](const rt::rootsig::RootParameter& p) { return p.visibility != rt::rootsig::Visibility::All; })) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1) < 12) {
+                std::fprintf(stderr, "[rt] d3d12: root signature with stage-only parameters:");
+                for (std::size_t i = 0; i < parsed.sig.params.size(); ++i)
+                    std::fprintf(stderr, " p%zu(type %d vis %d s%u)", i, int(parsed.sig.params[i].type),
+                                 int(parsed.sig.params[i].visibility), packed.ok ? packed.first_sgpr[i] : 0u);
+                std::fprintf(stderr, "\n");
+            }
+        }
         RootArgumentLayout layout;
         layout.flags = parsed.sig.flags;
         layout.graphics_ok = packed.ok;

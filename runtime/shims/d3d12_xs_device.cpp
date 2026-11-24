@@ -2818,6 +2818,12 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
             }
             self->real->CreateShaderResourceView(resource, &vd, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
             resource->Release();
+            if (tell && readable(destination, 32)) {
+                const auto* w = reinterpret_cast<const std::uint32_t*>(destination);
+                std::fprintf(stderr, "[rt] d3d12_xs:   -> 0x%llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                             static_cast<unsigned long long>(destination), w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+                             w[7]);
+            }
             return;
         }
     }
