@@ -148,8 +148,8 @@ int main() {
         EXPECT(driver::waits() == 0);
         std::printf("3 nothing uploaded on A: B does not wait\n");
 
-        // 4. A descriptor write only (vkUpdateDescriptorSets on the CPU): the table is unchanged.
-        set.update_image(ImageDimension::dim_2d, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
+        // 4. A descriptor write only (vkUpdateDescriptorSets on the CPU, a removal): the table is unchanged.
+        set.remove_image(ImageDimension::dim_2d, index);
         EXPECT(a.execute(lists) == ReplayResult::success);
         EXPECT(!uploaded);
         EXPECT(b.execute(lists) == ReplayResult::success);

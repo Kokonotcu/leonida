@@ -813,7 +813,7 @@ struct ComputePipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     std::uint64_t code_base = 0;
-    VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every dispatch; null: none
+    bool uses_set0 = false;  // the layout has set 0: the device's current one (ReplayFunctions::bindless_set) is bound at every dispatch
     // A shader object instead of `pipeline` (LEONIDA_SHADER_OBJECTS=1, docs/aot_pipelines.md): binds it at the
     // compute stage. Null on the pipeline path.
     std::function<void(VkCommandBuffer)> bind_shader;
@@ -834,7 +834,7 @@ struct GraphicsPipeline {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkShaderStageFlags push_stages = 0;   // the layout's push-constant range; vkCmdPushConstants must name the same
     std::uint64_t code_base = 0;
-    VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every draw; null: none
+    bool uses_set0 = false;  // the layout has set 0: the device's current one (ReplayFunctions::bindless_set) is bound at every draw
     std::vector<VkFormat> color_formats;  // by render-target slot
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags depth_aspects = 0;
@@ -899,8 +899,8 @@ enum class ReplayResult {
 };
 
 struct ReplayFunctions {
-    // Set 0 for the pipelines that declare one (their own `bindless_set` is only the marker): the device's current
-    // generation of it, which a flush may have replaced since the pipeline was made. Null: the pipeline's.
+    // Set 0 for the pipelines that declare one (their `uses_set0` marks them): the device's current
+    // generation of it, read under the descriptor lock at submit. Null: such pipelines are refused.
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;
     PFN_vkCmdPipelineBarrier pipeline_barrier = nullptr;
     PFN_vkCmdClearColorImage clear_color_image = nullptr;
@@ -2446,7 +2446,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shaders)) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
-    if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+    if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set)) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
     p.pipeline = pipeline->pipeline;
@@ -3569,7 +3569,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
                 if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shader)) return ReplayResult::unresolved_resource;
-                if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+                if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set)) return ReplayResult::unsupported;
                 p.pipeline = *pipeline;
             }
             if (ind->kind != IndirectKind::dispatch && !ind->state && !ind->raw) return ReplayResult::unsupported;
@@ -3709,7 +3709,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::unsupported;
             const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
             if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shader)) return ReplayResult::unresolved_resource;
-            if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+            if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set)) return ReplayResult::unsupported;
             p.pipeline = *pipeline;
         } else if (const auto* draw = std::get_if<Draw>(&command)) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
@@ -4658,8 +4658,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 data.heap_base = vk.heap_base;
                 data.code_base = p.pipeline.code_base;
                 bind_compute(p.pipeline, command_buffer, vk.bind_pipeline);
-                if (p.pipeline.bindless_set) {
-                    const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
+                if (p.pipeline.uses_set0) {
+                    const VkDescriptorSet set0 = vk.bindless_set;
                     vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0,
                                             1, &set0, 0, nullptr);
                 }
@@ -4774,8 +4774,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             data.heap_base = vk.heap_base;
             data.code_base = p.pipeline.code_base;
             bind_compute(p.pipeline, command_buffer, vk.bind_pipeline);
-            if (p.pipeline.bindless_set) {
-                const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : p.pipeline.bindless_set;
+            if (p.pipeline.uses_set0) {
+                const VkDescriptorSet set0 = vk.bindless_set;
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline.layout, 0, 1,
                                         &set0, 0, nullptr);
             }
@@ -4867,8 +4867,8 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.set_viewport(command_buffer, 0, 1, &viewport);
                 vk.set_scissor(command_buffer, 0, 1, &d.scissor);
             }
-            if (graphics.bindless_set) {
-                const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : graphics.bindless_set;
+            if (graphics.uses_set0) {
+                const VkDescriptorSet set0 = vk.bindless_set;
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
                                         &set0, 0, nullptr);
             }

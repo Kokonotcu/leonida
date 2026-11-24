@@ -1563,7 +1563,8 @@ public:
     }
 
     // The set 0 the commands of this ExecuteCommandLists bind, read after `prepare` succeeded and under the same
-    // locks (a flush may have made a new set). Without it the pipelines' own set is bound.
+    // locks (a flush may have made a new set). Without it, lists with set-0 pipelines are refused (review D10:
+    // pipelines keep no set of their own, whose handle a flush could free).
     void set_bindless_current(std::function<VkDescriptorSet()> current) {
         std::unique_lock lock(resource_mutex_);
         bindless_current_ = std::move(current);
@@ -2756,7 +2757,10 @@ private:
         // use only the first lists.size() entries, so stale entries are never prepared, queried or emitted.
         if (prepared.size() < lists.size()) prepared.resize(lists.size());
         ReplayFunctions replay = context_.replay_;
-        replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
+        // Provisional, so that prepare refuses set-0 pipelines on a device without one; re-read after the flush below.
+        // The resource lock held from here keeps bindless_current_ in place.
+        replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
+        replay.queue_stages = kind_ == QueueKind::copy     ? detail::queue_stages_copy
                               : kind_ == QueueKind::compute ? detail::queue_stages_compute
                                                             : 0;
         replay.prepare_khr_instances = [this, &replay, &khr_guard](const BuildAccelerationStructure& build,

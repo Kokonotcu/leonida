@@ -87,6 +87,8 @@ struct BindlessFeatures {
     // maxUpdateAfterBindDescriptorsInAllPools with update_after_bind (size_bindings() sets it): every generation of
     // the set has a pool of its own, and all that are alive count against it. No limit otherwise.
     std::uint32_t pool_limit = 0xffffffffu;
+    // maxStorageBufferRange (size_bindings() sets it): the most bytes binding 2's table may take (D10).
+    std::uint32_t max_table_bytes = 0xffffffffu;
 };
 
 namespace bindless {
@@ -245,6 +247,7 @@ inline bool size_bindings(BindlessFeatures& features, const VkPhysicalDeviceLimi
     resource_limit -= std::min(resource_limit, std::min(limits.maxColorAttachments, 8u));
     const std::uint32_t pool_limit = uab ? v12.maxUpdateAfterBindDescriptorsInAllPools : 0xffffffffu;
     features.pool_limit = pool_limit;
+    features.max_table_bytes = limits.maxStorageBufferRange;
 
     auto& counts = features.counts;
     counts = default_counts();
@@ -347,6 +350,8 @@ public:
     BindlessSet(PFN_vkGetDeviceProcAddr get, VkDevice device, const VkPhysicalDeviceMemoryProperties& memory,
                 BindlessFeatures features = {})
         : device_(device), memory_(memory), features_(features) {
+        // Binding 2 names the whole table buffer (VK_WHOLE_SIZE): it must stay within maxStorageBufferRange (D10).
+        table_.set_max_bytes(features_.max_table_bytes);
         ok_ = vk_.load(get, device) && create_layout() && create_fallbacks() && create_table_buffers() && fill();
     }
 
@@ -446,14 +451,6 @@ public:
         if (!index) index = allocate(used, 1, low_end);
         if (index) write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
         return index;
-    }
-
-    // New views or a new layout for an index add_image returned (a texture's state changed, say).
-    void update_image(ImageDimension dimension, std::uint32_t index, VkImageView sampled, VkImageLayout sampled_layout,
-                      const StorageViews& storage = {}, std::uint32_t sampled_class = 0) {
-        const auto& used = image_used_[std::uint32_t(dimension)];
-        if (index && index < used.size() && used[index])
-            write_image(dimension, index, sampled, sampled_layout, storage, sampled_class);
     }
 
     // Returns the index to the fallback and frees it. The caller removes the image's keys with erase_key() first.

@@ -4887,7 +4887,7 @@ public:
             layout_recipe.bindless = layout_bindless_;
             const leonida::pso::LayoutCreateInfo layout(layout_recipe,
                                                         uses_bindless ? device_.bindless->layout() : VK_NULL_HANDLE);
-            if (uses_bindless) graphics_.bindless_set = device_.bindless->set();
+            graphics_.uses_set0 = uses_bindless;  // the set itself is read at submit, under the descriptor lock
             if (vk.vkCreatePipelineLayout(dev, &layout.info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
         }
 
@@ -5076,7 +5076,7 @@ public:
             set0_layout = device_.bindless->layout();
             layout_info.setLayoutCount = 1;
             layout_info.pSetLayouts = &set0_layout;
-            pipeline_.bindless_set = device_.bindless->set();
+            pipeline_.uses_set0 = true;  // the set itself is read at submit, under the descriptor lock
         }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};

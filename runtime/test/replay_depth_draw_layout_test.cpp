@@ -40,8 +40,12 @@ VKAPI_ATTR void VKAPI_CALL begin_rendering(VkCommandBuffer, const VkRenderingInf
 }
 VKAPI_ATTR void VKAPI_CALL end_rendering(VkCommandBuffer) {}
 VKAPI_ATTR void VKAPI_CALL bind_pipeline(VkCommandBuffer, VkPipelineBindPoint, VkPipeline) {}
-VKAPI_ATTR void VKAPI_CALL bind_sets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, std::uint32_t, std::uint32_t,
-                                     const VkDescriptorSet*, std::uint32_t, const std::uint32_t*) {}
+std::vector<VkDescriptorSet> g_bound_sets;  // every set 0 bound
+VKAPI_ATTR void VKAPI_CALL bind_sets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, std::uint32_t first,
+                                     std::uint32_t count, const VkDescriptorSet* sets, std::uint32_t,
+                                     const std::uint32_t*) {
+    if (first == 0 && count) g_bound_sets.push_back(sets[0]);
+}
 VKAPI_ATTR void VKAPI_CALL push(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t,
                                 const void*) {}
 VKAPI_ATTR void VKAPI_CALL viewport(VkCommandBuffer, std::uint32_t, std::uint32_t, const VkViewport*) {}
@@ -96,13 +100,14 @@ int main() {
     p.pipeline = handle<VkPipeline>(pso);
     p.layout = handle<VkPipelineLayout>(1);
     p.push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    p.bindless_set = handle<VkDescriptorSet>(1);
+    p.uses_set0 = true;
     p.color_formats = {VK_FORMAT_R8G8B8A8_UNORM};
     p.depth_format = VK_FORMAT_D32_SFLOAT;
     p.depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
     p.vertex_slots = 1;
 
     ReplayFunctions vk{};
+    vk.bindless_set = handle<VkDescriptorSet>(1);
     vk.pipeline_barrier = barrier;
     vk.begin_rendering = begin_rendering;
     vk.end_rendering = end_rendering;
@@ -200,6 +205,55 @@ int main() {
         // No barrier takes the image from the state's layout to another one, other than the draw's.
         for (const VkImageMemoryBarrier& b : g_depth_barriers)
             expect(b.oldLayout == b.newLayout || b.newLayout == state_layout || b.newLayout == c.expected, c.what);
+    }
+
+    // Review D10: a set-0 pipeline binds the device's current set (ReplayFunctions::bindless_set, read under the
+    // descriptor lock at submit) and keeps none of its own. It used to keep the set of its creation, read without
+    // that lock, and bind it when the submit had none: a handle a flush may since have retired and freed.
+    {
+        const auto resolve = [&](ResourceId id) -> const ResourceBinding* {
+            return id == color_id ? &rt : id == vertex_id ? &vb : nullptr;
+        };
+        Draw d{};
+        d.pipeline = pso;
+        DrawViews views;
+        views.render_targets = {TargetView{color_id, 0, 0, 1}};
+        views.vertex_buffers = {VertexBufferView{0x10000, 1024, 16}};
+        d.views = std::make_shared<const DrawViews>(views);
+        d.topology = 4;
+        d.viewport = {0, 0, 64, 64, 0, 1};
+        d.scissor = {0, 0, 64, 64};
+        d.blend_factor = {1, 1, 1, 1};
+        d.count = 3;
+        d.instances = 1;
+        CommandList list;
+        expect(list.draw(d) && list.close(), "D10: record the draw");
+        p.depth_format = VK_FORMAT_UNDEFINED;
+        p.depth_aspects = 0;
+
+        vk.bindless_set = handle<VkDescriptorSet>(7);  // a flush made generation 7 after the pipeline was created
+        PreparedList prepared;
+        expect(prepare(list, resolve, vk, prepared) == ReplayResult::success, "D10: prepare with the current set");
+        g_bound_sets.clear();
+        LayoutTracker tracker;
+        tracker.track(color_id, rt, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        emit(prepared, VK_NULL_HANDLE, vk, &tracker);
+        expect(g_bound_sets.size() == 1 && g_bound_sets[0] == handle<VkDescriptorSet>(7),
+               "D10: the draw binds the device's current set 0");
+
+        vk.bindless_set = VK_NULL_HANDLE;  // no current set: nothing safe to bind, so the list is refused
+        PreparedList refused;
+        expect(prepare(list, resolve, vk, refused) == ReplayResult::unsupported,
+               "D10: a set-0 pipeline without a current set is refused");
+
+        p.uses_set0 = false;  // a pipeline without set 0 needs none
+        PreparedList plain;
+        expect(prepare(list, resolve, vk, plain) == ReplayResult::success, "D10: no set 0, no current set needed");
+        g_bound_sets.clear();
+        LayoutTracker plain_tracker;
+        plain_tracker.track(color_id, rt, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        emit(plain, VK_NULL_HANDLE, vk, &plain_tracker);
+        expect(g_bound_sets.empty(), "D10: no set 0 bound for a pipeline without one");
     }
 
     if (failures) return 1;
