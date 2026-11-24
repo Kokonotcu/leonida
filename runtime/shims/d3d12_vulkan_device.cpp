@@ -6287,6 +6287,10 @@ public:
         if (const char* v = std::getenv("LEONIDA_CONSOLE_HEAP_VA"); v && v[0] == '1')
             rt::d3d12_xs::set_console_descriptor_heap_handler(&create_console_descriptor_heap);
         state_.info = info;
+        // The translated shader index (26k entries for the retail corpus) is read off the title's thread from now
+        // on: read cold at the first pipeline it outlasted the retail watchdog (about 30 s; PR #8134's boot runs).
+        // library() is locked, so a pipeline that comes first waits only for what is left of the read.
+        library_preload_ = std::thread([this] { state_.library(); });
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
@@ -6787,6 +6791,7 @@ public:
     }
 
     ~Device() override {
+        if (library_preload_.joinable()) library_preload_.join();
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
@@ -10274,6 +10279,7 @@ private:
     std::vector<std::uint32_t> compute_users_;
     std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
+    std::thread library_preload_;  // state_.library() at creation (see the constructor)
     // What the command allocators take spill arrays from (DeviceArenaPages); null without an arena.
     std::shared_ptr<ArenaPages> arena_pages_;
     std::atomic<bool> removed_{false};

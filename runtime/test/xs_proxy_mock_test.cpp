@@ -205,6 +205,8 @@ void copy_array(Mock* m, unsigned slot, std::uint64_t objects, std::uint64_t cou
     for (std::uint32_t i = 0; in && i < static_cast<std::uint32_t>(count) && i < 4; ++i) m->array[slot][i] = in[i];
 }
 
+D3D12_SAMPLER_DESC g_last_sampler{};  // the description of the device's last CreateSampler with a real pointer
+
 // `words` are the call's first five words (a1..a5), copied into the thunk's own frame.
 std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
@@ -218,6 +220,9 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
                 if (a1) m->array[14][0] = reinterpret_cast<const D3D12_DESCRIPTOR_HEAP_DESC*>(a1)->NumDescriptors;
                 return static_cast<std::uint32_t>(mock_create(m, Kind::heap, a2, a3));
             case 15: return kMockDescriptorInc;                                                  // GetDescriptorHandleIncrementSize
+            case 22:  // CreateSampler: a real description is kept (the tests also pass small dummy words)
+                if (a1 > 0x10000) std::memcpy(&g_last_sampler, reinterpret_cast<const void*>(a1), sizeof(g_last_sampler));
+                break;
             case 23:                                                                             // CopyDescriptors
                 copy_array(m, 23, a2, a1);                                                       // dest starts
                 copy_array(m, 24, words[4], a4);                                                 // src starts (recorded in slot 24's array)
@@ -1574,6 +1579,30 @@ int check_descriptor_heap_hooks() {
     EXPECT(real->args[21][2] == kMockHeapCpuStart + off7);
     raw(device, 22, 0x55, kCustomBase + off3);                                          // CreateSampler
     EXPECT(real->args[22][1] == kMockHeapCpuStart + off3);
+    {
+        // Console slot 61 CreateSamplerX: the console's 0x54-byte description (offsets from PR #8134) becomes a PC
+        // sampler written through the translated handle.
+        std::uint8_t x[0x54] = {};
+        const auto put32 = [&](std::size_t o, std::uint32_t v) { std::memcpy(x + o, &v, 4); };
+        const auto putf = [&](std::size_t o, float v) { std::memcpy(x + o, &v, 4); };
+        put32(0x04, 2); put32(0x08, 2); put32(0x0c, 1);          // min/mag linear, mip point
+        put32(0x14, 1);                                          // comparison
+        put32(0x18, 3); put32(0x1c, 1); put32(0x20, 9);          // CLAMP, WRAP, out of range -> WRAP
+        putf(0x24, 1.0f); putf(0x28, 8.0f); putf(0x30, -0.5f);   // LODs, bias
+        put32(0x34, 1); put32(0x40, 4);                          // no anisotropy, LESS_EQUAL
+        putf(0x44, 0.25f); putf(0x50, 1.0f);                     // border r, a
+        raw(device, 61, word(x), kCustomBase + off7);
+        EXPECT(real->args[22][1] == kMockHeapCpuStart + off7);
+        EXPECT(g_last_sampler.Filter == D3D12_ENCODE_BASIC_FILTER(D3D12_FILTER_TYPE_LINEAR, D3D12_FILTER_TYPE_LINEAR,
+                                                                  D3D12_FILTER_TYPE_POINT,
+                                                                  D3D12_FILTER_REDUCTION_TYPE_COMPARISON));
+        EXPECT(g_last_sampler.AddressU == D3D12_TEXTURE_ADDRESS_MODE_CLAMP &&
+               g_last_sampler.AddressV == D3D12_TEXTURE_ADDRESS_MODE_WRAP &&
+               g_last_sampler.AddressW == D3D12_TEXTURE_ADDRESS_MODE_WRAP);
+        EXPECT(g_last_sampler.MinLOD == 1.0f && g_last_sampler.MaxLOD == 8.0f && g_last_sampler.MipLODBias == -0.5f);
+        EXPECT(g_last_sampler.MaxAnisotropy == 1 && g_last_sampler.ComparisonFunc == D3D12_COMPARISON_FUNC_LESS_EQUAL);
+        EXPECT(g_last_sampler.BorderColor[0] == 0.25f && g_last_sampler.BorderColor[3] == 1.0f);
+    }
     raw(device, 24, 1, kCustomBase + off7, kCustomBase + off3, 0);                      // CopyDescriptorsSimple
     EXPECT(real->args[24][1] == kMockHeapCpuStart + off7);
     EXPECT(real->args[24][2] == kMockHeapCpuStart + off3);
