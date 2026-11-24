@@ -3906,6 +3906,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_copy_barrier_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_copy_barrier COMMAND replay_copy_barrier_test)
+    # A UAV barrier on a compute queue keeps the acceleration-structure build stage (B20; no GPU).
+    add_executable(replay_uav_barrier_as_test test/replay_uav_barrier_as_test.cpp)
+    target_link_libraries(replay_uav_barrier_as_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_uav_barrier_as_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_uav_barrier_as COMMAND replay_uav_barrier_as_test)
     # Copies over common leave the texture in GENERAL; a copy queue's lists decay what they left in a transfer
     # layout back to GENERAL (no GPU).
     add_executable(replay_copy_promotion_test test/replay_copy_promotion_test.cpp)

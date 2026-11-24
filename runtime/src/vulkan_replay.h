@@ -1417,9 +1417,11 @@ inline void clip(std::span<const Rect> rects, VkExtent2D extent, std::uint32_t l
 inline constexpr VkPipelineStageFlags2 queue_stages_copy =
     VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
     VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT;
+// A compute queue also builds acceleration structures (B20): a barrier there keeps that stage and its accesses,
+// which only appear when the device has VK_KHR_acceleration_structure.
 inline constexpr VkPipelineStageFlags2 queue_stages_compute =
     queue_stages_copy | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
-    VK_PIPELINE_STAGE_2_CLEAR_BIT;
+    VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
 
 inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags2& stages, VkAccessFlags2& access) {
     if (!vk.queue_stages) return;
@@ -1429,7 +1431,8 @@ inline void restrict_to_queue(const ReplayFunctions& vk, VkPipelineStageFlags2& 
     if (vk.queue_stages & VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT)
         allowed |= VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_UNIFORM_READ_BIT |
                    VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+                   VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT |
+                   VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR | VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
     stages &= vk.queue_stages;
     if (!stages) stages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     access &= allowed;
