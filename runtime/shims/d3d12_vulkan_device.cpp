@@ -307,6 +307,48 @@ LoadedPipelineCache create_pipeline_cache(const leonida::VulkanDeviceFunctions& 
     return out;
 }
 
+// The sha256 of a shader container's FSSM program (what the library is indexed by), or empty without one. The program
+// is inflated and hashed once per distinct container: the retail title passes the same few thousand shaders to tens
+// of thousands of pipeline states, and inflating and hashing each again was the largest share of the busy samples
+// of its game threads during the boot. The key is the container's length and two independent 64-bit hashes of its
+// bytes, so a different container never takes another's result.
+std::string cached_fssm_hash(std::span<const std::uint8_t> bytecode) {
+    std::uint64_t a = 0x9E3779B97F4A7C15ull ^ bytecode.size();
+    std::uint64_t b = 0xC2B2AE3D27D4EB4Full + bytecode.size();
+    std::size_t at = 0;
+    for (; at + 8 <= bytecode.size(); at += 8) {
+        std::uint64_t w;
+        std::memcpy(&w, bytecode.data() + at, 8);
+        a = (a ^ w) * 0x100000001B3ull;
+        a ^= a >> 29;
+        b = (b + w) * 0x9FB21C651E98DF25ull;
+        b ^= b >> 31;
+    }
+    std::uint64_t tail = 0;
+    std::memcpy(&tail, bytecode.data() + at, bytecode.size() - at);
+    a = (a ^ tail) * 0x100000001B3ull;
+    b = (b + tail) * 0x9FB21C651E98DF25ull;
+    struct Item {
+        std::uint64_t b;
+        std::size_t size;
+        std::string sha;
+    };
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Item> cache;
+    {
+        std::lock_guard lock(mutex);
+        if (const auto it = cache.find(a); it != cache.end() && it->second.b == b && it->second.size == bytecode.size())
+            return it->second.sha;
+    }
+    const std::vector<std::uint8_t> program = leonida::fssm_program(bytecode);
+    if (program.empty()) return {};
+    std::string sha = leonida::sha256_hex(program);
+    std::lock_guard lock(mutex);
+    if (cache.size() >= 200000) cache.clear();
+    cache[a] = Item{b, bytecode.size(), sha};
+    return sha;
+}
+
 // The cache's data size, what teardown compares with to see whether anything was added; 0 when it cannot be asked.
 std::size_t pipeline_cache_data_size(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache) {
     std::size_t size = 0;
@@ -1101,10 +1143,28 @@ struct DeviceState {
         return any;
     }
 
-    std::uint32_t sparse_buffer_memory_types = 0;
+    // The memory types a sparse buffer can bind, asked of the driver with a throwaway sparse buffer on first use (a
+    // reserved resource): asked at device creation it cost the retail boot about 3 s there once the arena was in VRAM.
+    bool sparse_buffers_possible = false;  // set at device creation
+    mutable std::once_flag sparse_buffer_types_once;
+    mutable std::uint32_t sparse_buffer_types = 0;
+    std::uint32_t sparse_buffer_memory_types() const {
+        std::call_once(sparse_buffer_types_once, [this] {
+            if (!sparse_buffers_possible || !context) return;
+            auto& vk = context->vk;
+            const auto sparse_info = sparse_buffer_info(leonida::tile_size_in_bytes);
+            VkBuffer sample = VK_NULL_HANDLE;
+            if (vk.vkCreateBuffer(info.device, &sparse_info, nullptr, &sample) != VK_SUCCESS) return;
+            VkMemoryRequirements requirements{};
+            vk.vkGetBufferMemoryRequirements(info.device, sample, &requirements);
+            vk.vkDestroyBuffer(info.device, sample, nullptr);
+            if (!(leonida::tile_size_in_bytes % requirements.alignment)) sparse_buffer_types = requirements.memoryTypeBits;
+        });
+        return sparse_buffer_types;
+    }
     bool sparse_image_tiles = false;
 
-    bool tiles_share_arena() const { return (sparse_buffer_memory_types & (1u << arena.memory_type)) != 0; }
+    bool tiles_share_arena() const { return (sparse_buffer_memory_types() & (1u << arena.memory_type)) != 0; }
 
     VkBufferCreateInfo sparse_buffer_info(VkDeviceSize bytes) const {
         VkBufferCreateInfo result{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -2031,6 +2091,15 @@ struct DeviceState {
         if (!bindless) return false;
         const auto existing = image_entries.find(words);
         if (existing != image_entries.end() && (existing->second.storage || !storage)) return true;
+        // LEONIDA_LOG_TSHARP_8BIT=1: every new T# of an 8-bit format (GFX10 format 1: the glyph atlases), with its
+        // image's address, size and the Vulkan image, to compare with the T#s the text draws read (LEONIDA_LOG_DESC).
+        if (static const bool log_8bit = std::getenv("LEONIDA_LOG_TSHARP_8BIT") != nullptr; log_8bit && image.format == 1) {
+            std::fprintf(stderr, "[rt] d3d12: 8-bit T# registered (address %#llx, %ux%u, image %p):",
+                         static_cast<unsigned long long>(image.address), image.width, image.height,
+                         static_cast<void*>(vk_image));
+            for (const std::uint32_t w : words) std::fprintf(stderr, " %08x", w);
+            std::fprintf(stderr, "%s\n", storage ? " (storage)" : "");
+        }
 
         leonida::ImageDimension dimension;
         switch (image.type) {
@@ -3585,7 +3654,7 @@ public:
         vk.vkGetBufferMemoryRequirements(device_.info.device, sparse->buffer, &requirements);
         sparse->memory_types = requirements.memoryTypeBits;
         if (tile_bytes % requirements.alignment ||
-            !(sparse->memory_types & device_.sparse_buffer_memory_types)) return E_NOTIMPL;
+            !(sparse->memory_types & device_.sparse_buffer_memory_types())) return E_NOTIMPL;
         VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         address.buffer = sparse->buffer;
         va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
@@ -4559,7 +4628,7 @@ public:
         if (placed_buffer_ || (image && placed_image_)) return {};
         if (!tile_allocation_) {
             std::uint32_t memory_type = 0;
-            if (!image) memory_types = device_.sparse_buffer_memory_types;
+            if (!image) memory_types = device_.sparse_buffer_memory_types();
             const VkMemoryRequirements requirements{desc_.SizeInBytes, leonida::tile_size_in_bytes,
                                                     memory_types};
             const auto memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
@@ -5307,8 +5376,8 @@ public:
             VkShaderStageFlagBits bit;
             const D3D12_SHADER_BYTECODE& code;
             const leonida::ShaderEntry* entry = nullptr;
-            std::vector<std::uint8_t> fssm;
             std::vector<std::uint32_t> words;
+            std::uint64_t library_hash = 0;  // pso::spirv_hash of the library's words (cached with them)
             bool edited = false;  // words differ from the library's file (f16 link, depth24 patch)
         };
         Stage stages[3] = {mesh ? Stage{"ms", VK_SHADER_STAGE_MESH_BIT_EXT, *ms}
@@ -5342,12 +5411,11 @@ public:
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             const std::span bytecode(static_cast<const std::uint8_t*>(stage.code.pShaderBytecode),
                                      stage.code.BytecodeLength);
-            stage.fssm = leonida::fssm_program(bytecode);
-            if (stage.fssm.empty()) {
+            const std::string hash = cached_fssm_hash(bytecode);
+            if (hash.empty()) {
                 log_once("shader bytecode holds no FSSM program; bytes", int(stage.code.BytecodeLength));
                 return E_INVALIDARG;
             }
-            const std::string hash = leonida::sha256_hex(stage.fssm);
             // Containers with the same program can differ in their input signature or bindings: a VS must have its
             // inputs fed by this input layout (else the layout check below reports it).
             const bool vertex = stage.bit == VK_SHADER_STAGE_VERTEX_BIT;
@@ -5395,7 +5463,7 @@ public:
                 }
                 code_stage = &stage;
             }
-            stage.words = library->spirv(*stage.entry);
+            stage.words = library->spirv_cached(*stage.entry, &stage.library_hash, &leonida::pso::spirv_hash);
             if (stage.words.empty()) return E_FAIL;
             const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
             if (!inner.valid) return E_INVALIDARG;
@@ -5482,7 +5550,7 @@ public:
             if (stage.bit == VK_SHADER_STAGE_GEOMETRY_BIT) has_geometry_ = true;
             stage_meta_.push_back({std::uint32_t(stage.bit), stage.entry->name, std::uint32_t(info.flags),
                                    info.pNext ? required_sizes[stage_infos.size()].requiredSubgroupSize : 0u,
-                                   leonida::pso::spirv_hash(stage.words)});
+                                   stage.edited ? leonida::pso::spirv_hash(stage.words) : stage.library_hash});
             stage_infos.push_back(info);
         }
         if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
@@ -5910,10 +5978,14 @@ public:
         }
 
         if (code_stage) {
+            // The stage reads its own program from memory: inflated here, for this stage only.
+            const std::vector<std::uint8_t> fssm = leonida::fssm_program(
+                {static_cast<const std::uint8_t*>(code_stage->code.pShaderBytecode), code_stage->code.BytecodeLength});
             VkDeviceSize offset = 0;
-            if (!device_.arena_allocate(code_stage->fssm.size(), 256, offset, DeviceState::arena_shader)) return E_OUTOFMEMORY;
-            std::memcpy(device_.arena.mapped + offset, code_stage->fssm.data(), code_stage->fssm.size());
-            code_bytes_ = code_stage->fssm.size();
+            if (fssm.empty() || !device_.arena_allocate(fssm.size(), 256, offset, DeviceState::arena_shader))
+                return E_OUTOFMEMORY;
+            std::memcpy(device_.arena.mapped + offset, fssm.data(), fssm.size());
+            code_bytes_ = fssm.size();
             code_base_ = offset;
             graphics_.code_base = offset;
         }
@@ -7587,18 +7659,8 @@ public:
             info.queue_family < family_count && (families[info.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT);
         state_.sparse_image_tiles = sparse_aliasing && info.features.sparseResidencyImage2D &&
                                     state_.context->vk.vkGetImageSparseMemoryRequirements;
-        if (sparse_aliasing && state_.arena.memory && info.features.sparseResidencyBuffer) {
-            auto& vk = state_.context->vk;
-            const auto sparse_info = state_.sparse_buffer_info(leonida::tile_size_in_bytes);
-            VkBuffer sample = VK_NULL_HANDLE;
-            if (vk.vkCreateBuffer(info.device, &sparse_info, nullptr, &sample) == VK_SUCCESS) {
-                VkMemoryRequirements requirements{};
-                vk.vkGetBufferMemoryRequirements(info.device, sample, &requirements);
-                vk.vkDestroyBuffer(info.device, sample, nullptr);
-                if (!(leonida::tile_size_in_bytes % requirements.alignment))
-                    state_.sparse_buffer_memory_types = requirements.memoryTypeBits;
-            }
-        }
+        // The memory types themselves are asked on first use (DeviceState::sparse_buffer_memory_types).
+        state_.sparse_buffers_possible = sparse_aliasing && state_.arena.memory && info.features.sparseResidencyBuffer;
         startup_mark("breadcrumbs, labels, sparse checks");
     }
 
@@ -8863,6 +8925,16 @@ public:
                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateRenderTargetView");
         if (!destination.ptr) return;
+        // LEONIDA_DUMP_TITLE_TEXTURE (glyph atlas hunt): a render target view of a 2048x2048 8-bit texture, the
+        // atlas's size: the GPU then draws into it, and a copy from the title's bytes would overwrite what it drew.
+        if (static const bool hunt = std::getenv("LEONIDA_DUMP_TITLE_TEXTURE") != nullptr; hunt && resource) {
+            const D3D12_RESOURCE_DESC d = resource->GetDesc();
+            static std::atomic<int> told{0};
+            if (d.Width == 2048 && d.Height == 2048 &&
+                (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM) && told.fetch_add(1) < 8)
+                std::fprintf(stderr, "[rt] d3d12: render target view of a 2048x2048 8-bit texture %p (view format %d)\n",
+                             static_cast<void*>(resource), desc ? int(desc->Format) : -1);
+        }
         leonida::TargetView view{};
         leonida::ResourceId rid = 0;
         D3D12_RESOURCE_DESC rd{};
@@ -11456,7 +11528,7 @@ private:
         if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         ID3D12Resource* resource = nullptr;
         HRESULT hr = S_OK;
-        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && state_.sparse_buffer_memory_types) {
+        if (desc->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && state_.sparse_buffer_memory_types()) {
             auto* sparse = new Resource(state_, backing, heap, D3D12_HEAP_FLAG_NONE);
             sparse->attach_device(identity());
             hr = sparse->create_sparse_buffer();
@@ -11864,8 +11936,27 @@ void sync_title_textures() {
         if (static const char* dir = std::getenv("LEONIDA_DUMP_TITLE_TEXTURE"); dir && *dir) {
             const D3D12_RESOURCE_DESC& d = t->resource->desc();
             static int dumped = 0;
-            if (((d.Width == 2048 && d.Height == 2048) || (d.Width == 256 && d.Height == 128)) &&
-                (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM) && dumped < 24) {
+            static int atlas_copies = 0;
+            const bool atlas = d.Width == 2048 && d.Height == 2048 &&
+                               (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM);
+            bool dump_now = false;
+            if (atlas) {
+                // Every copy of the glyph atlas: how many of its title bytes are set (glyphs written by the CPU make
+                // this grow), its flags and layout once; its bytes every 20th copy.
+                std::size_t set = 0;
+                for (std::size_t i = 0; i < t->bytes; ++i) set += t->title[i] != 0;
+                const int n = atlas_copies++;
+                if (n == 0)
+                    std::fprintf(stderr, "[rt] d3d12: atlas %p: flags 0x%x layout %d mapped %d, %zu bytes\n",
+                                 static_cast<const void*>(t->title), unsigned(d.Flags), int(d.Layout), int(t->mapped),
+                                 t->bytes);
+                if (n < 400)
+                    std::fprintf(stderr, "[rt] d3d12: atlas copy %d: %zu bytes set\n", n, set);
+                dump_now = n % 20 == 0;
+            }
+            if ((atlas ? dump_now : (d.Width == 256 && d.Height == 128 &&
+                                     (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM))) &&
+                dumped < 24) {
                 char path[512];
                 std::snprintf(path, sizeof path, "%s\\%p_%02d.bin", dir, static_cast<const void*>(t->title), dumped++);
                 CreateDirectoryA(dir, nullptr);
@@ -11983,7 +12074,7 @@ bool device_upload_in_vram(ID3D12Device* device) {
 
 bool device_sparse_buffer_tiles(ID3D12Device* device) {
     const Device* d = Device::from<Device>(device);
-    return d && d->state().sparse_buffer_memory_types != 0;
+    return d && d->state().sparse_buffer_memory_types() != 0;
 }
 
 std::uint64_t device_arena_size(ID3D12Device* device) {

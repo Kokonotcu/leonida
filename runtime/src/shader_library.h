@@ -21,7 +21,10 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <span>
+#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -1004,11 +1007,41 @@ public:
     }
 
     // The module's words, or empty when <dir>/<name>.spv is missing or not SPIR-V.
-    std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const {
+    std::vector<std::uint32_t> spirv(const ShaderEntry& entry) const { return spirv_cached(entry, nullptr); }
+
+    // The same, read from the file once per entry: the retail title creates tens of thousands of pipeline states from
+    // a few thousand shaders, and each opened and read its .spv again (a quarter of the busy samples of the boot's
+    // game threads). `hash_words`, when given, hashes the file's words once, into `*hash`. The cache holds at most
+    // kSpirvCacheBytes and starts over past that; a missing file is not cached.
+    std::vector<std::uint32_t> spirv_cached(const ShaderEntry& entry, std::uint64_t* hash,
+                                            std::uint64_t (*hash_words)(const std::vector<std::uint32_t>&) = nullptr) const {
+        SpirvCache& cache = *spirv_cache_;
+        {
+            std::lock_guard lock(cache.mutex);
+            if (const auto it = cache.by_name.find(entry.name); it != cache.by_name.end()) {
+                if (hash_words && !it->second.hashed) {
+                    it->second.hash = hash_words(*it->second.words);
+                    it->second.hashed = true;
+                }
+                if (hash) *hash = it->second.hash;
+                return *it->second.words;
+            }
+        }
         auto path = dir_;
         path += "/" + entry.name + ".spv";
         std::ifstream file(path, std::ios::binary | std::ios::ate);
-        return read_spirv_words(file, file.tellg());
+        auto words = std::make_shared<const std::vector<std::uint32_t>>(read_spirv_words(file, file.tellg()));
+        if (words->empty()) return {};
+        const std::uint64_t h = hash_words ? hash_words(*words) : 0;
+        if (hash) *hash = h;
+        std::lock_guard lock(cache.mutex);
+        cache.bytes += words->size() * sizeof(std::uint32_t);
+        if (cache.bytes > kSpirvCacheBytes) {
+            cache.by_name.clear();
+            cache.bytes = words->size() * sizeof(std::uint32_t);
+        }
+        cache.by_name.emplace(entry.name, SpirvCache::Item{words, h, hash_words != nullptr});
+        return *words;
     }
 
 private:
@@ -1142,6 +1175,20 @@ private:
         }
         return true;
     }
+
+    static constexpr std::size_t kSpirvCacheBytes = std::size_t(256) << 20;
+    struct SpirvCache {
+        struct Item {
+            std::shared_ptr<const std::vector<std::uint32_t>> words;
+            std::uint64_t hash = 0;
+            bool hashed = false;
+        };
+        std::mutex mutex;
+        std::unordered_map<std::string, Item> by_name;
+        std::size_t bytes = 0;
+    };
+    // Shared by copies of the library (a copy reads the same files).
+    std::shared_ptr<SpirvCache> spirv_cache_ = std::make_shared<SpirvCache>();
 
     std::filesystem::path dir_;
     std::size_t count_ = 0;

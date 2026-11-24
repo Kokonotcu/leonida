@@ -50,6 +50,7 @@
 #include <map>
 #include <bit>
 #include <mutex>
+#include <chrono>
 #include <set>
 #include <string>
 #include <atomic>
@@ -5155,6 +5156,28 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 std::uint64_t key = std::hash<std::string>{}(graphics.debug_name);
                 for (std::size_t i = 0; i < draw->user_data.size() && i < 16; ++i)
                     key = (key ^ data.s[i]) * 0x100000001b3ull;
+                // LEONIDA_LOG_DESC_AFTER=<seconds>: only draws that many seconds after the first matching one, each
+                // distinct texture descriptor at s8+0 once (up to 96): every T# the text of a later screen samples.
+                static const double after = [] {
+                    const char* v = std::getenv("LEONIDA_LOG_DESC_AFTER");
+                    return v ? std::atof(v) : -1.0;
+                }();
+                if (after >= 0.0) {
+                    static const auto start = std::chrono::steady_clock::now();
+                    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < after)
+                        goto log_desc_done;
+                    if (draw->user_data.size() > 8 && debug_targets::arena_mapped && data.s[8] >= 0x10000 &&
+                        data.s[8] + 64 <= debug_targets::arena_size) {
+                        const auto* w = reinterpret_cast<const std::uint32_t*>(debug_targets::arena_mapped + data.s[8]);
+                        key = std::hash<std::string>{}(graphics.debug_name);
+                        for (int i = 0; i < 8; ++i) key = (key ^ w[i]) * 0x100000001b3ull;
+                    }
+                    static std::set<std::uint64_t> seen_late;
+                    std::lock_guard late_lock(mutex);
+                    if (seen_late.size() < 96 && seen_late.insert(key).second)
+                        debug_targets::log_user_data(graphics.debug_name.c_str(), data.s, draw->user_data.size());
+                    goto log_desc_done;
+                }
                 std::lock_guard lock(mutex);
                 // The s8 tables logged, re-read 3000 matching draws later: a slot still zero then was never written
                 // (not just written after the draw was recorded).
@@ -5179,6 +5202,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                         later.emplace_back(data.s[8], draws + 3000);
                 }
             }
+        log_desc_done:
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
