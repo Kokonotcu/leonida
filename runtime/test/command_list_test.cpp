@@ -12,6 +12,22 @@
 int main() {
     using namespace leonida;
     namespace s = d3d12_state;
+    // B16: DispatchMesh(x, y, 0) does nothing, through either draw() overload (the COM layer passes an rvalue): no
+    // command is recorded, and the list stays valid.
+    {
+        CommandList mesh;
+        Draw empty{};
+        empty.pipeline = 1;
+        empty.mesh = true;
+        empty.count = 4;      // x
+        empty.instances = 2;  // y
+        empty.first = 0;      // z
+        CHECK(mesh.draw(empty) && mesh.commands().size() == 0);
+        CHECK(mesh.draw(Draw(empty)) && mesh.commands().size() == 0);
+        Draw groups = empty;
+        groups.first = 1;
+        CHECK(mesh.draw(Draw(groups)) && mesh.commands().size() == 1);
+    }
     CommandList list;
     TargetView descriptor{12, 1, 2, 3};
     ClearColor color{1, 0, 0, 1};

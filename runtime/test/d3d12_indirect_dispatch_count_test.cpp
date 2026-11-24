@@ -258,6 +258,29 @@ int main() {
     if (stale_host)
         std::printf("%u GPU-count-overwrite case(s) checked against the expected result only (stale WARP count)\n",
                     stale_host);
+    // The same cases on a device with VK_EXT_device_generated_commands, where the counted dispatch is one generated
+    // call whose sequence count is the GPU's count (I7), against the expected results.
+    if (vk.indirect_commands) {
+        info.indirect_commands = true;
+        info.indirect_properties = vk.indirect_properties;
+        Ref<ID3D12Device> generated;
+        if (FAILED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&generated.p)))) return 1;
+        unsigned generated_cases = 0;
+        for (UINT count : {0u, 1u, 3u, 7u})
+            for (bool update : {false, true}) {
+                std::array<UINT, 2> result{};
+                const auto want = expected(count, update);
+                if (!run(generated.p, container, count, update, result, true) || result != want) {
+                    std::fprintf(stderr, "generated commands: count %u update %d: layer %u/%u, expected %u/%u\n",
+                                 count, int(update), result[0], result[1], want[0], want[1]);
+                    return 1;
+                }
+                ++generated_cases;
+            }
+        std::printf("counted ExecuteIndirect(DISPATCH) as generated commands: %u cases match\n", generated_cases);
+    } else {
+        std::printf("no VK_EXT_device_generated_commands: the generated-commands cases are skipped\n");
+    }
     if (vk.validation_errors()) {
         std::fprintf(stderr, "validation errors: %u\n", vk.validation_errors());
         return 1;

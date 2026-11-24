@@ -833,7 +833,8 @@ public:
     }
     bool draw(Draw&& draw) {
         if (!draw.pipeline) return false;
-        if (!draw.count || !draw.instances) return !closed_;
+        // As the const& overload: a mesh draw with no thread groups in any dimension does nothing (B16).
+        if (!draw.count || !draw.instances || (draw.mesh && !draw.first)) return !closed_;
         return append(std::move(draw));
     }
 
