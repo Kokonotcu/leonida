@@ -610,7 +610,12 @@ struct TextureCreateInfo {
         info.arrayLayers = volume ? 1 : desc.DepthOrArraySize;
         info.samples = VkSampleCountFlagBits(std::max(1u, desc.SampleDesc.Count));
         info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        // B4G4R4A4 (A4R4G4B4_PACK16) is a D3D12 render-target format no NVIDIA driver renders to (RTX 3080 Laptop:
+        // no COLOR_ATTACHMENT in any 4444 format); the retail title makes a 2560x1440 one. Without the usage the
+        // texture exists and samples; its RTVs are null (CreateRenderTargetView), so draws into it are dropped.
+        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+            (attachment_usable || format.format != VK_FORMAT_A4R4G4B4_UNORM_PACK16))
+            info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         // No B8G8R8X8 view is ever a UAV, so its typeless family needs no storage usage (not every GPU has it for BGRA8).
         if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format)) {
@@ -8031,6 +8036,13 @@ public:
             const bool typed_bgra8_listed = r && !typed_rgba8 && rgba8_any_order(rd.Format) &&
                                             r->has_castable_formats();
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
+                view = {};
+            } else if (rd.Format == DXGI_FORMAT_B4G4R4A4_UNORM &&
+                       !state_.color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16)) {
+                // The texture has no attachment usage here (TextureCreateInfo): a null view, so its draws are dropped.
+                log_once("render-target view of a B4G4R4A4 texture: the GPU cannot render that format; a null "
+                         "view, format",
+                         int(rd.Format));
                 view = {};
             } else if (r && r->uint_backed() == VK_FORMAT_A1R5G5B5_UNORM_PACK16) {
                 // An R16_UINT-backed B5G5R5A1 UAV texture (Format::uint_backed) renders through an A1R5G5B5 view, in
