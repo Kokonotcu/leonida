@@ -222,6 +222,7 @@ public:
     HRESULT STDMETHODCALLTYPE Close() override {
         constexpr auto method = "ID3D12GraphicsCommandList::Close";
         if (list_.queries_open()) invalid_ = true;
+        if (render_pass_open_) invalid_ = true;  // a render pass must end before Close
         if (!list_.close()) return d3d12_trace::result(method, E_FAIL);
         stop_recording();
         return d3d12_trace::result(method, invalid_ ? E_INVALIDARG : S_OK);
@@ -238,6 +239,8 @@ public:
         if (!list_.reset()) return d3d12_trace::result(method, E_FAIL);  // D3D12 resets only closed lists
         record_into(command_allocator);
         invalid_ = false;
+        render_pass_open_ = false;
+        render_pass_resolves_.clear();
         calls_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
@@ -710,6 +713,57 @@ public:
         check(list_.resolve_subresource({resource_id(dst), dst_subresource, resource_id(src), src_subresource, region}));
     }
 
+    // Render passes (M3), on the calls they stand for: BeginRenderPass binds the targets (OMSetRenderTargets) and
+    // clears those whose beginning access is CLEAR; EndRenderPass resolves those whose ending access is RESOLVE
+    // (ResolveSubresourceRegion, per subresource the pass names). PRESERVE, DISCARD and NO_ACCESS need nothing (the
+    // contents stay, which a discard allows). Before, both were unimplemented stubs: the pass's clears and resolves
+    // were lost and its draws went to whatever targets were bound.
+    void STDMETHODCALLTYPE BeginRenderPass(UINT count, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* targets,
+                                           const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* depth,
+                                           D3D12_RENDER_PASS_FLAGS) override {
+        d3d12_trace::record("ID3D12GraphicsCommandList4::BeginRenderPass");
+        if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || render_pass_open_ || count > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT ||
+            (count && !targets))
+            return check(false);
+        render_pass_open_ = true;
+        render_pass_resolves_.clear();
+        D3D12_CPU_DESCRIPTOR_HANDLE handles[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
+        for (UINT i = 0; i < count; ++i) handles[i] = targets[i].cpuDescriptor;
+        const D3D12_CPU_DESCRIPTOR_HANDLE* dsv = depth ? &depth->cpuDescriptor : nullptr;
+        OMSetRenderTargets(count, count ? handles : nullptr, FALSE, dsv);
+        for (UINT i = 0; i < count; ++i) {
+            if (targets[i].BeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+                ClearRenderTargetView(targets[i].cpuDescriptor, targets[i].BeginningAccess.Clear.ClearValue.Color, 0,
+                                      nullptr);
+            keep_resolve(targets[i].EndingAccess);
+        }
+        if (depth) {
+            D3D12_CLEAR_FLAGS flags{};
+            if (depth->DepthBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+                flags |= D3D12_CLEAR_FLAG_DEPTH;
+            if (depth->StencilBeginningAccess.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR)
+                flags |= D3D12_CLEAR_FLAG_STENCIL;
+            if (flags)
+                ClearDepthStencilView(depth->cpuDescriptor, flags,
+                                      depth->DepthBeginningAccess.Clear.ClearValue.DepthStencil.Depth,
+                                      depth->StencilBeginningAccess.Clear.ClearValue.DepthStencil.Stencil, 0, nullptr);
+            keep_resolve(depth->DepthEndingAccess);
+            keep_resolve(depth->StencilEndingAccess);
+        }
+    }
+
+    void STDMETHODCALLTYPE EndRenderPass() override {
+        d3d12_trace::record("ID3D12GraphicsCommandList4::EndRenderPass");
+        if (!render_pass_open_) return check(false);
+        render_pass_open_ = false;
+        for (RenderPassResolve& r : render_pass_resolves_) {
+            D3D12_RECT* rect = r.rect.right > r.rect.left && r.rect.bottom > r.rect.top ? &r.rect : nullptr;
+            ResolveSubresourceRegion(r.dst, r.dst_subresource, r.x, r.y, r.src, r.src_subresource, rect, r.format,
+                                     r.mode);
+        }
+        render_pass_resolves_.clear();
+    }
+
     // A null buffer turns predication off (docs/d3d12_vulkan.md section 4.7). Bundles and copy lists may not set it.
     // Recording-time checks match live Windows 11 WARP and RTX 5090 D3D12: null buffer requires offset 0 and
     // EQUAL_ZERO; a non-null resource must be a non-READBACK buffer with an 8-byte aligned in-bounds range.
@@ -1079,6 +1133,27 @@ private:
         if (!ok) invalid_ = true;
     }
 
+    // A RESOLVE ending access of BeginRenderPass, one entry per subresource it names, for EndRenderPass (M3). The
+    // parameters are copied: D3D12 does not ask the application to keep them past BeginRenderPass.
+    struct RenderPassResolve {
+        ID3D12Resource* src;
+        ID3D12Resource* dst;
+        UINT src_subresource, dst_subresource, x, y;
+        D3D12_RECT rect;
+        DXGI_FORMAT format;
+        D3D12_RESOLVE_MODE mode;
+    };
+    void keep_resolve(const D3D12_RENDER_PASS_ENDING_ACCESS& access) {
+        if (access.Type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE) return;
+        const auto& r = access.Resolve;
+        if (!r.pSrcResource || !r.pDstResource || (r.SubresourceCount && !r.pSubresourceParameters)) return check(false);
+        for (UINT i = 0; i < r.SubresourceCount; ++i) {
+            const auto& s = r.pSubresourceParameters[i];
+            render_pass_resolves_.push_back({r.pSrcResource, r.pDstResource, s.SrcSubresource, s.DstSubresource, s.DstX,
+                                             s.DstY, s.SrcRect, r.Format, r.ResolveMode});
+        }
+    }
+
     void stop_recording() {
         if (!allocator_) return;
         if (allocator_->recording() == this) allocator_->set_recording(nullptr);
@@ -1310,6 +1385,8 @@ private:
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
+    bool render_pass_open_ = false;  // between BeginRenderPass and EndRenderPass
+    std::vector<RenderPassResolve> render_pass_resolves_;
     UINT front_stencil_ref_ = 0;
     UINT back_stencil_ref_ = 0;
     RootState compute_;

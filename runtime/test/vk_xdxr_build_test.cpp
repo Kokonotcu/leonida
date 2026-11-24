@@ -44,6 +44,50 @@ using namespace leonida;
 
 struct Tri { float v[3][3]; std::uint32_t geometry, primitive; };
 
+// A device function table that counts the commands a builder records (B21): dispatches, push constants, barriers,
+// pipeline binds and fills.
+PFN_vkGetDeviceProcAddr g_real_device_proc = nullptr;
+unsigned g_recorded_commands = 0;
+PFN_vkCmdDispatch g_real_dispatch = nullptr;
+PFN_vkCmdPushConstants g_real_push = nullptr;
+PFN_vkCmdPipelineBarrier g_real_barrier = nullptr;
+PFN_vkCmdBindPipeline g_real_bind = nullptr;
+PFN_vkCmdFillBuffer g_real_fill = nullptr;
+VKAPI_ATTR void VKAPI_CALL counted_dispatch(VkCommandBuffer cb, std::uint32_t x, std::uint32_t y, std::uint32_t z) {
+    ++g_recorded_commands;
+    g_real_dispatch(cb, x, y, z);
+}
+VKAPI_ATTR void VKAPI_CALL counted_push(VkCommandBuffer cb, VkPipelineLayout l, VkShaderStageFlags s, std::uint32_t o,
+                                        std::uint32_t n, const void* v) {
+    ++g_recorded_commands;
+    g_real_push(cb, l, s, o, n, v);
+}
+VKAPI_ATTR void VKAPI_CALL counted_barrier(VkCommandBuffer cb, VkPipelineStageFlags a, VkPipelineStageFlags b,
+                                           VkDependencyFlags f, std::uint32_t mc, const VkMemoryBarrier* m,
+                                           std::uint32_t bc, const VkBufferMemoryBarrier* bb, std::uint32_t ic,
+                                           const VkImageMemoryBarrier* ib) {
+    ++g_recorded_commands;
+    g_real_barrier(cb, a, b, f, mc, m, bc, bb, ic, ib);
+}
+VKAPI_ATTR void VKAPI_CALL counted_bind(VkCommandBuffer cb, VkPipelineBindPoint p, VkPipeline pipeline) {
+    ++g_recorded_commands;
+    g_real_bind(cb, p, pipeline);
+}
+VKAPI_ATTR void VKAPI_CALL counted_fill(VkCommandBuffer cb, VkBuffer b, VkDeviceSize o, VkDeviceSize n, std::uint32_t v) {
+    ++g_recorded_commands;
+    g_real_fill(cb, b, o, n, v);
+}
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL counting_device_proc(VkDevice device, const char* name) {
+    const PFN_vkVoidFunction real = g_real_device_proc(device, name);
+    const std::string n = name;
+    if (n == "vkCmdDispatch") { g_real_dispatch = reinterpret_cast<PFN_vkCmdDispatch>(real); return reinterpret_cast<PFN_vkVoidFunction>(counted_dispatch); }
+    if (n == "vkCmdPushConstants") { g_real_push = reinterpret_cast<PFN_vkCmdPushConstants>(real); return reinterpret_cast<PFN_vkVoidFunction>(counted_push); }
+    if (n == "vkCmdPipelineBarrier") { g_real_barrier = reinterpret_cast<PFN_vkCmdPipelineBarrier>(real); return reinterpret_cast<PFN_vkVoidFunction>(counted_barrier); }
+    if (n == "vkCmdBindPipeline") { g_real_bind = reinterpret_cast<PFN_vkCmdBindPipeline>(real); return reinterpret_cast<PFN_vkVoidFunction>(counted_bind); }
+    if (n == "vkCmdFillBuffer") { g_real_fill = reinterpret_cast<PFN_vkCmdFillBuffer>(real); return reinterpret_cast<PFN_vkVoidFunction>(counted_fill); }
+    return real;
+}
+
 struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     void* map = nullptr;
@@ -316,6 +360,32 @@ int main(int argc, char** argv) {
         std::printf("%u triangles: %.2f ms (best of 3), refit %.2f ms, result %u bytes, scratch %llu bytes, sort size %u\n",
                     n, best, refit, layout.size, static_cast<unsigned long long>(layout.scratch), layout.sort_size);
         return 0;
+    }
+
+    // B21: geometries whose triangles do not fill the layout are refused before anything is recorded (a half-recorded
+    // build would run on the GPU). A builder on a counting function table: no command at all for the refused build.
+    {
+        g_real_device_proc = gpu.device_proc;
+        XdxrBuilder counting(counting_device_proc, gpu.device);
+        EXPECT(counting.loaded());
+        XdxrLayout layout;
+        EXPECT(layout.compute(8, false));
+        Buffer dst = make(gpu, layout.size, true), scratch = make(gpu, std::size_t(layout.scratch), true);
+        EXPECT(dst.buffer && scratch.buffer);
+        XdxrTriangles short_geometry;
+        short_geometry.vertices = dst.address;  // never read: nothing is recorded
+        short_geometry.triangle_count = 5;     // 5 of the layout's 8
+        bool recorded = true;
+        g_recorded_commands = 0;
+        EXPECT(gpu.run([&](VkCommandBuffer cb) {
+            recorded = counting.record_blas(cb, layout, {short_geometry}, dst.address, scratch.address);
+            return true;
+        }));
+        EXPECT(!recorded);
+        if (g_recorded_commands)
+            std::fprintf(stderr, "a refused BLAS build recorded %u commands\n", g_recorded_commands);
+        EXPECT(g_recorded_commands == 0);
+        std::printf("a BLAS build whose geometries miss 3 of 8 triangles is refused with nothing recorded\n");
     }
 
     std::mt19937 rng(7);
