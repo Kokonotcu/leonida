@@ -4251,8 +4251,9 @@ std::chrono::steady_clock::duration title_texture_watch() {
 constexpr auto kTitleTextureFirstWatch = std::chrono::seconds(1);
 constexpr auto kTitleTextureRecheck = std::chrono::milliseconds(250);
 constexpr auto kMappedRecheck = std::chrono::milliseconds(33);  // a mapped texture: a sample at about 30 Hz
-constexpr double kTitleTextureRecheckRate = 64.0 * 1024 * 1024;            // bytes hashed per second, at most
-constexpr std::size_t kTitleTextureRecheckBurst = 8ull * 1024 * 1024;       // budget kept across idle time
+constexpr double kTitleTextureRecheckRate = 256.0 * 1024 * 1024;           // bytes hashed per second, at most
+constexpr std::size_t kTitleTextureRecheckBurst = 16ull * 1024 * 1024;      // budget kept across idle time
+constexpr std::size_t kTitleTextureFullCheckBytes = 8ull * 1024 * 1024;     // small: full hashes, not samples
 
 // LEONIDA_DUMP_MISSING=<dir>: the bytecode the title passed for a shader the library has no translation of, as
 // <dir>/<stage>_<program sha256>.dxbc (once per file), for translating it offline.
@@ -7827,8 +7828,27 @@ public:
                 if (have.Width != desc.Width || have.Height != desc.Height || have.Dimension != desc.Dimension)
                     continue;
                 // A view is where the title's new bytes are taken: it makes a texture's view once its data has
-                // arrived (five-star-recomp, docs/gpu-resources.md, "Refresh points").
-                t->dirty = true;
+                // arrived (five-star-recomp, docs/gpu-resources.md, "Refresh points"). Not for a texture the GPU
+                // writes (render target or UAV): its pages are not its contents.
+                if (t->watch) t->dirty = true;
+                t->resource->AddRef();
+                return t->resource;
+            }
+            // No exact match, but a texture the title placed at this address: the view goes on it, whatever extent
+            // the view's words name. A separate copy made from the pages would not hold what the GPU draws into it:
+            // Scaleform draws its glyph cache on the GPU, and the cached letters came out as blocks or missing (the
+            // ones without ascenders or descenders, on every screen).
+            for (const auto& t : title_textures()) {
+                if (reinterpret_cast<std::uint64_t>(t->title) != va) continue;
+                static std::atomic<int> told_alias{0};
+                if (told_alias.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    const D3D12_RESOURCE_DESC& have = t->resource->desc();
+                    std::fprintf(stderr, "[rt] d3d12: slot-70 view of %llux%u format %d at %#llx goes on the texture "
+                                         "placed there (%llux%u format %d, flags %#x)\n",
+                                 static_cast<unsigned long long>(desc.Width), desc.Height, int(desc.Format),
+                                 static_cast<unsigned long long>(va), static_cast<unsigned long long>(have.Width),
+                                 have.Height, int(have.Format), unsigned(have.Flags));
+                }
                 t->resource->AddRef();
                 return t->resource;
             }
@@ -11610,6 +11630,16 @@ void sync_title_textures() {
                 if (now >= t->next_check) {  // the first second after a copy: a sample at about 30 Hz
                     t->next_check = now + kMappedRecheck;
                     check = Check::probe;
+                }
+            } else if (t->bytes <= kTitleTextureFullCheckBytes) {
+                // A small texture (glyph pages, atlases, UI images) takes writes of a few bytes per row that a sample
+                // misses: the glyph cache was copied before its letters were drawn and never again, so the letters
+                // without ascenders or descenders were missing on every screen. A full hash at most every 500 ms.
+                if (now >= t->next_check && budget >= t->bytes) {
+                    budget -= t->bytes;
+                    t->next_check = now + std::chrono::milliseconds(500);
+                    cursor = (cursor + n + 1) % count;
+                    check = Check::full;
                 }
             } else if (now >= t->next_check && budget >= t->bytes / 64) {
                 budget -= t->bytes / 64;  // for life, from the byte budget, round robin
