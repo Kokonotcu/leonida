@@ -50,6 +50,7 @@
 #include <map>
 #include <bit>
 #include <mutex>
+#include <set>
 #include <string>
 #include <atomic>
 #include <memory>
@@ -5126,6 +5127,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                  graphics.debug_name.find("exe/container") != std::string::npos)) {
                 static std::atomic<int> told{0};
                 if (told.fetch_add(1, std::memory_order_relaxed) < 9)
+                    debug_targets::log_user_data(graphics.debug_name.c_str(), data.s, draw->user_data.size());
+            }
+            // LEONIDA_LOG_DESC=<part of a shader pair's name>: the user data and the descriptor words it points at,
+            // for the first 48 draws of matching pipelines with user data not logged before.
+            if (static const char* want = std::getenv("LEONIDA_LOG_DESC");
+                want && *want && !graphics.debug_name.empty() && graphics.debug_name.find(want) != std::string::npos) {
+                static std::mutex mutex;
+                static std::set<std::uint64_t> seen;
+                std::uint64_t key = std::hash<std::string>{}(graphics.debug_name);
+                for (std::size_t i = 0; i < draw->user_data.size() && i < 16; ++i)
+                    key = (key ^ data.s[i]) * 0x100000001b3ull;
+                std::lock_guard lock(mutex);
+                if (seen.size() < 48 && seen.insert(key).second)
                     debug_targets::log_user_data(graphics.debug_name.c_str(), data.s, draw->user_data.size());
             }
             data.heap_base = vk.heap_base;

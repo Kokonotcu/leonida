@@ -4075,17 +4075,15 @@ std::uint64_t title_hash(const std::uint8_t* p, std::size_t bytes) {
 }
 
 // How long after each copy a texture without render-target or UAV usage is hashed (see "Title-placed textures").
-// Glyph caches (the UI font atlas) get new glyphs written by the CPU whenever a screen shows text it has not drawn
-// before, long after the first copy: one second dropped those letters (LEGAL NOTICES drew "C py ight"). So the watch
-// lasts for the texture's life by default. For kTitleTextureFirstWatch after each copy a texture is hashed on every
-// submission; after that at most every kTitleTextureRecheck, round robin, from a byte budget of
-// kTitleTextureRecheckRate (a few textures per frame, whatever the number the title placed).
-// LEONIDA_TITLE_TEXTURE_WATCH=<seconds> sets a finite window again (0 = only the copy after each texture computer
-// write).
+// For kTitleTextureFirstWatch after each copy a texture is hashed on every submission. LEONIDA_TITLE_TEXTURE_WATCH=
+// <seconds> (or "life") keeps watching longer: after the first second at most every kTitleTextureRecheck, round
+// robin, from a byte budget of kTitleTextureRecheckRate. Not the default: a lifelong watch did not bring back the
+// letters LEGAL NOTICES drops ("C py ight", retail 1.0.2.1), and it cost frame rate.
 std::chrono::steady_clock::duration title_texture_watch() {
     static const std::chrono::steady_clock::duration watch = [] {
         const char* v = std::getenv("LEONIDA_TITLE_TEXTURE_WATCH");
-        if (!v || !*v) return std::chrono::steady_clock::duration::max() / 2;
+        if (!v || !*v) return std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(1));
+        if (_stricmp(v, "life") == 0) return std::chrono::steady_clock::duration::max() / 2;
         return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::duration<double>(std::strtod(v, nullptr)));
     }();
