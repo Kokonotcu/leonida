@@ -361,6 +361,15 @@ bool mapped_image_base(uint64_t address, uint64_t& base) {
     return false;
 }
 
+void* mapped_module_base(uint64_t address) {
+    std::string module;
+    uint32_t rva = 0;
+    std::lock_guard lock(g_lookup_mutex);
+    for (auto& l : g_lookups)
+        if (l.fn(l.ctx, address, module, rva)) return reinterpret_cast<void*>(address - rva);
+    return nullptr;
+}
+
 std::string module_offset(uint64_t address) {
     char b[48];
     std::string module;
