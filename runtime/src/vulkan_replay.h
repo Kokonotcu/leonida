@@ -5129,6 +5129,34 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 if (told.fetch_add(1, std::memory_order_relaxed) < 9)
                     debug_targets::log_user_data(graphics.debug_name.c_str(), data.s, draw->user_data.size());
             }
+            // LEONIDA_FIND_TSHARP=<word 0 hex>: each pipeline whose draws' tables (the first 256 bytes behind any user
+            // data word that is an arena offset) hold a T# starting with that word, once per pipeline and slot.
+            if (static const std::uint32_t find = [] {
+                    const char* v = std::getenv("LEONIDA_FIND_TSHARP");
+                    return v ? std::uint32_t(std::strtoul(v, nullptr, 16)) : 0u;
+                }();
+                find && debug_targets::arena_mapped) {
+                static std::mutex mutex;
+                static std::set<std::string> seen;
+                for (std::size_t i = 0; i < draw->user_data.size() && i < 16; ++i) {
+                    const std::uint64_t va = data.s[i];
+                    if (va < 0x10000 || (va & 3) || va + 256 > debug_targets::arena_size) continue;
+                    const auto* w = reinterpret_cast<const std::uint32_t*>(debug_targets::arena_mapped + va);
+                    for (int k = 0; k < 64; k += 8) {
+                        // LEONIDA_FIND_TSHARP_WORD=2 matches word 2 (the extent) instead of word 0 (the address).
+                        static const int word = [] {
+                            const char* v = std::getenv("LEONIDA_FIND_TSHARP_WORD");
+                            return v ? std::atoi(v) & 7 : 0;
+                        }();
+                        if (w[k + word] != find) continue;
+                        const std::string key = graphics.debug_name + " s" + std::to_string(i) + "+" +
+                                                std::to_string(k * 4);
+                        std::lock_guard lock(mutex);
+                        if (seen.size() < 64 && seen.insert(key).second)
+                            std::fprintf(stderr, "[rt] find: T# %08x %08x in %s\n", w[k], w[k + 1], key.c_str());
+                    }
+                }
+            }
             // LEONIDA_LOG_DESC=<part of a shader pair's name>: the user data and the descriptor words it points at,
             // for the first 48 draws of matching pipelines with user data not logged before.
             if (static const char* want = std::getenv("LEONIDA_LOG_DESC");

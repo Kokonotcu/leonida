@@ -3008,7 +3008,15 @@ struct TitleTexture {
     std::chrono::steady_clock::time_point watch_until{};
     std::chrono::steady_clock::time_point first_watch_until{};  // hashed on every submission until then
     std::chrono::steady_clock::time_point next_check{};         // then at most this often, from a byte budget
+    bool mapped = false;  // the title mapped it (Map): written by the CPU whenever it likes, checked for life
 };
+
+// A title-placed texture the title maps is written by the CPU at any time, for its whole life: Bink decodes every video
+// frame into its Y, Cr and Cb planes (R8, mapped once), so the 1 s watch after a copy left the planes at their first
+// contents and the intro video showed grey, then all green (YUV zeros). Such textures are hashed for life, at most
+// every kMappedRecheck (one check a frame at 60 Hz), outside the byte budget: there are few (12 in the intro video).
+// five-star-recomp found the same (ThatRecompDev, docs/gpu-resources.md, "CPU-mapped textures").
+void mark_title_texture_mapped(const Resource* resource);
 
 std::mutex& title_texture_mutex() {
     static std::mutex mutex;
@@ -3026,6 +3034,40 @@ void unregister_title_texture(const Resource* resource) {
     auto& textures = title_textures();
     std::erase_if(textures, [&](const auto& t) { return t->resource == resource; });
     g_title_texture_count.store(textures.size(), std::memory_order_release);
+}
+
+// The title ranges of mapped textures (under title_texture_mutex): every title texture over such a range is refreshed
+// as a mapped one, also one made later by another description of the same pages (a slot-70 view of a video plane).
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& mapped_title_ranges() {
+    static std::vector<std::pair<std::uintptr_t, std::uintptr_t>> ranges;
+    return ranges;
+}
+
+bool overlaps_mapped_range(const std::uint8_t* title, std::size_t bytes) {
+    const auto begin = reinterpret_cast<std::uintptr_t>(title), end = begin + bytes;
+    for (const auto& [b, e] : mapped_title_ranges())
+        if (begin < e && b < end) return true;
+    return false;
+}
+
+void mark_title_texture_mapped(const Resource* resource) {
+    if (!g_title_texture_count.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(title_texture_mutex());
+    const TitleTexture* mapped = nullptr;
+    for (const auto& t : title_textures())
+        if (t->resource == resource) mapped = t.get();
+    if (!mapped || overlaps_mapped_range(mapped->title, mapped->bytes)) return;
+    const auto begin = reinterpret_cast<std::uintptr_t>(mapped->title);
+    mapped_title_ranges().emplace_back(begin, begin + mapped->bytes);
+    static int told = 0;
+    if (told++ < 24)
+        std::fprintf(stderr, "[rt] d3d12: title texture %p mapped (%zu bytes)\n", static_cast<const void*>(mapped->title),
+                     mapped->bytes);
+    for (const auto& t : title_textures())
+        if (!t->mapped && overlaps_mapped_range(t->title, t->bytes)) {
+            t->mapped = true;
+            t->dirty = true;  // whatever the title writes through the mapping from now on
+        }
 }
 
 // rt::xg's write listener: the texture computer wrote [address, address + bytes).
@@ -3729,6 +3771,7 @@ public:
                 return E_INVALIDARG;
             }
             *data = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(va_)) + f.Offset;
+            mark_title_texture_mapped(this);  // CPU writes through this pointer reach the image (sync_title_textures)
             return S_OK;
         }
         if (image_) {
@@ -4068,6 +4111,7 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
     t->watch = !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
     rt::xg::g_write_listener.store(&title_texture_written, std::memory_order_release);
     std::lock_guard lock(title_texture_mutex());
+    t->mapped = overlaps_mapped_range(t->title, t->bytes);  // pages the title already writes through a mapping
     title_textures().push_back(std::move(t));
     g_title_texture_count.store(title_textures().size(), std::memory_order_release);
     return true;
@@ -4117,6 +4161,7 @@ std::chrono::steady_clock::duration title_texture_watch() {
 }
 constexpr auto kTitleTextureFirstWatch = std::chrono::seconds(1);
 constexpr auto kTitleTextureRecheck = std::chrono::milliseconds(250);
+constexpr auto kMappedRecheck = std::chrono::milliseconds(15);  // a mapped texture: about once a frame
 constexpr double kTitleTextureRecheckRate = 64.0 * 1024 * 1024;            // bytes hashed per second, at most
 constexpr std::size_t kTitleTextureRecheckBurst = 8ull * 1024 * 1024;       // budget kept across idle time
 
@@ -11446,7 +11491,10 @@ void sync_title_textures() {
                 leonida::debug_targets::note(t->resource->id());
         }
         bool watching = false;
-        if (!t->dirty && t->watch && t->copied && now < t->watch_until) {
+        if (!t->dirty && t->mapped && t->copied && now >= t->next_check) {
+            watching = true;  // mapped: for life, once a frame (mark_title_texture_mapped)
+            t->next_check = now + kMappedRecheck;
+        } else if (!t->dirty && t->watch && t->copied && now < t->watch_until) {
             if (now < t->first_watch_until) {
                 watching = true;  // the first second after a copy: every submission, as before
             } else if (now >= t->next_check && budget >= t->bytes) {
@@ -11457,7 +11505,15 @@ void sync_title_textures() {
             }
         }
         if (!t->dirty && !watching) continue;
-        if (!title_range_readable(t->title, t->bytes)) continue;  // reserved pages: a later submission copies it
+        if (!title_range_readable(t->title, t->bytes)) {  // reserved pages: a later submission copies it
+            if (t->mapped) {
+                static int told = 0;
+                if (told++ < 8)
+                    std::fprintf(stderr, "[rt] d3d12: mapped title texture %p not readable (%zu bytes)\n",
+                                 static_cast<const void*>(t->title), t->bytes);
+            }
+            continue;
+        }
         const std::uint64_t hash = title_hash(t->title, t->bytes);
         if (t->copied && hash == t->hash) {  // nothing new since the last copy
             t->dirty = false;
@@ -11474,6 +11530,13 @@ void sync_title_textures() {
         t->hash = hash;
         t->first_watch_until = now + kTitleTextureFirstWatch;
         t->watch_until = now + title_texture_watch();
+        if (t->mapped) {  // the video planes: the first 40 copies of mapped textures, and every 100th after
+            static int copies = 0;
+            if (copies < 40 || copies % 100 == 0)
+                std::fprintf(stderr, "[rt] d3d12: mapped title texture %p copied again (copy %d, hash %016llx)\n",
+                             static_cast<const void*>(t->title), copies, static_cast<unsigned long long>(hash));
+            ++copies;
+        }
         // LEONIDA_DUMP_TITLE_TEXTURE=<dir>: the title bytes of each copied 2048x2048 A8/R8 texture (the glyph atlas),
         // as <dir>/<title address>_<copy n>.bin, the first 24 copies.
         if (static const char* dir = std::getenv("LEONIDA_DUMP_TITLE_TEXTURE"); dir && *dir) {

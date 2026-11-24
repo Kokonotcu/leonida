@@ -4793,6 +4793,29 @@ void sync_title_heaps() {
     if (title_syncs().empty()) return;
     ++g_title_sync_stats.syncs;
     for (const auto& sync : title_syncs()) sync_title_heap(*sync, sampler_slots, g_title_sync_stats);
+    // LEONIDA_SCAN_HEAP_TSHARP=<word 2 hex>: every 2000 syncs, the descriptors of the shader-visible heaps whose word 2
+    // (a T#'s extent) is that value: how many, and the first indices with their word 0.
+    static const std::uint32_t scan = [] {
+        char v[16] = {};
+        return GetEnvironmentVariableA("LEONIDA_SCAN_HEAP_TSHARP", v, sizeof v) ? std::uint32_t(std::strtoul(v, nullptr, 16))
+                                                                                 : 0u;
+    }();
+    if (scan && g_title_sync_stats.syncs % 2000 == 0) {
+        for (const auto& sync : title_syncs()) {
+            if (sync->sampler || sync->increment != 32) continue;
+            std::size_t found = 0;
+            char first[512] = {};
+            std::size_t used = 0;
+            for (std::size_t at = 0; at + 32 <= sync->bytes; at += 32) {
+                const auto* w = reinterpret_cast<const std::uint32_t*>(sync->title + at);
+                if (w[2] != scan || (w[3] >> 28) < 8) continue;
+                if (found++ < 12 && used < sizeof(first) - 40)
+                    used += std::snprintf(first + used, sizeof(first) - used, " %zu:%08x", at / 32, w[0]);
+            }
+            std::fprintf(stderr, "[rt] d3d12_xs: heap scan (sync %llu): %zu T#s of extent %08x;%s\n",
+                         static_cast<unsigned long long>(g_title_sync_stats.syncs), found, scan, first);
+        }
+    }
 }
 
 TitleHeapSyncStats title_heap_sync_stats() {
