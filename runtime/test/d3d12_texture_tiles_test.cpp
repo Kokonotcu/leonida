@@ -248,21 +248,35 @@ bool run(ID3D12Device& device, UINT width, UINT height, UINT64 tile_copy_offset,
     return true;
 }
 
-ComPtr<ID3D12Device> native_device() {
+// The native reference runs on the GPU the Vulkan device runs on (its LUID), so both runs compare one vendor's tiling.
+// On a hybrid laptop DXGI lists the integrated GPU first, and its driver has its own CopyTiles behaviour (the Intel
+// UHD's reads a linear buffer at a 1-byte offset one byte off), which is not what the replay must match.
+// With no LUID (or no such adapter), the first hardware adapter with tier 2 tiled resources, as before.
+ComPtr<ID3D12Device> native_device(LUID luid) {
     ComPtr<IDXGIFactory4> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return {};
+    const auto try_adapter = [](IDXGIAdapter1* adapter) -> ComPtr<ID3D12Device> {
+        DXGI_ADAPTER_DESC1 desc{};
+        if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) return {};
+        ComPtr<ID3D12Device> device;
+        if (FAILED(D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) return {};
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
+            options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2) return {};
+        std::printf("Native D3D12: %ls, tiled resources tier %u\n", desc.Description, unsigned(options.TiledResourcesTier));
+        return device;
+    };
+    if (luid.LowPart || luid.HighPart) {
+        ComPtr<IDXGIAdapter1> same;
+        if (SUCCEEDED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&same)))) {
+            if (auto device = try_adapter(same.Get())) return device;
+            std::puts("The Vulkan device's adapter has no native tier 2 tiled resources; comparing with another");
+        }
+    }
     for (UINT i = 0;; ++i) {
         ComPtr<IDXGIAdapter1> adapter;
         if (factory->EnumAdapters1(i, &adapter) != S_OK) return {};
-        DXGI_ADAPTER_DESC1 desc{};
-        if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
-        ComPtr<ID3D12Device> device;
-        if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) continue;
-        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
-        if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) ||
-            options.TiledResourcesTier < D3D12_TILED_RESOURCES_TIER_2) continue;
-        std::printf("Native D3D12: %ls, tiled resources tier %u\n", desc.Description, unsigned(options.TiledResourcesTier));
-        return device;
+        if (auto device = try_adapter(adapter.Get())) return device;
     }
 }
 
@@ -283,7 +297,7 @@ int main() {
         std::fputs("A texture with multiple mips did not use the committed fallback\n", stderr);
         return 1;
     }
-    auto native = native_device();
+    auto native = native_device(vulkan->GetAdapterLuid());
     const auto* info = rt::d3d12::vulkan_device_info(vulkan.Get());
     const bool dedicated_copy = info && !info->copy_queues.empty() && info->copy_family != info->queue_family;
     struct ReplayCase {

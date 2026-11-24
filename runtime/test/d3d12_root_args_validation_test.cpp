@@ -453,6 +453,7 @@ int main() {
     std::vector<HRESULT> layer_hr(table.size(), E_FAIL);
     std::vector<HRESULT> warp_hr(table.size(), kNotRun);
     std::vector<HRESULT> hw_hr(table.size(), kNotRun);
+    LUID layer_luid{};
 
     {
         rt::d3d12::VulkanDeviceInfo info{};
@@ -465,6 +466,7 @@ int main() {
         info.buffer_device_address = vk.buffer_device_address;
         Ref<ID3D12Device> ours;
         REQUIRE(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&ours.p))));
+        layer_luid = ours.p->GetAdapterLuid();
         Env env;
         REQUIRE(env.init(ours.p));
         for (std::size_t i = 0; i < table.size(); ++i) REQUIRE(run_case(env, table[i], false, layer_hr[i]));
@@ -487,9 +489,18 @@ int main() {
                 REQUIRE(warp_dev->GetDeviceRemovedReason() == S_OK);
                 warp_ran = true;
             }
-            for (UINT i = 0;; ++i) {
+            // The hardware reference is the GPU the layer runs on (its LUID) when DXGI has it: on a hybrid laptop DXGI
+            // lists the integrated GPU first, and its driver answers some cases on its own terms (the Intel UHD's
+            // fails CreateCommandAllocator(BUNDLE)), which is not what the layer must match. Then, as before, the
+            // first hardware adapter.
+            const bool have_luid = layer_luid.LowPart || layer_luid.HighPart;
+            for (int i = have_luid ? -1 : 0;; ++i) {
                 Ref<IDXGIAdapter1> adapter;
-                if (factory->EnumAdapters1(i, &adapter.p) == DXGI_ERROR_NOT_FOUND) break;
+                if (i < 0) {
+                    if (FAILED(factory->EnumAdapterByLuid(layer_luid, IID_PPV_ARGS(&adapter.p)))) continue;
+                } else if (factory->EnumAdapters1(static_cast<UINT>(i), &adapter.p) == DXGI_ERROR_NOT_FOUND) {
+                    break;
+                }
                 DXGI_ADAPTER_DESC1 desc{};
                 adapter->GetDesc1(&desc);
                 if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
