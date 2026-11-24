@@ -22,7 +22,6 @@ import os
 import struct
 import subprocess
 import sys
-import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
@@ -88,14 +87,11 @@ MC = _llvm_mc()
 
 
 def assemble(cpu, text):
-    """(returncode, stdout, stderr) of llvm-mc assembling `text` for `cpu`, through a file (no BOM, no pipe)."""
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "in.s")
-        with open(path, "w", encoding="ascii", newline="\n") as f:
-            f.write(text)
-        r = subprocess.run(MC + ["-triple=amdgcn", f"-mcpu={cpu}", "-show-encoding", path],
-                           capture_output=True, text=True, timeout=60)
-    return r.returncode, r.stdout, r.stderr
+    """(returncode, stdout, stderr) of llvm-mc assembling `text` for `cpu`, through stdin as ASCII (no BOM), like the
+    tools: an LLVM_MC command line such as 'wsl -e .../llvm-mc' cannot open a Windows file path."""
+    r = subprocess.run(MC + ["-triple=amdgcn", f"-mcpu={cpu}", "-show-encoding"], input=text.encode("ascii"),
+                       capture_output=True, timeout=60)
+    return r.returncode, r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
 
 
 def encodings(stdout):
