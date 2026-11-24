@@ -448,7 +448,44 @@ int test_capacity_overflow() {
     return 0;
 }
 
+// Review D10: the GPU copy is bound as one storage buffer (binding 2), so it may not outgrow maxStorageBufferRange.
+// A growth past set_max_bytes is refused before the table changes, like the other refusals.
+int test_max_bytes_caps_growth() {
+    DescriptorTable table;
+    const std::uint64_t limit = 4 + 64 * sizeof(DescriptorEntry) + 39;  // room for 64 entries, not 128
+    table.set_max_bytes(limit);
+    std::vector<DescriptorKey> keys;
+    bool rejected = false;
+    for (std::uint32_t i = 0; i < 1000 && !rejected; ++i) {
+        DescriptorKey key{};
+        key[0] = i * 2654435761u;
+        key[1] = i;
+        try {
+            table.insert(key, i + 1);
+            keys.push_back(key);
+        } catch (const std::length_error&) {
+            rejected = true;
+        }
+    }
+    EXPECT(rejected);
+    EXPECT(table.capacity() == 64 && table.size_bytes() <= limit);
+    EXPECT(keys.size() == 32);  // half full at 64 slots: the next insert would grow
+    for (std::uint32_t i = 0; i < keys.size(); ++i) EXPECT(table.lookup(keys[i]) == i + 1);
+    EXPECT(table.insert_or_update(keys[0].data(), 77) == DescriptorTable::InsertResult::replaced);
+    EXPECT(table.erase(keys[1]));
+    DescriptorKey last{};
+    last[0] = 0xdeadbeef;
+    EXPECT(table.insert(last, 5) && table.lookup(last) == 5);  // an erased key's room is used again
+    // 0 lifts the limit.
+    table.set_max_bytes(0);
+    DescriptorKey more{};
+    more[0] = 0xfeedface;
+    EXPECT(table.insert(more, 6) && table.capacity() == 128);
+    return 0;
+}
+
 int main() {
+    EXPECT(test_max_bytes_caps_growth() == 0);
     EXPECT(test_unresolvable_hash_collision() == 0);
     EXPECT(test_capacity_overflow() == 0);
     EXPECT(test_fnv1a_hash_matches_contract() == 0);

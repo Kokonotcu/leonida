@@ -1023,14 +1023,10 @@ int main(int argc, char** argv) {
         EXPECT(set.insert_key(tsharp, gradient_index) && set.flush_replaces_table());
         EXPECT(flush());
 
-        // Another view at the same index, then removal of the index.
-        set.update_image(ImageDimension::dim_2d, gradient_index, decoy_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        EXPECT(flush());
-        EXPECT(!set.last_flush_uploaded());  // a descriptor write only: the table is unchanged, nothing to wait for
-        CHECK(draw());
-        compare("7 other view", orange_colour);
+        // Removal of the index. (Rewriting a live index in place, update_image, is gone: review D10.)
         set.remove_image(ImageDimension::dim_2d, gradient_index);
         EXPECT(flush());
+        EXPECT(!set.last_flush_uploaded());  // a descriptor write only: the table is unchanged, nothing to wait for
         CHECK(draw());
         compare("8 removed", zeros);
         EXPECT(set.add_image(ImageDimension::dim_2d, gradient_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) == gradient_index);
