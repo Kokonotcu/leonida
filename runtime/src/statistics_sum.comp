@@ -2,9 +2,10 @@
 
 // Adds the D3D12_QUERY_DATA_PIPELINE_STATISTICS segments of one split pipeline-statistics query (D3D-162): one
 // invocation per counter, in the order of VkQueryPipelineStatisticFlagBits, which is the D3D12 field order.
-// `mesh` segments come from the pool a mesh draw can run in (D3D-291), which counts only clipping, fragment and
-// compute: they are copied to counters 5..8 of their record, so CSInvocations sits at 8 and the input-assembly,
-// vertex, geometry and tessellation counters (0..4, 8 and 9 of the D3D12 order) add nothing.
+// `mesh` segments come from the pool a mesh draw can run in (D3D-291), which counts only fragment and compute
+// invocations (VUID-vkCmdDrawMeshTasksEXT-pipelineStatistics-07076 rules out clipping too): they are copied to
+// counters 7..8 of their record, zero-filled before, so CSInvocations sits at 8, the clipping counters 5 and 6 read
+// 0, and the input-assembly, vertex, geometry and tessellation counters (0..4, 8 and 9 of the D3D12 order) add nothing.
 layout(local_size_x = 11) in;
 layout(set = 0, binding = 0, std430) buffer QueryResults {
     uvec2 total[11];

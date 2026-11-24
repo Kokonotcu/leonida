@@ -472,11 +472,14 @@ int main() {
             EXPECT(vertex_only.IAVertices == 6 && vertex_only.IAPrimitives == 2);
             EXPECT(mixed.GSInvocations == 0 && mixed.GSPrimitives == 0 && mixed.HSInvocations == 0 &&
                    mixed.DSInvocations == 0 && mixed.CSInvocations == 0);
-            EXPECT(mixed.CInvocations > vertex_only.CInvocations && mixed.PSInvocations > vertex_only.PSInvocations);
+            // A mesh draw's clipping counters cannot be queried in Vulkan (VUID-vkCmdDrawMeshTasksEXT-
+            // pipelineStatistics-07076): the mesh segments count only fragment and compute invocations, so the
+            // mixed query's clipping counters are the vertex draw's and a mesh-only query's are 0.
+            EXPECT(mixed.CInvocations == vertex_only.CInvocations && mixed.PSInvocations > vertex_only.PSInvocations);
             EXPECT(mesh_only.IAVertices == 0 && mesh_only.IAPrimitives == 0 && mesh_only.VSInvocations == 0 &&
                    mesh_only.GSInvocations == 0 && mesh_only.GSPrimitives == 0 && mesh_only.HSInvocations == 0 &&
                    mesh_only.DSInvocations == 0 && mesh_only.CSInvocations == 0);
-            EXPECT(mesh_only.CInvocations > 0 && mesh_only.PSInvocations > 0);
+            EXPECT(mesh_only.CInvocations == 0 && mesh_only.CPrimitives == 0 && mesh_only.PSInvocations > 0);
         } else {
             std::printf("pipelineStatisticsQuery not available: the D3D-291 statistics check is skipped\n");
         }
