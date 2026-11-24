@@ -499,17 +499,31 @@ int main() {
                                                          sizeof(quality_levels))));
             EXPECT(quality_levels.NumQualityLevels == (count == 1 ? 1u : 0u));
         }
-        // Depth/stencil and UAV A8 textures are refused, as on the PC runtime. A render-target A8 texture is made
-        // (an R8 image): the console title renders into A8, which the PC runtime refuses (d3d12_vulkan_device.cpp,
-        // texture_format).
-        for (auto flag : {D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS}) {
+        // A depth/stencil A8 texture is refused, as on the PC runtime. Render-target, UAV and non-2D A8 textures are
+        // made (R8 images): the console title makes them, which the PC runtime refuses (d3d12_vulkan_device.cpp,
+        // texture_format; UAV and non-2D from PR #8134's retail run).
+        {
             auto desc = texture_desc;
             desc.Format = DXGI_FORMAT_A8_UNORM;
-            desc.Flags = flag;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
             EXPECT(FAILED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
                                                           D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                           __uuidof(ID3D12Resource), nullptr)));
             EXPECT(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes == UINT64_MAX);
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            Ref<ID3D12Resource> a8_uav;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&a8_uav.p))));
+            EXPECT(device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes != UINT64_MAX);
+            desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+            desc.DepthOrArraySize = 4;
+            desc.MipLevels = 1;
+            Ref<ID3D12Resource> a8_volume;
+            EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &desc,
+                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                             IID_PPV_ARGS(&a8_volume.p))));
         }
         {
             auto desc = texture_desc;

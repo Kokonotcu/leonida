@@ -1,5 +1,6 @@
 #include "dxgi_com.h"
 #include "d3d12_stubs.h"
+#include "d3d12_xs_device.h"
 #include "log_seen.h"
 
 #include <winternl.h>  // NTSTATUS, which d3dkmthk.h needs and WIN32_LEAN_AND_MEAN leaves out
@@ -129,7 +130,10 @@ bool valid_flip_buffer_count(UINT count) {
 bool is_direct_present_queue(IUnknown* candidate) {
     ID3D12CommandQueue* queue = nullptr;
     if (!candidate || FAILED(candidate->QueryInterface(IID_PPV_ARGS(&queue))) || !queue) return false;
-    const bool direct = queue->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
+    // A queue proxy the title made through device slot 48 is called in the console's slot layout, where PC slot 18
+    // (GetDesc) is not GetDesc: ask the real queue behind it.
+    ID3D12CommandQueue* const real = rt::d3d12_xs::queue_proxy_real_queue(queue);
+    const bool direct = (real ? real : queue)->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT;
     queue->Release();
     return direct;
 }

@@ -764,6 +764,16 @@ Queues and fences are wrapped the same way.
   object implements but the proxy does not model is logged once and refused.
 - **The refused tail.** A slot past the public chain, up to the end of the proxy's own table (128 queue and
   64 fence slots, every one a thunk), logs its first four argument words once and returns `E_NOTIMPL`.
+- **The console queue layout.** A queue made through device slot 48 (`CreateCommandQueueX`, how the retail title
+  makes its queues) is called in the console's slot layout, measured on the retail executable 1.0.2.1 by PR #8134
+  (`console_queue_slot`): slot 35 is `ExecuteCommandLists(count, lists, 1, 0x100000000)` (PC 10; the two extra words
+  are not passed on), and slots 16..20 are the PC's 14..18 two slots up: 16 `Signal` (the title signals with
+  `(fence, 1)` and `(fence, 2)` there; forwarded by number, PC slot 16 wrote the timestamp frequency over the fence
+  proxy's vtable), 17 `Wait`, 18 `GetTimestampFrequency(UINT64*)` (PC slot 18, `GetDesc`, wrote 16 bytes into its
+  8-byte out), 19 `GetClockCalibration`, 20 `GetDesc`. Slots 14 and 15, console methods not measured, are refused
+  rather than sent to the PC `Signal` and `Wait`. A queue from slots 8 and 75 keeps the PC layout, since the runtime's own code and the tests
+  call it through `d3d12.h`; the runtime's code reaches a console-layout queue's real queue
+  (`queue_proxy_real_queue`) before calling a PC method on it. `queue_proxy_test` (`check_console_queue`).
 - **Fence slot 12.** The one served slot past the fence chain. The retail executable calls it as
   `(value, descriptor, flags)` and reads the return as a pointer to the fence's 64-bit completed value: it
   compares that value with `~0` (device removed) and subtracts the value it waits for. The proxy returns a

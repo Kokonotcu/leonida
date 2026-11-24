@@ -1197,11 +1197,17 @@ struct DeviceState {
         if (!xr_bias_compatible(desc)) return {};
         // Native D3D12 refuses an A8 render target; the console title renders into A8 (the 4K alpha/UI target).
         // The image is R8_UNORM, which is render-target capable, and the A8 view swizzles alpha out of R, so the
-        // console path allows the render-target flag. Depth/stencil and UAV stay refused as on the host.
-        if (desc.Format == DXGI_FORMAT_A8_UNORM &&
-            (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.SampleDesc.Count != 1 ||
-             (desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))))
-            return {};
+        // console path allows the render-target flag. The title also makes A8 textures the PC refuses beyond that
+        // (PR #8134: the retail executable 1.0.2.1 asks for one and stops when it is refused), so a UAV or a non-2D
+        // A8 texture is an R8 image too, logged once: a UAV store of alpha lands in R only where the view swizzles it
+        // there. Depth/stencil and multisampled A8 stay refused.
+        if (desc.Format == DXGI_FORMAT_A8_UNORM) {
+            if (desc.SampleDesc.Count != 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return {};
+            if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                log_once("A8_UNORM beyond a 2D shader resource or render target is an R8_UNORM image; resource flags",
+                         int(desc.Flags));
+        }
         if (desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
             if ((desc.SampleDesc.Count != 1 && (!(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) ||
                                                (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) ||

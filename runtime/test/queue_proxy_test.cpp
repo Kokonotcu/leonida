@@ -1508,6 +1508,85 @@ int check_xbox_client(const Backend& b) {
     return 0;
 }
 
+// A queue the way the retail title makes and calls it (PR #8134, measured on the retail executable 1.0.2.1): device
+// slot 48 (CreateCommandQueueX, a PC description followed by four console words), then the console's queue slots:
+// 35 ExecuteCommandLists(count, lists, 1, 0x100000000); 16..20 two past the PC's 14..18 (16 Signal, 17 Wait, 18
+// GetTimestampFrequency(UINT64*), which must write 8 bytes, 19 GetClockCalibration, 20 GetDesc); 14 and 15, not
+// measured, refused. Forwarded by number, slot 16 wrote the frequency over the fence proxy's vtable and slot 18 16
+// bytes over the caller's saved RBX.
+int check_console_queue(const Backend& b) {
+    const char* label = b.label;
+    void* device = b.device;
+    const std::uint32_t xbox_desc[8] = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0, 0, 0, 0, 0, 0, 0};
+    const IID iid_queue = __uuidof(ID3D12CommandQueue), iid_fence = __uuidof(ID3D12Fence);
+    Ref<ID3D12CommandQueue> queue;
+    Ref<ID3D12Fence> fence;
+    EXPECT(SUCCEEDED(as_hr(raw(device, 48, word(xbox_desc), word(&iid_queue), word(&queue.p)))));
+    EXPECT(SUCCEEDED(as_hr(raw(device, 36, 0, D3D12_FENCE_FLAG_NONE, word(&iid_fence), word(&fence.p)))));
+    EXPECT(xs::is_queue_proxy(queue.p) && xs::is_fence_proxy(fence.p));
+
+    // 18: the frequency, and nothing past its 8 bytes.
+    std::uint64_t frequency[2] = {0, 0x5a5a5a5a5a5a5a5aull};
+    std::uint64_t before = xs::queue_slot_hits(18);
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 18, word(frequency)))));
+    EXPECT(frequency[0] > 0 && frequency[1] == 0x5a5a5a5a5a5a5a5aull);
+    EXPECT(xs::queue_slot_hits(18) == before + 1);
+
+    // 35: a list really runs (it clears nothing; the fence after it completes).
+    Ref<ID3D12CommandAllocator> allocator;
+    Ref<ID3D12GraphicsCommandList> list;
+    EXPECT(SUCCEEDED(b.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
+    EXPECT(SUCCEEDED(b.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
+                                                 IID_PPV_ARGS(&list.p))));
+    EXPECT(SUCCEEDED(list->Close()));
+    ID3D12CommandList* lists[] = {list.p};
+    before = xs::queue_slot_hits(35);
+    raw(queue.p, 35, 1, word(lists), 1, 0x100000000ull);
+    EXPECT(xs::queue_slot_hits(35) == before + 1);
+    before = xs::queue_slot_hits(16);
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 16, word(fence.p), 1))));  // Signal(fence, 1), as the title signals
+    EXPECT(xs::queue_slot_hits(16) == before + 1);
+    Event done;
+    EXPECT(SUCCEEDED(as_hr(raw(fence.p, 9, 1, word(done.h)))) && done.set_within(5000));
+    EXPECT(xs::is_fence_proxy(fence.p));  // its vtable is intact
+    if (b.vulkan) EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+
+    // 17 Wait holds the queue until the CPU signals; a Signal of another fence after it waits too.
+    Ref<ID3D12Fence> second;
+    EXPECT(SUCCEEDED(as_hr(raw(device, 36, 0, D3D12_FENCE_FLAG_NONE, word(&iid_fence), word(&second.p)))));
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 17, word(fence.p), 3))));
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 16, word(second.p), 1))));
+    Sleep(50);
+    EXPECT(raw(second.p, 8) == 0);
+    EXPECT(SUCCEEDED(as_hr(raw(fence.p, 10, 3))));
+    EXPECT(SUCCEEDED(as_hr(raw(second.p, 9, 1, word(done.h)))) && done.set_within(5000));
+
+    // 19 GetClockCalibration(gpu, cpu) and 20 GetDesc (the PC's struct return: the description through RDX).
+    std::uint64_t gpu = 0, cpu = 0;
+    EXPECT(SUCCEEDED(as_hr(raw(queue.p, 19, word(&gpu), word(&cpu)))) && cpu > 0);
+    D3D12_COMMAND_QUEUE_DESC got{};
+    got.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+    EXPECT(raw(queue.p, 20, word(&got)) == word(&got) && got.Type == D3D12_COMMAND_LIST_TYPE_DIRECT);
+
+    // 14 and 15 are not sent to the PC Signal and Wait.
+    before = xs::queue_slot_hits(14);
+    EXPECT(as_hr(raw(queue.p, 14, word(second.p), 7)) == E_NOTIMPL);
+    EXPECT(as_hr(raw(queue.p, 15, word(second.p), 7)) == E_NOTIMPL);
+    EXPECT(xs::queue_slot_hits(14) == before + 1);
+    Sleep(20);
+    EXPECT(raw(second.p, 8) == 1);
+    EXPECT(raw(second.p, 2) == 0);
+    second.p = nullptr;
+
+    EXPECT(raw(fence.p, 2) == 0);
+    fence.p = nullptr;
+    EXPECT(raw(queue.p, 2) == 0);
+    queue.p = nullptr;
+    std::printf("%s: a slot-48 queue in the console layout: 35 executes lists, 16..20 are PC 14..18 (Signal, Wait, "
+                "GetTimestampFrequency in 8 bytes, GetClockCalibration, GetDesc), 14/15 refused\n", label);
+    return 0;
+}
+
 // ---- 9. Coverage gate ----
 //
 // Every changed device slot, every queue slot and every fence slot of the tables must have been called in this
@@ -1689,7 +1768,8 @@ int check_repeated(const Backend& b) {
 int run_all(const Backend& b) {
     g_shared_checked = g_shared_created = g_reserved_checked = false;
     return check_slots(b) || check_guard(b) || check_differential(b) || check_identity(b) || check_shared(b) ||
-           check_threads(b) || check_repeated(b) || check_xbox_client(b) || check_coverage(b);
+           check_threads(b) || check_repeated(b) || check_xbox_client(b) || check_console_queue(b) ||
+           check_coverage(b);
 }
 
 // Host PC runtime on `adapter`. 77 when no device can be made on it.

@@ -9,7 +9,7 @@
 //   {"seq":5,"t":0.010,"kind":"unimplemented_call","import":"x.dll!Foo","caller":"a.dll+0x3f10"}   (first call only)
 //   {"seq":6,"t":0.011,"kind":"debug_string","text":"..."}
 //   {"seq":7,"t":0.020,"kind":"exception","code":"0xc0000005","at":"a.dll+0x4a00","access":"read","address":"0x0",
-//        "stack":["a.dll+0x4a00","a.dll+0x2210"]}
+//        "regs":"rax=0x0 rbx=... rsp=...","stack":["a.dll+0x4a00","a.dll+0x2210"]}
 //   {"seq":8,"t":0.030,"kind":"exit","code":0}
 //
 // The exception handler is vectored, logs and returns EXCEPTION_CONTINUE_SEARCH: it never changes what the process
@@ -263,6 +263,14 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
                 }
             }
             if (r.ExceptionCode == kCppException) f += ",\"cpp\":true";
+            // The registers a fault's operands come from (PR #8134 read its retail faults this way).
+            if (info.ContextRecord) {
+                const CONTEXT& c = *info.ContextRecord;
+                f += ",\"regs\":" + quote("rax=" + hex(c.Rax) + " rbx=" + hex(c.Rbx) + " rcx=" + hex(c.Rcx) +
+                                          " rdx=" + hex(c.Rdx) + " rsi=" + hex(c.Rsi) + " rdi=" + hex(c.Rdi) +
+                                          " r8=" + hex(c.R8) + " r9=" + hex(c.R9) + " r14=" + hex(c.R14) +
+                                          " r15=" + hex(c.R15) + " rsp=" + hex(c.Rsp));
+            }
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
             // A write to address 0 is how the retail title's watchdog stops the process when a thread stops making

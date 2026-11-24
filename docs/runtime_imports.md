@@ -165,12 +165,20 @@ policy "other" (none is counted as returning an `HRESULT`), and they come from s
 
 The game executable imports two functions from `xg_xs.dll`, the console's texture layout library:
 `XGSuggestSwizzleMode` (2 call sites, in the helper that fills a texture description) and `XGCreateTextureComputer`
-(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable). The runtime has no model of the console
-resource layout, so `runtime/shims/xg_xs.cpp` computes none: both return `E_NOTIMPL` and write no layout. Two of the
-four `XGCreateTextureComputer` callers ignore the HRESULT and call through the object at once, so the shim still stores
-a static object in the out pointer; its slot 1 (read as `Release`) does nothing, and every other slot up to 31 logs its
-index and caller once and returns `E_NOTIMPL` without writing its arguments. The call shapes and the reasoning are at
-the top of the file; `xg_xs_test` covers them. Textures whose layout the game asks for are therefore not laid out yet.
+(4 call sites, which use slots 1, 2, 8 and 10 of the returned object's vtable; PR #8134 measured them as
+`GetResourceLayout`, `CopyIntoSubresource` and the `GetResourceTiling` arguments). `runtime/shims/xg_xs.cpp` hands a
+texture description a computer with a LINEAR layout (`runtime/shims/xg_linear_layout.h`, PR #8134's, ported): slot 2
+writes the console's `XG_RESOURCE_LAYOUT` records (header and four planes, nothing past them), slot 8 copies a
+subresource's rows into it, slot 10 reports its 64 KiB tiles, all from one computation. It only has to agree with this
+runtime, and it does: every subresource is a D3D12 placed footprint (mips one after another, each holding its array
+slices, 2D slices at 512 bytes with 256-byte rows, a 3D mip's depth slices row pitch * rows apart), so memory the title
+fills through slot 8 can be copied into a texture with `CopyTextureRegion`; and device slots 25 and 108 size a console
+caller's texture at least this large, so that memory holds what slot 8 writes. Still open: a title-placed texture
+(device slot 133) is an ordinary committed texture, so nothing copies the title's linear bytes into it yet.
+`XGSuggestSwizzleMode` still returns `E_NOTIMPL` and writes nothing (its out is the description's `Layout`, which the
+runtime reads as the PC's). A description the layout does not cover gets the static object as before: two of the four
+callers ignore the HRESULT and call through it at once; its slot 1 does nothing, and every other slot up to 31 logs
+once and returns `E_NOTIMPL` without writing its arguments. `xg_xs_test` covers both.
 The table above was measured before this shim and still lists these two as unimplemented; they are served now.
 
 Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
