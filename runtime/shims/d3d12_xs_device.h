@@ -133,6 +133,11 @@ using ResourceByVaProvider = ID3D12Resource* (*)(ID3D12Device* real, std::uint64
 // `device` is the proxy or its DXGI pointer. False, with a line on stderr, when it is neither. Without a provider slot
 // 70 writes only the null view.
 bool set_device_resource_provider(void* device, ResourceByVaProvider provider);
+// The texture at a console GPU address, for a slot-70 view of a texture: the title-placed texture registered there with
+// the description's extent, or a new one placed there as device slot 133 places one. Returns it with a reference
+// added (the proxy releases it), or null.
+using TextureByVaProvider = ID3D12Resource* (*)(ID3D12Device* real, std::uint64_t va, const D3D12_RESOURCE_DESC* desc);
+bool set_device_texture_provider(void* device, TextureByVaProvider provider);
 // The device proxy an IDXGIDevice pointer handed out by one belongs to, or null.
 void* device_proxy_from_dxgi_device(void* dxgi_device);
 // The device proxy itself, given the proxy or its DXGI pointer; null for anything else.

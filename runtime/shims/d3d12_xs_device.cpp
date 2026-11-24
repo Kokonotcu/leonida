@@ -85,6 +85,7 @@ struct DeviceProxy {
     void** dxgi_vtable;
     DxgiAdapterProvider adapter_provider;
     ResourceByVaProvider resource_provider;  // slot 70: a buffer by console VA; null leaves slot 70 on the null view
+    TextureByVaProvider texture_provider = nullptr;  // slot 70: a texture by console VA
     std::atomic<int> gpu_thread_priority;
     std::atomic<unsigned> max_frame_latency;
     // The first-frame subset of SetFrameIntervalX/ScheduleFrameEventX/WaitFrameEventX. The token source is shared with
@@ -2785,6 +2786,41 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
     // Hook point for the CPU destination: the console hands a CPU descriptor handle that the PC layer may not be able
     // to write as it is. Translating it (#7021) goes here, on `destination`, before either write below.
 
+    // A texture view (five-star-recomp, docs/gpu-resources.md "Slot 70"): the words are a desktop resource description
+    // and SRV description followed by the texture's address. The view goes on the title-placed texture at that address
+    // (one is placed there when none is), so its T# names an image fed from the title's pages. Until this every such
+    // view was null, and the Scaleform programs that read the glyph cache through one drew no letters ("C py ight" on
+    // LEGAL NOTICES: the letters without ascenders or descenders come from the cache).
+    if (readable(texture_words, sizeof(D3D12_RESOURCE_DESC)) &&
+        readable(view_desc, sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) + sizeof(D3D12_GPU_VIRTUAL_ADDRESS))) {
+        D3D12_RESOURCE_DESC rd{};
+        D3D12_SHADER_RESOURCE_VIEW_DESC vd{};
+        D3D12_GPU_VIRTUAL_ADDRESS va = 0;
+        std::memcpy(&rd, reinterpret_cast<const void*>(texture_words), sizeof(rd));
+        std::memcpy(&vd, reinterpret_cast<const void*>(view_desc), sizeof(vd));
+        std::memcpy(&va, reinterpret_cast<const std::uint8_t*>(view_desc) + sizeof(vd), sizeof(va));
+        const bool texture = rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
+                             rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                             rd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if (texture && vd.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) {
+            static std::atomic<int> told{0};
+            const bool tell = told.fetch_add(1, std::memory_order_relaxed) < 8;
+            ID3D12Resource* resource = va && self->texture_provider ? self->texture_provider(self->real, va, &rd) : nullptr;
+            if (tell)
+                std::fprintf(stderr, "[rt] d3d12_xs: slot 70 texture view at 0x%llx: %llux%u x%u, %u mips, format %d "
+                                     "(view format %d, dimension %d) -> %s\n",
+                             static_cast<unsigned long long>(va), static_cast<unsigned long long>(rd.Width), rd.Height,
+                             rd.DepthOrArraySize, rd.MipLevels, int(rd.Format), int(vd.Format), int(vd.ViewDimension),
+                             resource ? "texture" : self->texture_provider ? "null view" : "null view (no provider)");
+            if (!resource) {
+                write_null_srv(self, destination);
+                return;
+            }
+            self->real->CreateShaderResourceView(resource, &vd, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+            resource->Release();
+            return;
+        }
+    }
     RawSrvShape shape{};
     const char* why = parse_raw_srv(texture_words, view_desc, shape);
     if (why || !self->resource_provider) {
@@ -4635,6 +4671,7 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out) {
     proxy->dxgi_vtable = get_dxgi_vtable();
     proxy->adapter_provider = nullptr;
     proxy->resource_provider = nullptr;
+    proxy->texture_provider = nullptr;
     proxy->gpu_thread_priority.store(0, std::memory_order_relaxed);
     proxy->max_frame_latency.store(3, std::memory_order_relaxed);
 
@@ -4686,6 +4723,13 @@ bool set_device_resource_provider(void* device, ResourceByVaProvider provider) {
         return false;
     }
     proxy->resource_provider = provider;
+    return true;
+}
+
+bool set_device_texture_provider(void* device, TextureByVaProvider provider) {
+    auto* proxy = static_cast<DeviceProxy*>(device_proxy_primary(device));
+    if (!proxy) return false;
+    proxy->texture_provider = provider;
     return true;
 }
 

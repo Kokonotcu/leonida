@@ -7680,6 +7680,53 @@ public:
     void own(const OwnedRuntime& owned) { owned_ = owned; }
     void set_outer(IUnknown* outer) { outer_ = outer; }
 
+    // The title-placed texture at console address `va` with the extent `desc` names, with a reference added for the
+    // caller; a texture placed there as device slot 133 places one when none is (kept until the device goes, like the
+    // views the title writes of it), or null when the address is not readable title memory.
+    ID3D12Resource* add_ref_texture_at(std::uint64_t va, const D3D12_RESOURCE_DESC& desc) {
+        {
+            std::lock_guard lock(title_texture_mutex());
+            for (const auto& t : title_textures()) {
+                if (reinterpret_cast<std::uint64_t>(t->title) != va) continue;
+                const D3D12_RESOURCE_DESC& have = t->resource->desc();
+                if (have.Width != desc.Width || have.Height != desc.Height || have.Dimension != desc.Dimension)
+                    continue;
+                t->resource->AddRef();
+                return t->resource;
+            }
+        }
+        static std::atomic<int> told{0};
+        // Pages not committed yet are no reason to refuse: xmem commits physical pages on first touch, and the title
+        // makes a texture's view before it writes the texels (the glyph cache). sync_title_textures copies the pages
+        // at the first submission that finds them readable.
+        if (!va) return nullptr;
+        D3D12_RESOURCE_DESC placed = desc;
+        // A view's texture is read by shaders only: no target or UAV usage, so the title's pages feed it. The words
+        // also carry console-only flags (0x300000 on every view of the boot), which the PC refuses: none are kept.
+        placed.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (!placed.SampleDesc.Count) placed.SampleDesc.Count = 1;
+        void* made = nullptr;
+        const HRESULT hr =
+            create_at_host_address(reinterpret_cast<void*>(va), placed, 0, __uuidof(ID3D12Resource), &made);
+        if (FAILED(hr) || !made) {
+            if (told.fetch_add(1) < 6)
+                std::fprintf(stderr, "[rt] d3d12: slot-70 texture at %#llx: creation failed %#x (layout %d, alignment "
+                                     "%llu, samples %u, flags %#x)\n", static_cast<unsigned long long>(va),
+                             unsigned(hr), int(desc.Layout), static_cast<unsigned long long>(desc.Alignment),
+                             desc.SampleDesc.Count, unsigned(desc.Flags));
+            return nullptr;
+        }
+        auto* resource = static_cast<ID3D12Resource*>(made);
+        static std::mutex keep_mutex;
+        static std::vector<ID3D12Resource*> kept;  // one reference each, for the views written of them
+        {
+            std::lock_guard lock(keep_mutex);
+            kept.push_back(resource);
+        }
+        resource->AddRef();
+        return resource;
+    }
+
     // The buffer resource holding console VA `va`, with a reference added for the caller, or null when no resource this
     // layer made holds it. `start` and `size` are the resource's first VA and byte size.
     // Only this layer's own buffers have a VA in the registry (the swapchain's are images, a copy's staging binding has
@@ -11249,6 +11296,12 @@ void set_device_outer(ID3D12Device* device, IUnknown* outer) {
                       std::uint64_t* size) -> ID3D12Resource* {
                 Device* device = Device::from<Device>(real);
                 return device ? device->add_ref_buffer_at(va, bytes, *start, *size) : nullptr;
+            });
+    if (rt::d3d12_xs::is_device_proxy(outer))
+        rt::d3d12_xs::set_device_texture_provider(
+            outer, [](ID3D12Device* real, std::uint64_t va, const D3D12_RESOURCE_DESC* desc) -> ID3D12Resource* {
+                Device* device = Device::from<Device>(real);
+                return device && desc ? device->add_ref_texture_at(va, *desc) : nullptr;
             });
     // And for the same outer: its IDXGIDevice1::GetAdapter (d3d12_xs_device.h) hands
     // out this layer's adapter, the one create_dxgi_factory enumerates, so a title on the Vulkan device never gets
