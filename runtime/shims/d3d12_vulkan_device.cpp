@@ -28,6 +28,7 @@
 #include "../src/depth24_fragment.h"
 #include "../src/rect_list_gs.h"
 #include "../src/debug_targets.h"
+#include "xmem.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
@@ -1245,6 +1246,10 @@ struct DeviceState {
         }
         return shader_library.loaded() ? &shader_library : nullptr;
     }
+    // Loads the library on its own thread from device creation on: parsing the corpus index (57 MB of JSON, 29,267
+    // entries, 2.65 s measured) then overlaps the title's own start instead of stalling its first pipeline creation.
+    // Joined before the members above go (declared after them).
+    std::jthread library_preload;
 
     bool depth_usable(VkFormat format) const {
         VkFormatProperties properties{};
@@ -3009,7 +3014,53 @@ struct TitleTexture {
     std::chrono::steady_clock::time_point first_watch_until{};  // hashed on every submission until then
     std::chrono::steady_clock::time_point next_check{};         // then at most this often, from a byte budget
     bool mapped = false;  // the title mapped it (Map): written by the CPU whenever it likes, checked for life
+    std::uint64_t probe = 0;  // sampled hash (probe_hash) of the title bytes at the last copy
+    std::chrono::steady_clock::time_point next_full{};       // mapped: the next plain once-a-second copy
+    std::chrono::steady_clock::time_point readable_until{};  // the next VirtualQuery of its pages, at the earliest
+    bool readable = false;                                    // what the last VirtualQuery found
+    std::uint64_t readable_generation = 0;                    // xmem's map generation then
 };
+
+// A cheap change detector for a texture's title bytes: 64 bytes of every 4 KiB page. Bink writes every video frame
+// straight into its plane textures on the title's pages, never through Map (the game's plane helper uses the address
+// it placed them at, 0x1451218DD in 1.0.2.1), so the 1 s watch after a copy missed a video that starts later: the
+// intro played its sound over a green picture (YUV zeros). A changed sample takes a full hash and copy.
+std::uint64_t probe_hash(const std::uint8_t* p, std::size_t bytes);
+std::uint64_t title_hash(const std::uint8_t* p, std::size_t bytes);
+
+// The hashes over the title's pages, which the title may unmap on another thread between the readability check and the
+// read (streaming): false instead of a crash (probe_hash faulted in a retail run). No C++ objects here: __try.
+bool guarded_probe_hash(const std::uint8_t* p, std::size_t bytes, std::uint64_t& out) {
+    __try {
+        out = probe_hash(p, bytes);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                 : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+bool guarded_title_hash(const std::uint8_t* p, std::size_t bytes, std::uint64_t& out) {
+    __try {
+        out = title_hash(p, bytes);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                 : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
+std::uint64_t probe_hash(const std::uint8_t* p, std::size_t bytes) {
+    std::uint64_t h = 0xcbf29ce484222325ull;
+    for (std::size_t at = 0; at < bytes; at += 4096) {
+        const std::size_t n = std::min<std::size_t>(64, bytes - at);
+        for (std::size_t i = 0; i + 8 <= n; i += 8) {
+            std::uint64_t w;
+            std::memcpy(&w, p + at + i, 8);
+            h = (h ^ w) * 0x100000001b3ull;
+        }
+    }
+    return h;
+}
 
 // A title-placed texture the title maps is written by the CPU at any time, for its whole life: Bink decodes every video
 // frame into its Y, Cr and Cb planes (R8, mapped once), so the 1 s watch after a copy left the planes at their first
@@ -4199,7 +4250,7 @@ std::chrono::steady_clock::duration title_texture_watch() {
 }
 constexpr auto kTitleTextureFirstWatch = std::chrono::seconds(1);
 constexpr auto kTitleTextureRecheck = std::chrono::milliseconds(250);
-constexpr auto kMappedRecheck = std::chrono::milliseconds(15);  // a mapped texture: about once a frame
+constexpr auto kMappedRecheck = std::chrono::milliseconds(33);  // a mapped texture: a sample at about 30 Hz
 constexpr double kTitleTextureRecheckRate = 64.0 * 1024 * 1024;            // bytes hashed per second, at most
 constexpr std::size_t kTitleTextureRecheckBurst = 8ull * 1024 * 1024;       // budget kept across idle time
 
@@ -7297,6 +7348,7 @@ public:
                                                                       info.buffer_device_address);
         state_.context->mesh_queries = info.mesh_shader_queries;
         state_.context->set_depth_range_unrestricted(info.depth_range_unrestricted);
+        state_.library_preload = std::jthread([this] { state_.library(); });
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -11531,34 +11583,73 @@ void sync_title_textures() {
                 (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM))
                 leonida::debug_targets::note(t->resource->id());
         }
-        bool watching = false;
-        if (!t->dirty && t->mapped && t->copied && now >= t->next_check) {
-            watching = true;  // mapped: for life, once a frame (mark_title_texture_mapped)
-            t->next_check = now + kMappedRecheck;
-        } else if (!t->dirty && t->watch && t->copied && now < t->watch_until) {
+        // What to look at (see "Title-placed textures"): every check but the dirty one is a sampled hash (probe_hash,
+        // 1/64 of the bytes), never a full one per submission. Full hashes of every watched texture on every
+        // submission, and of the video planes every 15 ms, ran the game at 0.1 fps once the mirrored window gave the
+        // title's textures their data.
+        enum class Check { none, full, probe, copy };
+        Check check = Check::none;
+        if (t->dirty) {
+            check = Check::full;  // created, written by the texture computer, or a new view: compare, then copy
+        } else if (!t->copied) {
+            continue;
+        } else if (t->mapped) {
+            // Mapped (Bink's planes, the glyph atlas): a sample at about 30 Hz catches a video frame, and a plain copy
+            // once a second catches small writes a sample misses (new glyphs), without hashing the whole texture.
+            if (now >= t->next_check) {
+                t->next_check = now + kMappedRecheck;
+                if (now >= t->next_full) {
+                    t->next_full = now + std::chrono::seconds(1);
+                    check = Check::copy;
+                } else {
+                    check = Check::probe;
+                }
+            }
+        } else if (t->watch) {
             if (now < t->first_watch_until) {
-                watching = true;  // the first second after a copy: every submission, as before
-            } else if (now >= t->next_check && budget >= t->bytes) {
-                watching = true;
-                budget -= t->bytes;
+                if (now >= t->next_check) {  // the first second after a copy: a sample at about 30 Hz
+                    t->next_check = now + kMappedRecheck;
+                    check = Check::probe;
+                }
+            } else if (now >= t->next_check && budget >= t->bytes / 64) {
+                budget -= t->bytes / 64;  // for life, from the byte budget, round robin
                 t->next_check = now + kTitleTextureRecheck;
                 cursor = (cursor + n + 1) % count;  // the next call starts after the last one checked
+                check = Check::probe;
             }
         }
-        if (!t->dirty && !watching) continue;
-        if (!title_range_readable(t->title, t->bytes)) {  // reserved pages: a later submission copies it
-            if (t->mapped) {
-                static int told = 0;
-                if (told++ < 8)
-                    std::fprintf(stderr, "[rt] d3d12: mapped title texture %p not readable (%zu bytes)\n",
-                                 static_cast<const void*>(t->title), t->bytes);
-            }
-            continue;
+        if (check == Check::none) continue;
+        // A mapped texture on physical pages xmem commits on first touch, written through another view of the same
+        // pages (the game's mirrored window): commit them so this view shows what the other wrote.
+        // VirtualQuery costs one call per 64 KiB view, and the mirrored window is all 64 KiB views: asked for every
+        // texture on every submission, it was the game's frame (about 1 fps, ntdll in the sampled stack). A range found
+        // readable is asked again only when xmem mapped or unmapped something since, at most every 250 ms; one found
+        // unreadable is retried every 250 ms (the guarded hashes below cover what changes in between).
+        const std::uint64_t generation = rt::xmem::g_map_generation.load(std::memory_order_acquire);
+        const bool known_readable = t->readable && (t->readable_generation == generation || now < t->readable_until);
+        if (!known_readable) {
+            if (!t->readable && now < t->readable_until) continue;  // found unreadable lately
+            t->readable_until = now + std::chrono::milliseconds(250);
+            if (t->mapped && !title_range_readable(t->title, t->bytes))
+                if (const auto commit = rt::xmem::g_commit_range.load(std::memory_order_acquire))
+                    commit(t->title, t->bytes);
+            t->readable = title_range_readable(t->title, t->bytes);
+            t->readable_generation = generation;
+            if (!t->readable) continue;  // reserved pages: a later submission copies it
         }
-        const std::uint64_t hash = title_hash(t->title, t->bytes);
-        if (t->copied && hash == t->hash) {  // nothing new since the last copy
-            t->dirty = false;
-            continue;
+        std::uint64_t hash = t->hash;
+        std::uint64_t probe = 0;
+        if (!guarded_probe_hash(t->title, t->bytes, probe)) continue;  // unmapped meanwhile: a later submission
+        if (check == Check::probe) {
+            if (probe == t->probe) continue;
+            hash = 0;  // changed: copied below without a full hash
+        } else if (check == Check::full) {
+            if (!guarded_title_hash(t->title, t->bytes, hash)) continue;
+            if (t->copied && hash == t->hash) {  // nothing new since the last copy
+                t->dirty = false;
+                t->probe = probe;
+                continue;
+            }
         }
         t->dirty = false;
         if (!t->resource->copy_from_title(t->title, *t->layout)) {
@@ -11569,6 +11660,7 @@ void sync_title_textures() {
         }
         t->copied = true;
         t->hash = hash;
+        t->probe = probe;  // as sampled before the copy
         t->first_watch_until = now + kTitleTextureFirstWatch;
         t->watch_until = now + title_texture_watch();
         if (t->mapped) {  // the video planes: the first 40 copies of mapped textures, and every 100th after

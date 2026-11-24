@@ -351,6 +351,40 @@ struct MappedPage {
 std::unordered_map<uintptr_t, MappedPage> g_mapped;
 SRWLOCK g_fault_lock = SRWLOCK_INIT;
 
+// Mirrored windows (with g_phys_mutex held). The retail title reserves two windows of one size and type for its GPU
+// memory (0x141E6C110 in 1.0.2.1: attributes 0x21 with PAGE_READWRITE, then attributes 3 with
+// PAGE_GRAPHICS_NOACCESS), maps physical pages into the first only, and places textures and buffers in the second: on
+// the console both show the same memory, and the game turns an address in one into the other (ptr - A + B,
+// 0x145121930). Unmirrored, everything placed in the second window was empty: Bink decoded its video into the first
+// and the intro played green. A reserve-only window whose protection is graphics-only right after a window of the same
+// size and type is the first one's mirror: every page mapped into (or unmapped from) either is mapped at the same
+// offset in the other.
+struct Mirror {
+    uintptr_t base;
+    SIZE_T size;
+    uintptr_t partner;
+};
+std::vector<Mirror> g_mirrors;
+struct LastWindow {
+    uintptr_t base = 0;
+    SIZE_T size = 0;
+    DWORD type = 0;
+    DWORD host_protect = 0;
+} g_last_window;
+
+uintptr_t mirror_of(uintptr_t address) {
+    for (const Mirror& m : g_mirrors)
+        if (address - m.base < m.size) return m.partner + (address - m.base);
+    return 0;
+}
+
+// Forget the mirrors of any range a new window takes over (the title released it first).
+void drop_mirrors(uintptr_t start, uintptr_t end) {
+    std::erase_if(g_mirrors, [&](const Mirror& m) {
+        return (m.base < end && start < m.base + m.size) || (m.partner < end && start < m.partner + m.size);
+    });
+}
+
 struct FaultLockExclusive {
     FaultLockExclusive() { AcquireSRWLockExclusive(&g_fault_lock); }
     ~FaultLockExclusive() { ReleaseSRWLockExclusive(&g_fault_lock); }
@@ -376,6 +410,7 @@ void record_window(void* base, SIZE_T size, DWORD protect) {
         if (prev->first + prev->second.size > start) it = prev;
     }
     while (it != g_windows.end() && it->first < end) it = g_windows.erase(it);
+    drop_mirrors(start, end);
     g_windows[start] = Window{size, protect};
     auto r = g_reservations.lower_bound(start);
     if (r != g_reservations.begin() && std::prev(r)->first + std::prev(r)->second > start) r = std::prev(r);
@@ -608,6 +643,20 @@ void* virtual_alloc_paged(void* address, SIZE_T size, DWORD allocation_type, DWO
         if (result && window) {
             const std::lock_guard lock(g_phys_mutex);
             record_window(result, size, host_prot);
+            const auto base = reinterpret_cast<uintptr_t>(result);
+            const bool graphics_only = (protect & kConsoleProtectBits) && host_prot == PAGE_NOACCESS;
+            // Large windows only, after a CPU-visible one: the title also reserves many 64 KiB windows, which must never
+            // be paired by accident.
+            if (graphics_only && size >= (SIZE_T{256} << 20) && g_last_window.base && g_last_window.base != base &&
+                g_last_window.size == size && g_last_window.type == allocation_type &&
+                g_last_window.host_protect != PAGE_NOACCESS) {
+                // This window mirrors the one reserved just before it (see Mirror).
+                g_mirrors.push_back(Mirror{g_last_window.base, size, base});
+                g_mirrors.push_back(Mirror{base, size, g_last_window.base});
+                std::fprintf(stderr, "[rt] xmem: window %p (%llu bytes, graphics-only) mirrors window %p\n", result,
+                             static_cast<unsigned long long>(size), reinterpret_cast<void*>(g_last_window.base));
+            }
+            g_last_window = LastWindow{base, size, allocation_type, host_prot};
         }
         return result;
     }
@@ -633,6 +682,7 @@ bool unmap_page(uintptr_t address) {
         return false;
     }
     g_mapped.erase(it);
+    rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
     return true;
 }
 
@@ -654,7 +704,30 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
                                                    protect, nullptr, 0);
     if (!view) return false;
     g_mapped[address] = MappedPage{page, it->second.section, it->second.offset};
+    rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
     return true;
+}
+
+DWORD view_protect(const Window& window);
+
+// With g_phys_mutex held: the same page (0: none) at the mirror of `address`, if its window has one (see Mirror). A
+// failure there is logged, not returned: the title's own mapping succeeded.
+void map_mirror(uintptr_t address, uint64_t page) {
+    const uintptr_t partner = mirror_of(address);
+    if (!partner) return;
+    bool ok;
+    if (page == 0) {
+        ok = unmap_page(partner);
+    } else {
+        const Window* const window = find_window(partner, kPhysicalPageSize);
+        ok = window && map_page(partner, page, view_protect(*window));
+    }
+    if (!ok) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr, "[rt] xmem: mirroring page %llu at %p failed (error %lu)\n",
+                         static_cast<unsigned long long>(page), reinterpret_cast<void*>(partner), GetLastError());
+    }
 }
 
 enum class PageCommit { not_ours, committed_before, committed_now, failed };
@@ -782,6 +855,7 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         SetLastError(ERROR_NOT_SUPPORTED);
         return FALSE;
     }
+    rt::xmem::g_commit_range.store(&rt::xmem::commit_physical_range, std::memory_order_release);
     const uint64_t bytes = count * kPhysicalPageSize;  // below 2^37: count is below 2^21
     const HANDLE handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                              static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
@@ -867,6 +941,7 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
     if (!page_array) {
         for (uint64_t i = 0; i < page_count; ++i) {
             if (!unmap_page(start + i * kPhysicalPageSize)) return nullptr;
+            map_mirror(start + i * kPhysicalPageSize, 0);
         }
         return address;
     }
@@ -878,6 +953,7 @@ void* WINAPI XMemMapPhysicalPages(void* address, uint64_t page_count, const uint
     const DWORD protect = view_protect(*window);
     for (uint64_t i = 0; i < page_count; ++i) {
         if (!map_page(start + i * kPhysicalPageSize, page_array[i], protect)) return nullptr;
+        map_mirror(start + i * kPhysicalPageSize, page_array[i]);
     }
     return address;
 }
@@ -905,6 +981,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
         const uint64_t page = page_array ? page_array[i] : 0;
         if (page == 0) {
             if (!unmap_page(address)) return FALSE;
+            map_mirror(address, 0);
             continue;
         }
         const Window* const window = find_window(address, kPhysicalPageSize);
@@ -913,6 +990,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(void* const* addresses, uint32_t page_co
             return FALSE;
         }
         if (!map_page(address, page, view_protect(*window))) return FALSE;
+        map_mirror(address, page);
     }
     return TRUE;
 }
