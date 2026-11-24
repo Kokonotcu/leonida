@@ -591,6 +591,44 @@ enum class IndirectKind : std::uint8_t {
     dispatch_mesh = 3,  // D3D12_DISPATCH_MESH_ARGUMENTS, the same 12 bytes as VkDrawMeshTasksIndirectCommandEXT
 };
 
+// One argument of a command signature (D3D12_INDIRECT_ARGUMENT_DESC), with where it sits in a record and where it
+// lands. Records hold the arguments in order, tightly packed, and are `stride` bytes apart.
+enum class IndirectArgumentType : std::uint8_t {
+    draw,           // D3D12_DRAW_ARGUMENTS (16 bytes)
+    draw_indexed,   // D3D12_DRAW_INDEXED_ARGUMENTS (20 bytes)
+    dispatch,       // D3D12_DISPATCH_ARGUMENTS (12 bytes)
+    constants,      // Num32BitValuesToSet root constants into user-data dwords
+    root_view,      // a root CBV, SRV or UAV: a 64-bit GPU virtual address into two user-data dwords
+    vertex_buffer,  // D3D12_VERTEX_BUFFER_VIEW (16 bytes) for input slot `slot`
+    index_buffer,   // D3D12_INDEX_BUFFER_VIEW (16 bytes)
+    dispatch_mesh,  // D3D12_DISPATCH_MESH_ARGUMENTS (12 bytes); only alone in a signature (no generated commands)
+};
+
+struct IndirectArgument {
+    IndirectArgumentType type = IndirectArgumentType::draw;
+    std::uint32_t offset = 0;      // byte offset of the argument in a record
+    std::uint32_t size = 0;        // bytes it takes in a record
+    std::uint32_t user_dword = 0;  // constants, root_view: first of the 32 user-data dwords it writes (s0..s31)
+    std::uint32_t dwords = 0;      // constants: Num32BitValuesToSet; root_view: 2
+    std::uint32_t slot = 0;        // vertex_buffer: the input slot
+};
+
+// A command signature as the replay needs it (ID3D12CommandSignature). A signature whose only argument is a draw or
+// dispatch is `simple`: it replays as vkCmdDraw*Indirect / vkCmdDispatchIndirect. Anything else changes state per
+// record and replays through VK_EXT_device_generated_commands (vulkan_indirect.h); without it (no extension, a limit,
+// a pipeline it cannot run) the replay falls back to the draw or dispatch arguments alone, read at action_offset().
+// A signature whose leading arguments cannot be generated at all (an incrementing constant, root arguments past the
+// user-data dwords) is described by its action alone, at the offset it has in the record, so it is simple too.
+struct IndirectSignature {
+    std::uint32_t stride = 0;
+    IndirectKind kind = IndirectKind::draw;  // what the last argument is
+    std::vector<IndirectArgument> arguments;
+    std::uint32_t arguments_size = 0;  // bytes of one record the arguments use (stride is at least this)
+    bool simple() const { return arguments.size() <= 1; }
+    // Where the draw or dispatch arguments start in a record (the last argument comes last).
+    std::uint32_t action_offset() const { return arguments.empty() ? 0 : arguments.back().offset; }
+};
+
 struct ExecuteIndirect {
     IndirectKind kind = IndirectKind::draw;
     std::uint32_t stride = 0;
@@ -614,6 +652,12 @@ struct ExecuteIndirect {
     // as it is.
     std::uintptr_t pipeline = 0;
     std::array<std::uint32_t, 32> user_data{};
+    // Set for a signature with more than the draw or dispatch argument, or with the action at an offset (null for one
+    // argument at a record's start, and for the raw calls of the unit tests; only a signature that is not simple() gets
+    // generated commands): `kind` and `stride` then repeat its values. `argument_offset` still names the draw or
+    // dispatch arguments of the first record; the record itself starts signature->action_offset() bytes before.
+    // Last, so the unit tests that fill the struct in order are unaffected.
+    std::shared_ptr<const IndirectSignature> signature;
 };
 
 // Triangle geometry descriptor for a BLAS build (ID3D12GraphicsCommandList4::BuildRaytracingAccelerationStructure).
@@ -916,6 +960,10 @@ public:
         if (indirect.state && (!indirect.state->pipeline || indirect.kind == IndirectKind::dispatch)) return false;
         // A mesh dispatch carries DispatchMesh's state, a draw kind a draw's.
         if (indirect.state && indirect.state->mesh != (indirect.kind == IndirectKind::dispatch_mesh)) return false;
+        if (indirect.signature && (indirect.signature->stride != indirect.stride ||
+                                   indirect.signature->arguments.empty() || indirect.signature->kind != indirect.kind ||
+                                   indirect.argument_offset < indirect.signature->action_offset()))
+            return false;
         if (!indirect.max_count) return !closed_;  // the PC runtime takes MaxCommandCount 0 as a no-op
         return append(indirect);
     }

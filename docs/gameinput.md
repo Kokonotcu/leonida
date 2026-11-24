@@ -25,7 +25,8 @@ SDL3 is available in one of these ways:
   `-DSDL3_DIR=C:/SDL3/cmake`. No flag is needed.
 - **`-DLEONIDA_SDL3_FETCH=ON`**: downloads the pinned release `SDL3-3.4.20.tar.gz` from SDL's GitHub releases once at
   configure time, checks its SHA-256, and builds it static with only the gamepad parts (no audio, video, GPU or
-  render). That takes about a minute on the first build. `scripts/build_runtime.ps1 -FetchSdl3` passes it.
+  render). That takes about a minute on the first build. `scripts/build_runtime.ps1 -FetchSdl3` passes it, and
+  `make_game.py` does so when `LEONIDA_SDL3_FETCH=1` is set.
 - **A local copy of that tarball**: extract it and pass `-DFETCHCONTENT_SOURCE_DIR_SDL3=<path to SDL3-3.4.20>`; it is
   built the same way, without a download.
 

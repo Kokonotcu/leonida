@@ -35,6 +35,7 @@
 #include "uav_clear.h"
 
 #include <vulkan/vulkan.h>
+#include "vulkan_indirect.h"
 #include "vulkan_predicate.h"
 #include "vulkan_predicated_copy.h"
 #include "vulkan_indirect_dispatch_count.h"
@@ -816,6 +817,7 @@ struct ComputePipeline {
     // A shader object instead of `pipeline` (LEONIDA_SHADER_OBJECTS=1, docs/aot_pipelines.md): binds it at the
     // compute stage. Null on the pipeline path.
     std::function<void(VkCommandBuffer)> bind_shader;
+    VkShaderEXT shader_object = VK_NULL_HANDLE;  // the shader bind_shader binds (generated commands name it)
 };
 
 // Binds a compute pipeline or, with shader objects, its shader.
@@ -852,6 +854,12 @@ struct GraphicsPipeline {
     std::function<void(VkCommandBuffer, const VkViewport&, const VkRect2D&, const VkDeviceSize* strides,
                        std::uint32_t stride_count)>
         bind_shaders;
+    // The shaders bind_shaders binds, one per stage the PSO has (generated commands name them,
+    // VkGeneratedCommandsShaderInfoEXT); null entries are unused.
+    std::array<VkShaderEXT, 4> shader_objects{};
+    // A pipeline linked from pipeline libraries (docs/aot_pipelines.md step 3, src/pso_library.h): sets, after the
+    // pipeline is bound, the state the libraries leave dynamic that a whole pipeline bakes in. Null otherwise.
+    std::function<void(VkCommandBuffer)> set_state;
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -985,6 +993,13 @@ struct ReplayFunctions {
     bool multi_draw_indirect = false;
     // VkPhysicalDeviceLimits::maxDrawIndirectCount: a call takes at most this many records.
     std::uint32_t max_draw_indirect_count = UINT32_MAX;
+    // ExecuteIndirect with a multi-argument command signature (vulkan_indirect.h, VK_EXT_device_generated_commands):
+    // `indirect_prepare` makes the plan while the list is checked, `indirect_prepass` records the pass that rebases
+    // buffer views and bounds the count (outside rendering), `indirect_execute` the generated commands. Without them
+    // (or when a call cannot be planned) the call runs its draw or dispatch arguments alone (detail::prepare_generated).
+    std::function<bool(const IndirectExpander::Request&, IndirectPlan&)> indirect_prepare;
+    std::function<void(VkCommandBuffer, const IndirectPlan&)> indirect_prepass;
+    std::function<void(VkCommandBuffer, const IndirectPlan&)> indirect_execute;
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
     // A KHR TLAS built from D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS needs a pointer array whose entries are Vulkan
@@ -1122,6 +1137,7 @@ struct Prepared {
     VkDeviceSize fill_scratch_offset = 0;
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
+    IndirectPlan indirect;     // ExecuteIndirect with a multi-argument signature
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
@@ -1679,6 +1695,90 @@ inline VkDeviceSize indirect_record_size(IndirectKind kind) {
     case IndirectKind::dispatch_mesh: return sizeof(VkDrawMeshTasksIndirectCommandEXT);
     }
     return 0;
+}
+
+// An ExecuteIndirect whose signature sets root arguments or views per record runs without them (the draw or dispatch
+// arguments alone); each reason is said once.
+inline void log_indirect_fallback(const char* reason) {
+    static std::mutex mutex;
+    static std::set<std::string> said;
+    std::lock_guard lock(mutex);
+    if (said.insert(reason).second)
+        std::fprintf(stderr, "[rt] d3d12: ExecuteIndirect: a signature's root arguments/views are not applied (%s); the "
+                             "draw or dispatch arguments run alone\n",
+                     reason);
+}
+
+// Plans the generated commands of an ExecuteIndirect with a multi-argument signature into p.indirect (its layout set
+// on success). `record_start` is where its first record starts in the argument buffer, `draw` the prepared draw of a
+// draw kind (null for a dispatch), p.pipeline the dispatch's pipeline. Null on success, else why the call falls back.
+// The pipeline the draw binds is the prepared one (a variant for unbound slots); with shader objects the commands
+// name the bound shaders instead (VkGeneratedCommandsShaderInfoEXT). `helpers_counted`: a pipeline-statistics query
+// is active and cannot be split around the passes before the commands (the count bound and the view rebase).
+inline const char* prepare_generated(const ExecuteIndirect& ind, const IndirectSignature& signature,
+                                     VkDeviceSize record_start, Prepared& p, const PreparedDraw* draw,
+                                     const ReplayFunctions& vk, bool helpers_counted) {
+    p.indirect = {};
+    if (!vk.indirect_prepare || !vk.indirect_prepass || !vk.indirect_execute)
+        return "the device has no VK_EXT_device_generated_commands";
+    const bool compute = ind.kind == IndirectKind::dispatch;
+    if (compute ? !ind.pipeline : (!draw || !draw->graphics)) return "a call without the list's pipeline state";
+    bool views = false;
+    for (const IndirectArgument& a : signature.arguments)
+        views |= a.type == IndirectArgumentType::vertex_buffer || a.type == IndirectArgumentType::index_buffer;
+    if ((views || ind.count_buffer) && helpers_counted)
+        return "a pipeline-statistics query would count the passes before the generated commands";
+    std::array<VkShaderEXT, IndirectPlan::max_shaders> shaders{};
+    std::uint32_t shader_count = 0;
+    IndirectExpander::Request request;
+    request.signature = &ind.signature;
+    if (compute) {
+        request.pipeline_layout = p.pipeline.layout;
+        request.push_stages = VK_SHADER_STAGE_COMPUTE_BIT;
+        if (p.pipeline.bind_shader) {
+            if (!p.pipeline.shader_object) return "a compute shader object without its handle";
+            shaders[shader_count++] = p.pipeline.shader_object;
+        } else {
+            request.pipeline = p.pipeline.pipeline;
+        }
+    } else {
+        const GraphicsPipeline& graphics = *draw->graphics;
+        if (graphics.mesh) return "a mesh pipeline";
+        request.pipeline_layout = graphics.layout;
+        request.push_stages = graphics.push_stages;
+        if (graphics.bind_shaders) {
+            // The commands' stages are the bound shaders' (one kind of pipeline: vertex, geometry, fragment); the
+            // push-constant range the tokens write keeps the layout's stages, which name the mesh stage too.
+            constexpr VkShaderStageFlags stage_of[] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_GEOMETRY_BIT,
+                                                       VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_MESH_BIT_EXT};
+            static_assert(std::size(stage_of) == std::tuple_size_v<decltype(graphics.shader_objects)>);
+            for (std::size_t i = 0; i < graphics.shader_objects.size(); ++i) {
+                if (!graphics.shader_objects[i]) continue;
+                if (shader_count == shaders.size()) return "more shader objects than a call binds";
+                shaders[shader_count++] = graphics.shader_objects[i];
+                request.shader_stages |= stage_of[i];
+            }
+            if (!shader_count) return "graphics shader objects without their handles";
+            if (request.shader_stages & VK_SHADER_STAGE_MESH_BIT_EXT) return "a mesh shader object";
+        } else {
+            request.pipeline = draw->pipeline;
+        }
+    }
+    request.shaders = shaders.data();
+    request.shader_count = shader_count;
+    request.argument_buffer = p.binding.buffer;
+    request.argument_offset = p.binding.buffer_offset + record_start;
+    if (ind.count_buffer) {
+        request.count_buffer = p.source.buffer;
+        request.count_offset = p.source.buffer_offset + ind.count_offset;
+    }
+    request.max_count = ind.max_count;
+    request.heap_base = vk.heap_base;
+    if (!vk.indirect_prepare(request, p.indirect) || !p.indirect.layout) {
+        p.indirect = {};
+        return "the generated commands could not be prepared";
+    }
+    return nullptr;
 }
 
 inline bool indirect_range(const ResourceBinding& binding, VkDeviceSize offset, VkDeviceSize bytes) {
@@ -2624,7 +2724,7 @@ inline void plan_statistics_segments(PreparedList& out) {
     for (std::size_t i = 0; i < out.commands.size(); ++i) {
         auto& p = out.commands[i];
         if (begin && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                      p.counted_dispatch.indirect)) {
+                      p.counted_dispatch.indirect || IndirectExpander::has_prepass(p.indirect))) {
             inner.push_back({&p.statistics_end, &p.statistics_begin, -1});
             splits = true;
         }
@@ -2711,10 +2811,16 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
             // A helper dispatch while a query runs would be counted into it (D3D-162): close the shared physical
             // segment before it and open a new one after, the way resolves do.
             if (!active.empty() && (p.predicate.scratch || !p.predicated_copy.empty() || p.has_depth24 ||
-                                    p.counted_dispatch.indirect)) {
+                                    p.counted_dispatch.indirect || IndirectExpander::has_prepass(p.indirect))) {
                 p.statistics_end = current;
                 current = open();
                 p.statistics_begin = current;
+                // An ExecuteIndirect draw after its passes (generated commands) is the new segment's first draw.
+                if (const auto* indirect = std::get_if<ExecuteIndirect>(&commands[i]);
+                    indirect && indirect->kind != IndirectKind::dispatch) {
+                    kind = 0;
+                    out.statistics_mesh[current] = 0;
+                }
                 continue;
             }
             // A draw of the other kind than the open segment's starts a segment in its own pool (D3D-291).
@@ -3288,16 +3394,25 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             out.queries.push_back({i, heap, statistics_active});
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command)) {
             if (!bind(ind->argument_buffer) || !p.binding.buffer) return ReplayResult::unresolved_resource;
+            // argument_offset names the draw or dispatch arguments of the first record. With a multi-argument
+            // signature the whole records must lie in the buffer: they start action_offset() bytes earlier and use
+            // arguments_size bytes each (the draw or dispatch arguments come last, so they are inside).
+            const IndirectSignature* signature = ind->signature.get();
             const VkDeviceSize record_size = detail::indirect_record_size(ind->kind);
             if (!record_size || ind->stride < record_size || ind->stride % sizeof(std::uint32_t))
                 return ReplayResult::invalid_indirect_arguments;
-            // The span is max_count * stride, the bytes the signature can walk, as D3D12 measures it: a record that
-            // fits at the end of the buffer while its stride runs past it is refused (`240` with stride `20` in a
-            // `256`-byte buffer). A zero max_count still has to name an offset inside the buffer.
-            if (ind->argument_offset > p.binding.size ||
-                ind->max_count > (p.binding.size - ind->argument_offset) / ind->stride ||
-                !detail::indirect_range(p.binding, ind->argument_offset,
-                                        VkDeviceSize(ind->max_count) * ind->stride))
+            if (signature && (signature->arguments_size > ind->stride ||
+                              signature->action_offset() > ind->argument_offset ||
+                              signature->arguments_size < signature->action_offset() + record_size))
+                return ReplayResult::invalid_indirect_arguments;
+            const VkDeviceSize record_start =
+                signature ? ind->argument_offset - signature->action_offset() : ind->argument_offset;
+            // The span is max_count * stride from the first record's start, the bytes the signature can walk, as
+            // D3D12 measures it: a record that fits at the end of the buffer while its stride runs past it is refused
+            // (`240` with stride `20` in a `256`-byte buffer). A zero max_count still has to name an offset inside the
+            // buffer.
+            if (record_start > p.binding.size || ind->max_count > (p.binding.size - record_start) / ind->stride ||
+                !detail::indirect_range(p.binding, record_start, VkDeviceSize(ind->max_count) * ind->stride))
                 return ReplayResult::invalid_indirect_arguments;
             if (ind->count_buffer) {
                 const ResourceBinding* cnt = resolve(ind->count_buffer);
@@ -3305,6 +3420,36 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!detail::indirect_range(*cnt, ind->count_offset, sizeof(std::uint32_t)))
                     return ReplayResult::invalid_indirect_arguments;
                 p.source = *cnt;
+            }
+            if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
+                if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
+                const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
+                if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shader)) return ReplayResult::unresolved_resource;
+                if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
+                p.pipeline = *pipeline;
+            }
+            if (ind->kind != IndirectKind::dispatch && !ind->state && !ind->raw) return ReplayResult::unsupported;
+            // A draw with the list's graphics state: prepared as a Draw is (the argument and count buffers stay in
+            // p.binding and p.source). Recording uses p.draw, as for a Draw.
+            if (ind->state) {
+                if (out.draw_count == out.draws.size()) out.draws.emplace_back();
+                auto& prepared_draw = out.draws[out.draw_count];
+                prepared_draw.reset();
+                p.draw = std::uint32_t(out.draw_count++);
+                if (const auto r = detail::prepare_draw(*ind->state, resolve, vk, prepared_draw); r != ReplayResult::success)
+                    return r;
+            }
+            // Root arguments and views per record: generated commands (vulkan_indirect.h) where the device has them
+            // and can run this call, on the pipeline or the shader objects in effect. Otherwise the draw or dispatch
+            // arguments alone (read at argument_offset, past the leading ones, which are then not applied).
+            if (signature && !signature->simple()) {
+                const char* fallback = detail::prepare_generated(*ind, *signature, record_start, p,
+                                                                 ind->state ? &out.draws[p.draw] : nullptr, vk,
+                                                                 statistics_active && !statistics_helpers);
+                if (fallback) detail::log_indirect_fallback(fallback);
+            }
+            if (p.indirect.layout) continue;  // generated: the count, if any, is the sequence count address
+            if (ind->count_buffer) {
                 if (ind->kind == IndirectKind::dispatch) {
                     // Vulkan lacks vkCmdDispatchIndirectCount. Copy the GPU-visible commands to private scratch
                     // and replace commands past min(count, max_count) with zero-group dispatches.
@@ -3325,24 +3470,6 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     (ind->kind == IndirectKind::dispatch && !vk.dispatch_indirect) ||
                     (ind->kind == IndirectKind::dispatch_mesh && !vk.draw_mesh_tasks_indirect))
                     return ReplayResult::unsupported;
-            }
-            if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments it was recorded
-                if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
-                const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
-                if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shader)) return ReplayResult::unresolved_resource;
-                if (pipeline->bindless_set && !vk.bind_descriptor_sets) return ReplayResult::unsupported;
-                p.pipeline = *pipeline;
-            }
-            if (ind->kind != IndirectKind::dispatch && !ind->state && !ind->raw) return ReplayResult::unsupported;
-            // A draw with the list's graphics state: prepared as a Draw is (the argument and count buffers stay in
-            // p.binding and p.source). Recording uses p.draw, as for a Draw.
-            if (ind->state) {
-                if (out.draw_count == out.draws.size()) out.draws.emplace_back();
-                auto& prepared_draw = out.draws[out.draw_count];
-                prepared_draw.reset();
-                p.draw = std::uint32_t(out.draw_count++);
-                if (const auto r = detail::prepare_draw(*ind->state, resolve, vk, prepared_draw); r != ReplayResult::success)
-                    return r;
             }
         } else if (const auto* build = std::get_if<BuildAccelerationStructure>(&command)) {
             p.khr_instances = 0;
@@ -3781,9 +3908,19 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         // A draw of the other kind inside a statistics query starts a segment in its pool (D3D-291), before the
         // draw's own rendering scope begins. Counted dispatches split their query around the helper in the dispatch
         // path below.
-        if (const auto* indirect = std::get_if<ExecuteIndirect>(&command);
-            std::holds_alternative<Draw>(command) || (indirect && indirect->kind != IndirectKind::dispatch)) {
+        // The passes before generated commands (vulkan_indirect.h: the count bound, the view rebase) are compute
+        // dispatches: outside rendering, so an open draw scope ends first, and between the segments, so no
+        // application query counts them. The draw or dispatch path below then runs the commands themselves.
+        const auto* indirect_call = std::get_if<ExecuteIndirect>(&command);
+        const bool generated_prepass = indirect_call && p.indirect.layout && IndirectExpander::has_prepass(p.indirect);
+        if (generated_prepass) close_scope();
+        if (std::holds_alternative<Draw>(command) || (indirect_call && indirect_call->kind != IndirectKind::dispatch)) {
             end_statistics();
+            if (generated_prepass) vk.indirect_prepass(command_buffer, p.indirect);
+            begin_statistics();
+        } else if (generated_prepass) {
+            end_statistics();
+            vk.indirect_prepass(command_buffer, p.indirect);
             begin_statistics();
         }
         if (const auto* predication = std::get_if<Predication>(&command)) {
@@ -4309,13 +4446,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                    VK_PIPELINE_STAGE_TRANSFER_BIT);
             vk.copy_buffer(command_buffer, p.source.buffer, p.binding.buffer, 1, p.buffer_copies.data());
         } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command); ind && !ind->state) {
-            if (ind->kind == IndirectKind::dispatch && ind->count_buffer) {
+            const bool generated = p.indirect.layout != VK_NULL_HANDLE;  // its passes ran above, before this binding
+            if (!generated && ind->kind == IndirectKind::dispatch && ind->count_buffer) {
                 // No D3D12 query must count this internal compute pass as an application dispatch.
                 end_statistics();
                 vk.emit_counted_dispatch(command_buffer, p.counted_dispatch);
                 begin_statistics();
             }
-            if (ind->kind == IndirectKind::dispatch && ind->pipeline) {
+            if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments recorded
                 ShaderUserData data{};
                 std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
                 data.heap_base = vk.heap_base;
@@ -4329,7 +4467,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data),
                                   &data);
             }
-            detail::emit_indirect(vk, command_buffer, p, *ind);
+            if (generated)
+                vk.indirect_execute(command_buffer, p.indirect);  // per-record root arguments, then the dispatch
+            else
+                detail::emit_indirect(vk, command_buffer, p, *ind);
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
             vk.xdxr_record(command_buffer, *xdxr_build);
@@ -4523,6 +4664,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                       std::uint32_t(d.vertex_strides.size()));
             } else {
                 vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
+                if (graphics.set_state) graphics.set_state(command_buffer);
                 vk.set_viewport(command_buffer, 0, 1, &viewport);
                 vk.set_scissor(command_buffer, 0, 1, &d.scissor);
             }
@@ -4553,7 +4695,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (draw->indexed && !draw->mesh)
                 vk.bind_index_buffer(command_buffer, d.index_buffer, d.index_offset, d.index_type);
             if (const auto* indirect = std::get_if<ExecuteIndirect>(&command)) {
-                detail::emit_indirect(vk, command_buffer, p, *indirect);  // the arguments hold the counts
+                // Generated commands: per-record root constants, views and buffers, then the draw (its passes ran
+                // before this scope began). Otherwise the arguments hold the counts.
+                if (p.indirect.layout)
+                    vk.indirect_execute(command_buffer, p.indirect);
+                else
+                    detail::emit_indirect(vk, command_buffer, p, *indirect);
             } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {

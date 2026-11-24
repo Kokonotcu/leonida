@@ -1,0 +1,20 @@
+// ExecuteIndirect with a count buffer: D3D12 runs min(count, MaxCommandCount) commands, but
+// VK_EXT_device_generated_commands (VUID-VkGeneratedCommandsInfoEXT-sequenceCountAddress-11068) wants the value at
+// sequenceCountAddress to be at most maxSequenceCount. One invocation writes the bounded count to scratch
+// (vulkan_indirect.h), and that address is what the generated commands read.
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 1) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Word { uint w; };
+layout(push_constant) uniform Count {
+    uint64_t source;
+    uint64_t destination;
+    uint64_t unused;
+    uint maximum;
+} p;
+void main() {
+    Word src = Word(p.source);
+    Word dst = Word(p.destination);
+    dst.w = min(src.w, p.maximum);
+}

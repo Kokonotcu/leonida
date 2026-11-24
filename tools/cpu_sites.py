@@ -27,8 +27,10 @@ def image_identity(path: str) -> tuple[int, int]:
     """(SizeOfImage, TimeDateStamp) of a PE32+ image."""
     with open(path, "rb") as f:
         head = f.read(4096)
+    if len(head) < 0x40 or head[:2] != b"MZ":
+        raise ValueError(f"{path} is not a PE image")
     pe = struct.unpack_from("<I", head, 0x3C)[0]
-    if head[pe:pe + 4] != b"PE\0\0":
+    if pe + 24 + 60 > len(head) or head[pe:pe + 4] != b"PE\0\0":
         raise ValueError(f"{path} is not a PE image")
     stamp = struct.unpack_from("<I", head, pe + 8)[0]
     size_of_image = struct.unpack_from("<I", head, pe + 24 + 56)[0]
