@@ -4330,7 +4330,7 @@ void report_title_overlap(const std::uint8_t* title, std::size_t bytes, const D3
         // Only pairs where one is GPU-written or atlas-sized: small textures whose computed layout spans past the
         // title's spacing (17x17 tables 0x1B000 apart with 128 KiB layouts) overlap their neighbours by the hundred.
         constexpr auto gpu = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        if (!((desc.Flags | o.Flags) & gpu) && desc.Width < 1024 && o.Width < 1024) continue;
+        if (!((desc.Flags | o.Flags) & gpu)) continue;
         std::fprintf(stderr, "[rt] d3d12: title %s at %p (%zu B, %llux%u fmt %d flags 0x%x) overlaps title texture at %p "
                              "(%zu B, %llux%u fmt %d flags 0x%x%s)\n",
                      kind, static_cast<const void*>(title), bytes, static_cast<unsigned long long>(desc.Width),
@@ -11903,9 +11903,27 @@ void sync_title_textures() {
             leonida::debug_targets::dump_at() && std::getenv("LEONIDA_DUMP_TITLE_TEXTURE") != nullptr;
         if (note_atlas) {
             const D3D12_RESOURCE_DESC& d = t->resource->desc();
-            if (d.Width == 2048 && d.Height == 2048 &&
-                (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM))
+            // The glyph atlas and the 4K 8-bit masks the text's gradient-mask pipelines sample.
+            if (((d.Width == 2048 && d.Height == 2048) || (d.Width == 3840 && d.Height == 2160)) &&
+                (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM)) {
                 leonida::debug_targets::note(t->resource->id());
+                // A 4K 8-bit texture (the gradient mask): its flags and how many of its title bytes are set, every
+                // 5 s, whether or not it is copied (render targets are not watched).
+                if (d.Width == 3840) {
+                    static std::map<const void*, std::chrono::steady_clock::time_point> next;
+                    auto& when = next[t->title];
+                    if (now >= when && title_range_readable(t->title, t->bytes)) {
+                        when = now + std::chrono::seconds(5);
+                        std::size_t set = 0;
+                        for (std::size_t i = 0; i < t->bytes; i += 64) set += t->title[i] != 0;
+                        std::fprintf(stderr, "[rt] d3d12: 4K 8-bit title texture %p (image %#llx): flags 0x%x watch %d "
+                                             "mapped %d copied %d, %zu of %zu sampled bytes set\n",
+                                     static_cast<const void*>(t->title),
+                                     static_cast<unsigned long long>(t->resource->image_address()), unsigned(d.Flags),
+                                     int(t->watch), int(t->mapped), int(t->copied), set, t->bytes / 64);
+                    }
+                }
+            }
         }
         // What to look at (see "Title-placed textures"): every check but the dirty one is a sampled hash (probe_hash,
         // 1/64 of the bytes), never a full one per submission. Full hashes of every watched texture on every
@@ -11991,12 +12009,25 @@ void sync_title_textures() {
         }
         std::uint64_t hash = t->hash;
         std::uint64_t probe = 0;
-        if (!guarded_probe_hash(t->title, t->bytes, probe)) continue;  // unmapped meanwhile: a later submission
+        // A read that faulted (pages unmapped although the readability check passed): unreadable for a second, not
+        // retried at every submission. Each fault also costs the crash logger's full report (thousands of log lines a
+        // minute on the retail boot).
+        const auto faulted = [&] {
+            t->readable = false;
+            t->readable_until = now + std::chrono::seconds(1);
+        };
+        if (!guarded_probe_hash(t->title, t->bytes, probe)) {
+            faulted();
+            continue;
+        }
         if (check == Check::probe) {
             if (probe == t->probe) continue;
             hash = 0;  // changed: copied below without a full hash
         } else if (check == Check::full) {
-            if (!guarded_title_hash(t->title, t->bytes, hash)) continue;
+            if (!guarded_title_hash(t->title, t->bytes, hash)) {
+                faulted();
+                continue;
+            }
             if (t->copied && hash == t->hash) {  // nothing new since the last copy
                 t->dirty = false;
                 t->probe = probe;
@@ -12005,6 +12036,7 @@ void sync_title_textures() {
         }
         t->dirty = false;
         if (!guarded_copy_from_title(t->resource, t->title, *t->layout)) {
+            faulted();
             log_once("a title-placed texture could not be copied from the title's pages; it keeps its texels; "
                      "dimension",
                      int(t->resource->desc().Dimension));
