@@ -1735,6 +1735,23 @@ if(TARGET Vulkan::Headers)
     set_tests_properties(vk_storage_init_wait PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
   endif()
+  # A new bindless generation reuses a spare set and writes only what changed (I8).
+  add_executable(vk_bindless_generation_test test/vk_bindless_generation_test.cpp)
+  target_link_libraries(vk_bindless_generation_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_bindless_generation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(vk_bindless_generation_test PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_bindless_generation_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_bindless_generation COMMAND vk_bindless_generation_test)
+    set_tests_properties(vk_bindless_generation PROPERTIES SKIP_RETURN_CODE 77
+                         FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+  endif()
   # A failed ExecuteCommandLists names the list, command, kind and VkResult that made it fail (I4).
   add_executable(vk_execute_failure_test test/vk_execute_failure_test.cpp)
   target_link_libraries(vk_execute_failure_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})

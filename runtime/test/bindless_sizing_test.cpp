@@ -232,8 +232,12 @@ int main() {
         const std::uint32_t per_set = totals(f).all;
         EXPECT(f.pool_limit == 1048576 && per_set <= f.pool_limit);
         const std::size_t cap = bindless::retired_generation_cap(f, 8);
-        EXPECT((cap + 2) * per_set <= f.pool_limit);  // before: 8 retired, 10 pools, about 0.9M descriptors
-        EXPECT(cap == std::min<std::size_t>(8, f.pool_limit / per_set - 2));
+        // Retired, current, new and spare (I8) pools; before: 8 retired, 10 pools, about 0.9M descriptors.
+        EXPECT((cap + 2 + bindless::spare_sets(f)) * per_set <= f.pool_limit);
+        EXPECT(cap == std::min<std::size_t>(8, f.pool_limit / per_set - 2 - bindless::spare_sets(f)));
+        // Room for five sets: a spare, and two retired generations.
+        f.pool_limit = 5 * per_set;
+        EXPECT(bindless::spare_sets(f) == 1 && bindless::retired_generation_cap(f, 8) == 2);
         // Room for exactly three sets: one retired generation.
         f.pool_limit = 3 * per_set + per_set / 2;
         EXPECT(bindless::retired_generation_cap(f, 8) == 1);
