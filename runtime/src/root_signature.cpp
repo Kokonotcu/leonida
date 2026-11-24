@@ -61,7 +61,12 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
     uint64_t next = out.base;
     std::vector<uint32_t> first;
     first.reserve(sig.params.size());
-    std::string spill;  // the first parameter that does not fit; every parameter is still validated after it
+    // Once a parameter does not fit, it and every later one go to the spill array (byte offset `spill_at`), which is
+    // laid out for compute only (root_signature.h).
+    const bool compute = stage == Stage::Compute;
+    bool spilling = false;
+    uint64_t spill_at = 0;
+    std::string refused;  // why the spill can't be laid out; every parameter is still validated after it
     for (size_t i = 0; i < sig.params.size(); ++i) {
         const RootParameter& p = sig.params[i];
         if (p.type == ParamType::Constants && p.num_values == 0) {
@@ -74,17 +79,37 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
             return out;
         }
         const uint64_t dwords = stage_dwords(p.type, p.num_values);
-        if (spill.empty() && next + dwords > kMaxUserSgprs)
-            // The console moves this parameter and every later one to the spill array behind s[0:1]; that array's
-            // layout is not modelled here, so refuse rather than drop arguments.
-            spill = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
-                    std::to_string(out.base) + " (spill array not modelled)";
-        first.push_back(static_cast<uint32_t>(next));
-        next += dwords;
+        if (!spilling && next + dwords > kMaxUserSgprs) spilling = true;
+        if (!spilling) {
+            first.push_back(static_cast<uint32_t>(next));
+            next += dwords;
+            continue;
+        }
+        if (refused.empty() && !compute)
+            refused = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
+                      std::to_string(out.base) + " (where a graphics stage's spill pointer goes is not measured)";
+        if (refused.empty() && p.type == ParamType::Table)
+            refused = "root parameter " + std::to_string(i) +
+                      " is a descriptor table in the compute spill array (its size there is not measured)";
+        // Packed in root order, no alignment: a constant 4 bytes per value, a root descriptor 8 (its 64-bit VA).
+        first.push_back(static_cast<uint32_t>(kMaxUserSgprs + spill_at / 4));
+        spill_at += 4 * (p.type == ParamType::Descriptor ? 2 : uint64_t(p.num_values));
     }
-    if (!spill.empty()) {
-        out.error = std::move(spill);
+    if (spilling && refused.empty() &&
+        (sig.flags & (kFlagResourceHeapDirectlyIndexed | kFlagSamplerHeapDirectlyIndexed)))
+        refused = "a heap base for direct heap indexing after a compute spill (its place is not measured)";
+    if (!refused.empty()) {
+        out.error = std::move(refused);
         out.spills = true;
+        return out;
+    }
+    if (spilling) {
+        // s[0:1] holds the array's pointer; the arguments still in user SGPRs end at s31 at most.
+        out.first_sgpr = std::move(first);
+        out.end_sgpr = static_cast<uint32_t>(next);
+        out.spill_bytes = static_cast<uint32_t>(spill_at);
+        out.d3d12_cost = static_cast<uint32_t>(cost);
+        out.ok = true;
         return out;
     }
     // The heap bases follow the last parameter, the CBV/SRV/UAV heap's first (docs/d3d12_vulkan.md section 3.4).

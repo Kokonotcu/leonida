@@ -667,7 +667,10 @@ struct DeviceState {
     VkPhysicalDeviceMemoryProperties memory{};
     // D3D-96: upload-heap buffers prefer DEVICE_LOCAL | HOST_VISIBLE memory, so the GPU reads them from VRAM. Only
     // with Resizable BAR (leonida::resizable_bar); LEONIDA_UPLOAD_SYSMEM=1 keeps them in system memory to compare.
+    // M8: committed upload buffers live in the arena, whose memory prefers the same; LEONIDA_UPLOAD_SYSMEM=1 keeps
+    // them out of it, in their own system memory (upload_sysmem), with the old VA (a V# cannot reach them).
     bool upload_in_vram = false;
+    bool upload_sysmem = false;
     // D3D-299: the first texture or default-heap buffer that lands outside device-local memory is logged, once.
     mutable std::once_flag spill_logged;
 
@@ -2753,9 +2756,12 @@ public:
     VkMemoryPropertyFlags memory_flags() const { return memory_flags_; }  // of the memory type behind it
     const DeviceState& device_state() const { return device_; }
 
-    // Default-heap buffers are ranges of the GPU address arena: console VA = offset, zeroed through the arena's host
-    // mapping. Upload and readback buffers keep their own host memory; with buffer device addresses their console
-    // VA is their device address minus heap_base, so a shader's heap_base + VA still lands on them (section 3.3).
+    // Every buffer is a range of the GPU address arena: console VA = offset, zeroed through the arena's host mapping.
+    // Upload and readback buffers too (M8): the arena is host-visible and coherent, so their Map pointer is that
+    // range's mapping, and their VA is an arena offset like any other, which a V# (48 bits), a 32-bit table pointer and
+    // the BVH builder (below 2^40) can all hold (docs/d3d12_vulkan.md section 3.3, "Measured (D3D-53)"). When the arena
+    // has no room for one, it keeps its own memory as before (logged once): its VA is then its device address minus
+    // heap_base, which root descriptors and views resolve but a V# does not.
     HRESULT create_buffer(D3D12_RESOURCE_STATES initial_state = D3D12_RESOURCE_STATE_COMMON) {
         auto& vk = device_.context->vk;
         // A buffer has at least one byte, and its size must survive alignment to 64 KiB without wrapping.
@@ -2763,6 +2769,29 @@ public:
         const bool host = cpu_visible();
         leonida::ResourceBinding binding{};  // a buffer: no image
         binding.size = desc_.Width;
+        if (host && device_.arena.mapped && !(heap_.Type == D3D12_HEAP_TYPE_UPLOAD && device_.upload_sysmem)) {
+            if (device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
+                                       DeviceState::arena_buffer)) {
+                in_arena_ = true;
+                va_ = arena_offset_;
+                mapped_ = device_.arena.mapped + arena_offset_;
+                std::memset(mapped_, 0, std::size_t(desc_.Width));  // committed resources start zeroed
+                memory_flags_ = device_.memory.memoryTypes[device_.arena.memory_type].propertyFlags;
+                binding.va = va_;
+                binding.buffer = device_.arena.buffer;
+                binding.buffer_offset = arena_offset_;
+                // Upload (and CPU-written custom) bytes are inputs host_at() may read; readback bytes are GPU-written.
+                binding.host = cpu_writable() ? static_cast<const std::uint8_t*>(mapped_) : nullptr;
+                binding.host_readable = (heap_.Type == D3D12_HEAP_TYPE_READBACK ||
+                                         (heap_.Type == D3D12_HEAP_TYPE_CUSTOM &&
+                                          heap_.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_WRITE_BACK));
+                device_.context->add_resource(id(), binding);
+                return S_OK;
+            }
+            log_once("GPU address arena full: an upload or readback buffer keeps its own memory, so a V# cannot "
+                     "reach it (raise LEONIDA_ARENA_MB); size in KiB:",
+                     int(desc_.Width / 1024));
+        }
         if (!host && device_.arena.mapped) {
             if (!device_.arena_allocate(desc_.Width, D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT, arena_offset_,
                                         DeviceState::arena_buffer)) {
@@ -6214,6 +6243,26 @@ private:
     bool registered_ = false;            // added to the context, so removed from it on destruction
 };
 
+// The arena ranges command allocators sub-allocate GPU data from (the compute root spill arrays, M10). An allocator
+// holds a reference to its device, so the device's state outlives every range taken here.
+class DeviceArenaPages final : public ArenaPages {
+public:
+    explicit DeviceArenaPages(DeviceState& state) : state_(state) {}
+    bool allocate(std::uint64_t bytes, std::uint64_t& va, std::uint8_t*& host) override {
+        VkDeviceSize offset = 0;
+        if (!state_.arena.mapped || !state_.arena_allocate(bytes, 256, offset, DeviceState::arena_buffer)) return false;
+        va = offset;
+        host = state_.arena.mapped + offset;
+        return true;
+    }
+    void release(std::uint64_t va, std::uint64_t bytes) override {
+        state_.arena_release(va, bytes, DeviceState::arena_buffer);
+    }
+
+private:
+    DeviceState& state_;
+};
+
 // The Vulkan device create_vulkan_device_standalone made, destroyed with the D3D12 device. The instance belongs to
 // the process and is never destroyed (create_vulkan_device_standalone).
 struct OwnedRuntime {
@@ -6284,6 +6333,7 @@ public:
             size_t length = 0;
             const bool sysmem = getenv_s(&length, text, "LEONIDA_UPLOAD_SYSMEM") == 0 && length > 1 && text[0] != '0';
             state_.upload_in_vram = leonida::resizable_bar(state_.memory) && !sysmem;
+            state_.upload_sysmem = sysmem;
             std::fprintf(stderr, "[rt] d3d12: upload heaps in %s\n",
                          state_.upload_in_vram ? "VRAM (DEVICE_LOCAL | HOST_VISIBLE, Resizable BAR)"
                          : sysmem             ? "system memory (LEONIDA_UPLOAD_SYSMEM)"
@@ -6732,6 +6782,7 @@ public:
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
+        arena_pages_ = std::make_shared<DeviceArenaPages>(state_);
         return true;
     }
 
@@ -7034,7 +7085,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandAllocator";
-        return d3d12_trace::result(method, create_command_allocator(type, riid, out, identity()));
+        return d3d12_trace::result(method, create_command_allocator(type, riid, out, identity(), arena_pages_));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandList(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
@@ -7059,7 +7110,7 @@ public:
             return d3d12_trace::result(method, E_INVALIDARG);
         if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         ID3D12CommandAllocator* allocator = nullptr;
-        HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity());
+        HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity(), arena_pages_);
         if (FAILED(hr)) return d3d12_trace::result(method, hr);
         ID3D12GraphicsCommandList* list = nullptr;
         hr = create_command_list(type, allocator, IID_PPV_ARGS(&list), identity());
@@ -7389,9 +7440,8 @@ public:
             std::memcpy(&container_size, bytes + 24, sizeof(container_size));
             if (container_size != size) return E_INVALIDARG;
         }
-        // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then pack
-        // the parameters into the 32 user-data dwords. pack() refuses what it cannot place (more than 32 dwords:
-        // the console spills those to memory, in a layout that is still open), and so does this.
+        // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then lay the
+        // parameters out in the user-data dwords and, for compute, the spill array (pack_stage, below).
         const rt::rootsig::DecodeResult parsed = rt::rootsig::parse_rts0(bytes, size);
         if (!parsed.ok) {
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
@@ -7399,8 +7449,10 @@ public:
         }
         // Two layouts, one per bind point (RootArgumentLayout), both the console's (pack_stage, D3D-448): graphics
         // from s8 (the vertex, pixel and geometry stages), compute from s4. A signature that breaks a D3D12 limit is
-        // refused. One that is valid but would spill at a bind point (the console's spill array is not modelled) is
-        // created, as on the console, and marked unusable there: binding it there invalidates the list, loudly.
+        // refused. A compute spill of constants and root descriptors goes to the console's spill array behind s[0:1]
+        // (M10). One that is valid but would spill where that is not modelled (any graphics spill; a table or heap
+        // base in the compute spill) is created, as on the console, and marked unusable there: binding it there
+        // invalidates the list, loudly.
         const rt::rootsig::StagePackResult packed = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Pixel);
         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
         if ((!packed.ok && !packed.spills) || (!compute.ok && !compute.spills)) {
@@ -7422,6 +7474,7 @@ public:
         if (compute.ok) {
             layout.compute_resource_heap_sgpr = compute.resource_heap_sgpr;
             layout.compute_sampler_heap_sgpr = compute.sampler_heap_sgpr;
+            layout.compute_spill_bytes = compute.spill_bytes;
         }
         if (packed.ok) {
             layout.graphics_resource_heap_sgpr = packed.resource_heap_sgpr;
@@ -10221,6 +10274,8 @@ private:
     std::vector<std::uint32_t> compute_users_;
     std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
+    // What the command allocators take spill arrays from (DeviceArenaPages); null without an arena.
+    std::shared_ptr<ArenaPages> arena_pages_;
     std::atomic<bool> removed_{false};
     DeviceRemovedData dred_;
     OwnedRuntime owned_;
@@ -10329,6 +10384,19 @@ VkMemoryPropertyFlags vulkan_memory_flags(ID3D12Resource* resource) {
 VkBuffer vulkan_buffer(ID3D12Resource* resource) {
     const Resource* r = Resource::from<Resource>(resource);
     return r ? r->buffer() : VK_NULL_HANDLE;
+}
+
+bool vulkan_buffer_range(ID3D12Resource* resource, VkBuffer& buffer, VkDeviceSize& offset) {
+    Resource* r = Resource::from<Resource>(resource);
+    if (!r || r->image()) return false;
+    if (r->buffer()) {
+        buffer = r->buffer();
+        offset = 0;
+        return true;
+    }
+    buffer = r->device_state().arena.buffer;  // an arena range: its offset is its console VA
+    offset = r->GetGPUVirtualAddress();
+    return buffer != VK_NULL_HANDLE;
 }
 
 const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
