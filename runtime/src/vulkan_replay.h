@@ -1138,6 +1138,8 @@ struct Prepared {
     QueryPool* queries = nullptr;  // query commands: the heap
     ComputePipeline pipeline;  // dispatches
     IndirectPlan indirect;     // ExecuteIndirect with a multi-argument signature
+    // A simple counted DISPATCH run as generated commands (I7): the signature its plan names.
+    std::shared_ptr<const IndirectSignature> generated_signature;
     std::uint32_t draw = 0;    // draws: its PreparedDraw in PreparedList::draws
     VkAccelerationStructureKHR accel_dst = VK_NULL_HANDLE;
     VkDeviceAddress khr_instances = 0;  // staged ARRAY_OF_POINTERS instance list for a KHR TLAS; 0: use the VA directly
@@ -1723,9 +1725,11 @@ inline void log_indirect_fallback(const char* reason) {
 // The pipeline the draw binds is the prepared one (a variant for unbound slots); with shader objects the commands
 // name the bound shaders instead (VkGeneratedCommandsShaderInfoEXT). `helpers_counted`: a pipeline-statistics query
 // is active and cannot be split around the passes before the commands (the count bound and the view rebase).
+// `signature_owner`: the shared pointer the plan names (by default the call's own; I7 passes a made-up one).
 inline const char* prepare_generated(const ExecuteIndirect& ind, const IndirectSignature& signature,
                                      VkDeviceSize record_start, Prepared& p, const PreparedDraw* draw,
-                                     const ReplayFunctions& vk, bool helpers_counted) {
+                                     const ReplayFunctions& vk, bool helpers_counted,
+                                     const std::shared_ptr<const IndirectSignature>* signature_owner = nullptr) {
     p.indirect = {};
     if (!vk.indirect_prepare || !vk.indirect_prepass || !vk.indirect_execute)
         return "the device has no VK_EXT_device_generated_commands";
@@ -1739,7 +1743,7 @@ inline const char* prepare_generated(const ExecuteIndirect& ind, const IndirectS
     std::array<VkShaderEXT, IndirectPlan::max_shaders> shaders{};
     std::uint32_t shader_count = 0;
     IndirectExpander::Request request;
-    request.signature = &ind.signature;
+    request.signature = signature_owner ? signature_owner : &ind.signature;
     if (compute) {
         request.pipeline_layout = p.pipeline.layout;
         request.push_stages = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1787,6 +1791,21 @@ inline const char* prepare_generated(const ExecuteIndirect& ind, const IndirectS
         return "the generated commands could not be prepared";
     }
     return nullptr;
+}
+
+// A command signature of dispatch arguments alone (at `offset` in records of `stride` bytes), for running a simple
+// counted DISPATCH as generated commands (I7).
+inline std::shared_ptr<const IndirectSignature> dispatch_signature(std::uint32_t stride, std::uint32_t offset) {
+    auto signature = std::make_shared<IndirectSignature>();
+    signature->stride = stride;
+    signature->kind = IndirectKind::dispatch;
+    IndirectArgument dispatch;
+    dispatch.type = IndirectArgumentType::dispatch;
+    dispatch.offset = offset;
+    dispatch.size = 3 * sizeof(std::uint32_t);
+    signature->arguments.push_back(dispatch);
+    signature->arguments_size = offset + dispatch.size;
+    return signature;
 }
 
 inline bool indirect_range(const ResourceBinding& binding, VkDeviceSize offset, VkDeviceSize bytes) {
@@ -3549,6 +3568,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                                                  ind->state ? &out.draws[p.draw] : nullptr, vk,
                                                                  statistics_active && !statistics_helpers);
                 if (fallback) detail::log_indirect_fallback(fallback);
+            } else if (ind->kind == IndirectKind::dispatch && ind->count_buffer && ind->max_count > 1 &&
+                       ind->pipeline && vk.indirect_prepare) {
+                // I7: Vulkan has no vkCmdDispatchIndirectCount, and the counted path below records max_count
+                // dispatches (zero-group ones past the count). Generated commands take the count as their sequence
+                // count instead: one call. Where they cannot (a limit), that path runs, as before.
+                p.generated_signature =
+                    detail::dispatch_signature(ind->stride, signature ? signature->action_offset() : 0);
+                detail::prepare_generated(*ind, *p.generated_signature, record_start, p, nullptr, vk,
+                                          statistics_active && !statistics_helpers, &p.generated_signature);
             }
             if (p.indirect.layout) continue;  // generated: the count, if any, is the sequence count address
             if (ind->count_buffer) {

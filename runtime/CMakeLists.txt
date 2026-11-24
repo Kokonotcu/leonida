@@ -3892,6 +3892,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_first_use_fill_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_first_use_fill COMMAND replay_first_use_fill_test)
+    # A counted ExecuteIndirect(DISPATCH) is one generated-commands call where the device has them (I7; no GPU).
+    add_executable(replay_counted_dispatch_test test/replay_counted_dispatch_test.cpp)
+    target_link_libraries(replay_counted_dispatch_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_counted_dispatch_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_counted_dispatch COMMAND replay_counted_dispatch_test)
     # Copies over common leave the texture in GENERAL; a copy queue's lists decay what they left in a transfer
     # layout back to GENERAL (no GPU).
     add_executable(replay_copy_promotion_test test/replay_copy_promotion_test.cpp)
