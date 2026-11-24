@@ -559,6 +559,14 @@ void test_deserializer() {
         check(rewrote && out.size() == zero_hash.size() && std::memcmp(out.data() + 4, kZero, 16) == 0,
               "blob helper rewrites an all-zero-checksum Xbox blob and keeps its zero checksum");
 
+        // The rule itself, measured: the host deserializer takes the helper's output (zero checksum, PC flags).
+        if (rewrote) {
+            ID3D12RootSignatureDeserializer* host_zero = nullptr;
+            const HRESULT hr_host = D3D12CreateRootSignatureDeserializer(out.data(), out.size(), IID_PPV_ARGS(&host_zero));
+            check(SUCCEEDED(hr_host) && host_zero, "host deserializer accepts an all-zero DXBC checksum");
+            if (host_zero) host_zero->Release();
+        }
+
         ID3D12RootSignatureDeserializer* shim_zero = nullptr;
         const HRESULT hr_zero = deserialize(zero_hash.data(), zero_hash.size(), IID_PPV_ARGS(&shim_zero));
         check(SUCCEEDED(hr_zero) && shim_zero && shim_zero->GetRootSignatureDesc()->Flags == 0,
