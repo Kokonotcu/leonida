@@ -1634,9 +1634,12 @@ inline bool zero_compressed_image(const ReplayFunctions& vk, VkCommandBuffer com
 // Images registered with the tracker in UNDEFINED have never been used. D3D12 committed resources start zeroed,
 // so each such piece is zero-filled (clear for uncompressed images, zero-buffer copy for block-compressed formats
 // when a zero page or transfer scratch is available) and moved to `layout`, the layout the operation about to run
-// expects; with not_zeroed, it is only moved. The tracker records it. True when any piece was initialized.
+// expects; with not_zeroed, it is only moved, and so with `overwritten`: the operation writes every texel of the
+// pieces (a copy over whole subresources, a whole-view clear), so a fill would be overwritten at once (I5). The
+// tracker records it. True when any piece was initialized.
 inline bool initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const ResourceBinding& resource,
-                       ResourceId id, LayoutPieces& pieces, VkImageLayout layout, LayoutTracker* tracker) {
+                       ResourceId id, LayoutPieces& pieces, VkImageLayout layout, LayoutTracker* tracker,
+                       bool overwritten = false) {
     constexpr VkAccessFlags any_memory = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
     bool initialized = false;
     for (auto& piece : pieces) {
@@ -1646,7 +1649,7 @@ inline bool initialize(const ReplayFunctions& vk, VkCommandBuffer command_buffer
         const bool color = piece.range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT;
         const bool can_clear = !vk.queue_stages || ((vk.queue_stages & VK_PIPELINE_STAGE_2_CLEAR_BIT) && color);
         const bool compressed = fmt.block > 1 || (!can_clear && color);
-        if (resource.not_zeroed || (!can_clear && !color)) {
+        if (resource.not_zeroed || overwritten || (!can_clear && !color)) {
             image_barrier(vk, command_buffer, resource, piece.range, VK_IMAGE_LAYOUT_UNDEFINED, layout, 0,
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, any_memory, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
         } else if (compressed) {
@@ -2254,16 +2257,61 @@ inline ReplayResult keep_around_resolve(const ReplayFunctions& vk, Prepared& p) 
 // through its set-0 descriptor, written in GENERAL. So a range with any piece in GENERAL, or never used (UNDEFINED:
 // as far as the layer knows, created in common), is copied in GENERAL, all of it; the tracker keeps GENERAL. A range
 // with no such piece is moved to `wanted` and tracked.
+// True when the copy regions write every texel of every subresource in `range` of `resource`: for each mip and
+// layer one region whose aspects include the range's, from offset 0 over the whole mip (I5). `Region` is
+// VkBufferImageCopy or VkImageCopy (the destination side). Conservative: false for anything it does not check.
+template<typename Region>
+bool regions_cover(const ResourceBinding& resource, const VkImageSubresourceRange& range,
+                   const std::vector<Region>& regions) {
+    const std::uint32_t mips =
+        range.levelCount == VK_REMAINING_MIP_LEVELS ? resource.mip_levels - range.baseMipLevel : range.levelCount;
+    const std::uint32_t layers = range.layerCount == VK_REMAINING_ARRAY_LAYERS
+                                     ? resource.array_layers - range.baseArrayLayer
+                                     : range.layerCount;
+    if (!mips || !layers || std::uint64_t(mips) * layers * regions.size() > 65536) return false;
+    for (std::uint32_t m = range.baseMipLevel; m < range.baseMipLevel + mips; ++m) {
+        const VkExtent2D e = mip_extent(resource, m);
+        const std::uint32_t depth = resource.volume ? std::max(1u, resource.depth >> m) : 1u;
+        for (std::uint32_t l = range.baseArrayLayer; l < range.baseArrayLayer + layers; ++l) {
+            bool covered = false;
+            for (const Region& r : regions) {
+                VkImageSubresourceLayers sub;
+                VkOffset3D offset;
+                VkExtent3D x;
+                if constexpr (std::is_same_v<Region, VkBufferImageCopy>) {
+                    sub = r.imageSubresource;
+                    offset = r.imageOffset;
+                    x = r.imageExtent;
+                } else {
+                    sub = r.dstSubresource;
+                    offset = r.dstOffset;
+                    x = r.extent;
+                }
+                covered = sub.mipLevel == m && (sub.aspectMask & range.aspectMask) == range.aspectMask &&
+                          (resource.volume || (l >= sub.baseArrayLayer && l - sub.baseArrayLayer < sub.layerCount)) &&
+                          offset.x == 0 && offset.y == 0 && offset.z == 0 && x.width >= e.width &&
+                          x.height >= e.height && x.depth >= depth;
+                if (covered) break;
+            }
+            if (!covered) return false;
+        }
+    }
+    return true;
+}
+
+// `overwritten`: the copy writes every texel of `range` (a destination it covers whole), so a never-used piece is
+// not zero-filled first (I5).
 inline VkImageLayout copy_layout(const ReplayFunctions& vk, VkCommandBuffer command_buffer,
                                  const ResourceBinding& resource, ResourceId id, const VkImageSubresourceRange& range,
-                                 VkImageLayout wanted, VkAccessFlags access, LayoutTracker* tracker) {
+                                 VkImageLayout wanted, VkAccessFlags access, LayoutTracker* tracker,
+                                 bool overwritten = false) {
     const VkImageLayout transfer = image_layout(resource, wanted);
     auto pieces = current(tracker, id, range, transfer);
     bool promoted = false;
     for (const auto& piece : pieces)
         promoted = promoted || piece.layout == VK_IMAGE_LAYOUT_GENERAL || piece.layout == VK_IMAGE_LAYOUT_UNDEFINED;
     const VkImageLayout target = promoted ? VK_IMAGE_LAYOUT_GENERAL : transfer;
-    initialize(vk, command_buffer, resource, id, pieces, target, tracker);
+    initialize(vk, command_buffer, resource, id, pieces, target, tracker, overwritten);
     // D3D12 orders back-to-back copies and resolves on a resource that stays in COPY_DEST or COPY_SOURCE without a
     // barrier from the application; Vulkan does not. A piece already in the transfer layout gets no layout
     // transition, so an earlier transfer write to it is ordered here instead (write-after-write and read-after-write,
@@ -4114,7 +4162,9 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (p.skip) continue;
             const VulkanAccess state = vulkan_access(d3d12_state::render_target, false);
             auto pieces = detail::current(tracker, id, p.range, image_layout(p.binding, state.layout));
-            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
+            // A whole-view clear (no rectangles, which a predicated clear always has) overwrites the view (I5).
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker,
+                               p.rects.empty());
             const VkClearColorValue color = detail::render_target_clear_color(p.clear_format, color_clear->color);
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
@@ -4149,7 +4199,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             const auto range = detail::planes_for_layout(p.binding, p.range, separate);
             const VulkanAccess state = vulkan_access(d3d12_state::depth_write, false);
             auto pieces = detail::current(tracker, id, range, image_layout(p.binding, state.layout));
-            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker);
+            // A whole-view clear of every plane the pieces hold overwrites them (I5); with the planes tracked
+            // together, clearing depth alone leaves the stencil to be zeroed.
+            detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker,
+                               p.rects.empty() && !(range.aspectMask & ~p.range.aspectMask));
             const float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
                                 : p.binding.format == VK_FORMAT_D16_UNORM
                                     ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
@@ -4269,9 +4322,12 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     self ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     self ? VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT,
                     tracker);
-                const VkImageLayout dst_layout = self ? src_layout : detail::copy_layout(
-                    vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                const auto dst_range = detail::planes_for_layout(p.binding, p.range, separate);
+                const VkImageLayout dst_layout =
+                    self ? src_layout
+                         : detail::copy_layout(vk, command_buffer, p.binding, dst_id, dst_range,
+                                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                                               tracker, detail::regions_cover(p.binding, dst_range, p.image_copies));
                 const auto count = std::uint32_t(p.image_copies.size());
                 const auto depth_stencil = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
                 if (std::holds_alternative<CopyResource>(command) &&
@@ -4320,9 +4376,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                     regions = &converted;
                     source = p.depth24.scratch;
                 }
+                const auto dst_range = detail::planes_for_layout(p.binding, p.range, separate);
                 const VkImageLayout dst_layout = detail::copy_layout(
-                    vk, command_buffer, p.binding, dst_id, detail::planes_for_layout(p.binding, p.range, separate),
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, tracker);
+                    vk, command_buffer, p.binding, dst_id, dst_range, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, tracker, detail::regions_cover(p.binding, dst_range, *regions));
                 vk.copy_buffer_to_image(command_buffer, source, p.binding.image, dst_layout,
                                         std::uint32_t(regions->size()), regions->data());
             } else {
