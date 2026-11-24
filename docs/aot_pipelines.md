@@ -108,6 +108,8 @@ Windows drivers, which have no `VK_EXT_shader_object`.
   (`Link::cached`: `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`, with `pipelineCreationCacheControl`)
   and takes it at creation, with no fast link and no background work; only when the cache does not have it
   (`VK_PIPELINE_COMPILE_REQUIRED`) does it fast-link. Variants for unbound attachment slots stay fast-linked.
+  `LEONIDA_GPL_CACHED_LINK=0` skips that question (always fast-link, then optimise in the background); the test uses
+  it because NVIDIA's own disk cache answers it too once the same shaders have run on the machine before.
 - `gta6rt --prebuild-shaders` on a device without shader objects (or with `LEONIDA_SHADER_OBJECTS=0`) makes every
   translated vertex shader's pre-rasterization part (depth clipped and depth clamped) and every pixel shader's
   fragment part through the device's pipeline cache and saves the cache (`prebuild_pipeline_libraries`). What it

@@ -1431,6 +1431,7 @@ struct DeviceState {
     std::mutex gpl_mutex;
     std::map<std::uint64_t, VkPipeline> gpl_libraries;  // shared parts by pso::library_key
     std::atomic<std::uint32_t> gpl_parts_made{0}, gpl_parts_cached{0}, gpl_links{0}, gpl_links_cached{0};
+    bool gpl_cached_link = true;  // LEONIDA_GPL_CACHED_LINK (gpl_ready)
 
     bool gpl_ready() {
         if (!info.graphics_pipeline_library || info.shader_objects) return false;
@@ -1451,6 +1452,10 @@ struct DeviceState {
                 gpl_layout = VK_NULL_HANDLE;
                 return;
             }
+            // LEONIDA_GPL_CACHED_LINK=0: a PSO does not ask the pipeline cache for its optimised link at creation, so
+            // it is always fast-linked first and optimised in the background (for tests: a driver's own disk cache
+            // can otherwise answer that question on a machine that ran the same shaders before).
+            gpl_cached_link = environment_text(L"LEONIDA_GPL_CACHED_LINK") != L"0";
             gpl_ok = true;
         });
         return gpl_ok;
@@ -5074,7 +5079,7 @@ private:
         gpl_outputs_.push_back(output);
         const std::array<VkPipeline, 4> parts{gpl_input_, pre_raster, fragment, output};
         if (leonida::pso::Recorder* recorder = device_.pso_recorder()) recorder->record(recipe);
-        if (base && device_.info.pipeline_creation_cache_control) {
+        if (base && device_.info.pipeline_creation_cache_control && device_.gpl_cached_link) {
             const leonida::pso::LinkCreateInfo cached_create(parts, graphics_.layout, Link::cached);
             VkResult result = VK_SUCCESS;
             if (const VkPipeline optimized = device_.gpl_create(cached_create.info, cached, &result)) {

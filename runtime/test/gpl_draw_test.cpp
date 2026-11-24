@@ -275,7 +275,12 @@ int main() {
 
     // 3. A new device: linked PSOs from the cache the prebuild saved, fast-linked; their first draws ask for the
     //    optimised links, which the background worker makes, puts in the pipeline cache and swaps in; the list again.
+    // LEONIDA_GPL_CACHED_LINK=0: a driver's own disk cache (NVIDIA's keeps pipelines across processes) could otherwise
+    // already answer the optimised links at creation on a machine that ran this test before, and nothing would be left
+    // to do in the background.
+    _wputenv_s(L"LEONIDA_GPL_CACHED_LINK", L"0");
     if (!draw_once(shaders, linked, true)) return 1;
+    _wputenv_s(L"LEONIDA_GPL_CACHED_LINK", L"1");
     if (!linked.linked) {
         std::puts("SKIP: this device has no graphicsPipelineLibrary");
         return 77;
