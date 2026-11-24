@@ -11,7 +11,7 @@ your own copy or with a synthetic test before you build on it, and record the re
   [design.md](design.md) and stop.
 - **Nothing online**: no Xbox Live or Rockstar services.
 - **Claim first.** Put the lead's ID (BL-1 …) in the coordination issue before you open a pull request (the search
-  link is in [CONTRIBUTING.md](CONTRIBUTING.md)), and check the open pull requests for the same item.
+  link is in [CONTRIBUTING.md](../CONTRIBUTING.md)), and check the open pull requests for the same item.
 - A translator rule needs a row in the contract table in [design.md](design.md) with how it was confirmed, and a
   hand-written `.asm` fixture in `tests/semantic/`.
 - In the pull request, say what you tested and on which GPU and driver.

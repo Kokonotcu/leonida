@@ -141,12 +141,13 @@ public:
     // update ignores `pair`.
     bool record_blas(VkCommandBuffer cb, const XdxrLayout& layout, const std::vector<XdxrTriangles>& geometries,
                      std::uint64_t dst, std::uint64_t scratch, std::uint64_t update_from = 0, bool pair = false) {
-        if (!loaded_ || layout.tlas) return false;
-        // The geometries must fill the layout's elements exactly; checked before anything is recorded, so a
-        // refused build leaves the command buffer as it was (B21).
-        std::uint64_t triangles = 0;
-        for (const auto& geo : geometries) triangles += geo.triangle_count;
-        if (triangles != layout.elements) return false;
+        if (!loaded_ || layout.tlas || !layout.size || !dst || !scratch) return false;
+        std::uint64_t total = 0;
+        for (const auto& geo : geometries) {
+            total += geo.triangle_count;
+            if (total > layout.elements) return false;
+        }
+        if (total != layout.elements) return false;
         Push p = base(layout, dst, scratch);
         if (pair && !update_from) p.flags |= flag_pair;
         if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
@@ -168,7 +169,6 @@ public:
             dispatch(cb, t, t.count);
             first += geo.triangle_count;
         }
-        if (first != layout.elements) return false;
         if (update_from) refit_finish(cb, layout, p); else finish(cb, layout, p);
         return true;
     }
@@ -177,7 +177,8 @@ public:
     // `update_from`: as for record_blas; the instances may move, and name other BLASes.
     bool record_tlas(VkCommandBuffer cb, const XdxrLayout& layout, std::uint64_t instances, std::uint64_t dst,
                      std::uint64_t scratch, std::uint64_t bias = 0, std::uint64_t update_from = 0) {
-        if (!loaded_ || !layout.tlas) return false;
+        if (!loaded_ || !layout.tlas || !layout.size || !dst || !scratch || (layout.elements && !instances))
+            return false;
         Push p = base(layout, dst, scratch);
         p.bias = split(bias);
         if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
