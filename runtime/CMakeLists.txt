@@ -2724,6 +2724,8 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_render_pass_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_render_pass COMMAND d3d12_render_pass_test)
     set_tests_properties(d3d12_render_pass PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME d3d12_clear_restricted_depth COMMAND d3d12_clear_test --restricted-depth)
+    set_tests_properties(d3d12_clear d3d12_clear_restricted_depth PROPERTIES SKIP_RETURN_CODE 77)
 
     # Synthetic typed-view readbacks against Windows WARP; run explicitly on a Vulkan GPU.
     add_executable(d3d12_typeless_rtv_test test/d3d12_typeless_rtv_test.cpp)

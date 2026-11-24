@@ -1418,8 +1418,6 @@ public:
     // The indirect-draw features enabled on the device (VulkanDeviceInfo::multi_draw_indirect / draw_indirect_count).
     // multiViewport: how many viewports a draw may bind (ReplayFunctions::max_viewports); 1 without the feature.
     void set_max_viewports(std::uint32_t count) { replay_.max_viewports = std::max(1u, count); }
-    // VK_EXT_depth_range_unrestricted is enabled (ReplayFunctions::depth_range_unrestricted).
-    void set_depth_range_unrestricted(bool on) { replay_.depth_range_unrestricted = on; }
     void set_indirect_features(bool multi_draw, bool draw_count, std::uint32_t max_draw_count = UINT32_MAX) {
         replay_.multi_draw_indirect = multi_draw;
         replay_.max_draw_indirect_count = max_draw_count;
@@ -1440,6 +1438,11 @@ public:
         replay_.zero_buffer = buffer;
         replay_.zero_offset = offset;
         replay_.zero_size = size;
+    }
+
+    void set_depth_range_unrestricted(bool enabled) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.depth_range_unrestricted = enabled;
     }
 
     // Physical-device COLOR_ATTACHMENT format check for reinterpreted UAV clears.
