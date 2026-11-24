@@ -1171,6 +1171,9 @@ struct PreparedDraw {
     VkExtent2D area{};
     VkRect2D scissor{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
+    // What the attachments alone allow (UINT32_MAX: none bound): what a later draw with the same views reuses (I6).
+    VkExtent2D target_area{UINT32_MAX, UINT32_MAX};
+    std::uint32_t target_layers = UINT32_MAX;
 
     // Back to a new draw's state, keeping the vectors' storage.
     void reset() {
@@ -1187,6 +1190,8 @@ struct PreparedDraw {
         index_type = VK_INDEX_TYPE_UINT16;
         area = {};
         layers = 1;
+        target_area = {UINT32_MAX, UINT32_MAX};
+        target_layers = UINT32_MAX;
     }
 };
 
@@ -2315,16 +2320,45 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const
 
 namespace detail {
 
+inline ReplayResult finish_draw(const Draw& draw, const ReplayFunctions& vk, PreparedDraw& p, const Draw* previous_draw,
+                                const PreparedDraw* previous);
+
+inline bool same_target_view(const TargetView& a, const TargetView& b) {
+    return a.resource == b.resource && a.mip == b.mip && a.first_layer == b.first_layer &&
+           a.layer_count == b.layer_count && a.format == b.format;
+}
+
 // Resolves a draw's pipeline, attachments and buffers. Attachment views take the pipeline's formats, so a
-// typeless texture is viewed as the format the pipeline renders.
+// typeless texture is viewed as the format the pipeline renders. `previous` (with `previous_draw`, the draw it was
+// prepared for, earlier in the same list): a draw with the same views block, pipeline and depth view takes its
+// attachments, area limits and vertex buffers, and with the same index buffer view its index buffer, instead of
+// resolving them again (I6). Within one prepare() the resources resolve the same way every time, so the result is
+// the same.
 template<typename Resolve>
-ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p) {
+ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p,
+                          const Draw* previous_draw = nullptr, const PreparedDraw* previous = nullptr) {
     if (!vk.graphics_pipeline || !vk.buffer_at || !vk.image_view || !vk.begin_rendering || !vk.end_rendering ||
         !vk.bind_vertex_buffers2 || !vk.bind_index_buffer || !vk.set_viewport || !vk.set_scissor ||
         !vk.set_primitive_topology || !vk.set_primitive_restart_enable || !vk.set_stencil_reference ||
         !vk.set_blend_constants || !vk.draw ||
         !vk.draw_indexed || !vk.bind_pipeline || !vk.push_constants)
         return ReplayResult::unsupported;
+    const bool same_state = previous && previous_draw && previous->graphics && draw.views &&
+                            previous_draw->views == draw.views && previous_draw->pipeline == draw.pipeline &&
+                            previous_draw->mesh == draw.mesh && same_target_view(previous_draw->depth, draw.depth);
+    if (same_state) {
+        p.graphics = previous->graphics;
+        p.pipeline = previous->pipeline;
+        p.colors = previous->colors;
+        p.depth = previous->depth;
+        p.target_area = previous->target_area;
+        p.target_layers = previous->target_layers;
+        p.vertex_buffers = previous->vertex_buffers;
+        p.vertex_offsets = previous->vertex_offsets;
+        p.vertex_sizes = previous->vertex_sizes;
+        p.vertex_strides = previous->vertex_strides;
+        return finish_draw(draw, vk, p, previous_draw, previous);
+    }
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shaders)) return ReplayResult::unresolved_resource;
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
@@ -2377,24 +2411,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         if (!a.view) return ReplayResult::unsupported;
         shrink(a.binding, draw.depth, a.range);
     }
-    // D3D rasterization implicitly scissors to the floored viewport edges (functional spec 15.7).
-    // Clip to nonnegative framebuffer coordinates before converting; floor the far edge after adding the origin.
-    const auto edge = [](float value) {
-        return static_cast<std::int32_t>(std::min(double(INT32_MAX), std::max(0.0, double(value))));
-    };
-    const Viewport& v = draw.viewport;
-    const Rect& s = draw.scissor;
-    const auto left = std::max(s.left, edge(v.x)), top = std::max(s.top, edge(v.y));
-    const auto right = std::min(s.right, edge(v.x + v.width)), bottom = std::min(s.bottom, edge(v.y + v.height));
-    p.scissor = {};
-    if (right > left && bottom > top)
-        p.scissor = {{left, top}, {std::uint32_t(right - left), std::uint32_t(bottom - top)}};
-    if (p.area.width == UINT32_MAX) {
-        // Without attachments, bound rendering by the effective scissor. Vulkan still needs a nonempty render area
-        // when no sample is covered; the empty scissor suppresses the fragments in that case.
-        p.area = p.scissor.extent.width ? VkExtent2D{std::uint32_t(right), std::uint32_t(bottom)} : VkExtent2D{1, 1};
-    }
-    p.layers = layers == UINT32_MAX ? 1 : std::max(1u, layers);
+    p.target_area = p.area;
+    p.target_layers = layers;
 
     // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
     // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
@@ -2433,7 +2451,41 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
     }
+    return finish_draw(draw, vk, p, previous_draw, previous);
+}
+
+// The part of prepare_draw every draw computes: the scissor and render area (from the attachments' limits in
+// p.target_area), the layers, and the index buffer (taken from `previous` when it had the same index view).
+inline ReplayResult finish_draw(const Draw& draw, const ReplayFunctions& vk, PreparedDraw& p, const Draw* previous_draw,
+                                const PreparedDraw* previous) {
+    // D3D rasterization implicitly scissors to the floored viewport edges (functional spec 15.7).
+    // Clip to nonnegative framebuffer coordinates before converting; floor the far edge after adding the origin.
+    const auto edge = [](float value) {
+        return static_cast<std::int32_t>(std::min(double(INT32_MAX), std::max(0.0, double(value))));
+    };
+    const Viewport& v = draw.viewport;
+    const Rect& s = draw.scissor;
+    const auto left = std::max(s.left, edge(v.x)), top = std::max(s.top, edge(v.y));
+    const auto right = std::min(s.right, edge(v.x + v.width)), bottom = std::min(s.bottom, edge(v.y + v.height));
+    p.scissor = {};
+    if (right > left && bottom > top)
+        p.scissor = {{left, top}, {std::uint32_t(right - left), std::uint32_t(bottom - top)}};
+    p.area = p.target_area;
+    if (p.area.width == UINT32_MAX) {
+        // Without attachments, bound rendering by the effective scissor. Vulkan still needs a nonempty render area
+        // when no sample is covered; the empty scissor suppresses the fragments in that case.
+        p.area = p.scissor.extent.width ? VkExtent2D{std::uint32_t(right), std::uint32_t(bottom)} : VkExtent2D{1, 1};
+    }
+    p.layers = p.target_layers == UINT32_MAX ? 1 : std::max(1u, p.target_layers);
+
     if (draw.indexed) {
+        if (previous && previous_draw && previous_draw->indexed && previous_draw->index.va == draw.index.va &&
+            previous_draw->index.size == draw.index.size && previous_draw->index.format == draw.index.format) {
+            p.index_type = previous->index_type;
+            p.index_buffer = previous->index_buffer;
+            p.index_offset = previous->index_offset;
+            return ReplayResult::success;
+        }
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
         else if (draw.index.va) return ReplayResult::unsupported;
@@ -2961,6 +3013,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.wrote_readback = false;
     out.readback_src_stages = 0;
 
+    const Draw* previous_draw = nullptr;  // the last Draw prepared in this list, and its entry in out.draws
+    std::size_t previous_draw_slot = 0;
     for (std::size_t i = 0; i < commands.size(); ++i) {
         out.failed_command = i;  // what a failure returned from this loop names (I4)
         const auto& command = commands[i];
@@ -3563,8 +3617,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             auto& prepared_draw = out.draws[out.draw_count];
             prepared_draw.reset();
             p.draw = std::uint32_t(out.draw_count++);
-            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success)
+            // The draw before it in this list, for what the two share (I6).
+            const detail::PreparedDraw* previous = previous_draw ? &out.draws[previous_draw_slot] : nullptr;
+            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw, previous_draw, previous);
+                r != ReplayResult::success)
                 return r;
+            previous_draw = draw;
+            previous_draw_slot = p.draw;
         }
     }
     out.failed_command = PreparedList::no_command;  // a failure from here on is the list's, not one command's

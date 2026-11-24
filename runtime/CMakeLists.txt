@@ -3878,6 +3878,13 @@ if(TARGET Vulkan::Headers)
       target_compile_definitions(replay_depth_draw_layout_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     endif()
     add_test(NAME replay_depth_draw_layout COMMAND replay_depth_draw_layout_test)
+    # Draws sharing their views reuse the attachments and buffers the draw before them resolved (I6; no GPU).
+    add_executable(replay_draw_prepare_bench_test test/replay_draw_prepare_bench_test.cpp)
+    target_link_libraries(replay_draw_prepare_bench_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_draw_prepare_bench_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_draw_prepare_bench COMMAND replay_draw_prepare_bench_test)
     # Copies over common leave the texture in GENERAL; a copy queue's lists decay what they left in a transfer
     # layout back to GENERAL (no GPU).
     add_executable(replay_copy_promotion_test test/replay_copy_promotion_test.cpp)
