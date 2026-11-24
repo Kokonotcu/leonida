@@ -532,8 +532,8 @@ class ShaderStageResumeTest(unittest.TestCase):
 
 
 class TranslationSourcesTest(unittest.TestCase):
-    def test_the_list_covers_every_local_module_the_translator_imports(self):
-        seen, todo = set(), ["rdna2spirv"]
+    def test_the_list_covers_the_translator_and_native_catalog_imports(self):
+        seen, todo = set(), ["rdna2spirv", "native_pso_hashes"]
         while todo:
             name = todo.pop()
             if name in seen:

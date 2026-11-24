@@ -9,6 +9,11 @@ trace tool for the first boot. The executable's `ws2_32.dll` imports are served 
 `winhttp.dll` (`runtime/shims/ws2_32_offline.cpp`), so no socket or DNS query leaves the
 process. Nothing here quotes game data; a real trace stays on the player's machine.
 
+Outbound `ws2_32.dll` and `winhttp.dll` calls are restricted offline by the shims (`winhttp_offline.cpp` refuses all
+requests). A runtime configured with `-DLEONIDA_WS2_HOST_LOOPBACK=ON` uses upstream's `ws2_offline.cpp` instead of
+`ws2_32_offline.cpp`, which leaves the host's `ws2_32.dll` loaded and permits loopback only; running with the network
+off remains good defence in depth either way.
+
 Loader switches for the first boot: `LEONIDA_TLS_GA_PATCH=0` turns off the rewrite of the executable's index-0 TLS
 reads (`gs:[58h]`, pe_loader.cpp); `LEONIDA_HEAP_PROBE=1` validates the CRT heap at each `GetModuleHandleW` and logs it
 (library_loader.cpp), to find which call first sees a corrupt heap; `LEONIDA_CPU_PATCH=0` and `LEONIDA_CPU_SITES` are

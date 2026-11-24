@@ -1844,11 +1844,12 @@ def runtime_gpu_max_push_constants():
     return int(v) if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
 
 
-# Source and data files that produce the translated modules, metadata and partner stubs.
+# Source and data files that produce the translated modules, metadata, partner stubs and native PSO catalog.
 TRANSLATION_SOURCES = ("rdna2spirv.py", "shader_ir.py", "cfg_structure.py", "file_mode.py", "fssm_header.py", "lane_masks.py", "wave64_halves.py",
                        "wave64_emulate_opt.py", "shader_meta.py", "spirv_stubs.py", "spirv_asm.py", "spirv_asm_tables.py",
                        "spirv_opt.py", "report_paths.py", "replace_retry.py", "fssm_unpack.py", "shader_stage_manifest.py",
-                       "rdna2_decode.py", "rdna2_isa_tables.py", "gfx10_formats.json")
+                       "rdna2_decode.py", "rdna2_isa_tables.py", "gfx10_formats.json",
+                       "native_pso_hashes.py", "shader_carve.py", "shader_carve_accel.py")
 
 
 def sources_digest(folder: str, names, lead: str = "") -> str:
