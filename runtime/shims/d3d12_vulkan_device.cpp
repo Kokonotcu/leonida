@@ -1971,6 +1971,17 @@ struct DeviceState {
                     VkFormat image_format, VkImageAspectFlags aspects, bool storage,
                     bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED) {
         namespace g = leonida::gfx10;
+        // LEONIDA_LOG_TSHARP=<GPU address, hex>: every T# registered for a texture at that address, so a T# a shader
+        // reads (LEONIDA_LOG_DESC) can be compared with the ones the hash table knows.
+        if (static const std::uint64_t want = [] {
+                const char* v = std::getenv("LEONIDA_LOG_TSHARP");
+                return v ? std::strtoull(v, nullptr, 16) : 0ull;
+            }();
+            want && image.address == want) {
+            std::fprintf(stderr, "[rt] d3d12: T# registered for %#llx:", static_cast<unsigned long long>(want));
+            for (const std::uint32_t w : words) std::fprintf(stderr, " %08x", w);
+            std::fprintf(stderr, "%s\n", storage ? " (storage)" : "");
+        }
         std::lock_guard lock(descriptor_mutex);
         if (!bindless) return false;
         const auto existing = image_entries.find(words);
@@ -9495,6 +9506,11 @@ public:
             log_once("a title-placed texture (device slot 133) is a committed texture whose GPU VA is the title "
                      "address, fed from the title's pages at each submission; dimension",
                      int(desc.Dimension));
+            if (const char* v = std::getenv("LEONIDA_LOG_TSHARP");
+                v && std::strtoull(v, nullptr, 16) == reinterpret_cast<std::uint64_t>(address))
+                std::fprintf(stderr, "[rt] d3d12: title-placed texture at %p: %llux%u, %u mips, format %d, flags %#x, "
+                                     "layout %u\n", address, static_cast<unsigned long long>(desc.Width), desc.Height,
+                             desc.MipLevels, int(desc.Format), unsigned(desc.Flags), layout);
             // The title's barrier layout (slot 133's third argument, measured by @dracbat) is checked against the
             // description as CreateCommittedResource checks a state; one it refuses (or UNDEFINED) gives COMMON, so
             // the title still gets its texture. The image itself starts undefined either way: the first command that

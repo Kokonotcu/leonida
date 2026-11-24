@@ -7339,7 +7339,15 @@ class Gen:
         args = [dict(a) for a in ins["args"]]
         if len(args) < 2:
             raise Unsupported("DPP operands")
-        if args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
+        # VOPC with DPP (v_cmp_*_dpp vcc, ...: 12 compares in pipeline-library reductions of 1.0.2.1) writes a lane
+        # mask, which the DPP write guard (VGPR stores) does not cover: taken when every lane writes, i.e. full row
+        # and bank masks with bound_ctrl:1 or DPP8, so no lane keeps its old bit.
+        lane_mask_dst = (args[0].get("k") == "special" and args[0].get("t", "") in ("vcc", "vcc_lo")
+                         and base_op(ins["op"]).startswith("v_cmp_"))
+        if lane_mask_dst:
+            if row_mask != 0xF or bank_mask != 0xF or not (bound or dpp8 is not None):
+                raise Unsupported("DPP compare with a partial write mask")
+        elif args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
             raise Unsupported("DPP destination")
         if args[1].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
@@ -7519,7 +7527,7 @@ class Gen:
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
         args[1] = {"k": "ssa", "v": src0}
         previous = self.dpp_guard
-        self.dpp_guard = write
+        self.dpp_guard = None if lane_mask_dst else write
         try:
             return self._insn({**ins, "args": args})
         finally:
@@ -7680,9 +7688,11 @@ class Gen:
                 half = self.mask_half(x) if self.wave64 else None
                 mask_words = [hi if half == "hi" else lo]
             if d["k"] == "special" and d.get("t", "").startswith(("exec", "vcc")):
-                if op != "s_bitreplicate_b64_b32" or d["t"] != "exec":
+                if op != "s_bitreplicate_b64_b32" or d["t"] not in ("exec", "vcc") or mask_words is not None:
                     raise Unsupported(op + " on a lane mask")
-                # EXEC's bit for lane L comes from scalar-source bit L // 2.
+                # EXEC's (or VCC's) bit for lane L comes from scalar-source bit L // 2. VCC from a constant
+                # (s_bitreplicate_b64_b32 vcc, 0xf0f0f0f: 6 pipeline-library programs of 1.0.2.1) is a lane mask
+                # each invocation holds as 0 or ~0, as a compare leaves it.
                 shift, shifted, bit = (self.tmp() for _ in range(3))
                 lane = self.wave_lane()
                 word = self.src_u(x)
@@ -7693,7 +7703,10 @@ class Gen:
                 # which a mask answers for every lane and a plain 0/1 only for lanes 0 and 32.
                 mask = self.tmp()
                 self.emit(f"{mask} = OpISub %uint {self.cu(0)} {bit}")
-                self.set_exec(mask)
+                if d["t"] == "vcc":
+                    self.emit(f"OpStore %vcc {mask}")
+                else:
+                    self.set_exec(mask)
                 return
             if mask_words is not None:
                 words = mask_words
