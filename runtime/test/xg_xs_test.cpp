@@ -161,9 +161,19 @@ int main() {
         std::vector<uint8_t> base(static_cast<size_t>(got.size_bytes), 0xcd);
         std::vector<uint8_t> linear(40 * 3);
         for (size_t i = 0; i < linear.size(); ++i) linear[i] = static_cast<uint8_t>(i + 1);
+        // Slot 8 tells the write listener (the D3D12 layer's title-placed textures) which range it wrote.
+        static const void* noted_at = nullptr;
+        static std::size_t noted_bytes = 0;
+        rt::xg::g_write_listener.store(+[](const void* address, std::size_t bytes) {
+            noted_at = address;
+            noted_bytes = bytes;
+        });
         check(reinterpret_cast<Slot8Fn>(vtable[8])(computer, base.data(), 0, 4, linear.data(), 40, 120) == S_OK,
               "slot 8 CopyIntoSubresource");
+        rt::xg::g_write_listener.store(nullptr);
         const size_t at = static_cast<size_t>(m1.offset_bytes + m1.slice2d_size_bytes);
+        check(noted_at == base.data() + at && noted_bytes == m1.slice2d_size_bytes,
+              "slot 8 reports the subresource it wrote to the write listener");
         bool rows = true, rest = true;
         for (size_t y = 0; y < 3; ++y)
             rows = rows && std::memcmp(base.data() + at + y * 256, linear.data() + y * 40, 24) == 0;

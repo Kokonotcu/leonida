@@ -173,8 +173,14 @@ subresource's rows into it, slot 10 reports its 64 KiB tiles, all from one compu
 runtime, and it does: every subresource is a D3D12 placed footprint (mips one after another, each holding its array
 slices, 2D slices at 512 bytes with 256-byte rows, a 3D mip's depth slices row pitch * rows apart), so memory the title
 fills through slot 8 can be copied into a texture with `CopyTextureRegion`; and device slots 25 and 108 size a console
-caller's texture at least this large, so that memory holds what slot 8 writes. Still open: a title-placed texture
-(device slot 133) is an ordinary committed texture, so nothing copies the title's linear bytes into it yet.
+caller's texture at least this large, so that memory holds what slot 8 writes. A title-placed texture (device slot 133)
+is a committed image fed from the title's pages in this layout: at each `ExecuteCommandLists`, before the lists, every
+subresource is copied in from its footprint when the texture is new, when slot 8 wrote into its range since its last
+copy, or (a texture without render-target or UAV usage) when its bytes changed within a second of that copy. That
+timing is an ASSUMPTION from the console semantics, where the GPU reads those pages as the CPU left them at submission;
+a CPU write after the watch second that does not go through slot 8 is not seen (it would need a write watch on the
+pages). Depth-stencil and multisampled textures are not copied (`d3d12_vulkan_device.cpp`, "Title-placed textures";
+`d3d12_existing_heap_test`).
 `XGSuggestSwizzleMode` still returns `E_NOTIMPL` and writes nothing (its out is the description's `Layout`, which the
 runtime reads as the PC's). A description the layout does not cover gets the static object as before: two of the four
 callers ignore the HRESULT and call through it at once; its slot 1 does nothing, and every other slot up to 31 logs

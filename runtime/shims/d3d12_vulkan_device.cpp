@@ -19,6 +19,7 @@
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
 #include "log_seen.h"
+#include "xg_linear_layout.h"  // title-placed textures: the texture computer's layout
 #include "../src/arena_size.h"
 #include "../src/synthetic_va.h"
 #include "../src/gfx10_descriptors.h"
@@ -2693,6 +2694,69 @@ private:
     bool console_addressed_ = false;
 };
 
+// ---- Title-placed textures (Xbox device slot 133) ----
+//
+// On the console a texture the title places at its own address IS those pages: the GPU reads, when a command list
+// runs, whatever the CPU wrote there before submitting it. Here such a texture is a committed image (the driver's
+// layout), so the texels the title writes at the address are copied in. The title lays them out with xg_xs's texture
+// computer, whose layout this runtime chose (shims/xg_linear_layout.h: every subresource a D3D12 placed footprint),
+// so each subresource is a WriteToSubresource-style staged copy from `title + footprint.Offset`.
+//
+// When (ASSUMPTION, from the console semantics, not measured on the title): a copy happens at an ExecuteCommandLists,
+// before the lists, for every registered texture that is
+//   - new (never copied): the title fills a placed texture before the first command list that reads it;
+//   - written through the texture computer since its last copy (CopyIntoSubresource reports the range it wrote:
+//     rt::xg::note_write), the title's structured way of filling one;
+//   - inside its watch window and changed: for 1 s after each copy a texture without render-target or UAV usage is
+//     hashed at every submission, so bytes the title writes itself right after creating it (a memcpy, a decompress)
+//     still arrive. After that, only the computer's writes re-copy it: catching every later CPU write would need a
+//     write watch on the title's pages. A render target or UAV is GPU-written: its title bytes are copied when it is
+//     new and when the computer writes it, never by hash (they would undo the GPU's writes only if the title rewrote
+//     them, which is what the console would show too).
+// Not covered: depth-stencil and multisampled textures, and formats the linear layout does not cover (no copy; the
+// image keeps what the GPU writes, as before).
+class Resource;
+struct TitleTexture {
+    Resource* resource;  // unregistered by ~Resource, under the registry's lock
+    const std::uint8_t* title;
+    std::size_t bytes;
+    std::unique_ptr<rt::xg::ResourceLayout> layout;
+    bool watch = false;        // hashed during its watch window (no render-target or UAV usage)
+    bool dirty = true;         // never copied, or written through the texture computer since
+    bool copied = false;
+    std::uint64_t hash = 0;    // of the title bytes at the last copy
+    std::chrono::steady_clock::time_point watch_until{};
+};
+
+std::mutex& title_texture_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+std::vector<std::unique_ptr<TitleTexture>>& title_textures() {
+    static std::vector<std::unique_ptr<TitleTexture>> textures;
+    return textures;
+}
+std::atomic<std::size_t> g_title_texture_count{0};  // one load per submission when nothing is registered
+
+void unregister_title_texture(const Resource* resource) {
+    if (!g_title_texture_count.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(title_texture_mutex());
+    auto& textures = title_textures();
+    std::erase_if(textures, [&](const auto& t) { return t->resource == resource; });
+    g_title_texture_count.store(textures.size(), std::memory_order_release);
+}
+
+// rt::xg's write listener: the texture computer wrote [address, address + bytes).
+void title_texture_written(const void* address, std::size_t bytes) {
+    if (!g_title_texture_count.load(std::memory_order_acquire)) return;
+    const auto begin = reinterpret_cast<std::uintptr_t>(address), end = begin + bytes;
+    std::lock_guard lock(title_texture_mutex());
+    for (const auto& t : title_textures()) {
+        const auto first = reinterpret_cast<std::uintptr_t>(t->title);
+        if (begin < first + t->bytes && first < end) t->dirty = true;
+    }
+}
+
 class Resource final
     : public Child<Resource, ID3D12Resource1Stubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable, ID3D12Resource,
                    ID3D12Resource1> {
@@ -2712,6 +2776,7 @@ public:
         : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
 
     ~Resource() override {
+        unregister_title_texture(this);
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
@@ -3271,9 +3336,9 @@ public:
     // through Xbox slot 133 reports that title address, as the console does: a title uses it as the CPU pointer it
     // clears the texture through (docs/d3d12_vulkan.md 3.3). Any other texture answers 0, as on D3D12.
     D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE GetGPUVirtualAddress() override { return accel_ ? gpu_va_ : va_; }
-    // The title's own address for a texture Xbox slot 133 placed. The image is still the committed fallback, so its
-    // pixels do not alias the title's pages yet; the address is what GetGPUVirtualAddress answers (XCL PR #168's
-    // behavior, measured on a retail title).
+    // The title's own address for a texture Xbox slot 133 placed. The image is the committed fallback, fed from the
+    // title's pages at its submissions ("Title-placed textures"); the address is what GetGPUVirtualAddress answers
+    // (XCL PR #168's behavior, measured on a retail title).
     void set_title_address(D3D12_GPU_VIRTUAL_ADDRESS address) { va_ = address; }
 
     // ID3D12Resource1: as for a heap, no resource belongs to a protected session (DXGI_ERROR_NOT_FOUND, null out).
@@ -3343,6 +3408,22 @@ public:
         return cpu_copy(false, subresource, box, data, row_pitch, depth_pitch);
     }
 
+    // A title-placed texture's texels from the title's pages, laid out as `layout` (sync_title_textures): every
+    // subresource, each a D3D12 placed footprint at its offset from `title`.
+    bool copy_from_title(const std::uint8_t* title, const rt::xg::ResourceLayout& layout) {
+        const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        const UINT count = layout.mip_levels * (volume ? 1u : desc_.DepthOrArraySize);
+        for (UINT s = 0; s < count; ++s) {
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT f{};
+            if (!rt::xg::footprint(desc_, layout, s, f)) return false;
+            const rt::xg::MipRecord& mip = layout.plane[0].mip[s % layout.mip_levels];
+            if (FAILED(cpu_copy(true, s, nullptr, const_cast<std::uint8_t*>(title + f.Offset), f.Footprint.RowPitch,
+                                static_cast<UINT>(mip.slice2d_size_bytes), /*quiet=*/true)))
+                return false;
+        }
+        return true;
+    }
+
 private:
     // One subresource region in copy units: rows of texels, or of 4x4 blocks for block-compressed formats.
     struct Region {
@@ -3386,15 +3467,16 @@ private:
         return true;
     }
 
+    // `quiet`: the runtime's own copy into a texture outside a CPU-visible heap (copy_from_title), not logged.
     HRESULT cpu_copy(bool write, UINT subresource, const D3D12_BOX* box, void* data, UINT row_pitch,
-                     UINT depth_pitch) {
+                     UINT depth_pitch, bool quiet = false) {
         if (!image_ || !data) return E_INVALIDARG;
         Region r{};
         if (!region(subresource, box, r)) return E_INVALIDARG;
         if (!r.rows || !r.slices) return S_OK;  // an empty box: nothing to copy
         // The pitches are not checked, as on the host runtime: rows or slices that overlap (a pitch smaller than a
         // row, or 0) are copied in order, row by row and slice by slice, so on a read the last one wins.
-        if (!cpu_visible())
+        if (!cpu_visible() && !quiet)
             log_once(write ? "WriteToSubresource on a texture outside a CPU-visible heap; heap type"
                            : "ReadFromSubresource on a texture outside a CPU-visible heap; heap type",
                      heap_.Type);
@@ -3622,6 +3704,55 @@ private:
     // first, and the range must not go to another allocation while this buffer lives.
     std::shared_ptr<const leonida::TileHeapAllocation> heap_range_;
 };
+
+// A title-placed texture to keep fed from the title's pages (see "Title-placed textures" above). False when its
+// description is not one the copies cover.
+bool register_title_texture(Resource* texture, const void* address, const D3D12_RESOURCE_DESC& desc) {
+    if (!texture || !address || desc.SampleDesc.Count > 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
+        return false;
+    auto t = std::make_unique<TitleTexture>();
+    t->layout = std::make_unique<rt::xg::ResourceLayout>();
+    if (!rt::xg::linear_layout(desc, *t->layout)) return false;
+    t->resource = texture;
+    t->title = static_cast<const std::uint8_t*>(address);
+    t->bytes = static_cast<std::size_t>(t->layout->size_bytes);
+    t->watch = !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    rt::xg::g_write_listener.store(&title_texture_written, std::memory_order_release);
+    std::lock_guard lock(title_texture_mutex());
+    title_textures().push_back(std::move(t));
+    g_title_texture_count.store(title_textures().size(), std::memory_order_release);
+    return true;
+}
+
+// Every page of [p, p + bytes) committed and readable: the title's range may still be reserved (xmem commits pages as
+// they are touched), and a copy then waits for a later submission.
+bool title_range_readable(const std::uint8_t* p, std::size_t bytes) {
+    const std::uint8_t* const end = p + bytes;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(p, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT ||
+            (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !info.Protect)
+            return false;
+        p = static_cast<const std::uint8_t*>(info.BaseAddress) + info.RegionSize;
+    }
+    return true;
+}
+
+// FNV-1a over 64-bit words, then the tail bytes: a change detector, not a cryptographic hash.
+std::uint64_t title_hash(const std::uint8_t* p, std::size_t bytes) {
+    std::uint64_t h = 0xcbf29ce484222325ull;
+    std::size_t i = 0;
+    for (; i + 8 <= bytes; i += 8) {
+        std::uint64_t w;
+        std::memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001b3ull;
+    }
+    for (; i < bytes; ++i) h = (h ^ p[i]) * 0x100000001b3ull;
+    return h;
+}
+
+// How long after each copy a texture without render-target or UAV usage is hashed (see "Title-placed textures").
+constexpr auto kTitleTextureWatch = std::chrono::seconds(1);
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
 bool vertex_format(DXGI_FORMAT format, VkFormat& out, UINT& bytes) {
@@ -8634,10 +8765,10 @@ public:
             // same description, as slot 76 gives one, so the title has its resource instead of asserting (found in
             // review). Its GPU VA is still the title's address: the console answers a placed texture's
             // GetGPUVirtualAddress with the address the title placed it at, and a title turns that into the CPU
-            // pointer it clears the texture through (docs/d3d12_vulkan.md 3.3). What the title writes at `address`
-            // does not reach the image yet.
+            // pointer it clears the texture through (docs/d3d12_vulkan.md 3.3). What the title writes at `address`, in
+            // the texture computer's layout, is copied into the image at its submissions ("Title-placed textures").
             log_once("a title-placed texture (device slot 133) is a committed texture whose GPU VA is the title "
-                     "address; its pixels do not alias the title's pages yet; dimension",
+                     "address, fed from the title's pages at each submission; dimension",
                      int(desc.Dimension));
             // The title's barrier layout (slot 133's third argument, measured by @dracbat) is checked against the
             // description as CreateCommittedResource checks a state; one it refuses (or UNDEFINED) gives COMMON, so
@@ -8654,8 +8785,11 @@ public:
                 // The console answers the texture's GetGPUVirtualAddress with the title's address; without it a
                 // title that clears the texture through that pointer writes at address 0 (XCL measured this on a
                 // retail title). The image stays the committed fallback above, so only the address is folded in.
-                if (auto* texture = Resource::from<Resource>(static_cast<IUnknown*>(*out)))
+                if (auto* texture = Resource::from<Resource>(static_cast<IUnknown*>(*out))) {
                     texture->set_title_address(reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address));
+                    // What the title writes at the address reaches the image at its submissions (sync_title_textures).
+                    register_title_texture(texture, address, desc);
+                }
             }
             return d3d12_trace::result(method, hr);
         }
@@ -10446,6 +10580,32 @@ HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const
     auto* d = Device::from<Device>(real ? real : device);
     if (!d) return E_NOTIMPL;
     return d->create_at_host_address(address, desc, layout, riid, out);
+}
+
+void sync_title_textures() {
+    if (!g_title_texture_count.load(std::memory_order_acquire)) return;  // one load when nothing is registered
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(title_texture_mutex());
+    for (const auto& t : title_textures()) {
+        const bool watching = t->watch && t->copied && now < t->watch_until;
+        if (!t->dirty && !watching) continue;
+        if (!title_range_readable(t->title, t->bytes)) continue;  // reserved pages: a later submission copies it
+        const std::uint64_t hash = title_hash(t->title, t->bytes);
+        if (t->copied && hash == t->hash) {  // nothing new since the last copy
+            t->dirty = false;
+            continue;
+        }
+        t->dirty = false;
+        if (!t->resource->copy_from_title(t->title, *t->layout)) {
+            log_once("a title-placed texture could not be copied from the title's pages; it keeps its texels; "
+                     "dimension",
+                     int(t->resource->desc().Dimension));
+            continue;
+        }
+        t->copied = true;
+        t->hash = hash;
+        t->watch_until = now + kTitleTextureWatch;
+    }
 }
 
 bool device_supports_ray_tracing(ID3D12Device* device) {

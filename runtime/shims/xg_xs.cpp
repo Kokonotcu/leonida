@@ -122,6 +122,8 @@ HRESULT __stdcall linear_copy_into(Computer* c, std::uint8_t* base, std::uint32_
         for (std::uint32_t y = 0; y < r.height_elements; ++y)
             std::memcpy(base + f.Offset + std::uint64_t{z} * r.slice2d_size_bytes + std::uint64_t{y} * r.pitch_bytes,
                         linear + std::uint64_t{z} * slice_pitch + std::uint64_t{y} * row_pitch, copy);
+    // A texture the title placed on these pages (device slot 133) takes the new texels at its next submission.
+    rt::xg::note_write(base + f.Offset, static_cast<std::size_t>(r.slice2d_size_bytes * f.Footprint.Depth));
     return S_OK;
 }
 

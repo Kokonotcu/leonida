@@ -1961,6 +1961,8 @@ public:
         }
         // LEONIDA_TITLE_HEAP_SYNC: what changed in title-backed shader-visible heaps reaches their real heaps first.
         rt::d3d12_xs::sync_title_heaps();
+        // What the title wrote into the pages of its slot-133 textures reaches their images before the lists run.
+        sync_title_textures();
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success) {
