@@ -1344,6 +1344,9 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
     native_pso_hashes(dxbc, spirv)
     fspx_shaders(game, work, signature, emulate=emulate, fallbacks=fallbacks)
     bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
+    # The executable's own 10 embedded programs (1 VS, 9 PS; docs/embedded_shaders.md, RT-5): the boot and loading
+    # screens draw with them, and without them every such draw is left out (a black screen).
+    bvh_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks, image=EXE_IMAGE, folder="exe")
     library_shaders(game, work, signature, jobs, emulate=emulate, fallbacks=fallbacks)
     log("shaders: done")
 
@@ -1568,6 +1571,8 @@ BVH_TOOLS = ("pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py",   
 # the translator's 65536 default and 22,236 B under this cap; no other module changes, natively none does, and the
 # same 51 programs translate either way.
 BVH_MAX_SHARED_MEMORY = 32768
+# The retail executable, whose embedded containers bvh_shaders(image=EXE_IMAGE, folder="exe") translates the same way.
+EXE_IMAGE = "game_scarlett_master.exe"
 
 
 def bvh_settings(dll: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
@@ -1596,11 +1601,11 @@ def bvh_programs(unpacked: str, spirv: str) -> "tuple[list[str], list[str]] | No
     return extracted, [name for name in extracted if name not in found]
 
 
-def bvh_report(programs: "tuple[list[str], list[str]]") -> None:
+def bvh_report(programs: "tuple[list[str], list[str]]", image: str = BVH_DLL) -> None:
     """One line with the counts, and one that names every program left without a module. It is printed on every
     run, also when the step itself is reused: a program the translator has no rule for is never dropped quietly."""
     extracted, missing = programs
-    log(f"shaders: {len(extracted) - len(missing)} of {len(extracted)} {BVH_DLL} programs translated")
+    log(f"shaders: {len(extracted) - len(missing)} of {len(extracted)} {image} programs translated")
     if missing:
         log(f"shaders: NOT translated: {', '.join(missing)}. The runtime has no module for "
             f"{'it' if len(missing) == 1 else 'them'}, so that compute pipeline is refused (E_INVALIDARG) and the "
@@ -1609,8 +1614,9 @@ def bvh_report(programs: "tuple[list[str], list[str]]") -> None:
 
 
 def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate: bool = False,
-                fallbacks: tuple[str, ...] = ()) -> None:
-    """XboxBvhBuilder.dll's compute programs (docs/embedded_shaders.md): pe_shader_containers.py extracts the DLL's
+                fallbacks: tuple[str, ...] = (), image: str = BVH_DLL, folder: str = "bvh") -> None:
+    """XboxBvhBuilder.dll's compute programs (or another image's embedded programs: `image` in the game folder,
+    translated into <work>/shaders/<folder> and <work>/shaders/spirv/<folder>) (docs/embedded_shaders.md): pe_shader_containers.py extracts the DLL's
     DXBC containers into <work>/shaders/bvh, fssm_unpack.py and shader_disasm.py unpack and disassemble their FSSM
     programs there, as for a shader from shaders.rpf, and rdna2spirv.py translates them into
     <work>/shaders/spirv/bvh, where the runtime's shader library finds them by fssm_sha256, the key of the game's
@@ -1618,32 +1624,32 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
 
     The 52 programs take seconds, so the step runs whole. Reuse requires both indexes, the translated modules and a
     matching bvh_build.json (bvh_settings)."""
-    dll = os.path.join(game, BVH_DLL)
-    unpacked = os.path.join(work, "shaders", "bvh")
-    spirv = os.path.join(work, "shaders", "spirv", "bvh")
+    dll = os.path.join(game, image)
+    unpacked = os.path.join(work, "shaders", folder)
+    spirv = os.path.join(work, "shaders", "spirv", folder)
     extracted = os.path.join(unpacked, "index.json")
     unpack_index = os.path.join(unpacked, "fssm_index.json")
     translated = os.path.join(spirv, "index.json")
-    settings_file = os.path.join(spirv, "bvh_build.json")
+    settings_file = os.path.join(spirv, f"{folder}_build.json")
     if not os.path.isfile(dll):
-        # A work folder used before with a package that had the DLL still holds that run's index, and the runtime
-        # loads <shaders>/bvh/index.json whenever it is there. Without the index the old modules are not found.
+        # A work folder used before with a package that had the image still holds that run's index, and the runtime
+        # loads <shaders>/<folder>/index.json whenever it is there. Without the index the old modules are not found.
         drop(translated, settings_file)
-        log(f"shaders: no {BVH_DLL} in the game folder, so no BVH builder programs to translate")
+        log(f"shaders: no {image} in the game folder, so none of its embedded programs to translate")
         return
     settings = bvh_settings(dll, mc_signature, emulate, fallbacks)
     programs = bvh_programs(unpacked, spirv) if read_shader_setting(settings_file) == settings else None
     if programs:
-        bvh_report(programs)
+        bvh_report(programs, image)
         return
-    log(f"shaders: extracting and translating the compute programs of {BVH_DLL}")
+    log(f"shaders: extracting and translating the embedded programs of {image}")
     drop(translated, settings_file, extracted, unpack_index)
     # pe_shader_containers.py never overwrites a container (a second run would write <module>_NN.dxbc beside the
     # first), and a program that no longer translates must not keep a module from the run before.
-    for folder, suffixes in ((unpacked, (".dxbc",)), (os.path.join(unpacked, "fssm"), (".fssm",)),
-                             (os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
-        if os.path.isdir(folder):
-            with os.scandir(folder) as entries:
+    for stale, suffixes in ((unpacked, (".dxbc",)), (os.path.join(unpacked, "fssm"), (".fssm",)),
+                            (os.path.join(unpacked, "disasm"), (".s",)), (spirv, (".spv", ".spvasm"))):
+        if os.path.isdir(stale):
+            with os.scandir(stale) as entries:
                 for entry in entries:
                     if entry.name.endswith(suffixes) and entry.is_file(follow_symlinks=False):
                         os.unlink(entry.path)
@@ -1659,9 +1665,9 @@ def bvh_shaders(game: str, work: str, mc_signature: str, jobs: int = 1, emulate:
     programs = bvh_programs(unpacked, spirv)
     if not programs or len(programs[1]) == len(programs[0]):
         drop(translated)   # an empty or unreadable index would read as a finished step
-        fail(f"shaders: none of the {BVH_DLL} programs translated, so their index is not kept. Run the shaders "
+        fail(f"shaders: none of the {image} programs translated, so their index is not kept. Run the shaders "
              "stage again; if it happens again, the tool output above is why.")
-    bvh_report(programs)
+    bvh_report(programs, image)
     with open(settings_file, "w", encoding="utf-8", newline="\n") as f:
         f.write(settings + "\n")
 

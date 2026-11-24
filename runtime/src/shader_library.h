@@ -883,7 +883,9 @@ public:
     //     fssm_sha256 like the game's own shaders (docs/embedded_shaders.md);
     //   - <dir>/library/index.json, the compute programs of the pipeline library in shaders.rpf, which the executable
     //     creates with slot 67; entries named "library/<name>" and found by fspx_code_sha256 and fspx_state_sha256
-    //     like the FSPX ones (docs/shader_library.md).
+    //     like the FSPX ones (docs/shader_library.md);
+    //   - <dir>/exe/index.json, the retail executable's own embedded FSSM programs (1 VS, 9 PS: the boot and loading
+    //     screens draw with them), entries named "exe/<name>" and found by fssm_sha256 like bvh/ (counted with them).
     // Entries with neither fssm_sha256 nor fspx_code_sha256 cannot be found by content and are skipped. The folders
     // are optional: a missing or unreadable index there leaves the main one, and the other folders', loaded.
     bool load(const std::filesystem::path& dir, std::string* error = nullptr) {
@@ -903,7 +905,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* sub_folder : {"fspx", "bvh", "library"}) {
+        for (const char* sub_folder : {"fspx", "bvh", "library", "exe"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = folder / sub_folder;
@@ -923,8 +925,8 @@ public:
     // reaches these: their programs come from FidelityFX DLLs and the pipeline library, so callers comparing reached
     // entries with size() must leave them out.
     std::size_t fspx_size() const { return fspx_count_; }
-    // Entries loaded from <dir>/bvh/index.json. No RPF container reaches these either: XboxBvhBuilder.dll passes
-    // their containers itself.
+    // Entries loaded from <dir>/bvh/index.json and <dir>/exe/index.json. No RPF container reaches these either:
+    // XboxBvhBuilder.dll and the executable pass their containers themselves.
     std::size_t bvh_size() const { return bvh_count_; }
 
     // The first entry for this program. Two containers can hold the same FSSM program with different input
@@ -1124,7 +1126,7 @@ private:
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && (prefix == "fspx/" || prefix == "library/")) ++fspx_count_;
-            if (prefix == "bvh/") ++bvh_count_;
+            if (prefix == "bvh/" || prefix == "exe/") ++bvh_count_;
             ++count_;
         }
         return true;
