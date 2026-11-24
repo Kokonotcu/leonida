@@ -18,6 +18,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
+#include "log_seen.h"
 #include "../src/arena_size.h"
 #include "../src/synthetic_va.h"
 #include "../src/gfx10_descriptors.h"
@@ -98,10 +99,13 @@ constexpr D3D_ROOT_SIGNATURE_VERSION kHighestRootSignatureVersion = D3D_ROOT_SIG
 std::atomic<int> g_global_realtime_privilege_override{-1};
 
 void log_once(const char* what, int value) {
+    static rt::log_seen::Sites sites;  // a repeat is one relaxed load (review I11)
+    if (sites.seen(what, value)) return;
     static std::mutex mutex;
     static std::set<std::pair<std::string, int>> seen;
     std::lock_guard lock(mutex);
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+    sites.remember(what, value);
 }
 
 // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
@@ -841,10 +845,12 @@ struct DeviceState {
     // VK_EXT_external_memory_host; null unless info.host_pointer_alignment is set and the entry point loaded.
     PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties = nullptr;
 
-    // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to
-    // the device's VkQueue and waited for. Created on first use.
+    // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to a
+    // VkQueue the game's first queues do not use and waited for (review D9): the copy family's for colour textures,
+    // the graphics family's for the rest (staged_copy). Created on first use.
     std::mutex staging_mutex;
     std::unique_ptr<leonida::VulkanQueue> staging_queue;
+    std::unique_ptr<leonida::VulkanQueue> staging_copy_queue;
 
     // The GPU address arena (docs/d3d12_vulkan.md section 3.3): one host-visible, device-addressable VkBuffer that
     // stands in for the console's GPU address space. A console VA is an offset in it, and heap_base (push-constant
@@ -1818,6 +1824,14 @@ struct DeviceState {
             if (entry.storage) vk.vkDestroyImageView(info.device, entry.storage, nullptr);
             return false;
         }
+        // Review D11: a key the table cannot take (it would outgrow binding 2, or too many keys share a hash) comes
+        // back as false, not as an exception through the game's call. The T# then keeps what it had: the read-only
+        // entry it replaced, or the fallback. The new entry goes the deferred way, as its descriptor is written.
+        if (!bindless->insert_key(words, entry.index)) {
+            log_once("the descriptor hash table cannot take another T#; entries", int(bindless->table().size()));
+            release(entry);
+            return false;
+        }
         if (existing != image_entries.end()) {
             replaced_images.push_back(existing->second);  // the read-only entry of the same bytes
             existing->second = entry;
@@ -1825,7 +1839,6 @@ struct DeviceState {
             image_entries.emplace(words, entry);
             image_keys.emplace(image.address, words);
         }
-        bindless->insert_key(words, entry.index);
         return true;
     }
 
@@ -2055,11 +2068,18 @@ struct DeviceState {
             context->vk.vkDestroySampler(info.device, vk_sampler, nullptr);
             return nullptr;
         }
+        // Review D11: refused by the hash table (false, not an exception through the game's call). The index was
+        // only queued, no key names it, so it and the sampler go at once, as in release_sampler.
+        if (!bindless->insert_key(key, index)) {
+            log_once("the descriptor hash table cannot take another S#; entries", int(bindless->table().size()));
+            bindless->remove_sampler(index);
+            context->vk.vkDestroySampler(info.device, vk_sampler, nullptr);
+            return nullptr;
+        }
         SamplerEntry entry;
         entry.sampler = vk_sampler;
         entry.index = index;
         sampler_keys[index] = key;
-        bindless->insert_key(key, index);
         return &sampler_entries.emplace(key, entry).first->second;
     }
 
@@ -3502,14 +3522,33 @@ private:
         leonida::ReplayResult result = leonida::ReplayResult::unsupported;
         {
             std::lock_guard lock(device_.staging_mutex);
-            if (!device_.staging_queue) {
-                device_.staging_queue = std::make_unique<leonida::VulkanQueue>(*device_.context, device_.info.queue,
-                                                                               device_.info.queue_family);
+            // Review D9: a VkQueue the game's direct queue is not on. CreateCommandQueue hands each family's VkQueues
+            // out from the first, so the last one. A colour copy goes to the copy family, whose engine runs beside
+            // queued graphics work (a second graphics VkQueue may be time-sliced behind it, as on NVIDIA); a depth
+            // or stencil copy may convert D24, and an rgb96 one is repacked, by a compute shader, so they stay on
+            // the graphics family.
+            const bool copy_family =
+                !device_.info.copy_queues.empty() && aspects_ == VK_IMAGE_ASPECT_COLOR_BIT && !rgb96_;
+            auto& staging_queue = copy_family ? device_.staging_copy_queue : device_.staging_queue;
+            if (!staging_queue) {
+                if (copy_family) {
+                    staging_queue = std::make_unique<leonida::VulkanQueue>(
+                        *device_.context, device_.info.copy_queues.back(), device_.info.copy_family,
+                        leonida::VulkanQueue::QueueKind::copy);
+                } else {
+                    const auto& queues = device_.info.command_queues;
+                    const VkQueue own = queues.size() > 1 ? queues.back() : device_.info.queue;
+                    staging_queue = std::make_unique<leonida::VulkanQueue>(*device_.context, own,
+                                                                           device_.info.queue_family);
+                }
             }
-            if (device_.staging_queue->ok()) {
+            if (staging_queue->ok()) {
                 const leonida::CommandList* lists[] = {&list};
-                result = device_.staging_queue->execute(lists);
-                if (result == leonida::ReplayResult::success && !device_.staging_queue->idle())
+                result = staging_queue->execute(lists);
+                // Only this copy's own submission (review D9: was vkQueueWaitIdle under the submit lock). Other
+                // queues need no wait: D3D12 asks the application to have seen the texture's GPU work complete before
+                // a CPU copy, and that host wait, then this submission, orders it before the copy.
+                if (result == leonida::ReplayResult::success && !staging_queue->wait_submitted())
                     result = leonida::ReplayResult::unsupported;
             }
         }
@@ -4936,7 +4975,7 @@ public:
             layout_recipe.bindless = layout_bindless_;
             const leonida::pso::LayoutCreateInfo layout(layout_recipe,
                                                         uses_bindless ? device_.bindless->layout() : VK_NULL_HANDLE);
-            if (uses_bindless) graphics_.bindless_set = device_.bindless->set();
+            graphics_.uses_set0 = uses_bindless;  // the set itself is read at submit, under the descriptor lock
             if (vk.vkCreatePipelineLayout(dev, &layout.info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
         }
 
@@ -5126,7 +5165,7 @@ public:
             set0_layout = device_.bindless->layout();
             layout_info.setLayoutCount = 1;
             layout_info.pSetLayouts = &set0_layout;
-            pipeline_.bindless_set = device_.bindless->set();
+            pipeline_.uses_set0 = true;  // the set itself is read at submit, under the descriptor lock
         }
         if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -6758,7 +6797,8 @@ public:
             state_.context->set_bindless_release(nullptr, nullptr);
             state_.context->set_bindless_current(nullptr);  // the retired generations go with state_.bindless below
         }
-        state_.staging_queue.reset();  // it uses the context
+        state_.staging_queue.reset();  // they use the context
+        state_.staging_copy_queue.reset();
         if (state_.context && state_.bindless) {
             // Every texture is gone by now (each held this device), and its views with it; samplers remain.
             std::lock_guard lock(state_.descriptor_mutex);

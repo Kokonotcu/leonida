@@ -96,6 +96,16 @@ public:
         return insert(key.data(), index);
     }
 
+    // The table's GPU copy (size_bytes()) may take at most `bytes` (maxStorageBufferRange for binding 2): a growth
+    // past it throws std::length_error, as other refusals do, before the table changes. 0: no limit.
+    void set_max_bytes(std::uint64_t bytes) {
+        std::lock_guard lock(mutex_);
+        std::uint64_t entries = bytes > 4 ? (bytes - 4) / sizeof(DescriptorEntry) : 0;
+        std::uint64_t capacity = 16;
+        while (capacity * 2 <= entries && capacity * 2 <= max_capacity) capacity *= 2;
+        max_entries_ = bytes ? std::uint32_t(std::min<std::uint64_t>(capacity, max_capacity)) : max_capacity;
+    }
+
     // Queries the index associated with key. Returns 0 if not found.
     std::uint32_t lookup(const std::uint32_t key[8]) const {
         std::lock_guard lock(mutex_);
@@ -346,7 +356,7 @@ private:
     }
 
     void grow_locked() {
-        if (entries_.size() >= max_capacity) throw std::length_error("Descriptor table capacity exhausted");
+        if (entries_.size() >= max_entries_) throw std::length_error("Descriptor table capacity exhausted");
         std::uint32_t new_cap = static_cast<std::uint32_t>(entries_.size() * 2);
         while (true) {
             std::vector<DescriptorEntry> new_entries(new_cap);
@@ -379,12 +389,13 @@ private:
                 changed_slots_.clear();
                 break;
             }
-            if (new_cap >= max_capacity) throw std::length_error("Descriptor probe range exhausted");
+            if (new_cap >= max_entries_) throw std::length_error("Descriptor probe range exhausted");
             new_cap *= 2;
         }
     }
 
     static constexpr std::uint32_t max_capacity = std::uint32_t{1} << 31;
+    std::uint32_t max_entries_ = max_capacity;  // set_max_bytes
     mutable std::mutex mutex_;
     std::uint32_t mask_ = 15;
     std::vector<DescriptorEntry> entries_;

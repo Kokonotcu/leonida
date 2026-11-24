@@ -10,7 +10,8 @@
 //   1. the first flush (fallback initialization and the first table upload) on A: B's next submission waits on A;
 //   2. an added key, uploaded in place on A (no new generation): B's next submission waits on A;
 //   3. a flush with nothing to upload on A: B does not wait;
-//   4. only a descriptor written (an image's view changed, the table unchanged): B does not wait.
+//   4. only a descriptor written (an image removed, the table unchanged): B does not wait.
+// Then D10/D11: a set whose table may take only 64 entries refuses the key past them with false, without throwing.
 // Skips with exit code 77 without a Vulkan 1.3 device with the bindless features. No game data.
 #include "vk_test_device.h"
 #include "../src/vulkan_backend.h"
@@ -21,6 +22,7 @@
 #include <mutex>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #define EXPECT(condition) do { \
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); return 1; } \
@@ -148,8 +150,8 @@ int main() {
         EXPECT(driver::waits() == 0);
         std::printf("3 nothing uploaded on A: B does not wait\n");
 
-        // 4. A descriptor write only (vkUpdateDescriptorSets on the CPU): the table is unchanged.
-        set.update_image(ImageDimension::dim_2d, index, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL);
+        // 4. A descriptor write only (vkUpdateDescriptorSets on the CPU, a removal): the table is unchanged.
+        set.remove_image(ImageDimension::dim_2d, index);
         EXPECT(a.execute(lists) == ReplayResult::success);
         EXPECT(!uploaded);
         EXPECT(b.execute(lists) == ReplayResult::success);
@@ -157,6 +159,34 @@ int main() {
         std::printf("4 a descriptor write only on A: B does not wait\n");
 
         EXPECT(a.idle() && b.idle());
+    }
+
+    // Review D11: insert_key is called from D3D12 entry points the game called (CreateShaderResourceView, a sampler's
+    // first use), so a key the table cannot take comes back as false: no exception unwinds into the game. Here the
+    // table may take 64 entries (as if maxStorageBufferRange were that small, D10), which hold 32 keys at half load.
+    {
+        BindlessFeatures capped = features;
+        capped.max_table_bytes = std::uint32_t(4 + 64 * sizeof(DescriptorEntry));
+        BindlessSet set(d.device_proc, d.device, d.memory_properties(), capped);
+        EXPECT(set.ok());
+        std::vector<DescriptorKey> keys;
+        bool refused = false, threw = false;
+        try {
+            for (std::uint32_t i = 0; i < 1000 && !refused; ++i) {
+                DescriptorKey key{};
+                key[0] = i * 2654435761u;
+                key[1] = i + 1;
+                if (set.insert_key(key, 1)) keys.push_back(key);
+                else refused = true;
+            }
+        } catch (...) {
+            threw = true;
+        }
+        EXPECT(!threw && refused);
+        EXPECT(keys.size() == 32 && set.table().capacity() == 64);
+        for (const DescriptorKey& key : keys) EXPECT(set.table().lookup(key) == 1);
+        EXPECT(set.insert_key(keys[0], 1));  // an existing key still updates
+        std::printf("5 a table at its cap refuses the next key with false, keeping the 32 it has\n");
     }
 
     const unsigned errors = d.validation_errors();

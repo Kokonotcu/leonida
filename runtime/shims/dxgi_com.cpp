@@ -1,5 +1,6 @@
 #include "dxgi_com.h"
 #include "d3d12_stubs.h"
+#include "log_seen.h"
 
 #include <winternl.h>  // NTSTATUS, which d3dkmthk.h needs and WIN32_LEAN_AND_MEAN leaves out
 #include <d3dkmthk.h>
@@ -28,10 +29,13 @@ constexpr UINT max_waitable_frame_latency = 40;
 constexpr GUID kIID_LeonidaSwapChain = {0x3f6b1c52, 0x8e0d, 0x4b7a, {0x9a, 0x61, 0x2d, 0x5e, 0x47, 0xc3, 0x18, 0xb9}};
 
 void stub(const char* method) {
+    static log_seen::Sites sites;  // a repeat is one relaxed load (review I11)
+    if (sites.seen(method)) return;
     static std::mutex mutex;
     static std::set<std::string> seen;
     std::lock_guard lock(mutex);
     if (seen.insert(method).second) std::fprintf(stderr, "[rt] dxgi: unimplemented %s\n", method);
+    sites.remember(method);
 }
 
 // IDXGIObject private data, shared by the factory, adapter and swapchain. SetPrivateData keeps a copy of the bytes;

@@ -143,7 +143,7 @@ int main() {
         p.pipeline = handle<VkPipeline>(n);
         p.layout = handle<VkPipelineLayout>(1);
         p.push_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-        p.bindless_set = handle<VkDescriptorSet>(1);
+        p.uses_set0 = true;
         p.color_formats = {VK_FORMAT_R8G8B8A8_UNORM};
         p.depth_format = VK_FORMAT_D32_SFLOAT_S8_UINT;
         p.depth_aspects = depth_aspects;
@@ -154,6 +154,7 @@ int main() {
     const GraphicsPipeline with_stencil = pipeline(pso_stencil, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 
     ReplayFunctions vk{};
+    vk.bindless_set = handle<VkDescriptorSet>(1);
     vk.pipeline_barrier = barrier;
     vk.begin_rendering = begin_rendering;
     vk.end_rendering = end_rendering;
