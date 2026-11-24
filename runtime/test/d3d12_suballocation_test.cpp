@@ -6,6 +6,8 @@
 // (VK_ERROR_TOO_MANY_OBJECTS): one allocation per resource runs into it, suballocation must not. Each upload buffer and CPU-visible texture keeps a pattern of its own, so ranges of a block
 // that overlapped would show, and every allocation must be freed by the time the device is released. Skips (77)
 // without a Vulkan GPU. No shaders or game data.
+// Upload buffers are ranges of the GPU address arena since M8; LEONIDA_UPLOAD_SYSMEM=1 keeps them in memory of their
+// own, the path an upload buffer the arena has no room for still takes, so that path stays measured here.
 #include "vk_test_device.h"
 #include "../shims/d3d12_com.h"
 
@@ -241,6 +243,7 @@ void print(const char* mode, const Result& r) {
 }  // namespace
 
 int main() {
+    _putenv_s("LEONIDA_UPLOAD_SYSMEM", "1");  // upload buffers outside the arena: see the top of the file
     vktest::Device d;
     const auto status = d.initialize();
     if (status == vktest::DeviceStatus::unavailable) return 77;  // no Vulkan GPU: ctest skips
