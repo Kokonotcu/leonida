@@ -22,6 +22,7 @@
 #include "log_seen.h"
 #include "xg_linear_layout.h"  // title-placed textures: the texture computer's layout
 #include "../src/arena_size.h"
+#include "../src/shader_module_cache.h"
 #include "../src/synthetic_va.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
@@ -1325,6 +1326,27 @@ struct DeviceState {
         std::uint64_t address;
     };
     std::unique_ptr<leonida::BindlessSet> bindless;
+    // Every PipelineState takes its VkShaderModules from here, one per distinct SPIR-V (src/shader_module_cache.h, from
+    // danekbiglike's frame-on-demand-graphics patch / #8851 A42): the retail title's ~25,000 native PSOs share a few
+    // thousand shaders, and a module per PSO and stage grew the process by gigabytes (boot 31).
+    std::once_flag shader_modules_once;
+    std::unique_ptr<leonida::ShaderModuleCache> shader_modules_cache;
+    leonida::ShaderModuleCache& shader_modules() {
+        std::call_once(shader_modules_once, [this] {
+            shader_modules_cache = std::make_unique<leonida::ShaderModuleCache>(
+                [this](const std::vector<std::uint32_t>& words) {
+                    VkShaderModuleCreateInfo create{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+                    create.codeSize = words.size() * 4;
+                    create.pCode = words.data();
+                    VkShaderModule module = VK_NULL_HANDLE;
+                    if (context->vk.vkCreateShaderModule(info.device, &create, nullptr, &module) != VK_SUCCESS)
+                        return VkShaderModule(VK_NULL_HANDLE);
+                    return module;
+                },
+                [this](VkShaderModule module) { context->vk.vkDestroyShaderModule(info.device, module, nullptr); });
+        });
+        return *shader_modules_cache;
+    }
 
     // docs/aot_pipelines.md: every graphics pipeline this device builds goes to pso_recipes.jsonl beside gta6rt.exe,
     // which `gta6rt --prebuild-pipelines` (and the build's pipelines stage) compiles ahead of the next run.
@@ -4380,6 +4402,16 @@ bool stub_pipelines_enabled() {
     return enabled;
 }
 
+// LEONIDA_DEFER_GRAPHICS=1: a graphics PSO builds nothing at creation, not even its shader modules; the first draw
+// builds the pipeline (GraphicsPipeline::deferred) and its modules (PipelineState::DeferredModule).
+bool defer_graphics_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("LEONIDA_DEFER_GRAPHICS");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
 bool console_stream_enum_enabled() {
     static const bool enabled = [] {
         char value[8] = {};
@@ -4593,7 +4625,7 @@ public:
         if (registered_) device_.context->remove_pipeline(id());
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
-        if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
+        if (module_) device_.shader_modules().release(module_);
         if (gpl_upgrade_) {
             // Waits for a running optimised link; one not started yet finds itself cancelled.
             std::lock_guard lock(gpl_upgrade_->mutex);
@@ -4606,7 +4638,7 @@ public:
         for (VkPipeline output : gpl_outputs_) vk.vkDestroyPipeline(dev, output, nullptr);
         if (gpl_input_) vk.vkDestroyPipeline(dev, gpl_input_, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
-        for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
+        for (VkShaderModule module : modules_) device_.shader_modules().release(module);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
     }
 
@@ -4796,6 +4828,7 @@ public:
             const leonida::ShaderEntry* entry = nullptr;
             std::vector<std::uint8_t> fssm;
             std::vector<std::uint32_t> words;
+            bool edited = false;  // words differ from the library's file (f16 link, depth24 patch)
         };
         Stage stages[3] = {mesh ? Stage{"ms", VK_SHADER_STAGE_MESH_BIT_EXT, *ms}
                                 : Stage{"vs", VK_SHADER_STAGE_VERTEX_BIT, desc.VS},
@@ -4912,6 +4945,7 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: %s\n", link_error.c_str());
                 return E_FAIL;
             }
+            vs_stage.edited = ps_stage.edited = true;
         }
         // A stage that declares a storage image or buffer it may write needs a device feature outside compute
         // (src/spirv_stores.h). Without it the pipeline would be created all the same and break
@@ -4929,6 +4963,7 @@ public:
                          pixel ? "fragmentStoresAndAtomics" : "vertexPipelineStoresAndAtomics");
             return E_NOTIMPL;
         }
+        const bool defer_modules = defer_graphics_enabled() && !device_.shader_objects_ready();
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
             // After the f16 link above, which can also edit the pixel shader's words.
@@ -4941,14 +4976,20 @@ public:
                     depth24_fragment = false;
                 } else {
                     stage.words = std::move(patched);
+                    stage.edited = true;
                 }
             }
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = stage.words.size() * 4;
-            module_info.pCode = stage.words.data();
+            // Deferred: no module yet. build() makes it from the library's file (or this PSO's edited words) at the
+            // first draw; ~2,000 distinct modules made at creation held ~3.5 MB of driver memory each (boot 36).
             VkShaderModule module = VK_NULL_HANDLE;
-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
-            modules_.push_back(module);
+            if (defer_modules) {
+                deferred_modules_.push_back(
+                    {stage_infos.size(), stage.entry, stage.edited ? stage.words : std::vector<std::uint32_t>{}});
+            } else {
+                module = device_.shader_modules().acquire(stage.words);
+                if (!module) return E_FAIL;
+                modules_.push_back(module);
+            }
             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             info.stage = stage.bit;
             info.module = module;
@@ -4961,12 +5002,8 @@ public:
         }
         if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
             const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias);
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = words.size() * 4;
-            module_info.pCode = words.data();
-            VkShaderModule module = VK_NULL_HANDLE;
-            if (words.empty() || vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS)
-                return E_FAIL;
+            const VkShaderModule module = words.empty() ? VK_NULL_HANDLE : device_.shader_modules().acquire(words);
+            if (!module) return E_FAIL;
             modules_.push_back(module);
             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
             info.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -5484,10 +5521,8 @@ public:
         // build's stored binary where it fits) and no compute pipeline is compiled.
         const bool shader_object = device_.shader_objects_ready();
         if (!shader_object) {
-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-            module_info.codeSize = words.size() * 4;
-            module_info.pCode = words.data();
-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
+            module_ = device_.shader_modules().acquire(words);
+            if (!module_) return E_FAIL;
         }
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -5535,6 +5570,16 @@ public:
             async_compute_->has_required = pipeline_info.stage.pNext != nullptr;
             async_compute_->info.stage.pNext = nullptr;
             pipeline_.pending = true;
+            // LEONIDA_LAZY_COMPUTE=1: nothing compiles until a dispatch meets the pending entry (request_compute in
+            // vulkan_replay.h). The title keeps the PSO alive while lists that use it execute, so `this` is valid there.
+            static const bool lazy = [] {
+                const char* v = std::getenv("LEONIDA_LAZY_COMPUTE");
+                return v && v[0] == '1';
+            }();
+            if (lazy) {
+                pipeline_.requested = std::make_shared<std::atomic<bool>>(false);
+                pipeline_.request = [this] { start_async_compile(); };
+            }
         } else {
             if (device_.create_pipeline(
                     [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
@@ -5556,8 +5601,15 @@ public:
         pipeline_.code_base = offset;
         device_.context->add_pipeline(id(), pipeline_);
         registered_ = true;
-        if (async_compute_) {
-            // After the pending entry is registered, so the compiled one the job registers is the one that stays.
+        // After the pending entry is registered, so the compiled one the job registers is the one that stays. Lazily
+        // compiled pipelines start at their first dispatch instead (ComputePipeline::request).
+        if (async_compute_ && !pipeline_.request) start_async_compile();
+        return S_OK;
+    }
+
+    // Compiles an async compute pipeline on DeviceState's workers and swaps it in when done (LEONIDA_ASYNC_PSO).
+    void start_async_compile() {
+        {
             AddRef();
             device_.compile_enqueue([this] {
                 auto& vkf = device_.context->vk;
@@ -5583,7 +5635,6 @@ public:
                 Release();
             });
         }
-        return S_OK;
     }
 
 private:
@@ -5666,6 +5717,23 @@ private:
     // made through pso_recipe.h's GraphicsCreateInfo (so --prebuild-pipelines makes the very same create info) and
     // recorded in pso_recipes.jsonl once it exists.
     VkPipeline build(std::uint32_t unbound) {
+        // Deferred modules (LEONIDA_DEFER_GRAPHICS): made at the first build, from the library's file or the words
+        // this PSO edited. variant() holds variants_mutex_ around every deferred build.
+        if (!deferred_modules_.empty()) {
+            const leonida::ShaderLibrary* library = device_.library();
+            for (const DeferredModule& d : deferred_modules_) {
+                const std::vector<std::uint32_t> words =
+                    !d.words.empty() ? d.words : library ? library->spirv(*d.entry) : std::vector<std::uint32_t>{};
+                const VkShaderModule module = words.empty() ? VK_NULL_HANDLE : device_.shader_modules().acquire(words);
+                if (!module || d.stage_index >= recipe_.stages.size()) {
+                    log_once("a deferred shader module could not be made; stage index", int(d.stage_index));
+                    return VK_NULL_HANDLE;
+                }
+                recipe_.stages[d.stage_index].module = module;
+                modules_.push_back(module);
+            }
+            deferred_modules_.clear();
+        }
         const leonida::pso::Recipe recipe = to_recipe(unbound);
         std::vector<VkShaderModule> modules;
         for (const VkPipelineShaderStageCreateInfo& s : recipe_.stages) modules.push_back(s.module);
@@ -5816,6 +5884,14 @@ private:
     };
     std::unique_ptr<AsyncCompute> async_compute_;
     std::vector<VkShaderModule> modules_;
+    // A graphics stage whose module build() makes (LEONIDA_DEFER_GRAPHICS): its place in recipe_.stages, its index
+    // entry, and its words only when this PSO edited them.
+    struct DeferredModule {
+        std::size_t stage_index;
+        const leonida::ShaderEntry* entry;
+        std::vector<std::uint32_t> words;
+    };
+    std::vector<DeferredModule> deferred_modules_;
     VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;
     bool registered_ = false;

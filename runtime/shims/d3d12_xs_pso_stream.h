@@ -57,6 +57,23 @@ private:
     std::vector<unsigned char> bytes_;
     std::vector<std::vector<unsigned char>> blobs_;  // owned copies; their buffers do not move when this grows
     std::vector<ID3D12RootSignature*> roots_;        // AddRef'd
+    std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> shared_;  // SharedBytecodeScope buffers, referenced
+};
+
+// While one is alive on a thread, capture() on that thread keeps a reference to each of these buffers instead of
+// copying shader bytecode that is exactly one of them. The native pipeline path (slot 57) creates ~25,000 PSOs from a
+// few thousand shared DXBC containers; copying both containers into every kept stream took gigabytes (retail boot 34:
+// 1,329 private allocations averaging 3.5 MB within 40 s).
+class SharedBytecodeScope {
+public:
+    explicit SharedBytecodeScope(std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> buffers);
+    ~SharedBytecodeScope();
+    SharedBytecodeScope(const SharedBytecodeScope&) = delete;
+    SharedBytecodeScope& operator=(const SharedBytecodeScope&) = delete;
+
+private:
+    std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> buffers_;
+    const std::vector<std::shared_ptr<const std::vector<std::uint8_t>>>* previous_;
 };
 
 enum class DeriveStatus { ok, unknown_tag, missing_state, malformed };

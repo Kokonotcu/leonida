@@ -15,6 +15,7 @@
 #pragma once
 
 #include "../src/native_pso.h"
+#include "d3d12_xs_pso_stream.h"
 
 #include <windows.h>
 
@@ -448,6 +449,11 @@ inline HRESULT create_native_graphics_pipeline(PipelineStreamCreator create, voi
                             e.step_rate});
     pc.InputLayout = {elements.data(), static_cast<UINT>(elements.size())};
 
+    // The kept stream (slot 55) references these containers instead of copying them (SharedBytecodeScope).
+    std::vector<Container> shared;
+    for (const Container& c : code)
+        if (c) shared.push_back(c);
+    const SharedBytecodeScope scope(std::move(shared));
     const HRESULT hr = create_from(create, context, pc, ms, *riid, out);
     return finish(hr, out, call, plan.stages.front().shader->path.c_str(), g_created);
 }

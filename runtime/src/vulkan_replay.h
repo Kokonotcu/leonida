@@ -47,6 +47,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <atomic>
 #include <memory>
 #include <span>
 #include <type_traits>
@@ -822,7 +823,18 @@ struct ComputePipeline {
     // pipeline replaces this entry, so the title never waits on the driver's compiler (its watchdog ends a run where
     // a thread makes no progress for ~30 s, and one wave64-emulated compute shader can take longer than that).
     bool pending = false;
+    // LEONIDA_LAZY_COMPUTE=1: a pending pipeline whose compile has not started; the first dispatch that meets it calls
+    // request() (once, across every copy of this entry) to start it. The retail title creates ~2,700 compute PSOs at
+    // start and compiling all of them took the process past 22 GB in a minute (boot 32) for programs most frames never
+    // dispatch.
+    std::function<void()> request;
+    std::shared_ptr<std::atomic<bool>> requested;
 };
+
+// Starts a lazily compiled pipeline's compile the first time a dispatch meets it (ComputePipeline::request).
+inline void request_compute(const ComputePipeline& p) {
+    if (p.request && p.requested && !p.requested->exchange(true, std::memory_order_acq_rel)) p.request();
+}
 
 // Binds a compute pipeline or, with shader objects, its shader.
 template<typename BindPipeline>
@@ -3648,6 +3660,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!vk.bind_pipeline || !vk.push_constants || !vk.compute_pipeline) return ReplayResult::unsupported;
                 const ComputePipeline* pipeline = vk.compute_pipeline(ind->pipeline);
                 if (pipeline && pipeline->pending) {
+                    request_compute(*pipeline);  // LEONIDA_LAZY_COMPUTE: the first dispatch starts the compile
                     p.skip = true;  // still compiling (LEONIDA_ASYNC_PSO)
                 } else {
                     if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shader))
@@ -3797,6 +3810,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::unsupported;
             const ComputePipeline* pipeline = vk.compute_pipeline(dispatch->pipeline);
             if (pipeline && pipeline->pending) {
+                request_compute(*pipeline);  // LEONIDA_LAZY_COMPUTE: the first dispatch starts the compile
                 p.skip = true;  // still compiling (LEONIDA_ASYNC_PSO)
             } else {
                 if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shader))

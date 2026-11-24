@@ -91,6 +91,17 @@ bool walk(const unsigned char* stream, std::size_t size, std::vector<Subobject>&
 }
 
 // Copies `count` bytes into a new owned blob and returns its address (stable: the blob's buffer does not move).
+// The innermost SharedBytecodeScope's buffers on this thread.
+thread_local const std::vector<std::shared_ptr<const std::vector<std::uint8_t>>>* t_buffers = nullptr;
+
+// The scoped buffer that is exactly [bytes, bytes + count), or null.
+std::shared_ptr<const std::vector<std::uint8_t>> scoped_buffer(const void* bytes, std::size_t count) {
+    if (!t_buffers) return nullptr;
+    for (const auto& buffer : *t_buffers)
+        if (buffer && buffer->data() == bytes && buffer->size() == count) return buffer;
+    return nullptr;
+}
+
 const unsigned char* own_blob(std::vector<std::vector<unsigned char>>& blobs, const void* bytes, std::size_t count) {
     const auto* src = static_cast<const unsigned char*>(bytes);
     blobs.emplace_back(src, src + count);
@@ -178,6 +189,13 @@ const Subobject* find_subobject(const std::vector<Subobject>& subs, const Target
 
 }  // namespace
 
+SharedBytecodeScope::SharedBytecodeScope(std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> buffers)
+    : buffers_(std::move(buffers)), previous_(t_buffers) {
+    t_buffers = &buffers_;
+}
+
+SharedBytecodeScope::~SharedBytecodeScope() { t_buffers = previous_; }
+
 PsoStreamRecord::~PsoStreamRecord() {
     for (ID3D12RootSignature* root : roots_)
         if (root) root->Release();
@@ -222,6 +240,10 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
             D3D12_SHADER_BYTECODE code{};
             std::memcpy(&code, payload, sizeof(code));
             if (code.pShaderBytecode && code.BytecodeLength) {
+                if (const auto shared = scoped_buffer(code.pShaderBytecode, code.BytecodeLength)) {
+                    shared_.push_back(shared);  // the pointer stays: this record now keeps the buffer alive
+                    return true;
+                }
                 code.pShaderBytecode = own_blob(blobs_, code.pShaderBytecode, code.BytecodeLength);
                 std::memcpy(payload, &code, sizeof(code));
             }
