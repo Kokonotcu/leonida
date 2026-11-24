@@ -604,9 +604,10 @@ HRESULT STDMETHODCALLTYPE accessibility_high_contrast(void*, uint32_t* mode) {
 // 4: HRESULT XClosedCaptionSetEnabled(bool enabled): there are no captions to show; accepted and dropped.
 HRESULT STDMETHODCALLTYPE accessibility_captions_set_enabled(void*, bool) { return S_OK; }
 
-// 8: HRESULT XSpeechSynthesizerEnumerateInstalledVoices(callback, void* context): no voice is installed, so the
-// callback runs zero times. ASSUMPTION: the argument order (GDK reference), only the count (2) was measured.
-HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void* callback, void*) {
+// 8: HRESULT XSpeechSynthesizerEnumerateInstalledVoices(void* context, callback), the GDK reference's order and what
+// the executable passes (review B20): no voice is installed, so the callback runs zero times. A null context is
+// the title's to pass; only a missing callback is refused.
+HRESULT STDMETHODCALLTYPE speech_enumerate_voices(void*, void* /*context*/, void* callback) {
     return callback ? S_OK : E_INVALIDARG;
 }
 
