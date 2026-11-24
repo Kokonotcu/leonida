@@ -931,6 +931,41 @@ void test_commit_into_window(const PhysicalApi& api) {
     check(api.free_pages(1, pages) == TRUE, "B7: free the page");
 }
 
+// Review M8: the title's VirtualFree(base, 0, MEM_RELEASE) of a window with pages mapped frees the whole window, and
+// the same pages map into a new window afterwards.
+void test_release_mapped_window(const PhysicalApi& api) {
+    const auto title_free = reinterpret_cast<BOOL(WINAPI*)(void*, SIZE_T, DWORD)>(
+        rt::shims::find("api-ms-win-core-memory-l1-1-0.dll", "VirtualFree"));
+    check(title_free != nullptr, "M8: registry exposes the title's VirtualFree");
+    if (!title_free) return;
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 4 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x27, PAGE_READWRITE));
+    check(window != nullptr, "M8: reserve a window");
+    if (!window) return;
+    uint64_t pages[2]{};
+    uint64_t count = 2;
+    check(api.allocate(0x380, &count, pages) == TRUE && count == 2, "M8: allocate two pages");
+    check(api.map(window + kPage64k, 2, pages) == window + kPage64k, "M8: map them into the window");
+    check(title_free(window, 0, MEM_RELEASE) == TRUE, "M8: VirtualFree releases the mapped window");
+    bool all_free = true;
+    for (int i = 0; i < 4; ++i) {
+        MEMORY_BASIC_INFORMATION info{};
+        all_free = all_free && VirtualQuery(window + i * kPage64k, &info, sizeof info) && info.State == MEM_FREE;
+    }
+    check(all_free, "M8: every 64 KiB of the window is free afterwards");
+    check(api.map(window, 1, pages) == nullptr, "M8: the released window takes no pages");
+    auto* const again = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, 2 * kPage64k, MEM_RESERVE | kXmem64kPages, 0x27, PAGE_READWRITE));
+    check(again != nullptr && api.map(again, 2, pages) == again, "M8: the pages map into a new window");
+    if (again) {
+        fill_page(again, 0x4d380000u);
+        check(page_holds(again, 0x4d380000u), "M8: the new window holds data");
+        check(title_free(again, 0, MEM_RELEASE) == TRUE, "M8: release the new window");
+    }
+    check(api.free_pages(2, pages) == TRUE, "M8: free the pages");
+    check(title_free(nullptr, 0, MEM_RELEASE) == FALSE, "M8: other calls pass through to the host");
+}
+
 // Review B8: a title's VirtualAlloc with the console page-size bits (2 MiB: MEM_LARGE_PAGES; 64 KiB: | MEM_PHYSICAL)
 // gets memory aligned to that page size without host large-page privileges; MEM_PHYSICAL alone is dropped.
 void test_title_page_modes() {
@@ -1103,6 +1138,7 @@ int main() {
         test_first_touch_during_remap(physical);
         test_placeholders(physical);
         test_commit_into_window(physical);
+        test_release_mapped_window(physical);
     }
     test_title_page_modes();
 

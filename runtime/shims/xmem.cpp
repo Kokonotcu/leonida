@@ -983,6 +983,36 @@ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_ty
     return host_virtual_alloc(address, size, type, host_protect(protect));
 }
 
+// Review M8: once pages are mapped into a physical-page window it is many host allocations (a view or a placeholder
+// per 64 KiB page), so the title's VirtualFree(base, 0, MEM_RELEASE) of the window would free only the first and
+// leave g_mapped naming views at addresses the host hands out again. A release at a window's base unmaps its pages,
+// releases every piece and forgets the window. Every other call passes through.
+BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
+    if (address && size == 0 && free_type == MEM_RELEASE && placeholder_api().available()) {
+        const std::lock_guard lock(g_phys_mutex);
+        const auto it = g_windows.find(reinterpret_cast<uintptr_t>(address));
+        if (it != g_windows.end()) {
+            const uintptr_t start = it->first, end = start + it->second.size;
+            for (uintptr_t page = start; page < end; page += kPhysicalPageSize) {
+                if (!unmap_page(page)) return FALSE;
+            }
+            for (uintptr_t cursor = start; cursor < end;) {
+                MEMORY_BASIC_INFORMATION info{};
+                if (!VirtualQuery(reinterpret_cast<void*>(cursor), &info, sizeof(info))) return FALSE;
+                const uintptr_t region_end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+                if (info.State != MEM_FREE && reinterpret_cast<uintptr_t>(info.AllocationBase) == cursor &&
+                    !VirtualFree(reinterpret_cast<void*>(cursor), 0, MEM_RELEASE)) {
+                    return FALSE;
+                }
+                cursor = region_end < end ? region_end : end;
+            }
+            g_windows.erase(start);
+            return TRUE;
+        }
+    }
+    return VirtualFree(address, size, free_type);
+}
+
 // XMemMakeTag packs a four-character code into the top 24 bits of an XMem flags word, six bits per character from the
 // documented alphabet (a-z, A-Z, 0-9 and '$'). ASSUMPTION: the console's order inside that alphabet is not public. The
 // tag only travels back into XMem calls, which ignore it here, so any stable packing is enough.
@@ -1080,7 +1110,9 @@ bool commit_physical_pages(const uint64_t* page_array, size_t count) {
 
 }
 
-#define TITLE_VIRTUAL_ALLOC(dll) {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}
+#define TITLE_VIRTUAL_ALLOC(dll)                                          \
+    {dll, "VirtualAlloc", reinterpret_cast<void*>(&TitleVirtualAlloc)}, \
+    {dll, "VirtualFree", reinterpret_cast<void*>(&TitleVirtualFree)}
 
 // The classic libraries and the memory api sets a title's imports name.
 SHIM_TABLE(title_memory,
