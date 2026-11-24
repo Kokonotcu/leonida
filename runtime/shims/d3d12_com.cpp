@@ -1959,6 +1959,8 @@ public:
             for (UINT i = 0; i < count; ++i)
                 ring->label_list(recorded[i], dred_debug_name(GraphicsCommandList::from(lists[i])));
         }
+        // LEONIDA_TITLE_HEAP_SYNC: what changed in title-backed shader-visible heaps reaches their real heaps first.
+        rt::d3d12_xs::sync_title_heaps();
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         if (last_result_ != leonida::ReplayResult::success) {

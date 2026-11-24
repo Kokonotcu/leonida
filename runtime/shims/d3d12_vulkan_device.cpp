@@ -98,6 +98,9 @@ constexpr D3D_ROOT_SIGNATURE_VERSION kHighestRootSignatureVersion = D3D_ROOT_SIG
 
 std::atomic<int> g_global_realtime_privilege_override{-1};
 
+// rt::d3d12_xs::TitleSamplerSlotsFn of this device (defined after Device).
+void title_sampler_slots(ID3D12Device* real, std::uintptr_t first, std::uintptr_t end);
+
 void log_once(const char* what, int value) {
     static rt::log_seen::Sites sites;  // a repeat is one relaxed load (review I11)
     if (sites.seen(what, value)) return;
@@ -6294,6 +6297,8 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        // LEONIDA_TITLE_HEAP_SYNC: sampler-heap slots the title (or a sync) filled get their S#s' samplers.
+        rt::d3d12_xs::set_title_sampler_slots_handler(&title_sampler_slots);
         // Opt-in: the console-addressed descriptor heap reports the title's VA but does not back it (d3d12_xs_device.h).
         if (const char* v = std::getenv("LEONIDA_CONSOLE_HEAP_VA"); v && v[0] == '1')
             rt::d3d12_xs::set_console_descriptor_heap_handler(&create_console_descriptor_heap);
@@ -10593,6 +10598,23 @@ bool wait_pipeline_library_work(ID3D12Device* device, unsigned timeout_ms) {
 }
 
 namespace {
+// LEONIDA_TITLE_HEAP_SYNC: sampler-heap slots in title memory whose bytes changed (a sync found them, or their heap
+// is going and was zeroed). Each S# gets its sampler and the slot's reference, as CreateSampler gives them; an
+// all-zero slot holds none. The slots are keyed by their title addresses, as every other sampler call on such a heap
+// uses them in this mode.
+void title_sampler_slots(ID3D12Device* real, std::uintptr_t first, std::uintptr_t end) {
+    Device* d = Device::from<Device>(real);
+    if (!d) return;
+    DeviceState& state = d->mutable_state();
+    for (std::uintptr_t slot = first; slot + kDescriptorSize <= end; slot += kDescriptorSize) {
+        leonida::gfx10::SamplerWords words{};
+        std::memcpy(words.data(), reinterpret_cast<const void*>(slot), sizeof(words));
+        const bool empty = std::all_of(words.begin(), words.end(), [](std::uint32_t w) { return w == 0; });
+        if (empty) state.clear_sampler_slots(slot, slot + kDescriptorSize);
+        else state.bind_sampler_slot(words, slot);
+    }
+}
+
 const leonida::BindlessSet* bindless_of(ID3D12Device* device) {
     if (!device) return nullptr;
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);

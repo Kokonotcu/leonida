@@ -391,6 +391,14 @@ What is implemented (all of it testable without the game):
   - `CopyDescriptors` / `CopyDescriptorsSimple`. A descriptor is the bytes of its slot, so a copy is a byte copy:
     the destination and source range lists are walked together, one descriptor at a time, and null size arrays
     mean one descriptor per range;
+  - title-backed heaps (slot 14 with the title's `__XMemAllocationHooks__` backing): by default the proxy translates
+    their CPU handles to the real heap, so bytes the title copies into its own heap memory never reach the GPU.
+    `LEONIDA_TITLE_HEAP_SYNC=1` (opt-in, read at heap creation) makes title memory the heap instead: handles are not
+    translated, every descriptor call and every title `memcpy` lands there, and each `ExecuteCommandLists` first
+    copies the 4 KiB chunks of shader-visible ones that changed since the last sync (a host shadow, `memcmp`; the
+    write-combined arena is never read) into the real heap; sampler-heap slots are keyed by their title addresses
+    and rebound from their new bytes. Cost: about 3 ms per submit for a 1M-descriptor (32 MiB) heap even with
+    nothing changed (`xs_proxy_mock_test`); `d3d12_title_heap_sync_test` dispatches over a T# the test copied in;
   - committed buffers (upload and readback heaps mapped persistently and zeroed), 1D textures and 1D arrays (render
     targets and depth-stencils too: their attachment views are `VK_IMAGE_VIEW_TYPE_1D_ARRAY`), and
     2D textures in the common render-target, depth and texture formats (typeless families become mutable-format

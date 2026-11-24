@@ -156,6 +156,27 @@ void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, Des
 // Returns `handle` unchanged when it does not fall inside any active custom-backed heap.
 D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE handle);
 
+// LEONIDA_TITLE_HEAP_SYNC=1 (off by default): title memory is the canonical copy of a title-backed heap. Its CPU
+// handles are not translated, so every descriptor write (slots 17-24, 61) and every byte the title copies in itself
+// land there, and sync_title_heaps() copies the 4 KiB chunks of shader-visible ones that changed since the last sync
+// (a host shadow, compared with memcmp) into the real heap. The Vulkan device runs it at every ExecuteCommandLists.
+// set_title_heap_sync: tests; 1 on, 0 off, -1 back to the environment. Read at heap creation.
+void set_title_heap_sync(int mode);
+bool title_heap_sync_enabled();
+void sync_title_heaps();
+struct TitleHeapSyncStats {
+    std::uint64_t syncs = 0;            // sync_title_heaps() calls that had heaps to look at
+    std::uint64_t chunks_compared = 0;
+    std::uint64_t chunks_copied = 0;
+    std::uint64_t heaps = 0;            // shader-visible title heaps synced now
+};
+TitleHeapSyncStats title_heap_sync_stats();
+// The sampler-heap slots in [first, end) (title addresses, the device's slot keys in this mode) hold new bytes: the
+// device gives each S# its sampler and its slot reference, and drops the slot's old one (an all-zero slot holds none).
+// Installed by the Vulkan device; without one sampler heaps sync bytes only.
+using TitleSamplerSlotsFn = void (*)(ID3D12Device* real, std::uintptr_t first, std::uintptr_t end);
+void set_title_sampler_slots_handler(TitleSamplerSlotsFn handler);
+
 // Number of PC vtable slots the proxy forwards (detected from the interfaces the PC device supports).
 unsigned device_proxy_slot_count(const void* device);
 
