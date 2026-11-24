@@ -91,7 +91,11 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
     if backend == "python":
         asm, bad = rdna2_decode.disasm_bytes(code, mcpu=mcpu, wave32=wave32)
         return asm, bad, ""
-    text = " ".join(f"0x{b:02x}" for b in code)
+    # 16 bytes a line. llvm-mc reads its input as one byte stream (newlines are whitespace), so the instructions are the
+    # same as from one line, but each "invalid instruction encoding" message echoes the whole source line: with every
+    # byte on one line, a program with embedded data printed its whole byte list once per invalid word (lib_cs_01657
+    # of the pipeline library: 137 invalid words, 45 MB of messages, 37.6 s; 16 a line: 22 KB, 0.07 s, identical).
+    text = "\n".join(" ".join(f"0x{b:02x}" for b in code[i:i + 16]) for i in range(0, len(code), 16))
     try:
         p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
                            input=text, capture_output=True, text=True, errors="replace",
