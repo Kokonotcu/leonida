@@ -267,6 +267,21 @@ void run_checks(const std::filesystem::path& root) {
         check(delete_w(L"GAME:\\data\\nullable.aux"), "and it can be deleted again");
     }
 
+    // Win32 drops trailing dots and spaces, so ".gta6rt-deleted." would be the overlay's marker folder: the internal
+    // folders stay unreachable through such an alias, and an ordinary name with a trailing dot is the file itself.
+    for (const wchar_t* alias : {L"GAME:\\.gta6rt-deleted.\\data\\hello.txt", L"GAME:\\.gta6rt-copy \\x",
+                                 L"GAME:\\.gta6rt-persistent. .\\x", L"GAME:\\data\\...\\hello.txt"}) {
+        HANDLE h = create_w(alias, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE, "an internal folder or a dots-only component is refused, trailing dots or not");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+    {
+        HANDLE h = create_w(L"GAME:\\data\\hello.txt.", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package",
+              "a trailing dot names the same package file, as on Win32");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+
     // --trace: a failed open of a guest path is a "file_open_failed" event, a successful one is not, and with the
     // trace off nothing is written.
     {

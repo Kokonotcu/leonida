@@ -214,6 +214,15 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
     std::wstring part;
     auto flush = [&]() -> bool {
+        // Win32 drops a component's trailing dots and spaces ("a." and "a " are "a"), so the checks below must see the
+        // name the host will use: otherwise ".gta6rt-deleted." passes internal_dir and still names that folder.
+        // "." and ".." keep their meaning; a component that is nothing but dots and spaces names nothing.
+        // A search pattern keeps them: FindFirstFile reads "*." as "names with no extension".
+        if (part != L"." && part != L".." && part.find_first_of(L"*?<>\"") == std::wstring::npos) {
+            const bool had = !part.empty();
+            while (!part.empty() && (part.back() == L'.' || part.back() == L' ')) part.pop_back();
+            if (had && part.empty()) return false;
+        }
         if (part.empty() || part == L".") {
             part.clear();
             return true;
