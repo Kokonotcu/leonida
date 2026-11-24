@@ -553,6 +553,44 @@ class TranslationSourcesTest(unittest.TestCase):
         self.assertEqual({n + ".py" for n in seen},
                          {n for n in make_game.TRANSLATION_SOURCES if n.endswith(".py")})
 
+    def test_each_compute_stage_declares_every_module_its_tools_import(self):
+        """The three compute steps' settings lines (make_game.fspx_settings, library_settings, bvh_settings) hash
+        their own tool list plus TRANSLATION_SOURCES. A module a stage tool imports decides what that stage's
+        listings say, so it has to be named by one of the two lists: otherwise editing it leaves a work folder
+        that reuses a cache its own tool change should have thrown away. tools/shader_disasm.py is declared as a
+        tool of all three steps, and it imports tools/rdna2_decode.py, tools/rdna2_isa_tables.py and
+        tools/mc_command.py; tools/shader_library.py carves through tools/shader_carve.py.
+        """
+        declared = {n[:-3] for n in make_game.TRANSLATION_SOURCES if n.endswith(".py")}
+
+        def local_imports(name: str):
+            with open(os.path.join(make_game.TOOLS, name + ".py"), encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+            out = []
+            for node in ast.walk(tree):                     # function-level imports too
+                if isinstance(node, ast.Import):
+                    mods = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                    mods = [node.module]
+                else:
+                    continue
+                out += [m.split(".")[0] for m in mods
+                        if os.path.isfile(os.path.join(make_game.TOOLS, m.split(".")[0] + ".py"))]
+            return out
+
+        for stage, tools in (("fspx", make_game.FSPX_TOOLS), ("library", make_game.LIBRARY_TOOLS),
+                             ("bvh", make_game.BVH_TOOLS)):
+            seeds, seen, todo = {n[:-3] for n in tools}, set(), []
+            seen |= seeds
+            todo += sorted(seeds)
+            while todo:
+                name = todo.pop()
+                seen.add(name)
+                todo += [n for n in local_imports(name) if n not in seen]
+            left = sorted(seen - declared - seeds)
+            self.assertEqual(left, [], f"{stage} stage: {left} are imported by its declared tools and hashed by "
+                                       f"neither {stage.upper()}_TOOLS nor TRANSLATION_SOURCES")
+
 
 class MergePublishesLastTest(unittest.TestCase):
     """rdna2spirv.py --merge writes the stubs before index.json, which tells make_game.py the translation finished."""

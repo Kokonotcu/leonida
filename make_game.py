@@ -1373,7 +1373,10 @@ def native_pso_hashes(dxbc: str, spirv: str) -> None:
 
 
 FSPX_DLL = "amd_fidelityfx_upscaler_xbox.dll"
-FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py")   # with TRANSLATION_SOURCES, what the FSPX outputs come from
+# What the FSPX outputs come from, with TRANSLATION_SOURCES. fspx_unpack.py --disasm imports shader_disasm.py
+# (tools/fspx_unpack.py:205), which decodes through rdna2_decode.py, its tables and mc_command.py: the listings these
+# three produce are what rdna2spirv.py translates, so an edited decoder must rebuild the cache, not be reused from it.
+FSPX_TOOLS = ("fspx_unpack.py", "shader_disasm.py", "rdna2_decode.py", "rdna2_isa_tables.py", "mc_command.py")
 
 
 def file_sha256(path: str) -> str:
@@ -1449,7 +1452,11 @@ def fspx_shaders(game: str, work: str, mc_signature: str, emulate: bool = False,
 
 
 LIBRARY_ARCHIVE = "shaders.rpf"
-LIBRARY_TOOLS = ("shader_library.py", "fspx_unpack.py", "shader_disasm.py")  # with TRANSLATION_SOURCES
+# With TRANSLATION_SOURCES, what the library's compute programs come from: shader_library.py carves with
+# shader_carve.py (tools/shader_library.py:201) and unpacks/disassembles with fspx_unpack.py, so the decoder
+# shader_disasm.py imports belongs here too (the same list as FSPX_TOOLS).
+LIBRARY_TOOLS = ("shader_library.py", "shader_carve.py", "shader_carve_accel.py",
+                 "fspx_unpack.py", "shader_disasm.py", "rdna2_decode.py", "rdna2_isa_tables.py", "mc_command.py")
 
 
 def library_settings(archive: str, mc_signature: str, emulate: bool, fallbacks: tuple[str, ...]) -> str:
@@ -1552,7 +1559,8 @@ def fspx_key_clash(spirv: str):
 
 
 BVH_DLL = "XboxBvhBuilder.dll"
-BVH_TOOLS = ("pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py")   # as FSPX_TOOLS, for the builder
+BVH_TOOLS = ("pe_shader_containers.py", "fssm_unpack.py", "shader_disasm.py",   # as FSPX_TOOLS, for the builder:
+             "rdna2_decode.py", "rdna2_isa_tables.py", "mc_command.py")          # what shader_disasm.py decodes with
 # rdna2spirv.py's --max-shared-memory for the builder's programs: 32768, the maxComputeSharedMemorySize of the AMD
 # Windows and Intel drivers (docs/design.md, "Workgroup memory limit"). The constructor creates a pipeline for every
 # program and gives up at the first one that fails, so one module over the device's limit costs the whole builder.

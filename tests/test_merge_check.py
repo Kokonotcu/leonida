@@ -404,6 +404,33 @@ class MergeCheckTest(unittest.TestCase):
             self.assertEqual(mc.main(["--repo", self.repo, "--main", "main", "1=no-such-ref"]), 2)
         self.assertIn("merge_check:", err.getvalue())
 
+    def run_without_git(self, patch):
+        out, err = io.StringIO(), io.StringIO()
+        with patch, redirect_stdout(out), redirect_stderr(err):
+            code = mc.main(["--repo", self.repo, "--main", "main", "--json", "20=whatever"])
+        self.assertEqual((code, out.getvalue()), (2, ""))
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertTrue(err.getvalue().startswith("merge_check: cannot run git: "), err.getvalue())
+        return err.getvalue()
+
+    def test_git_that_cannot_be_run_is_a_git_error_not_a_traceback(self):
+        missing = FileNotFoundError(2, "No such file or directory")
+        message = self.run_without_git(mock.patch.object(subprocess, "run", side_effect=missing))
+        self.assertEqual(message, "merge_check: cannot run git: No such file or directory\n")
+
+    def test_git_missing_from_an_empty_path_is_a_git_error(self):
+        self.run_without_git(mock.patch.dict(os.environ, {"PATH": os.devnull}))
+
+    def test_a_folder_that_is_not_a_repository_is_a_git_error(self):
+        plain = tempfile.TemporaryDirectory(prefix="leonida not a repo ")
+        self.addCleanup(plain.cleanup)
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = mc.main(["--repo", plain.name, "--main", "main", "1=HEAD"])
+        self.assertEqual(code, 2)
+        self.assertTrue(err.getvalue().startswith("merge_check: git "), err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

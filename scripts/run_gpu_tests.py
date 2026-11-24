@@ -36,6 +36,7 @@ from check import (CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
 from check import cbv_modulate_test
 from check import HEAP_INIT_EXPECTED, heap_init_env   # cs_heap_init: vk_compute_test's VKC_HEAP_INIT
+from check import shift64_test   # dynamic 64-bit vector shifts and overlapping destinations
 from check import judged_words, words_match   # dump words not judged on some devices (cs_signed_zero_nan)
 from check import TEXOFF_ARGS, texoff_problem   # ps_texoff's expected words and arguments live in check.py
 from check import TEXOFF_FALLBACK, texoff_env   # LEONIDA_TEXOFF_FALLBACK=1: texel offsets without maintenance8
@@ -163,8 +164,13 @@ def spirv_as(asm_text: str, out_spv: str, assembler: str = "spirv-as") -> None:
         with open(out_spv, "wb") as f:
             f.write(spv_bytes)
         return
-    p = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-o", out_spv, "-"],
-                       input=asm_text, capture_output=True, text=True)
+    try:
+        p = subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-o", out_spv, "-"],
+                           input=asm_text, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RuntimeError("spirv-as not found on PATH (use --assembler python to assemble with tools/spirv_asm.py)") from None
+    except OSError as exc:
+        raise RuntimeError(f"spirv-as could not be started: {exc.strerror or exc}") from None
     if p.returncode != 0:
         raise RuntimeError(f"spirv-as failed for {out_spv}:\n{p.stderr}")
 
@@ -1011,6 +1017,10 @@ def run_suite(a, work: str) -> int:
         if name in CLIP_CASES:
             detail = clip_test(a.build, spirv_dir, name)
             results.append((name, None if isinstance(detail, Skip) else not detail, detail or "four pixel masks exact"))
+        elif name == "cs_w32_shift64":
+            detail = shift64_test(a.build, spirv_dir, cs_env)
+            results.append((name, None if isinstance(detail, Skip) else not detail,
+                            detail or "640 words exact (64 shift cases and unchanged inputs)"))
         elif name == "cs_workgroup_yz":
             rc, msg = run_cmd([vk_compute, spv, "2x3x4", "workgroup_yz"], env=cs_env)
             results.append((name,) + compute_result(rc, msg, rc == 0 and "2x3x4 workgroup Y/Z: 0 mismatches"
