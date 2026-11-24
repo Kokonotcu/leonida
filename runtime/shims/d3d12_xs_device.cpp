@@ -278,7 +278,113 @@ struct TitleHeapSync {
     std::size_t increment;
     bool sampler;
     std::unique_ptr<std::uint8_t[]> shadow;
+    int watch = -1;  // its slot in g_dirty_watches, or -1: every sync compares the whole heap
 };
+
+// ---- Dirty pages of the title-backed heaps (LEONIDA_TITLE_HEAP_DIRTY, on unless "0") ----
+// Comparing the whole heap at every submit read the retail title's 40 MB shader-visible heap and its 40 MB shadow per
+// ExecuteCommandLists (several a frame). Instead its pages stay read-only between syncs: the first write to one faults
+// once into title_heap_write_fault, which marks the page dirty and opens it; the sync re-protects each dirty page and
+// then copies it, so a write after the re-protect faults again and is copied by the next sync. A heap whose pages
+// cannot be protected (another protection, a failed call) keeps the whole-heap compare.
+constexpr std::size_t kTitleDirtyPage = 4096;
+struct DirtyWatch {
+    std::atomic<std::uintptr_t> begin{0};  // page-rounded; 0: a free slot
+    std::atomic<std::uintptr_t> end{0};
+    std::atomic<std::uint8_t>* dirty = nullptr;  // one byte per page; never freed (a late fault may still read it)
+    DWORD writable = 0;
+    DWORD readonly = 0;
+};
+DirtyWatch g_dirty_watches[16];
+
+LONG CALLBACK title_heap_write_fault(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD* r = info ? info->ExceptionRecord : nullptr;
+    if (!r || r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const std::uintptr_t at = r->ExceptionInformation[1];
+    for (DirtyWatch& w : g_dirty_watches) {
+        const std::uintptr_t begin = w.begin.load(std::memory_order_acquire);
+        if (!begin || at < begin || at >= w.end.load(std::memory_order_acquire)) continue;
+        const std::size_t page = (at - begin) / kTitleDirtyPage;
+        w.dirty[page].store(1, std::memory_order_release);  // before the page opens (see above)
+        DWORD old = 0;
+        if (!VirtualProtect(reinterpret_cast<void*>(begin + page * kTitleDirtyPage), kTitleDirtyPage, w.writable, &old))
+            return EXCEPTION_CONTINUE_SEARCH;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+bool title_heap_dirty_enabled() {
+    static const bool enabled = [] {
+        char value[8] = {};
+        const DWORD length = GetEnvironmentVariableA("LEONIDA_TITLE_HEAP_DIRTY", value, sizeof(value));
+        return !(length > 0 && length < sizeof(value) && value[0] == '0');
+    }();
+    return enabled;
+}
+
+// Every page of [first, first + pages * kTitleDirtyPage) to `protect`; false at the first page that refused.
+bool protect_pages(std::uintptr_t first, std::size_t pages, DWORD protect) {
+    for (std::size_t i = 0; i < pages; ++i) {
+        DWORD old = 0;
+        if (!VirtualProtect(reinterpret_cast<void*>(first + i * kTitleDirtyPage), kTitleDirtyPage, protect, &old))
+            return false;
+    }
+    return true;
+}
+
+// A watch slot for [title, title + bytes) with its pages read-only, or -1 (the heap keeps the whole compare).
+int start_dirty_watch(std::uint8_t* title, std::size_t bytes) {
+    if (!title_heap_dirty_enabled() || !bytes) return -1;
+    static std::once_flag handler_once;
+    static bool handler = false;
+    std::call_once(handler_once, [] { handler = AddVectoredExceptionHandler(1, &title_heap_write_fault) != nullptr; });
+    if (!handler) return -1;
+    const auto begin = reinterpret_cast<std::uintptr_t>(title) & ~std::uintptr_t(kTitleDirtyPage - 1);
+    const auto end = (reinterpret_cast<std::uintptr_t>(title) + bytes + kTitleDirtyPage - 1) &
+                     ~std::uintptr_t(kTitleDirtyPage - 1);
+    MEMORY_BASIC_INFORMATION info{};
+    if (!VirtualQuery(reinterpret_cast<void*>(begin), &info, sizeof(info)) || info.State != MEM_COMMIT ||
+        (info.Protect & 0xFF) != PAGE_READWRITE)
+        return -1;
+    const DWORD writable = info.Protect;
+    const DWORD readonly = (info.Protect & ~DWORD(0xFF)) | PAGE_READONLY;
+    const std::size_t pages = (end - begin) / kTitleDirtyPage;
+    for (int slot = 0; slot < int(std::size(g_dirty_watches)); ++slot) {
+        DirtyWatch& w = g_dirty_watches[slot];
+        if (w.begin.load(std::memory_order_acquire)) continue;
+        auto* dirty = new (std::nothrow) std::atomic<std::uint8_t>[pages];
+        if (!dirty) return -1;
+        for (std::size_t i = 0; i < pages; ++i) dirty[i].store(0, std::memory_order_relaxed);
+        w.dirty = dirty;
+        w.writable = writable;
+        w.readonly = readonly;
+        w.end.store(end, std::memory_order_release);
+        w.begin.store(begin, std::memory_order_release);  // published: faults in the range are this watch's
+        if (!protect_pages(begin, pages, readonly)) {
+            protect_pages(begin, pages, writable);
+            w.begin.store(0, std::memory_order_release);
+            return -1;
+        }
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+            std::fprintf(stderr, "[rt] d3d12_xs: title heap sync copies only written pages (%zu pages watched; "
+                                 "LEONIDA_TITLE_HEAP_DIRTY=0 compares whole heaps)\n", pages);
+        return slot;
+    }
+    return -1;
+}
+
+// The heap goes: its pages writable again, then the slot is free (a fault meanwhile still finds it).
+void stop_dirty_watch(int slot) {
+    if (slot < 0) return;
+    DirtyWatch& w = g_dirty_watches[slot];
+    const std::uintptr_t begin = w.begin.load(std::memory_order_acquire);
+    if (!begin) return;
+    protect_pages(begin, (w.end.load(std::memory_order_acquire) - begin) / kTitleDirtyPage, w.writable);
+    w.begin.store(0, std::memory_order_release);
+}
 
 // Immortal, like the range table. Held for a whole sync, so concurrent submits sync one at a time and a heap is never
 // freed under a sync (heap_release unregisters under it first).
@@ -301,6 +407,7 @@ bool register_title_sync(const HeapProxy* heap, ID3D12Device* real_device, SIZE_
         increment, sampler, std::unique_ptr<std::uint8_t[]>(new (std::nothrow) std::uint8_t[bytes]())});
     // The caller zeroes the title memory: it starts as the real heap does, so the two agree before the first sync.
     if (!sync || !sync->shadow) return false;
+    sync->watch = start_dirty_watch(sync->title, sync->bytes);
     try {
         std::lock_guard lock(title_sync_mutex());
         title_syncs().push_back(std::move(sync));
@@ -321,6 +428,7 @@ void unregister_title_sync(const HeapProxy* heap) {
             continue;
         }
         const TitleHeapSync& s = **it;
+        stop_dirty_watch(s.watch);
         if (s.sampler) {
             if (const TitleSamplerSlotsFn slots = g_title_sampler_slots.load(std::memory_order_acquire)) {
                 std::memset(s.title, 0, s.bytes);
@@ -337,8 +445,23 @@ void unregister_title_sync(const HeapProxy* heap) {
 // title bytes. A sampler heap's changed slots are rebound by their new bytes (TitleSamplerSlotsFn).
 void sync_title_heap(TitleHeapSync& s, TitleSamplerSlotsFn sampler_slots, TitleHeapSyncStats& stats) {
     alignas(64) std::uint8_t snapshot[kTitleSyncChunk];
-    for (std::size_t offset = 0; offset < s.bytes; offset += kTitleSyncChunk) {
-        const std::size_t length = (std::min)(kTitleSyncChunk, s.bytes - offset);
+    static_assert(kTitleSyncChunk == kTitleDirtyPage, "a dirty page is one chunk");
+    DirtyWatch* watch = s.watch >= 0 ? &g_dirty_watches[s.watch] : nullptr;
+    const std::uintptr_t watch_begin = watch ? watch->begin.load(std::memory_order_acquire) : 0;
+    const auto title_at = reinterpret_cast<std::uintptr_t>(s.title);
+    // With a watch: the heap's chunks are its pages (offset 0 may start inside the first page when the heap is not
+    // page-aligned), and only the dirty ones are looked at, each re-protected before it is read.
+    const std::size_t first_chunk = watch_begin ? kTitleDirtyPage - (title_at - watch_begin) : kTitleSyncChunk;
+    std::size_t length = 0;
+    for (std::size_t offset = 0; offset < s.bytes; offset += length) {
+        length = (std::min)(offset == 0 ? first_chunk : kTitleSyncChunk, s.bytes - offset);
+        if (watch_begin) {
+            const std::size_t page = (title_at + offset - watch_begin) / kTitleDirtyPage;
+            if (!watch->dirty[page].load(std::memory_order_relaxed) || !watch->dirty[page].exchange(0)) continue;
+            DWORD old = 0;
+            VirtualProtect(reinterpret_cast<void*>(watch_begin + page * kTitleDirtyPage), kTitleDirtyPage,
+                           watch->readonly, &old);
+        }
         ++stats.chunks_compared;
         if (std::memcmp(s.title + offset, s.shadow.get() + offset, length) == 0) continue;
         std::memcpy(snapshot, s.title + offset, length);

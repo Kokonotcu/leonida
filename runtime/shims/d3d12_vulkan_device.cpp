@@ -11725,16 +11725,16 @@ void sync_title_textures() {
         } else if (!t->copied) {
             continue;
         } else if (t->mapped) {
-            // Mapped (Bink's planes, the glyph atlas): a sample at about 30 Hz catches a video frame, and a plain copy
-            // once a second catches small writes a sample misses (new glyphs), without hashing the whole texture.
-            if (now >= t->next_check) {
-                t->next_check = now + kMappedRecheck;
-                if (now >= t->next_full) {
-                    t->next_full = now + std::chrono::seconds(1);
-                    check = Check::copy;
-                } else {
-                    check = Check::probe;
-                }
+            // Mapped (Bink's planes, the glyph atlas): a sample on every submission catches a video frame, and a plain
+            // copy once a second catches small writes a sample misses (new glyphs), without hashing the whole texture.
+            // Not every 33 ms: Bink decodes into one of two plane sets while the other is drawn, so a check that caught
+            // a set mid-decode copied half a frame, and the next submission drawing that set fell inside the 33 ms and
+            // drew the stale copy: the video jumped back and forth between frames.
+            if (now >= t->next_full) {
+                t->next_full = now + std::chrono::seconds(1);
+                check = Check::copy;
+            } else {
+                check = Check::probe;
             }
         } else if (t->watch) {
             if (now < t->first_watch_until) {
