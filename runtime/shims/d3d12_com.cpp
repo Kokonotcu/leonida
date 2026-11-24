@@ -6,6 +6,7 @@
 #include "d3d12_fence_waiter.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
+#include "log_seen.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <algorithm>
@@ -65,21 +66,27 @@ static bool append_tile_regions(const D3D12_TILED_RESOURCE_COORDINATE* start, co
 
 void stub(const char* method) {
     // Generated API stubs pass a bare method name; explanatory diagnostics are not separate calls.
-    if (!std::strchr(method, '(')) d3d12_trace::record(method, "unsupported");
+    if (d3d12_trace::enabled() && !std::strchr(method, '(')) d3d12_trace::record(method, "unsupported");
+    static log_seen::Sites sites;  // a repeat is one relaxed load (review I11)
+    if (sites.seen(method)) return;
     static std::mutex mutex;
     static std::set<std::string> seen;
     std::lock_guard lock(mutex);
     if (seen.insert(method).second) std::fprintf(stderr, "[rt] d3d12: unimplemented %s\n", method);
+    sites.remember(method);
 }
 
 namespace {
 
 // Reports a deliberate simplification once (unlike stub, which reports a method not implemented).
 void note_once(const char* what) {
+    static log_seen::Sites sites;  // a repeat is one relaxed load (review I11)
+    if (sites.seen(what)) return;
     static std::mutex mutex;
     static std::set<std::string> seen;
     std::lock_guard lock(mutex);
     if (seen.insert(what).second) std::fprintf(stderr, "[rt] d3d12: %s\n", what);
+    sites.remember(what);
 }
 
 const char* name(leonida::ReplayResult result) {

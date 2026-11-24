@@ -18,6 +18,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "dxgi_com.h"
+#include "log_seen.h"
 #include "../src/arena_size.h"
 #include "../src/synthetic_va.h"
 #include "../src/gfx10_descriptors.h"
@@ -98,10 +99,13 @@ constexpr D3D_ROOT_SIGNATURE_VERSION kHighestRootSignatureVersion = D3D_ROOT_SIG
 std::atomic<int> g_global_realtime_privilege_override{-1};
 
 void log_once(const char* what, int value) {
+    static rt::log_seen::Sites sites;  // a repeat is one relaxed load (review I11)
+    if (sites.seen(what, value)) return;
     static std::mutex mutex;
     static std::set<std::pair<std::string, int>> seen;
     std::lock_guard lock(mutex);
     if (seen.insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+    sites.remember(what, value);
 }
 
 // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
