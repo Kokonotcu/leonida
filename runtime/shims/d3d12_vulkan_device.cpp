@@ -10515,7 +10515,15 @@ WindowPresenter::~WindowPresenter() {
 namespace {
 HRESULT present_result(VkResult result) {
     if (result == VK_SUCCESS) return S_OK;
-    std::fprintf(stderr, "[rt] d3d12: present failed (VkResult %d)\n", int(result));
+    // Review I12: by name, and not every frame: a window that keeps failing (a lost surface, a full queue) printed a
+    // line per Present. The first 5, then every 1000th with the count.
+    static std::atomic<std::uint64_t> failures{0};
+    const std::uint64_t n = ++failures;
+    if (n <= 5 || n % 1000 == 0) {
+        const char* name = leonida::detail::vk_result_name(result);
+        std::fprintf(stderr, "[rt] d3d12: present failed (%s, VkResult %d); %llu present failures so far\n",
+                     name ? name : "unnamed", int(result), static_cast<unsigned long long>(n));
+    }
     if (result == VK_ERROR_DEVICE_LOST) return DXGI_ERROR_DEVICE_REMOVED;
     if (result == VK_ERROR_FORMAT_NOT_SUPPORTED) return DXGI_ERROR_UNSUPPORTED;
     return E_FAIL;
