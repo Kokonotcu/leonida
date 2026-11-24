@@ -78,6 +78,8 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }
+    Ref<ID3D12Device> proxy;
+    proxy.p = static_cast<ID3D12Device*>(proxy_raw);
 
     struct ConsoleDescriptorHeapDesc {
         D3D12_DESCRIPTOR_HEAP_DESC desc{};

@@ -7591,7 +7591,11 @@ class Gen:
                 self.emit(f"{shift} = OpShiftRightLogical %uint {lane} {self.cu(1)}")
                 self.emit(f"{shifted} = OpShiftRightLogical %uint {word} {shift}")
                 self.emit(f"{bit} = OpBitwiseAnd %uint {shifted} {self.cu(1)}")
-                self.set_exec(bit)
+                # As a lane mask (0 or ~0): set_exec takes this lane's bit of the value it is given (lane_bit_on),
+                # which a mask answers for every lane and a plain 0/1 only for lanes 0 and 32.
+                mask = self.tmp()
+                self.emit(f"{mask} = OpISub %uint {self.cu(0)} {bit}")
+                self.set_exec(mask)
                 return
             if wide_src:
                 lo, hi = self.src64_data(x, op)

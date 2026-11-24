@@ -1,5 +1,6 @@
-// Checks the registered audio boot shims the way the retail executable reaches them: xapu.dll and chad.dll from
-// audio_stub.cpp, and acphal.dll (shims/acphal.cpp, which has its own unit test) in the measured boot sequence.
+// Checks the registered audio boot shims the way the retail executable reaches them: acphal.dll (shims/acphal.cpp,
+// which has its own unit test) in the measured boot sequence, and that the registry serves xapu.dll and chad.dll
+// (xapu_chad.cpp; xapu_chad_test covers each call).
 //
 // Every function is resolved through rt::shims::find, the same table the loader binds imports to. The test calls each
 // with valid, null and fake arguments. The three functions whose measured callers dereference an output get a real
@@ -91,53 +92,6 @@ void test_registry() {
           "no ordinal alias is registered: this executable imports all 19 names by name");
 }
 
-void test_xapu(XApuConnectFn connect, XApuDisconnectFn disconnect, XApuDequeueResultFn dequeue,
-               XApuEnqueueCommandFn enqueue, XApuGetResultCountFn count) {
-    check(connect(nullptr, nullptr, nullptr) == kOk, "XApuConnect(NULLs) returns S_OK");
-    check(connect(kFakeHandle, kFakeHandle, kFakeHandle) == kOk, "XApuConnect(fake pointers) returns S_OK");
-
-    check(disconnect(nullptr) == kOk, "XApuDisconnect(NULL) returns S_OK");
-    check(disconnect(kFakeHandle) == kOk, "XApuDisconnect(fake handle) returns S_OK");
-
-    check(count(nullptr) == 0, "XApuGetResultCount(NULL) returns 0");
-    check(count(kFakeHandle) == 0, "XApuGetResultCount(fake handle) returns 0");
-
-    uint8_t result[16];
-    std::memset(result, 0xcc, sizeof result);
-    check(dequeue(nullptr, result) == kNoWork, "XApuDequeueResult(NULL handle) returns no-work");
-    check(result[0] == 0xcc && result[15] == 0xcc, "XApuDequeueResult leaves the result buffer untouched");
-    check(dequeue(kFakeHandle, result) == kNoWork, "XApuDequeueResult(fake handle) returns no-work");
-    check(dequeue(nullptr, nullptr) == kNoWork, "XApuDequeueResult(NULL out) returns no-work without writing");
-
-    uint8_t command[32];
-    std::memset(command, 0xaa, sizeof command);
-    check(enqueue(kFakeHandle, command, 0) == kOk, "XApuEnqueueCommand returns S_OK");
-    check(command[0] == 0xaa && command[31] == 0xaa, "XApuEnqueueCommand leaves the command untouched");
-}
-
-void test_chad(XDspActivateFn activate, XDspConnectWithMaximumStreamLimitFn connect_max, XDspDeactivateFn deactivate,
-               XDspDisconnectFn disconnect, XDspSubmitCommandFn submit) {
-    check(activate(nullptr, nullptr, nullptr, nullptr) == kOk, "XDspActivate(NULLs) returns 0");
-    check(activate(kFakeHandle, kFakeHandle, kFakeHandle, kFakeHandle) == kOk,
-          "XDspActivate(fake handles) returns 0");
-
-    int state = 0;
-    check(connect_max(kFakeHandle, 0, 0x80, 0x80, 1, &state) == kOk,
-          "XDspConnectWithMaximumStreamLimit returns 0");
-    check(connect_max(nullptr, 0, 0, 0, 0, nullptr) == kOk,
-          "XDspConnectWithMaximumStreamLimit(NULLs) returns 0");
-
-    check(deactivate(nullptr) == kOk, "XDspDeactivate(NULL) returns 0");
-    check(deactivate(kFakeHandle) == kOk, "XDspDeactivate(fake handle) returns 0");
-    check(disconnect(nullptr) == kOk, "XDspDisconnect(NULL) returns 0");
-    check(disconnect(kFakeHandle) == kOk, "XDspDisconnect(fake handle) returns 0");
-
-    uint8_t command[32];
-    std::memset(command, 0xbb, sizeof command);
-    check(submit(command, kFakeHandle) == kOk, "XDspSubmitCommand returns 0");
-    check(command[0] == 0xbb && command[31] == 0xbb, "XDspSubmitCommand leaves the command untouched");
-}
-
 // The measured boot sequence: ApuCreateHeap -> AcpHalAllocateShapeContexts (count 0x15e, 64 bytes each) -> ApuAlloc
 // (0x222e00 bytes, align 0x800, flags 2) -> memset of both buffers -> AcpHalCreate and its vtable calls -> XApuConnect
 // -> XDsp setup. The game's own code does the memsets and the vtable dispatch; doing the same here catches a shim that
@@ -182,20 +136,10 @@ void test_measured_boot_sequence(AcpHalCreateFn create, AcpHalAllocateShapeConte
         }
     }
 
-    alignas(16) uint8_t state_block[0x400] = {};
-    check(connect(state_block, state_block + 0x100, state_block + 0x200) == kOk, "boot: XApuConnect returns S_OK");
-    check(count(state_block + 0x200) == 0, "boot: XApuGetResultCount returns 0");
-    uint8_t command[0x40] = {};
-    check(enqueue(state_block + 0x200, command, 0) == kOk, "boot: XApuEnqueueCommand returns S_OK");
-    uint8_t result[0x20] = {};
-    check(dequeue(state_block + 0x200, result) == kNoWork, "boot: XApuDequeueResult returns no-work");
-    check(disconnect(state_block + 0x200) == kOk, "boot: XApuDisconnect returns S_OK");
-
-    check(activate(state_block, state_block + 0x100, state_block + 0x200, state_block + 0x300) == kOk,
-          "boot: XDspActivate returns 0");
-    check(connect_max(state_block, 0, 0x80, 0x80, 1, state_block + 0x300) == kOk,
-          "boot: XDspConnectWithMaximumStreamLimit returns 0");
-    check(submit(command, state_block) == kOk, "boot: XDspSubmitCommand returns 0");
+    // The xapu.dll / chad.dll steps that follow in the boot are xapu_chad_test's: that shim connects and frees for
+    // real, so the guessed argument shapes this test once passed a no-op stub would hand it a stack address to free.
+    (void)connect, (void)count, (void)enqueue, (void)dequeue, (void)disconnect;
+    (void)activate, (void)connect_max, (void)submit;
 
     check(release_shape() == kOk, "boot: AcpHalReleaseShapeContexts returns S_OK");
     if (audio_pool) apu_free(audio_pool);
@@ -226,8 +170,6 @@ int main() {
     const auto dsp_disconnect = require<XDspDisconnectFn>("chad.dll", "XDspDisconnect");
     const auto dsp_submit = require<XDspSubmitCommandFn>("chad.dll", "XDspSubmitCommand");
 
-    test_xapu(xapu_connect, xapu_disconnect, xapu_dequeue, xapu_enqueue, xapu_count);
-    test_chad(dsp_activate, dsp_connect_max, dsp_deactivate, dsp_disconnect, dsp_submit);
     test_measured_boot_sequence(create, allocate, release, apu_alloc, apu_free, apu_create_heap, xapu_connect,
                                 xapu_disconnect, xapu_dequeue, xapu_enqueue, xapu_count, dsp_activate, dsp_connect_max,
                                 dsp_submit);
