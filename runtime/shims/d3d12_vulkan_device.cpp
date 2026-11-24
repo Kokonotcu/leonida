@@ -4350,6 +4350,19 @@ bool missing_shader_stub_enabled() {
     return enabled;
 }
 
+// LEONIDA_STUB_PIPELINES=1: every compute and graphics PSO is registered pending, so no dispatch or draw reaches the
+// GPU. A diagnostic: it tells what the title does on the CPU apart from what translated shaders write (the name is the
+// one docs/retail_boot_intel_host.md's runs used on a branch).
+bool stub_pipelines_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("LEONIDA_STUB_PIPELINES");
+        const bool on = v && v[0] == '1';
+        if (on) std::fprintf(stderr, "[rt] d3d12: LEONIDA_STUB_PIPELINES=1: no pipeline runs on the GPU\n");
+        return on;
+    }();
+    return enabled;
+}
+
 bool console_stream_enum_enabled() {
     static const bool enabled = [] {
         char value[8] = {};
@@ -4658,6 +4671,14 @@ public:
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
+        if (stub_pipelines_enabled()) {
+            graphics_.pending = true;
+            graphics_.mesh = mesh;
+            device_.context->add_graphics_pipeline(id(), graphics_);
+            registered_ = true;
+            is_graphics_ = true;
+            return S_OK;
+        }
         if (as && as->pShaderBytecode && as->BytecodeLength) {
             log_once("amplification shaders are not supported (the game has none); bytes", int(as->BytecodeLength));
             return E_NOTIMPL;
@@ -5347,6 +5368,12 @@ public:
         if (!desc.CS.pShaderBytecode || !desc.CS.BytecodeLength) return E_INVALIDARG;
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
+        if (stub_pipelines_enabled()) {
+            pipeline_.pending = true;
+            device_.context->add_pipeline(id(), pipeline_);
+            registered_ = true;
+            return S_OK;
+        }
         if (!device_.arena.mapped) {
             log_once("pipelines need the GPU address arena (bufferDeviceAddress); stage", 0);
             return E_NOTIMPL;

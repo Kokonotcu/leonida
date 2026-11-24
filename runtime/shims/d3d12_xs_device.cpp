@@ -1521,6 +1521,13 @@ inline HRESULT list_query_interface(ListProxy* self, const IID* riid, void** out
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!riid) return E_POINTER;
+    // The console list interface {c3827890-...} is this proxy itself: the retail title asks for it at device slot 73
+    // (CreateCommandListX) and asserts on E_NOINTERFACE (boot 14). The PC list behind does not know it.
+    if (IsEqualIID(*riid, kXboxGraphicsCommandListIid)) {
+        *out = self;
+        list_add_ref(self);
+        return S_OK;
+    }
     if (!is_list_iid(*riid)) {
         if (supports_iid(self->real, *riid)) log_refused_iid("list", *riid);
         return E_NOINTERFACE;
