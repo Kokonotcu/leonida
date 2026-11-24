@@ -1576,14 +1576,28 @@ int check_descriptor_heap_hooks() {
 
     raw(device, 17, 0x11, kCustomBase + off3);                                          // CreateConstantBufferView
     EXPECT(real->args[17][1] == kMockHeapCpuStart + off3);
-    raw(device, 18, 0x22, 0x33, kCustomBase + off3);                                    // CreateShaderResourceView
-    EXPECT(real->args[18][2] == kMockHeapCpuStart + off3);
-    raw(device, 19, 0x22, 0x33, 0x44, kCustomBase + off7);                              // CreateUnorderedAccessView
-    EXPECT(real->args[19][3] == kMockHeapCpuStart + off7);
-    raw(device, 20, 0x22, 0x33, kCustomBase + off3);                                    // CreateRenderTargetView
-    EXPECT(real->args[20][2] == kMockHeapCpuStart + off3);
-    raw(device, 21, 0x22, 0x33, kCustomBase + off7);                                    // CreateDepthStencilView
-    EXPECT(real->args[21][2] == kMockHeapCpuStart + off7);
+    // View descriptions are read (a console-only format moves to the PC's, pc_format), so they are real ones here; a
+    // PC format reaches the PC device as the same pointer.
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R32_FLOAT;
+    D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+    rtv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+    dsv.Format = DXGI_FORMAT_D32_FLOAT;
+    raw(device, 18, 0x22, word(&srv), kCustomBase + off3);                              // CreateShaderResourceView
+    EXPECT(real->args[18][1] == word(&srv) && real->args[18][2] == kMockHeapCpuStart + off3);
+    raw(device, 19, 0x22, 0x33, word(&uav), kCustomBase + off7);                        // CreateUnorderedAccessView
+    EXPECT(real->args[19][2] == word(&uav) && real->args[19][3] == kMockHeapCpuStart + off7);
+    raw(device, 20, 0x22, word(&rtv), kCustomBase + off3);                              // CreateRenderTargetView
+    EXPECT(real->args[20][1] == word(&rtv) && real->args[20][2] == kMockHeapCpuStart + off3);
+    raw(device, 21, 0x22, word(&dsv), kCustomBase + off7);                              // CreateDepthStencilView
+    EXPECT(real->args[21][1] == word(&dsv) && real->args[21][2] == kMockHeapCpuStart + off7);
+    // The console's D16_UNORM_S8_UINT (118) is not a PC format: the PC device gets a copy in D24_UNORM_S8_UINT.
+    dsv.Format = static_cast<DXGI_FORMAT>(118);
+    raw(device, 21, 0x22, word(&dsv), kCustomBase + off7);
+    EXPECT(real->args[21][1] != word(&dsv) && dsv.Format == static_cast<DXGI_FORMAT>(118));
     raw(device, 22, 0x55, kCustomBase + off3);                                          // CreateSampler
     EXPECT(real->args[22][1] == kMockHeapCpuStart + off3);
     {
@@ -1692,9 +1706,13 @@ int check_title_heap_sync() {
     EXPECT(xs::translate_cpu_descriptor_handle(device, D3D12_CPU_DESCRIPTOR_HANDLE{base + off3}).ptr == base + off3);
     raw(device, 17, 0x11, base + off3);
     EXPECT(mock->args[17][1] == base + off3);
-    raw(device, 18, 0x22, 0x33, base + off3);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};  // view descriptions are read (pc_format), so real ones
+    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+    uav.Format = DXGI_FORMAT_R32_FLOAT;
+    raw(device, 18, 0x22, word(&srv), base + off3);
     EXPECT(mock->args[18][2] == base + off3);
-    raw(device, 19, 0x22, 0x33, 0x44, base + off7);
+    raw(device, 19, 0x22, 0x33, word(&uav), base + off7);
     EXPECT(mock->args[19][3] == base + off7);
     raw(device, 22, 0x55, base + off3);
     EXPECT(mock->args[22][1] == base + off3);

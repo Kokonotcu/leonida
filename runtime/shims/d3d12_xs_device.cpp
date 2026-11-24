@@ -2775,6 +2775,29 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     return hr;
 }
 
+// The console's own DXGI formats past the PC list (Xbox d3d12_x.h): 118 D16_UNORM_S8_UINT, 119 R16_UNORM_X8_TYPELESS
+// and 120 X16_TYPELESS_G8_UINT, the depth, depth-read and stencil-read members of a 16-bit depth + 8-bit stencil
+// family. The PC has no such family; the D24S8 one (45, 46, 47) has the same members, so a resource, its clear value
+// and its views move there together (the retail title's 1024x1024 depth-stencil target at slot 133, boot 11). Depth
+// is kept at more precision than the console's 16 bits, which a shader sampling it as UNORM cannot tell apart.
+DXGI_FORMAT pc_format(DXGI_FORMAT format) {
+    switch (static_cast<unsigned>(format)) {
+        case 118: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+        case 119: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case 120: return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+        default: return format;
+    }
+}
+
+// A view description with its format moved to the PC (pc_format): `copy` when it changed, else the original.
+template <class Desc>
+const Desc* pc_view_desc(const Desc* desc, Desc& copy) {
+    if (!desc || pc_format(desc->Format) == desc->Format) return desc;
+    copy = *desc;
+    copy.Format = pc_format(desc->Format);
+    return &copy;
+}
+
 // Device slots 17-24 write or copy descriptors using CPU handles. When a title supplies its own descriptor-heap base
 // via __XMemAllocationHooks__, those handles fall in [custom_start, custom_end) and must be translated back to the
 // underlying PC/Vulkan heap before forwarding.
@@ -2787,25 +2810,30 @@ void proxy_create_cbv(DeviceProxy* self, const D3D12_CONSTANT_BUFFER_VIEW_DESC* 
 void proxy_create_srv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_SHADER_RESOURCE_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(18);
-    self->real->CreateShaderResourceView(resource, desc, translate_cpu_handle(self, dest));
+    D3D12_SHADER_RESOURCE_VIEW_DESC copy;
+    self->real->CreateShaderResourceView(resource, pc_view_desc(desc, copy), translate_cpu_handle(self, dest));
 }
 
 void proxy_create_uav(DeviceProxy* self, ID3D12Resource* resource, ID3D12Resource* counter,
                       const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(19);
-    self->real->CreateUnorderedAccessView(resource, counter, desc, translate_cpu_handle(self, dest));
+    D3D12_UNORDERED_ACCESS_VIEW_DESC copy;
+    self->real->CreateUnorderedAccessView(resource, counter, pc_view_desc(desc, copy),
+                                          translate_cpu_handle(self, dest));
 }
 
 void proxy_create_rtv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(20);
-    self->real->CreateRenderTargetView(resource, desc, translate_cpu_handle(self, dest));
+    D3D12_RENDER_TARGET_VIEW_DESC copy;
+    self->real->CreateRenderTargetView(resource, pc_view_desc(desc, copy), translate_cpu_handle(self, dest));
 }
 
 void proxy_create_dsv(DeviceProxy* self, ID3D12Resource* resource, const D3D12_DEPTH_STENCIL_VIEW_DESC* desc,
                       D3D12_CPU_DESCRIPTOR_HANDLE dest) {
     note_slot(21);
-    self->real->CreateDepthStencilView(resource, desc, translate_cpu_handle(self, dest));
+    D3D12_DEPTH_STENCIL_VIEW_DESC copy;
+    self->real->CreateDepthStencilView(resource, pc_view_desc(desc, copy), translate_cpu_handle(self, dest));
 }
 
 void proxy_create_sampler(DeviceProxy* self, const D3D12_SAMPLER_DESC* desc, D3D12_CPU_DESCRIPTOR_HANDLE dest) {
@@ -3259,6 +3287,29 @@ void cover_linear_layout(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_ALLOCAT
     if (rt::xg::linear_layout(desc, layout) && layout.size_bytes > info.SizeInBytes) info.SizeInBytes = layout.size_bytes;
 }
 
+// A console texture description made one the PC takes, after the flag mask: the console-only formats move to their
+// PC family (pc_format). The console also creates depth-stencil textures that are unordered-access targets (the
+// retail title's 768x768x6 R16_TYPELESS cube at slot 133, Xbox flags 0x80300006, boot 10, which then stopped on an
+// int3); D3D12 on the PC refuses ALLOW_DEPTH_STENCIL with ALLOW_UNORDERED_ACCESS. The depth use is kept and the UAV
+// flag dropped, logged once: a UAV the title makes on such a texture is then refused by the view code instead of the
+// whole resource.
+template <class Desc>
+void pc_texture_desc(Desc& d, unsigned slot) {
+    d.Format = pc_format(d.Format);
+    constexpr auto kPair = static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) |
+                           static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    const auto flags = static_cast<std::uint32_t>(d.Flags);
+    if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || (flags & kPair) != kPair) return;
+    d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags &
+                                                ~static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr,
+                     "[rt] d3d12_xs: slot %u: a depth-stencil texture that also allows unordered access (%llux%u, "
+                     "format %u); the PC refuses the pair, so it is made without ALLOW_UNORDERED_ACCESS\n",
+                     slot, static_cast<unsigned long long>(d.Width), d.Height, static_cast<unsigned>(d.Format));
+}
+
 // RDX); a PC C++ caller passes the proxy in RCX and the return buffer in RDX. Both orders are accepted. Each resource
 // description's Xbox layout word (e.g. 0x101, 0x105) and console flag bits above the PC D3D12_RESOURCE_FLAGS are
 // normalized on a copy before the PC call, with SamplerFeedbackMipRegion zeroed so 56-byte D3D12_RESOURCE_DESC inputs
@@ -3311,6 +3362,7 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
             }
             constexpr std::uint32_t kPcResourceFlagsMask = 0x1FFu;
             d.Flags = static_cast<D3D12_RESOURCE_FLAGS>(static_cast<std::uint32_t>(d.Flags) & kPcResourceFlagsMask);
+            pc_texture_desc(d, 108);
             cleaned[i] = d;
         }
         descs_to_pass = cleaned.data();
@@ -3353,6 +3405,7 @@ HRESULT create_placed_resource_committed(DeviceProxy* self, std::uint64_t va, co
     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
+    pc_texture_desc(pc_desc, 133);
     const bool buffer = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     pc_desc.Layout = buffer ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     // The fourth word is a console D3D12_BARRIER_LAYOUT (0xFFFFFFFF is UNDEFINED), not a legacy resource state.
@@ -3373,8 +3426,10 @@ HRESULT create_placed_resource_committed(DeviceProxy* self, std::uint64_t va, co
     (void)va;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT, D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                      D3D12_MEMORY_POOL_UNKNOWN, 0, 0};
+    D3D12_CLEAR_VALUE clear_copy;
     return self->real->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &pc_desc, state,
-                                               clearable ? clear_value : nullptr, *riid, out);
+                                               clearable ? pc_view_desc(clear_value, clear_copy) : nullptr, *riid,
+                                               out);
 }
 
 // The Xbox routes at their configured indices. Returns false when `slot` is none of them. Slot 70 asks too, because an
@@ -3453,6 +3508,7 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
                                                                          : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlagsMask);
+    pc_texture_desc(pc_desc, 127);
 
     static std::atomic<bool> logged{false};
     if (first_call(logged))
@@ -3474,10 +3530,12 @@ HRESULT proxy_create_committed_resource3_x(DeviceProxy* self, std::uint64_t heap
 #endif
     if (!device10) return E_NOTIMPL;
     const auto create = reinterpret_cast<Fn>((*reinterpret_cast<void***>(device10))[kPcCreateCommittedResource3]);
+    D3D12_CLEAR_VALUE clear_copy;
     const HRESULT hr =
         create(static_cast<ID3D12Device*>(device10), reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(heap_word),
                static_cast<D3D12_HEAP_FLAGS>(static_cast<std::uint32_t>(heap_flags)), &pc_desc,
-               static_cast<std::uint32_t>(layout_word), reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word),
+               static_cast<std::uint32_t>(layout_word),
+               pc_view_desc(reinterpret_cast<const D3D12_CLEAR_VALUE*>(clear_word), clear_copy),
                reinterpret_cast<ID3D12ProtectedResourceSession*>(session_word),
                static_cast<std::uint32_t>(castable_count), reinterpret_cast<const DXGI_FORMAT*>(castable_formats), riid,
                out);
@@ -3543,6 +3601,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);
+    pc_texture_desc(pc_desc, 133);
     // The Xbox layout word (0x101 tiled, 0x1 row-major buffer) is no PC layout: ROW_MAJOR for a buffer and UNKNOWN
     // for everything else, as slot 76 does.
     pc_desc.Layout = pc_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
