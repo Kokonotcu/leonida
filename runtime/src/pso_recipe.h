@@ -136,8 +136,10 @@ public:
         assembly_.topology = VkPrimitiveTopology(r.topology);
         assembly_.primitiveRestartEnable = r.primitive_restart;
 
-        viewport_.viewportCount = 1;
-        viewport_.scissorCount = 1;
+        // Both counts are dynamic (VIEWPORT_WITH_COUNT, SCISSOR_WITH_COUNT): a draw sets one, or the viewports
+        // RSSetViewports bound for SV_ViewportArrayIndex (VUID-VkPipelineViewportStateCreateInfo-viewportCount-04135).
+        viewport_.viewportCount = 0;
+        viewport_.scissorCount = 0;
 
         raster_.depthClampEnable = r.depth_clamp;
         raster_.rasterizerDiscardEnable = r.rasterizer_discard;
@@ -185,13 +187,13 @@ public:
         // (VUID-vkCmdDraw-pStrides-04913). A mesh pipeline takes neither the topology nor the strides as dynamic
         // state (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066).
         static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
             VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
             VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
             VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
-        static constexpr VkDynamicState mesh_dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-                                                                 VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+        static constexpr VkDynamicState mesh_dynamic_states[] = {
+            VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
         if (r.mesh) {
             dynamic_.dynamicStateCount = std::uint32_t(std::size(mesh_dynamic_states));
             dynamic_.pDynamicStates = mesh_dynamic_states;

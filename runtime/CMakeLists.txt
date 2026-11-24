@@ -3028,6 +3028,60 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_m4_compute COMMAND d3d12_m4_compute_test)
       set_tests_properties(d3d12_m4_compute PROPERTIES SKIP_RETURN_CODE 77)
 
+      # M5: RWTexture3D UAVs, the whole volume and a W range (a sliced storage view), written by cs_uav3d_store.asm
+      # and read back by cs_uav3d_load.asm (image_load through the sampled 3D array, offset by the T#'s first slice).
+      set(LEONIDA_UAV3D_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/uav3d_shaders)
+      set(LEONIDA_UAV3D_FILES ${LEONIDA_UAV3D_DIR}/spirv/index.json ${LEONIDA_UAV3D_DIR}/fssm/cs_uav3d_store.fssm
+                              ${LEONIDA_UAV3D_DIR}/fssm/cs_uav3d_load.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_UAV3D_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_UAV3D_DIR}
+        # LEONIDA_USER_DATA_SHIFT=4: root arguments from s4 in a D3D12 compute PSO (see the M4 shaders above).
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                LEONIDA_USER_DATA_SHIFT=4
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_UAV3D_DIR} cs_uav3d_store cs_uav3d_load
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_uav3d_store.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_uav3d_load.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating cs_uav3d_store and cs_uav3d_load for the 3D UAV test"
+        VERBATIM)
+      add_executable(d3d12_uav3d_test test/d3d12_uav3d_test.cpp ${LEONIDA_UAV3D_FILES})
+      target_link_libraries(d3d12_uav3d_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_uav3d_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_UAV3D_DIR="${LEONIDA_UAV3D_DIR}")
+      target_compile_options(d3d12_uav3d_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_uav3d COMMAND d3d12_uav3d_test)
+      set_tests_properties(d3d12_uav3d PROPERTIES SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
+      # M4: two viewports and scissors, picked by SV_ViewportArrayIndex from vs_vpindex.asm (the pos1 misc vector),
+      # filled by ps_m5_flat.asm.
+      set(LEONIDA_VIEWPORTS_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/viewports_shaders)
+      set(LEONIDA_VIEWPORTS_FILES ${LEONIDA_VIEWPORTS_DIR}/spirv/index.json ${LEONIDA_VIEWPORTS_DIR}/fssm/vs_vpindex.fssm
+                                  ${LEONIDA_VIEWPORTS_DIR}/fssm/ps_m5_flat.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_VIEWPORTS_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_VIEWPORTS_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_VIEWPORTS_DIR} vs_vpindex ps_m5_flat
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/vs_vpindex.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_m5_flat.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating vs_vpindex and ps_m5_flat for the viewport-array test"
+        VERBATIM)
+      add_executable(d3d12_viewports_test test/d3d12_viewports_test.cpp ${LEONIDA_VIEWPORTS_FILES})
+      target_link_libraries(d3d12_viewports_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_viewports_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VIEWPORTS_DIR="${LEONIDA_VIEWPORTS_DIR}")
+      target_compile_options(d3d12_viewports_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_viewports COMMAND d3d12_viewports_test)
+      set_tests_properties(d3d12_viewports PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
       # Typed buffer UAVs and UAV counters: cs_buf_typed.asm writes typed views through V#s with a FORMAT, and
       # cs_buf_counter.asm appends to and consumes from a structured view whose counter is the second V# of its slot;
       # the test also compares typed-buffer and counter clears with the host runtime on the layer's adapter.

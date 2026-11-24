@@ -44,7 +44,7 @@ inline std::span<const VkDynamicState> library_dynamic_states(Part part, bool ve
                                                       VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
                                                       VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
     static constexpr VkDynamicState pre_raster[] = {
-        VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,    VK_DYNAMIC_STATE_CULL_MODE,
+        VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT, VK_DYNAMIC_STATE_CULL_MODE,
         VK_DYNAMIC_STATE_FRONT_FACE,        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_DEPTH_BIAS,
         VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_LINE_WIDTH};
     static constexpr VkDynamicState fragment[] = {
@@ -184,8 +184,8 @@ public:
                 conservative_.conservativeRasterizationMode = VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
                 raster_.pNext = &conservative_;
             }
-            viewport_.viewportCount = 1;
-            viewport_.scissorCount = 1;
+            viewport_.viewportCount = 0;  // dynamic, with the count (as GraphicsCreateInfo)
+            viewport_.scissorCount = 0;
             info.pRasterizationState = &raster_;
             info.pViewportState = &viewport_;
             break;

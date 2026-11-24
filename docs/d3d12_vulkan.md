@@ -960,7 +960,15 @@ The compute path, end to end:
     dynamic-rendering scope. Its layer count is the smallest layer count of the bound views.
   - **Viewport:** it is flipped (negative height), because translated vertex shaders write D3D clip coordinates;
     front-face winding then matches D3D12's.
-  - Only the first viewport and scissor are used, and primitive restart is not modelled yet.
+  - **Viewport arrays (M4):** pipelines take the viewport and scissor counts as dynamic state
+    (`VIEWPORT_WITH_COUNT`, `SCISSOR_WITH_COUNT`), so a draw after `RSSetViewports(N)` binds all N, each with its
+    scissor (one past the `RSSetScissorRects` count is empty), and `SV_ViewportArrayIndex` picks one: a vertex shader
+    writes it in the pos1 misc vector (`ShaderViewportIndex`), a geometry shader in a component of an output register
+    that each emit also stores to `ViewportIndex` (`MultiViewport`). `multiViewport` is enabled where the GPU has it
+    (`VulkanDeviceInfo::max_viewports`, at most 16); without it a draw uses the first viewport. An empty viewport among
+    several is bound as 1x1 behind an empty scissor; draws whose viewports are all empty are dropped, as with one.
+    An index at or past the bound count is not clamped to 0 (Vulkan leaves it undefined). `d3d12_viewports_test`.
+  - Primitive restart is not modelled yet.
 
   **Resources and heaps:**
   - A buffer of 0 bytes, or one whose size wraps when aligned, is `E_INVALIDARG`. One the arena cannot hold is

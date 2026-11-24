@@ -161,6 +161,9 @@ struct VulkanDeviceInfo {
     // pipelineCreationCacheControl is enabled: a linked PSO first asks the pipeline cache for its optimised link
     // (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) before it fast-links.
     bool pipeline_creation_cache_control = false;
+    // VK_EXT_image_sliced_view_of_3d and imageSlicedViewOf3D are enabled: a RWTexture3D UAV of a W range (FirstWSlice,
+    // WSize short of the whole mip) gets a sliced 3D storage view. Without it such a view is refused (logged).
+    bool image_sliced_view_of_3d = false;
     bool tessellation_shader = false;  // tessellationShader enabled: a shader-object draw binds those stages to null
     // Opt in only for shader libraries whose InnerCoverage input contract uses FullyCoveredEXT. The device
     // still checks physical Tier 2 and fullyCoveredFragmentShaderInputVariable properties. The standalone
@@ -232,6 +235,9 @@ struct VulkanDeviceInfo {
     // writes the layer or viewport declares ShaderLayer / ShaderViewportIndex (the index's `features`).
     bool shader_output_layer = false;
     bool shader_output_viewport_index = false;
+    // multiViewport enabled: the viewports a draw may bind for SV_ViewportArrayIndex (maxViewports, at most D3D12's
+    // 16). 1 without it: a draw after RSSetViewports with more uses the first, as before M4.
+    std::uint32_t max_viewports = 1;
     // The translator's output folder for pipeline creation. An empty value uses LEONIDA_SHADERS or the packaged path.
     std::string shader_dir;
     // VK_EXT_custom_border_color (with customBorderColors and customBorderColorWithoutFormat) is enabled on
