@@ -3017,6 +3017,7 @@ struct TitleTexture {
 // every kMappedRecheck (one check a frame at 60 Hz), outside the byte budget: there are few (12 in the intro video).
 // five-star-recomp found the same (ThatRecompDev, docs/gpu-resources.md, "CPU-mapped textures").
 void mark_title_texture_mapped(const Resource* resource);
+bool register_title_texture(Resource* texture, const void* address, const D3D12_RESOURCE_DESC& desc);
 
 std::mutex& title_texture_mutex() {
     static std::mutex mutex;
@@ -3101,6 +3102,7 @@ public:
 
     ~Resource() override {
         unregister_title_texture(this);
+        if (map_shadow_) VirtualFree(map_shadow_, 0, MEM_RELEASE);  // after the sync can no longer read it
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
             if (buffer_va_ && buffer_va_ != gpu_va_) device_.context->unregister_acceleration_structure(buffer_va_);
@@ -3774,6 +3776,39 @@ public:
             mark_title_texture_mapped(this);  // CPU writes through this pointer reach the image (sync_title_textures)
             return S_OK;
         }
+        if (image_ && data && subresource != leonida::all_subresources &&
+            !(desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+            // A texture the console title maps for a pointer (Bink's Y/Cr/Cb planes: the game maps each plane and
+            // registers the pointer with BinkRegisterFrameBuffers, 0x145121690 and 0x14442F9B8 in 1.0.2.1). The PC
+            // refuses such a Map, so the game skipped the planes, Bink had no buffers and the intro video showed
+            // green (YUV zeros). The title gets CPU memory in the linear layout the texture computer describes, which
+            // the title-texture sync copies into the image about once a frame (a mapped texture).
+            rt::xg::ResourceLayout layout;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT f{};
+            if (!rt::xg::linear_layout(desc_, layout) || !rt::xg::footprint(desc_, layout, subresource, f)) {
+                *data = nullptr;
+                return E_INVALIDARG;
+            }
+            if (!map_shadow_) {
+                auto* shadow = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, static_cast<SIZE_T>(layout.size_bytes),
+                                                                       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+                if (!shadow || !register_title_texture(this, shadow, desc_)) {
+                    if (shadow) VirtualFree(shadow, 0, MEM_RELEASE);
+                    *data = nullptr;
+                    return E_OUTOFMEMORY;
+                }
+                map_shadow_ = shadow;
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1) < 16)
+                    std::fprintf(stderr, "[rt] d3d12: a texture outside the title's pages is mapped (%llux%u, format "
+                                         "%d): CPU memory of its linear layout, copied in about once a frame\n",
+                                 static_cast<unsigned long long>(desc_.Width), desc_.Height, int(desc_.Format));
+            }
+            *data = map_shadow_ + f.Offset;
+            mark_title_texture_mapped(this);
+            return S_OK;
+        }
         if (image_) {
             VkImageSubresourceRange range{};
             return !data && cpu_visible() && subresource != leonida::all_subresources &&
@@ -4079,6 +4114,9 @@ private:
     std::vector<DXGI_FORMAT> castable_formats_;  // the same list as the application gave it
     VkFormat uint_backed_ = VK_FORMAT_UNDEFINED;
     std::uint64_t image_address_ = 0;  // what a T# names the texture by
+    // A texture not on the title's pages that the title maps: the CPU memory Map hands out, in the linear layout the
+    // title-texture sync copies from (Map). Freed with the resource.
+    std::uint8_t* map_shadow_ = nullptr;
     bool rgb96_ = false;
     VkImageAspectFlags aspects_ = 0;
     std::uint64_t buffer_va_ = 0;
