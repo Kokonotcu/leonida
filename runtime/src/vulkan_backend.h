@@ -1123,7 +1123,9 @@ public:
         // buffer as out of bounds, which is no reason to drop the submission.
         replay_.buffer_at = [this](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
             BufferVaIndex<ResourceId>::Hit hit{};
-            if (!buffer_vas_.find(va, hit, size)) return false;  // prefers an aliasing buffer that holds all of it
+            // prefers an aliasing buffer that holds all of it; a title address no buffer object covers is bound
+            // through the title-memory page table's import of it (set_title_buffer_lookup)
+            if (!buffer_vas_.find(va, hit, size)) return title_buffer_at_ && title_buffer_at_(va, size, buffer, offset);
             const ResourceBinding* b = resolve(hit.id);
             if (!b) return false;
             buffer = b->buffer;
@@ -1448,6 +1450,13 @@ public:
     std::uint64_t heap_base() {
         std::shared_lock lock(resource_mutex_);
         return replay_.heap_base;
+    }
+    // Where buffer_at looks for a title address (at or above 4 GiB) that no buffer object covers: the device's
+    // title-memory page table imports. Called with resource_mutex_ held; it must not take it.
+    using TitleBufferLookup = std::function<bool(std::uint64_t, std::uint64_t&, VkBuffer&, VkDeviceSize&)>;
+    void set_title_buffer_lookup(TitleBufferLookup lookup) {
+        std::unique_lock lock(resource_mutex_);
+        title_buffer_at_ = std::move(lookup);
     }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
@@ -2176,6 +2185,7 @@ private:
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
+    TitleBufferLookup title_buffer_at_;      // buffer_at's fallback for title addresses (set_title_buffer_lookup)
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;

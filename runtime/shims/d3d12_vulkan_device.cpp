@@ -26,6 +26,7 @@
 #include "../src/synthetic_va.h"
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
+#include "../src/rect_list_gs.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
@@ -928,8 +929,33 @@ struct DeviceState {
         std::uint32_t chunks = 0;                  // chunks handed out (1-based numbers in the directory)
         std::unordered_set<std::uint64_t> mapped;  // 64 KiB page VAs with an entry
         std::vector<std::pair<VkBuffer, VkDeviceMemory>> imports;
+        std::map<std::uint64_t, std::pair<std::uint64_t, VkBuffer>> runs;  // import start VA -> (end VA, buffer)
         std::uint64_t pages = 0, refused = 0;
     } title_pages;
+
+    // A title VA (at or above 4 GiB) as a buffer and offset, for what binds a VkBuffer rather than reading through
+    // the page table: vertex and index views, copies (VulkanContext::buffer_at falls back to this). Memory not
+    // imported yet is imported here. `size` is cut to the import that holds `va`.
+    bool title_buffer_at(std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+        if (va >> 32 == 0) return false;
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            {
+                std::lock_guard lock(title_pages.mutex);
+                auto it = title_pages.runs.upper_bound(va);
+                if (it != title_pages.runs.begin()) {
+                    --it;
+                    if (va < it->second.first) {
+                        buffer = it->second.second;
+                        offset = va - it->first;
+                        size = std::min<std::uint64_t>(size ? size : 1, it->second.first - va);
+                        return true;
+                    }
+                }
+            }
+            if (attempt == 0 && !map_title_memory(va, size ? size : 1)) return false;
+        }
+        return false;
+    }
 
     // Gives every committed 64 KiB page of [address, address + bytes) a page-table entry, importing the pages that
     // have none in runs of at most 64 MiB. A page that is not committed (or write-combined) stays unmapped: the
@@ -968,7 +994,9 @@ struct DeviceState {
             VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
             create.size = run;
             create.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
             share(create);
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceMemory imported = VK_NULL_HANDLE;
@@ -1014,6 +1042,7 @@ struct DeviceState {
                 continue;
             }
             title_pages.imports.emplace_back(buffer, imported);
+            title_pages.runs[p] = {q, buffer};
             auto* dir = reinterpret_cast<volatile std::uint32_t*>(arena.mapped + kPageTableDir);
             for (std::uint64_t v = p; v < q; v += page) {
                 const std::uint32_t d = static_cast<std::uint32_t>((v >> 32) & 0xFFFF);
@@ -5185,6 +5214,9 @@ public:
             info.module = module;
             info.pName = "main";
             subgroup_size_for(*stage.entry, required_sizes[stage_infos.size()], info);
+            // What a rect-list variant's geometry shader must pass on (build(), GraphicsPipeline::rect_list).
+            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT) vs_outputs_ = leonida::vertex_output_locations(stage.words);
+            if (stage.bit == VK_SHADER_STAGE_GEOMETRY_BIT) has_geometry_ = true;
             stage_meta_.push_back({std::uint32_t(stage.bit), stage.entry->name, std::uint32_t(info.flags),
                                    info.pNext ? required_sizes[stage_infos.size()].requiredSubgroupSize : 0u,
                                    leonida::pso::spirv_hash(stage.words)});
@@ -5946,9 +5978,24 @@ private:
             }
             deferred_modules_.clear();
         }
-        const leonida::pso::Recipe recipe = to_recipe(unbound);
+        leonida::pso::Recipe recipe = to_recipe(unbound);
         std::vector<VkShaderModule> modules;
         for (const VkPipelineShaderStageCreateInfo& s : recipe_.stages) modules.push_back(s.module);
+        if (unbound & leonida::GraphicsPipeline::rect_list) {
+            // Rect lists: the geometry shader that adds each rectangle's fourth corner, made for this VS's outputs.
+            if (has_geometry_ || recipe.mesh || !device_.info.features.geometryShader) {
+                log_once("a rect-list draw on a pipeline that cannot take the rect-list geometry shader; outputs",
+                         int(vs_outputs_));
+                return VK_NULL_HANDLE;
+            }
+            const std::vector<std::uint32_t> words = leonida::rect_list_geometry_shader(vs_outputs_);
+            const VkShaderModule gs = device_.shader_modules().acquire(words);
+            if (!gs) return VK_NULL_HANDLE;
+            recipe.stages.push_back({std::uint32_t(VK_SHADER_STAGE_GEOMETRY_BIT),
+                                     "<rect_list_gs_" + std::to_string(vs_outputs_) + ">", 0u, 0u,
+                                     leonida::pso::spirv_hash(words)});
+            modules.push_back(gs);
+        }
         if (gpl_) return link(recipe, modules, unbound == 0);
         const leonida::pso::GraphicsCreateInfo create(recipe, modules, graphics_.layout);
         VkPipeline pipeline = VK_NULL_HANDLE;
@@ -6083,6 +6130,8 @@ private:
     std::map<std::uint32_t, VkPipeline> variants_;
     std::atomic<bool> base_built_{false};      // variant 0 exists (GraphicsPipeline::ready)
     std::atomic<bool> base_requested_{false};  // its background build was asked for (GraphicsPipeline::request)
+    std::uint32_t vs_outputs_ = 0;              // the VS's output locations: the rect-list geometry shader's size
+    bool has_geometry_ = false;                 // the PSO has its own GS (no rect-list variant then)
     // Pipeline libraries (docs/aot_pipelines.md step 3): this PSO's vertex input part and its fragment output parts
     // (one per variant), kept with the pipelines linked from them; the shader parts are the device's.
     bool gpl_ = false;
@@ -7465,6 +7514,10 @@ public:
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
+        state_.context->set_title_buffer_lookup(
+            [state = &state_](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+                return state->title_buffer_at(va, size, buffer, offset);
+            });
         arena_pages_ = std::make_shared<DeviceArenaPages>(state_);
         return true;
     }

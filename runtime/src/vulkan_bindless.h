@@ -440,7 +440,14 @@ public:
         }
         vk_.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
                                  nullptr, 0, nullptr, std::uint32_t(barriers.size()), barriers.data());
-        const VkClearColorValue zero{};
+        // LEONIDA_FALLBACK_MAGENTA=1 (diagnostic): the fallbacks read opaque magenta instead of zero, so a shader whose
+        // T# lookup missed (index 0) shows on screen instead of reading black.
+        static const bool magenta = [] {
+            const char* v = std::getenv("LEONIDA_FALLBACK_MAGENTA");
+            return v && v[0] == '1';
+        }();
+        VkClearColorValue zero{};
+        if (magenta) zero.float32[0] = zero.float32[2] = zero.float32[3] = 1.0f;
         for (const auto& barrier : barriers)
             vk_.vkCmdClearColorImage(command_buffer, barrier.image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1,
                                      &barrier.subresourceRange);

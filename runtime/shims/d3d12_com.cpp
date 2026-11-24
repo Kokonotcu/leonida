@@ -1752,10 +1752,12 @@ private:
                                      : shown.load(std::memory_order_relaxed) < 12 &&
                                            shown.fetch_add(1, std::memory_order_relaxed) < 12)
                 std::fprintf(stderr, "[rt] d3d12: draw%s %u x %u instances from %u (base %d, instance %u), pipeline "
-                                     "%llx, topology %u, viewport %gx%g\n",
+                                     "%llx, topology %u, viewport %gx%g at %g,%g, scissor %d,%d..%d,%d (%u), rt0 %llx\n",
                              indexed ? " indexed" : "", count, instances, first, base_vertex, first_instance,
                              static_cast<unsigned long long>(graphics_pipeline_), unsigned(topology_),
-                             viewport_.width, viewport_.height);
+                             viewport_.width, viewport_.height, viewport_.x, viewport_.y, scissor_.left, scissor_.top,
+                             scissor_.right, scissor_.bottom, scissor_count_,
+                             static_cast<unsigned long long>(render_targets_[0].resource));
         }
         static std::atomic<std::uint64_t> recorded_ok{0}, recorded_bad{0};
         const std::uint64_t n = (ok ? recorded_ok : recorded_bad).fetch_add(1, std::memory_order_relaxed) + 1;

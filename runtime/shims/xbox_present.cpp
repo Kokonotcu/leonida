@@ -232,6 +232,21 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
                                  "as the GameDVR copy of the frame)");
     const XboxPresentPlaneParameters& shown = planes[sdr_copy ? 1 : 0];  // the plane shown alone or composed under plane 1
     const bool compose = (hdr0 && !sdr_copy) || placement(shown) || filter_of(shown) != xbox_scale_filter_default || overlay;
+    {
+        // What is shown: the first presents and then powers of two (a black screen is told apart from a present
+        // path that drops the frame, and the resource matched against the draws' render targets).
+        static std::atomic<std::uint64_t> shown_count{0};
+        const std::uint64_t n = shown_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 3 || (n & (n - 1)) == 0) {
+            const D3D12_RESOURCE_DESC d = shown.ppResources[0]->GetDesc();
+            std::fprintf(stderr, "[rt] presentx %llu: %u plane(s), shown %p (id %llx) %llux%u format %u flags 0x%x, "
+                                 "src rect %s, %s, hdr10 %d, overlay %d\n",
+                         static_cast<unsigned long long>(n), plane_count, static_cast<void*>(shown.ppResources[0]),
+                         static_cast<unsigned long long>(resource_id(shown.ppResources[0])),
+                         static_cast<unsigned long long>(d.Width), d.Height, unsigned(d.Format), unsigned(d.Flags),
+                         shown.pSrcViewRects ? "yes" : "no", compose ? "composed" : "direct", int(hdr0), int(overlay));
+        }
+    }
 
     if (compose) {
         // Every shown plane: a 2D texture, a source rectangle inside it, a placement inside the output.

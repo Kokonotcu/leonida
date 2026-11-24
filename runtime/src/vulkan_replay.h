@@ -849,6 +849,9 @@ inline void bind_compute(const ComputePipeline& p, VkCommandBuffer cb, BindPipel
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
 // reads. code_base: as for compute (one per pipeline; two stages that both read theirs are refused, question 14).
+// The console's rect-list topology value (AMD primitive type 0x11) as the title passes it to IASetPrimitiveTopology.
+inline constexpr std::uint32_t rect_list_topology = 17;
+
 struct GraphicsPipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -869,6 +872,9 @@ struct GraphicsPipeline {
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
     static constexpr std::uint32_t unbound_depth = 1u << 8;
+    // Not an attachment: the variant draws rect lists (console topology 17) through a geometry shader that adds each
+    // rectangle's fourth corner (src/rect_list_gs.h).
+    static constexpr std::uint32_t rect_list = 1u << 9;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
     // LEONIDA_DEFER_GRAPHICS=1: `pipeline` stays null and variant() builds the draw's attachment configuration on
     // first use (from danekbiglike's frame-on-demand-graphics patch: the retail title creates ~25,000 native PSOs at
@@ -2530,7 +2536,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         return ReplayResult::unsupported;
     const bool same_state = previous && previous_draw && previous->graphics && draw.views &&
                             previous_draw->views == draw.views && previous_draw->pipeline == draw.pipeline &&
-                            previous_draw->mesh == draw.mesh && same_target_view(previous_draw->depth, draw.depth);
+                            previous_draw->mesh == draw.mesh && same_target_view(previous_draw->depth, draw.depth) &&
+                            (previous_draw->topology == rect_list_topology) == (draw.topology == rect_list_topology);
     if (same_state) {
         p.graphics = previous->graphics;
         p.pipeline = previous->pipeline;
@@ -2606,6 +2613,10 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
+    // A rect list draws through the variant with the corner-adding geometry shader (pipelines only; shader objects
+    // and mesh draws keep the triangle the first three corners make).
+    if (draw.topology == rect_list_topology && !draw.mesh && !pipeline->bind_shaders)
+        unbound |= GraphicsPipeline::rect_list;
     // Shader objects bake no attachment formats: an unbound slot is just an attachment without a view.
     if ((unbound || pipeline->deferred) && !pipeline->bind_shaders) {
         p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
@@ -2724,7 +2735,8 @@ inline bool strip_topology(VkPrimitiveTopology topology) {
            topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP_WITH_ADJACENCY;
 }
 
-// D3D_PRIMITIVE_TOPOLOGY -> VkPrimitiveTopology (patch lists are not modelled).
+// D3D_PRIMITIVE_TOPOLOGY -> VkPrimitiveTopology (patch lists are not modelled). The console's rect list (17, AMD
+// primitive type 0x11) is drawn as a triangle list through the rect-list pipeline variant (GraphicsPipeline::rect_list).
 inline VkPrimitiveTopology vulkan_topology(std::uint32_t topology) {
     switch (topology) {
     case 1: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
