@@ -167,7 +167,6 @@ VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice, const VkSwapchainCreat
         if (in->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT)
             g.create_switchable = reinterpret_cast<const VkSwapchainPresentModesCreateInfoEXT*>(in)->presentModeCount;
 #endif
-    *out = reinterpret_cast<VkSwapchainKHR>(kSwapchain);
     *out = reinterpret_cast<VkSwapchainKHR>(kSwapchain + 0x10 * g.swapchains_made++);
     g.live = *out;
     return VK_SUCCESS;
@@ -475,6 +474,9 @@ int run_mode_case(const ModeCase& c) {
     if (swapchain.present(swapchain.current_back_buffer_index(), 0, c.tearing_chain))
         return fail("present should fail when vkQueuePresentKHR does");
     if (swapchain.last_present_mode() != before) return fail("a failed present changed last_present_mode");
+    return 0;
+}
+
 // Acquires and presents one frame on `swapchain`, which must still reach the live native swapchain.
 int present_one(const char* label, leonida::VulkanSwapchain& swapchain) {
     std::uint32_t index = 0;
@@ -555,6 +557,23 @@ int main() {
     for (const Case& c : cases) {
         if (const int result = run_case(c.label, c.requested, c.native, c.minimum, c.offscreen)) return result;
     }
+    struct FailCase {
+        const char* label;
+        std::uint32_t requested;
+        std::uint32_t native;
+        bool offscreen;
+        bool fail_swapchain;
+    };
+    const FailCase fail_cases[] = {
+        {"offscreen ring, vkCreateSwapchainKHR fails", 2, 4, true, true},
+        {"offscreen ring, the new ring fails", 2, 4, true, false},
+        {"matching counts, vkCreateSwapchainKHR fails", 3, 3, true, true},
+        {"matching counts, the new ring fails", 3, 3, true, false},
+    };
+    for (const FailCase& c : fail_cases) {
+        if (const int result = run_failed_resize(c.label, c.requested, c.native, c.offscreen, c.fail_swapchain))
+            return result;
+    }
 #ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
     const ModeCase mode_cases[] = {
         // The fix: a plain swap chain never tears, so Present(0, 0) without MAILBOX stays FIFO, not IMMEDIATE.
@@ -581,30 +600,11 @@ int main() {
         if (const int result = run_mode_case(c)) return result;
     }
     std::printf("dxgi_swapchain_count_test: PASS (3 buffer-count cases: extra native images, min above request, "
-                "request above min; %u present-mode cases)\n",
+                "request above min; 4 failed-resize cases; %u present-mode cases)\n",
                 static_cast<unsigned>(std::size(mode_cases)));
 #else
     std::printf("dxgi_swapchain_count_test: PASS (3 cases: extra native images, min above request, "
-                "request above min; present-mode cases need the swapchain_maintenance1 headers)\n");
+                "request above min; 4 failed-resize cases; present-mode cases need the swapchain_maintenance1 headers)\n");
 #endif
-    struct FailCase {
-        const char* label;
-        std::uint32_t requested;
-        std::uint32_t native;
-        bool offscreen;
-        bool fail_swapchain;
-    };
-    const FailCase fail_cases[] = {
-        {"offscreen ring, vkCreateSwapchainKHR fails", 2, 4, true, true},
-        {"offscreen ring, the new ring fails", 2, 4, true, false},
-        {"matching counts, vkCreateSwapchainKHR fails", 3, 3, true, true},
-        {"matching counts, the new ring fails", 3, 3, true, false},
-    };
-    for (const FailCase& c : fail_cases) {
-        if (const int result = run_failed_resize(c.label, c.requested, c.native, c.offscreen, c.fail_swapchain))
-            return result;
-    }
-    std::printf("dxgi_swapchain_count_test: PASS (3 cases: extra native images, min above request, "
-                "request above min; 4 failed-resize cases)\n");
     return 0;
 }
