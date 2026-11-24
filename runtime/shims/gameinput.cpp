@@ -477,7 +477,12 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
     ULONG STDMETHODCALLTYPE Release() override { return release_floor(refs_); }
 
-    const GameInputDeviceInfo* STDMETHODCALLTYPE GetDeviceInfo() override { return &info; }
+    // The block published at the last completed connect (publish_info), or the live one before any (the aggregate
+    // device's, which never changes).
+    const GameInputDeviceInfo* STDMETHODCALLTYPE GetDeviceInfo() override {
+        const GameInputDeviceInfo* p = published_.load(std::memory_order_acquire);
+        return p ? p : &info;
+    }
     uint32_t STDMETHODCALLTYPE GetDeviceStatus() override { return status.load(); }
     void STDMETHODCALLTYPE GetBatteryState(GameInputBatteryState* state) override;
     HRESULT STDMETHODCALLTYPE CreateForceFeedbackEffect(uint32_t motorIndex, const void* params, void** effect) override;
@@ -516,6 +521,28 @@ public:
     GameInputForceFeedbackMotorInfo ff_motor_info{};  // filled when SDL opened the pad as a haptic device
     GameInputHapticFeedbackMotorInfo haptic_motor_info[kHapticMotors]{};   // the trigger motors, when the pad has them
     GameInputHapticWaveformInfo haptic_waveform_info[kHapticMotors]{};     // one waveform each, an intensity
+
+    // What GetDeviceInfo hands out (review D8): the fields above are rewritten in place on a reconnect, under g().mu,
+    // while a title reads GetDeviceInfo's block with no lock at all, so it would see zero counts or a dangling
+    // report-info pointer mid-reconnect. Each completed connect publishes a copy of the whole block with every pointer
+    // aimed into the copy; copies are never freed (a title may keep pointers into one, and reconnects are rare).
+    struct PublishedInfo {
+        GameInputDeviceInfo info{};
+        std::string name;
+        GameInputString display_name{};
+        GameInputControllerAxisInfo axis_info[kAxisCount]{};
+        GameInputControllerButtonInfo button_info[kButtonCount]{};
+        GameInputGamepadInfo gamepad_info{};
+        GameInputUiNavigationInfo ui_info{};
+        GameInputMotionInfo motion_info{};
+        GameInputForceFeedbackMotorInfo ff_motor_info{};
+        GameInputHapticFeedbackMotorInfo haptic_motor_info[kHapticMotors]{};
+        GameInputHapticWaveformInfo haptic_waveform_info[kHapticMotors]{};
+        std::vector<GameInputRawDeviceReportInfo> raw_in, raw_out, raw_feature;
+    };
+    std::atomic<const GameInputDeviceInfo*> published_{nullptr};
+    void publish_info();  // under g().mu, once the live fields describe the connected pad
+
     std::atomic<uint32_t> status{GameInputDeviceNoStatus};
     std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
     uint64_t evicted_order = 0;    // order of the newest reading dropped from history
@@ -1303,6 +1330,45 @@ Reading* push_reading(Device* d, const Snapshot& snap, uint64_t ts) {
     return h.back();
 }
 
+void Device::publish_info() {
+    auto* p = new PublishedInfo;  // never freed: see PublishedInfo
+    p->info = info;
+    p->name = name;
+    std::memcpy(p->axis_info, axis_info, sizeof axis_info);
+    std::memcpy(p->button_info, button_info, sizeof button_info);
+    p->gamepad_info = gamepad_info;
+    p->ui_info = ui_info;
+    p->motion_info = motion_info;
+    p->ff_motor_info = ff_motor_info;
+    std::memcpy(p->haptic_motor_info, haptic_motor_info, sizeof haptic_motor_info);
+    std::memcpy(p->haptic_waveform_info, haptic_waveform_info, sizeof haptic_waveform_info);
+    p->raw_in = raw_in;
+    p->raw_out = raw_out;
+    p->raw_feature = raw_feature;
+    // Every pointer the live block has, aimed at the copy's own storage instead.
+    GameInputDeviceInfo& i = p->info;
+    if (i.displayName) {
+        p->display_name = display_name;
+        p->display_name.data = p->name.c_str();
+        i.displayName = &p->display_name;
+    }
+    if (i.controllerAxisInfo) i.controllerAxisInfo = p->axis_info;
+    if (i.controllerButtonInfo) i.controllerButtonInfo = p->button_info;
+    if (i.gamepadInfo) i.gamepadInfo = &p->gamepad_info;
+    if (i.uiNavigationInfo) i.uiNavigationInfo = &p->ui_info;
+    if (i.motionInfo) i.motionInfo = &p->motion_info;
+    if (i.forceFeedbackMotorInfo) i.forceFeedbackMotorInfo = &p->ff_motor_info;
+    if (i.hapticFeedbackMotorInfo) {
+        i.hapticFeedbackMotorInfo = p->haptic_motor_info;
+        for (uint32_t m = 0; m < kHapticMotors; ++m)
+            if (p->haptic_motor_info[m].waveformInfo) p->haptic_motor_info[m].waveformInfo = &p->haptic_waveform_info[m];
+    }
+    i.inputReportInfo = p->raw_in.empty() ? nullptr : p->raw_in.data();
+    i.outputReportInfo = p->raw_out.empty() ? nullptr : p->raw_out.data();
+    i.featureReportInfo = p->raw_feature.empty() ? nullptr : p->raw_feature.data();
+    published_.store(&p->info, std::memory_order_release);
+}
+
 // Raw HID (RT-175): opens the pad's HID device with the current backend and builds the report tables from its report
 // descriptor. A pad the backend cannot open, or whose descriptor cannot be read or declares no report, gets no raw
 // I/O: no GameInputKindRawDeviceReport, no report tables, and E_NOTIMPL from the raw device calls. Opening it is device
@@ -1566,6 +1632,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
     uint32_t status = kConnectedStatus;
     if (d->info.capabilities & GameInputDeviceCapabilityWireless) status |= GameInputDeviceWireless;
     if (d->hid) status |= GameInputDeviceRawIoEnabled;
+    d->publish_info();  // complete now: GetDeviceInfo hands out this copy from here on
     d->status = status;
     s.connected.push_back(d);
 

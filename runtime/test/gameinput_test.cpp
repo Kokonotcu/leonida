@@ -2136,6 +2136,16 @@ int main() {
     check(g_device_events.back().device == dev && (g_device_events.back().current & GameInputDeviceConnected),
           "the same pad plugged back in is the same device object");
     check(xbox2.player == 0, "it takes the free player slot 0");
+    // Review D8: the info block a title got before the reconnect stays as it was (it may still be reading it, or keep
+    // a pointer into it); the reconnected pad publishes a new block with the same description.
+    {
+        const GameInputDeviceInfo* again = dev->GetDeviceInfo();
+        check(again != info && info->controllerAxisCount == again->controllerAxisCount &&
+                  info->controllerAxisInfo != again->controllerAxisInfo &&
+                  info->controllerAxisInfo[0].restValue == again->controllerAxisInfo[0].restValue &&
+                  std::memcmp(&info->deviceId, &again->deviceId, sizeof info->deviceId) == 0,
+              "a reconnect publishes a new info block and leaves the one a title holds intact");
+    }
 
     // Async enumeration delivers on the next poll; unregistering stops callbacks.
     std::vector<DeviceEvent> before = g_device_events;
