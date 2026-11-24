@@ -83,6 +83,58 @@ HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DES
     return hr;
 }
 
+D3D12_ROOT_SIGNATURE_FLAGS* versioned_flags(D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc) {
+    switch (desc.Version) {
+        case D3D_ROOT_SIGNATURE_VERSION_1_0: return &desc.Desc_1_0.Flags;
+        case D3D_ROOT_SIGNATURE_VERSION_1_1: return &desc.Desc_1_1.Flags;
+        case D3D_ROOT_SIGNATURE_VERSION_1_2: return &desc.Desc_1_2.Flags;
+        default: return nullptr;
+    }
+}
+
+// Root-signature flags the host serializer refuses, asked once per bit with an otherwise empty 1.1 description.
+// Windows 10's built-in d3d12.dll predates shader model 6.6 and refuses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED (0x400)
+// and SAMPLER_HEAP_DIRECTLY_INDEXED (0x800) with "Unsupported bit-flag set" (measured, boot 9); the title's programs
+// use both, and a failed serialization leaves a null program in its pass table (the crash at +0xb5a5f8).
+std::uint32_t host_refused_flags(SerializeFn fn) {
+    static const std::uint32_t refused = [fn] {
+        std::uint32_t mask = 0;
+        for (const std::uint32_t bit : {0x100u, 0x200u, 0x400u, 0x800u}) {
+            D3D12_VERSIONED_ROOT_SIGNATURE_DESC probe{};
+            probe.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+            probe.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(bit);
+            ID3DBlob* blob = nullptr;
+            ID3DBlob* error = nullptr;
+            if (FAILED(fn(&probe, &blob, &error))) mask |= bit;
+            if (blob) blob->Release();
+            if (error) error->Release();
+        }
+        if (mask)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: the host d3d12.dll refuses root signature flags 0x%x; they are serialized "
+                         "without and written back into the blob\n",
+                         mask);
+        return mask;
+    }();
+    return refused;
+}
+
+// Serializes with the refused flags taken out, then puts them back into the RTS0 chunk of the result.
+HRESULT serialize_moving_flags(SerializeFn fn, D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc, ID3DBlob** blob,
+                               ID3DBlob** error) {
+    D3D12_ROOT_SIGNATURE_FLAGS* flags = versioned_flags(desc);
+    const std::uint32_t moved = flags ? (static_cast<std::uint32_t>(*flags) & host_refused_flags(fn)) : 0;
+    if (moved) *flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(static_cast<std::uint32_t>(*flags) & ~moved);
+    const HRESULT hr = fn(&desc, blob, error);
+    if (SUCCEEDED(hr) && moved && blob && *blob &&
+        !rt::d3d12_xs::set_rts0_flag_bits((*blob)->GetBufferPointer(), (*blob)->GetBufferSize(), moved)) {
+        (*blob)->Release();
+        *blob = nullptr;
+        return E_FAIL;
+    }
+    return hr;
+}
+
 HRESULT serialize_root_signature_unlogged(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc, ID3DBlob** blob,
                                           ID3DBlob** error) {
     static auto fn = reinterpret_cast<SerializeFn>(host("D3D12SerializeVersionedRootSignature"));
@@ -114,9 +166,9 @@ HRESULT serialize_root_signature_unlogged(const D3D12_VERSIONED_ROOT_SIGNATURE_D
             std::fprintf(stderr,
                          "[rt] d3d12_xs: the host d3d12.dll serializes root signatures only up to 1.1; version 1.2 "
                          "descriptions without static sampler flags are serialized as 1.1\n");
-        return fn(&v11, blob, error);
+        return serialize_moving_flags(fn, v11, blob, error);
     }
-    return fn(&cleared, blob, error);
+    return serialize_moving_flags(fn, cleared, blob, error);
 }
 
 // The package DLLs import the versioned serializer; the legacy entry point is kept because it is trivial to forward

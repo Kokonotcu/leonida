@@ -1503,6 +1503,7 @@ if(LEONIDA_D3D12_SHIM_TESTS)
     shims/d3d12_xs.cpp
     shims/registry.cpp
     shims/d3d12_xs_device.cpp
+    shims/presentx_capture.cpp
   )
   target_include_directories(d3d12_xs_root_signature_test PRIVATE shims)
   target_compile_definitions(d3d12_xs_root_signature_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
