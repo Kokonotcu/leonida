@@ -4962,12 +4962,13 @@ public:
             graphics_.pipeline = VK_NULL_HANDLE;
             graphics_.shader_objects = {shaders.vertex, shaders.geometry, shaders.fragment, shaders.mesh};
             graphics_.bind_shaders = [fn, shaders, recipe, device_stages, conservative](
-                                         VkCommandBuffer cb, const VkViewport& viewport, const VkRect2D& scissor,
-                                         const VkDeviceSize* strides, std::uint32_t stride_count) {
+                                         VkCommandBuffer cb, const VkViewport* viewports, const VkRect2D* scissors,
+                                         std::uint32_t viewport_count, const VkDeviceSize* strides,
+                                         std::uint32_t stride_count) {
                 leonida::shader_objects::bind(*fn, cb, shaders, device_stages);
                 leonida::shader_objects::emit_state(*fn, cb, *recipe, conservative, strides, stride_count);
-                fn->vkCmdSetViewportWithCount(cb, 1, &viewport);
-                fn->vkCmdSetScissorWithCount(cb, 1, &scissor);
+                fn->vkCmdSetViewportWithCount(cb, viewport_count, viewports);
+                fn->vkCmdSetScissorWithCount(cb, viewport_count, scissors);
             };
         } else {
             if (gpl_) {
@@ -6329,6 +6330,7 @@ public:
         }
         state_.context->set_indirect_features(info.multi_draw_indirect, info.draw_indirect_count,
                                               info.max_draw_indirect_count ? info.max_draw_indirect_count : UINT32_MAX);
+        state_.context->set_max_viewports(info.max_viewports);
         if (info.indirect_commands && info.buffer_device_address)
             state_.context->enable_indirect_commands(get_device, info.indirect_properties,
                                                      [this](const VkMemoryRequirements& requirements) {
@@ -11356,6 +11358,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     enable.logicOp = chosen_features.logicOp;
     enable.depthClamp = chosen_features.depthClamp;
     enable.geometryShader = chosen_features.geometryShader;  // translated geometry shaders (195 in the corpus)
+    // M4: up to D3D12's 16 viewports per draw, picked by SV_ViewportArrayIndex (cascaded shadow maps).
+    enable.multiViewport = chosen_features.multiViewport;
+    info.max_viewports = chosen_features.multiViewport
+                             ? std::min<std::uint32_t>(chosen.limits.maxViewports,
+                                                       D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+                             : 1;
     // What translated shaders declare (the index's `features`): 64-bit integers in most of the corpus (25,803 of
     // 26,503 entries), doubles, 16-bit integers, clip and cull distances in a few vertex shaders, image stores
     // without a format (StorageImageWriteWithoutFormat), gather offsets (ImageGatherExtended) and LOD-clamped samples

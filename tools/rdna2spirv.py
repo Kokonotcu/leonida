@@ -14537,6 +14537,15 @@ class Gen:
             self.emit(f"{pp} = OpAccessChain %_ptr_Function_v4_gs %gs_stage {i}")
             self.emit(f"{v} = OpLoad %v4float {pp}")
             self.emit(f"OpStore {'%gs_out_pos' if sv == 1 else f'%gs_out{reg}'} {v}")
+        for reg, comp, sv in self.gs.get("misc", ()):
+            i, pp, c, n = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{i} = OpIAdd %uint {base} {self.cu(reg)}")
+            self.emit(f"{pp} = OpAccessChain %_ptr_Function_v4_gs %gs_stage {i}")
+            self.emit(f"{c} = OpLoad %v4float {pp}")
+            self.emit(f"{n} = OpCompositeExtract %float {c} {comp}")
+            k3 = self.tmp()
+            self.emit(f"{k3} = OpBitcast %int {n}")
+            self.emit(f"OpStore {'%out_layer' if sv == 4 else '%out_viewport'} {k3}")
         self.emit("OpEmitVertex")
         if end_primitive:
             self.emit("OpEndPrimitive")
@@ -15321,6 +15330,7 @@ def assemble(gen):
             iface += ["%out_clip"]
         if gen.uses_cull:
             iface += ["%out_cull"]
+    if vs or gsx:
         if gen.uses_layer:
             iface += ["%out_layer"]
         if gen.uses_viewport:
@@ -15392,10 +15402,12 @@ def assemble(gen):
         caps.append("ClipDistance")
     if gen.uses_cull and not msc:
         caps.append("CullDistance")
-    if gen.uses_layer:
+    # A geometry shader writes Layer under Geometry and ViewportIndex under MultiViewport (the multiViewport
+    # feature); the 1.2 ShaderLayer / ShaderViewportIndex are for the stages before it.
+    if gen.uses_layer and not gsx:
         caps.append("ShaderLayer")
     if gen.uses_viewport:
-        caps.append("ShaderViewportIndex")
+        caps.append("MultiViewport" if gsx else "ShaderViewportIndex")
     if FLOAT_CONTROLS:
         # RDNA2 float ops are IEEE: NaN, +-inf and -0 come out as computed, and f16 denormals are kept. Without these
         # execution modes Vulkan lets the driver assume none of them occur, and drivers do: AMD's compiler folded a
@@ -15495,6 +15507,7 @@ def assemble(gen):
             dec.append("OpDecorate %out_clip BuiltIn ClipDistance")
         if gen.uses_cull:
             dec.append("OpDecorate %out_cull BuiltIn CullDistance")
+    if vs or gsx:
         if gen.uses_layer:
             dec.append("OpDecorate %out_layer BuiltIn Layer")
         if gen.uses_viewport:
@@ -15848,6 +15861,7 @@ def assemble(gen):
             types += [f"%arr_cull = OpTypeArray %float {gen.cu(gen.cull_count)}",
                       "%_ptr_Out_arr_cull = OpTypePointer Output %arr_cull"]
             gvars += ["%out_cull = OpVariable %_ptr_Out_arr_cull Output"]
+    if vs or gsx:
         if gen.uses_layer or gen.uses_viewport:
             types += ["%_ptr_Output_int = OpTypePointer Output %int"]
             if gen.uses_layer:
@@ -17345,7 +17359,14 @@ def translate(path):
                      any("GS_OP_EMIT" in x.get("t", "") for x in i["args"]))
         if not (1 <= n_emit <= 64):
             raise Unsupported("gs emit count")
-        g.gs = {"in": ins_sig, "out": outs, "nreg": max(r for r, _ in outs) + 1, "maxv": n_emit}
+        # SV_RenderTargetArrayIndex (4) / SV_ViewportArrayIndex (5): a uint in one component of its output register,
+        # which each emit also writes to BuiltIn Layer / ViewportIndex (on the console the copy shader puts it in the
+        # pos1 misc vector). (register, component, system value); the register stays a Location output too.
+        misc = sorted({(reg, (mask & -mask).bit_length() - 1, sv)
+                       for reg, _, sv, mask, _ in output_signature_full(path, info["name"]) if sv in (4, 5) and mask})
+        g.gs = {"in": ins_sig, "out": outs, "nreg": max(r for r, _ in outs) + 1, "maxv": n_emit, "misc": misc}
+        g.uses_layer = any(sv == 4 for _, _, sv in misc)
+        g.uses_viewport = any(sv == 5 for _, _, sv in misc)
         for i in (0, 1, 3, 8, 64, 128, 0x4000, g.gs["nreg"], 64 << 16):          # used by assemble
             g.cu(i)
         for i in range(n_emit * g.gs["nreg"] + 1):
@@ -18380,6 +18401,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "MinLod": "shaderResourceMinLod", "Image1D": "shaderImage1D? (core)", "Sampled1D": "core",
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
+             "MultiViewport": "multiViewport",
              "DrawParameters": "shaderDrawParameters",
              }     # FMAKHR: shaderFmaFloat32 / shaderFmaFloat64 (VK_KHR_shader_fma) by the width used, below
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
