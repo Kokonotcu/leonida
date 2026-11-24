@@ -806,9 +806,10 @@ The compute path, end to end:
   - Shader programs (FSSM blobs) are copied in as the code base.
 - **`CreateRootSignature`** parses the blob with `parse_rts0` and keeps each parameter's place in two layouts:
   `pack()` for the graphics bind point and `pack_stage(Stage::Compute)` for the compute one (from s4, one dword per
-  table; section 3.5, D3D-448). A signature neither can place (more than 32 user dwords: the spill layout is open; the
-  translated shaders have no below-base spill-pointer candidates) is refused with both reasons; one only a single layout places is created with a log line, and binding it at the other bind point
-  invalidates the list. Before
+  table; section 3.5, D3D-448). Past s31, compute arguments go to the spill array behind `s[0:1]` (M10, section 3.5);
+  a spill the layer does not model (graphics; a table or heap base in the compute spill) leaves that bind point
+  unusable. A signature neither can place is created with both reasons logged; one only a single layout places is
+  created with a log line, and binding it at the other bind point invalidates the list. Before
   that it answers as the host runtime does (`compare_invalid_arguments`, "root signature:", RTX 5070 / 621.14):
   `S_FALSE` for a null output whatever the blob, then `E_INVALIDARG` for a node other than node 0 or a DXBC
   container whose size (the dword at +24) is not the size passed.
@@ -1773,8 +1774,15 @@ Taken together this disagrees with the packing above (from s0, two dwords per ta
 in root order from the stage base, each while it fits whole, a constant taking one dword per value, a root
 CBV/SRV/UAV two (its 64-bit VA), a descriptor table **one** (the 32-bit VA of its first descriptor; the heaps live
 below 4 GiB), then the bound heaps' bases when the signature's flags ask for them (section 3.4). A parameter that
-does not fit goes, with every later one, to the spill array behind `s[0:1]` (section 7), which is not modelled: such
-a signature is still created, as on the console, and binding it at a bind point it spills at invalidates the list.
+does not fit goes, with every later one, to the spill array behind `s[0:1]` (section 7). **Compute (M10):** that
+array is laid out as the console compiler does (packed in root order, no alignment, a constant 4 bytes per value, a
+root CBV/SRV/UAV 8), each `Dispatch` and `ExecuteIndirect(DISPATCH)` gets its own copy in the GPU address arena from
+its command allocator (rewound by `Reset`), and `s[0:1]` holds its 40-bit VA (`d3d12_root_spill_test`). Two parts are
+**not measured** and so are refused rather than guessed: a descriptor table in the spill (its size there) and a heap
+base after a spill (its place). **Graphics:** where a vertex or pixel shader's spill pointer goes is not measured, so a
+signature that spills there is still created, as on the console, but binding it for graphics invalidates the list
+(`Close` fails, logged once); nothing is bound with arguments dropped. A command signature whose root arguments land
+in the spill is `E_NOTIMPL` (no token writes the array).
 A signature that breaks a D3D12 limit (more than 64 parameters, the 64-dword cost) is refused. How each part is
 known:
 - **Compute, base s4: measured three ways.**
@@ -1849,9 +1857,10 @@ Still open: which CBV index lands in which pair. The four pairs do appear in dec
 package proves that order, and every parameter in these 29 is `D3D12_SHADER_VISIBILITY_ALL`, so they say nothing
 about the visibility question below.
 
-Spill policy: a signature needing more than 32 user SGPRs, or more than the 64-dword D3D12 cost limit, is
-refused loudly (`pack` returns the offending parameter) instead of being truncated. The console spills through
-`__XB_GetRootSignatureSpillPointer`; until that layout is measured, refusing is the only correct behaviour.
+Spill policy: a signature over the 64-dword D3D12 cost limit is refused loudly (`pack` returns the offending
+parameter) instead of being truncated. The console spills through `__XB_GetRootSignatureSpillPointer`. The compute
+spill is modelled as section 7 measured it (the console layout above, M10); the graphics spill pointer, and a table or
+heap base in the compute spill, are not measured, and stay refused at bind time.
 
 Measured (D3D-315): zero below-base spill-pointer candidates in the translated shaders.
 `python -I tools/root_spill_census.py <spirv/index.json> --carve <dxbc/index.json> --expect-no-spill` exits 0 on
@@ -1878,7 +1887,8 @@ What this does not settle:
 - **A spill behind a pointer at or above the base.** It reads the same as a table pointer, so the census can't
   tell the two apart.
 
-The spill layout stays unimplemented: no shader in the translated set reads a candidate a spill could sit behind.
+No shader in the translated set reads a candidate a spill could sit behind, so nothing here measures a table's size
+in the spill array either; the compute spill (M10) therefore takes only what section 7 measured.
 
 Reconciliation: `tools/root_sig_contract.py` checks a candidate root signature against every shader's
 `user_sgpr_reads` from `spirv/index.json` (const32 vs constant dwords, 64-bit VAs vs view/table pairs) and fails

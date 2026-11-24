@@ -3082,6 +3082,31 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_viewports PROPERTIES SKIP_RETURN_CODE 77
                            FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
+      # M10: compute root arguments past s31 read from the spill array behind s[0:1] by cs_spill.asm, which is
+      # written for the D3D12 compute layout itself (no LEONIDA_USER_DATA_SHIFT).
+      set(LEONIDA_SPILL_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/spill_shaders)
+      set(LEONIDA_SPILL_FILES ${LEONIDA_SPILL_DIR}/spirv/index.json ${LEONIDA_SPILL_DIR}/fssm/cs_spill.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_SPILL_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_SPILL_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${LEONIDA_SPILL_DIR} cs_spill
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/compute_fixture.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/cs_spill.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/rdna2spirv.py
+        COMMENT "Translating cs_spill for the root spill test"
+        VERBATIM)
+      add_executable(d3d12_root_spill_test test/d3d12_root_spill_test.cpp ${LEONIDA_SPILL_FILES})
+      target_link_libraries(d3d12_root_spill_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_root_spill_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_SPILL_DIR="${LEONIDA_SPILL_DIR}")
+      target_compile_options(d3d12_root_spill_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_root_spill COMMAND d3d12_root_spill_test)
+      set_tests_properties(d3d12_root_spill PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+
       # Typed buffer UAVs and UAV counters: cs_buf_typed.asm writes typed views through V#s with a FORMAT, and
       # cs_buf_counter.asm appends to and consumes from a structured view whose counter is the second V# of its slot;
       # the test also compares typed-buffer and counter clears with the host runtime on the layer's adapter.

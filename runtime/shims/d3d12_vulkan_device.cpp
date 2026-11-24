@@ -6175,6 +6175,26 @@ private:
     bool registered_ = false;            // added to the context, so removed from it on destruction
 };
 
+// The arena ranges command allocators sub-allocate GPU data from (the compute root spill arrays, M10). An allocator
+// holds a reference to its device, so the device's state outlives every range taken here.
+class DeviceArenaPages final : public ArenaPages {
+public:
+    explicit DeviceArenaPages(DeviceState& state) : state_(state) {}
+    bool allocate(std::uint64_t bytes, std::uint64_t& va, std::uint8_t*& host) override {
+        VkDeviceSize offset = 0;
+        if (!state_.arena.mapped || !state_.arena_allocate(bytes, 256, offset, DeviceState::arena_buffer)) return false;
+        va = offset;
+        host = state_.arena.mapped + offset;
+        return true;
+    }
+    void release(std::uint64_t va, std::uint64_t bytes) override {
+        state_.arena_release(va, bytes, DeviceState::arena_buffer);
+    }
+
+private:
+    DeviceState& state_;
+};
+
 // The Vulkan device create_vulkan_device_standalone made, destroyed with the D3D12 device. The instance belongs to
 // the process and is never destroyed (create_vulkan_device_standalone).
 struct OwnedRuntime {
@@ -6693,6 +6713,7 @@ public:
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address);
         state_.context->set_zero_page(arena.buffer, 0, kArenaReserved);
+        arena_pages_ = std::make_shared<DeviceArenaPages>(state_);
         return true;
     }
 
@@ -6994,7 +7015,7 @@ public:
 
     HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE type, REFIID riid, void** out) override {
         constexpr auto method = "ID3D12Device::CreateCommandAllocator";
-        return d3d12_trace::result(method, create_command_allocator(type, riid, out, identity()));
+        return d3d12_trace::result(method, create_command_allocator(type, riid, out, identity(), arena_pages_));
     }
 
     HRESULT STDMETHODCALLTYPE CreateCommandList(UINT node_mask, D3D12_COMMAND_LIST_TYPE type,
@@ -7019,7 +7040,7 @@ public:
             return d3d12_trace::result(method, E_INVALIDARG);
         if (!out) return d3d12_trace::result(method, E_UNEXPECTED);
         ID3D12CommandAllocator* allocator = nullptr;
-        HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity());
+        HRESULT hr = create_command_allocator(type, IID_PPV_ARGS(&allocator), identity(), arena_pages_);
         if (FAILED(hr)) return d3d12_trace::result(method, hr);
         ID3D12GraphicsCommandList* list = nullptr;
         hr = create_command_list(type, allocator, IID_PPV_ARGS(&list), identity());
@@ -7349,9 +7370,8 @@ public:
             std::memcpy(&container_size, bytes + 24, sizeof(container_size));
             if (container_size != size) return E_INVALIDARG;
         }
-        // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then pack
-        // the parameters into the 32 user-data dwords. pack() refuses what it cannot place (more than 32 dwords:
-        // the console spills those to memory, in a layout that is still open), and so does this.
+        // The repository's root-signature model (runtime/src/root_signature.h): parse the RTS0 blob, then lay the
+        // parameters out in the user-data dwords and, for compute, the spill array (pack_stage, below).
         const rt::rootsig::DecodeResult parsed = rt::rootsig::parse_rts0(bytes, size);
         if (!parsed.ok) {
             std::fprintf(stderr, "[rt] d3d12: root signature not understood: %s\n", parsed.error.c_str());
@@ -7359,8 +7379,10 @@ public:
         }
         // Two layouts, one per bind point (RootArgumentLayout), both the console's (pack_stage, D3D-448): graphics
         // from s8 (the vertex, pixel and geometry stages), compute from s4. A signature that breaks a D3D12 limit is
-        // refused. One that is valid but would spill at a bind point (the console's spill array is not modelled) is
-        // created, as on the console, and marked unusable there: binding it there invalidates the list, loudly.
+        // refused. A compute spill of constants and root descriptors goes to the console's spill array behind s[0:1]
+        // (M10). One that is valid but would spill where that is not modelled (any graphics spill; a table or heap
+        // base in the compute spill) is created, as on the console, and marked unusable there: binding it there
+        // invalidates the list, loudly.
         const rt::rootsig::StagePackResult packed = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Pixel);
         const rt::rootsig::StagePackResult compute = rt::rootsig::pack_stage(parsed.sig, rt::rootsig::Stage::Compute);
         if ((!packed.ok && !packed.spills) || (!compute.ok && !compute.spills)) {
@@ -7382,6 +7404,7 @@ public:
         if (compute.ok) {
             layout.compute_resource_heap_sgpr = compute.resource_heap_sgpr;
             layout.compute_sampler_heap_sgpr = compute.sampler_heap_sgpr;
+            layout.compute_spill_bytes = compute.spill_bytes;
         }
         if (packed.ok) {
             layout.graphics_resource_heap_sgpr = packed.resource_heap_sgpr;
@@ -10181,6 +10204,8 @@ private:
     std::vector<std::uint32_t> compute_users_;
     std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
+    // What the command allocators take spill arrays from (DeviceArenaPages); null without an arena.
+    std::shared_ptr<ArenaPages> arena_pages_;
     std::atomic<bool> removed_{false};
     DeviceRemovedData dred_;
     OwnedRuntime owned_;
