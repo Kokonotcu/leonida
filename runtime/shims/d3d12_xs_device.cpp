@@ -151,6 +151,8 @@ struct HeapProxy {
     SIZE_T custom_byte_size;
     SIZE_T real_cpu_start;
     DescriptorHeapBackingFree custom_free;
+    // LEONIDA_TITLE_HEAP_SYNC: the title memory is the heap; nothing is translated (title_heap_sync_enabled()).
+    bool title_canonical;
 };
 
 struct DescriptorRange {
@@ -222,6 +224,112 @@ D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_handle(const DeviceProxy* device, D3D1
         }
     }
     return handle;
+}
+
+// ---- LEONIDA_TITLE_HEAP_SYNC: title memory canonical, changed chunks copied to the real heap at each submit ----
+
+std::atomic<int> g_title_sync_mode{-1};  // set_title_heap_sync; -1: the environment
+
+bool title_sync_from_environment() {
+    static const bool enabled = [] {
+        char value[8] = {};
+        const DWORD length = GetEnvironmentVariableA("LEONIDA_TITLE_HEAP_SYNC", value, sizeof(value));
+        const bool on = length > 0 && length < sizeof(value) && value[0] == '1';
+        if (on) std::fprintf(stderr, "[rt] d3d12_xs: LEONIDA_TITLE_HEAP_SYNC=1: title-backed descriptor heaps are kept "
+                                     "in title memory and copied to the GPU's heap at every ExecuteCommandLists\n");
+        return on;
+    }();
+    return enabled;
+}
+
+constexpr std::size_t kTitleSyncChunk = 4096;
+
+// One shader-visible title-backed heap. `shadow` is what the real heap holds, so a sync never reads the real heap
+// (write-combined arena memory on the Vulkan device).
+struct TitleHeapSync {
+    const HeapProxy* heap;
+    ID3D12Device* real_device;
+    std::uint8_t* title;
+    std::uint8_t* real;
+    std::size_t bytes;
+    std::size_t increment;
+    bool sampler;
+    std::unique_ptr<std::uint8_t[]> shadow;
+};
+
+// Immortal, like the range table. Held for a whole sync, so concurrent submits sync one at a time and a heap is never
+// freed under a sync (heap_release unregisters under it first).
+std::mutex& title_sync_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+std::vector<std::unique_ptr<TitleHeapSync>>& title_syncs() {
+    static auto* v = new std::vector<std::unique_ptr<TitleHeapSync>>;
+    return *v;
+}
+std::atomic<std::size_t> g_title_sync_count{0};
+std::atomic<TitleSamplerSlotsFn> g_title_sampler_slots{nullptr};
+TitleHeapSyncStats g_title_sync_stats;  // title_sync_mutex()
+
+bool register_title_sync(const HeapProxy* heap, ID3D12Device* real_device, SIZE_T title, SIZE_T bytes, SIZE_T real,
+                         std::size_t increment, bool sampler) {
+    auto sync = std::unique_ptr<TitleHeapSync>(new (std::nothrow) TitleHeapSync{
+        heap, real_device, reinterpret_cast<std::uint8_t*>(title), reinterpret_cast<std::uint8_t*>(real), bytes,
+        increment, sampler, std::unique_ptr<std::uint8_t[]>(new (std::nothrow) std::uint8_t[bytes]())});
+    // The caller zeroes the title memory: it starts as the real heap does, so the two agree before the first sync.
+    if (!sync || !sync->shadow) return false;
+    try {
+        std::lock_guard lock(title_sync_mutex());
+        title_syncs().push_back(std::move(sync));
+        g_title_sync_count.store(title_syncs().size(), std::memory_order_release);
+        return true;
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+}
+
+// The heap is going: no sync touches it from here on. A sampler heap's slots lose their S#s first.
+void unregister_title_sync(const HeapProxy* heap) {
+    std::lock_guard lock(title_sync_mutex());
+    auto& syncs = title_syncs();
+    for (auto it = syncs.begin(); it != syncs.end();) {
+        if ((*it)->heap != heap) {
+            ++it;
+            continue;
+        }
+        const TitleHeapSync& s = **it;
+        if (s.sampler) {
+            if (const TitleSamplerSlotsFn slots = g_title_sampler_slots.load(std::memory_order_acquire)) {
+                std::memset(s.title, 0, s.bytes);
+                const auto first = reinterpret_cast<std::uintptr_t>(s.title);
+                slots(s.real_device, first, first + s.bytes);
+            }
+        }
+        it = syncs.erase(it);
+    }
+    g_title_sync_count.store(syncs.size(), std::memory_order_release);
+}
+
+// The chunks of one heap that differ from its shadow go to the shadow and the real heap, from one snapshot of the
+// title bytes. A sampler heap's changed slots are rebound by their new bytes (TitleSamplerSlotsFn).
+void sync_title_heap(TitleHeapSync& s, TitleSamplerSlotsFn sampler_slots, TitleHeapSyncStats& stats) {
+    alignas(64) std::uint8_t snapshot[kTitleSyncChunk];
+    for (std::size_t offset = 0; offset < s.bytes; offset += kTitleSyncChunk) {
+        const std::size_t length = (std::min)(kTitleSyncChunk, s.bytes - offset);
+        ++stats.chunks_compared;
+        if (std::memcmp(s.title + offset, s.shadow.get() + offset, length) == 0) continue;
+        std::memcpy(snapshot, s.title + offset, length);
+        if (s.sampler && sampler_slots && s.increment) {
+            for (std::size_t at = 0; at + s.increment <= length; at += s.increment) {
+                if (std::memcmp(snapshot + at, s.shadow.get() + offset + at, s.increment) == 0) continue;
+                const auto slot = reinterpret_cast<std::uintptr_t>(s.title + offset + at);
+                sampler_slots(s.real_device, slot, slot + s.increment);
+            }
+        }
+        std::memcpy(s.shadow.get() + offset, snapshot, length);
+        std::memcpy(s.real + offset, snapshot, length);  // written in order, never read
+        ++stats.chunks_copied;
+    }
 }
 
 std::atomic<std::uint64_t> g_hits[kMaxSlots];
@@ -645,7 +753,10 @@ unsigned long heap_release(HeapProxy* self) {
     note_heap_slot(2);
     const unsigned long refs = self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1;
     if (refs == 0) {
-        if (self->custom_cpu_start != 0) unregister_descriptor_range(self);
+        if (self->custom_cpu_start != 0) {
+            if (self->title_canonical) unregister_title_sync(self);
+            else unregister_descriptor_range(self);
+        }
         void* const backing = reinterpret_cast<void*>(self->custom_cpu_start);
         const DescriptorHeapBackingFree free_fn = self->custom_free;
         ID3D12DescriptorHeap* real = self->real;
@@ -760,7 +871,8 @@ void** get_heap_vtable() {
 
 HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFIID riid, void** out,
                           SIZE_T custom_cpu_start = 0, SIZE_T custom_byte_size = 0, SIZE_T real_cpu_start = 0,
-                          DescriptorHeapBackingFree custom_free = nullptr) {
+                          DescriptorHeapBackingFree custom_free = nullptr,
+                          const D3D12_DESCRIPTOR_HEAP_DESC* heap_desc = nullptr, UINT increment = 0) {
     if (!real || !device) return E_POINTER;
     if (!out) return E_POINTER;
     *out = nullptr;
@@ -776,10 +888,25 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
     proxy->custom_byte_size = custom_byte_size;
     proxy->real_cpu_start = real_cpu_start;
     proxy->custom_free = custom_free;
+    // LEONIDA_TITLE_HEAP_SYNC: the title memory is the heap (no translation); a shader-visible one is copied to the
+    // real heap at each submit. Without a description (no caller passes none today) the upstream model stays.
+    proxy->title_canonical = custom_cpu_start != 0 && real_cpu_start != 0 && heap_desc && title_heap_sync_enabled();
     proxy_add_ref(device);  // the heap keeps its Xbox-ABI device alive for GetDevice
 
-    if (custom_cpu_start != 0 &&
-        !register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size, real_cpu_start)) {
+    bool registered = true;
+    if (proxy->title_canonical) {
+        // The real heap may be smaller (slot 14 caps a console-sized one at the device's limit): only what both hold
+        // is synced, as only that was reachable through translation.
+        const SIZE_T real_bytes = SIZE_T(heap_desc->NumDescriptors) * increment;
+        std::memset(reinterpret_cast<void*>(custom_cpu_start), 0, custom_byte_size);
+        if (heap_desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+            registered = register_title_sync(proxy, device->real, custom_cpu_start,
+                                             (std::min)(custom_byte_size, real_bytes), real_cpu_start, increment,
+                                             heap_desc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    } else if (custom_cpu_start != 0) {
+        registered = register_descriptor_range(device, proxy, custom_cpu_start, custom_byte_size, real_cpu_start);
+    }
+    if (!registered) {
         delete proxy;
         proxy_release(device);
         return E_OUTOFMEMORY;
@@ -788,7 +915,8 @@ HRESULT create_heap_proxy(ID3D12DescriptorHeap* real, DeviceProxy* device, REFII
     const HRESULT hr = heap_query_interface(proxy, &riid, out);
     if (FAILED(hr)) {
         // No reference escaped, and the caller still owns its references to `real` and `device`.
-        if (custom_cpu_start != 0) unregister_descriptor_range(proxy);
+        if (proxy->title_canonical) unregister_title_sync(proxy);
+        else if (custom_cpu_start != 0) unregister_descriptor_range(proxy);
         delete proxy;
         proxy_release(device);
         return hr;
@@ -2525,7 +2653,8 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     }
 
     hr = create_heap_proxy(heap, self, *riid, out, custom_cpu_start, custom_byte_size, real_cpu_start,
-                           custom_cpu_start ? free_fn : nullptr);
+                           custom_cpu_start ? free_fn : nullptr, desc,
+                           desc ? self->real->GetDescriptorHandleIncrementSize(desc->Type) : 0);
     if (FAILED(hr)) {
         heap->Release();
         if (custom_cpu_start && free_fn)
@@ -3824,6 +3953,33 @@ void set_default_descriptor_heap_allocator(DescriptorHeapBackingAlloc alloc, Des
     if (g_heap_alloc_explicit) return;
     g_heap_alloc = alloc;
     g_heap_free = free;
+}
+
+void set_title_heap_sync(int mode) { g_title_sync_mode.store(mode < 0 ? -1 : (mode ? 1 : 0)); }
+
+bool title_heap_sync_enabled() {
+    const int mode = g_title_sync_mode.load(std::memory_order_relaxed);
+    return mode >= 0 ? mode == 1 : title_sync_from_environment();
+}
+
+void sync_title_heaps() {
+    if (g_title_sync_count.load(std::memory_order_acquire) == 0) return;  // one load when nothing is registered
+    const TitleSamplerSlotsFn sampler_slots = g_title_sampler_slots.load(std::memory_order_acquire);
+    std::lock_guard lock(title_sync_mutex());
+    if (title_syncs().empty()) return;
+    ++g_title_sync_stats.syncs;
+    for (const auto& sync : title_syncs()) sync_title_heap(*sync, sampler_slots, g_title_sync_stats);
+}
+
+TitleHeapSyncStats title_heap_sync_stats() {
+    std::lock_guard lock(title_sync_mutex());
+    TitleHeapSyncStats stats = g_title_sync_stats;
+    stats.heaps = title_syncs().size();
+    return stats;
+}
+
+void set_title_sampler_slots_handler(TitleSamplerSlotsFn handler) {
+    g_title_sampler_slots.store(handler, std::memory_order_release);
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE translate_cpu_descriptor_handle(const void* device, D3D12_CPU_DESCRIPTOR_HANDLE handle) {

@@ -18,7 +18,9 @@
 
 #include <crtdbg.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +28,7 @@
 #include <iterator>
 #include <new>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -77,7 +80,8 @@ constexpr unsigned kMockSlots = 128;
 constexpr std::uint64_t kFenceHandle = 0x1000, kResourceHandle = 0x2000;  // the handles the mock device opens
 constexpr std::uint64_t kCompletedValue = 7;                            // what a mock fence's slot 8 returns
 constexpr UINT kHeapMarker = 0x26262626;  // the VisibleNodeMask a mock device's slot 26 answers
-constexpr SIZE_T kMockHeapCpuStart = 0x55550000ull;
+constexpr SIZE_T kMockHeapCpuStartDefault = 0x55550000ull;
+SIZE_T kMockHeapCpuStart = kMockHeapCpuStartDefault;  // the title-sync check points it at real memory
 constexpr UINT64 kMockHeapGpuStart = 0x66660000ull;
 constexpr UINT kMockDescriptorInc = 32;
 // {5d1e0c4a-2b7f-4e61-9a3d-8c4b2f1e6a70}: an interface the mock queue implements that the proxy does not model.
@@ -1651,6 +1655,111 @@ int check_descriptor_heap_hooks() {
     return 0;
 }
 
+// LEONIDA_TITLE_HEAP_SYNC: title memory is the heap. Descriptor writes (slots 17-24, 61) reach the real device with the
+// title handle untranslated, so they land in title memory, as bytes the title copies in itself do; sync_title_heaps
+// copies the 4 KiB chunks that changed into the real heap and leaves the others alone. Releasing the heap ends its
+// sync. Then the cost of a sync over a 1M-descriptor heap (32 MiB) with nothing and with a few chunks changed.
+int check_title_heap_sync() {
+    g_heap_hook = {};
+    xs::set_title_heap_sync(1);
+    xs::set_descriptor_heap_allocator(&mock_heap_alloc, &mock_heap_free);
+    constexpr UINT kDescriptors = 512;  // 16 KiB: four chunks
+    constexpr std::size_t kBytes = std::size_t(kDescriptors) * kMockDescriptorInc;
+    std::vector<std::uint8_t> title(kBytes, 0xcd), real(kBytes, 0xee);
+    kMockHeapCpuStart = reinterpret_cast<SIZE_T>(real.data());
+    g_heap_hook.next_ptr = title.data();
+
+    Mock* mock = new_mock(Kind::device);
+    mock->refs = 1;
+    mock->device_level = 9;
+    void* device = nullptr;
+    EXPECT(SUCCEEDED(xs::create_device_proxy(reinterpret_cast<ID3D12Device*>(mock), __uuidof(ID3D12Device), &device)));
+    D3D12_DESCRIPTOR_HEAP_DESC desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kDescriptors,
+                                    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    const IID iid_heap = __uuidof(ID3D12DescriptorHeap);
+    void* heap = nullptr;
+    EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&desc), word(&iid_heap), word(&heap)))));
+    const SIZE_T base = reinterpret_cast<SIZE_T>(title.data());
+    EXPECT(raw(heap, 9) == base);
+    EXPECT(std::all_of(title.begin(), title.end(), [](std::uint8_t b) { return b == 0; }));  // starts as the real heap
+    EXPECT(xs::title_heap_sync_stats().heaps == 1);
+
+    // No translation: the real device writes the title slot itself.
+    const SIZE_T off3 = 3 * kMockDescriptorInc, off7 = 7 * kMockDescriptorInc;
+    EXPECT(xs::translate_cpu_descriptor_handle(device, D3D12_CPU_DESCRIPTOR_HANDLE{base + off3}).ptr == base + off3);
+    raw(device, 17, 0x11, base + off3);
+    EXPECT(mock->args[17][1] == base + off3);
+    raw(device, 18, 0x22, 0x33, base + off3);
+    EXPECT(mock->args[18][2] == base + off3);
+    raw(device, 19, 0x22, 0x33, 0x44, base + off7);
+    EXPECT(mock->args[19][3] == base + off7);
+    raw(device, 22, 0x55, base + off3);
+    EXPECT(mock->args[22][1] == base + off3);
+    raw(device, 24, 1, base + off7, base + off3, 0);
+    EXPECT(mock->args[24][1] == base + off7 && mock->args[24][2] == base + off3);
+
+    // What the mock "wrote" and what the title copies in itself: slot 3 (chunk 0) and slot 300 (chunk 2).
+    std::uint8_t descriptor[32];
+    for (int i = 0; i < 32; ++i) descriptor[i] = std::uint8_t(0xa0 + i);
+    std::memcpy(title.data() + off3, descriptor, 32);
+    std::memcpy(title.data() + 300 * kMockDescriptorInc, descriptor, 32);
+    std::memset(real.data(), 0, kBytes);
+    real[kBytes - 1] = 0x77;  // chunk 3 is not touched by a sync: nothing changed in it
+    const auto before = xs::title_heap_sync_stats();
+    xs::sync_title_heaps();
+    const auto after = xs::title_heap_sync_stats();
+    EXPECT(after.chunks_compared - before.chunks_compared == 4 && after.chunks_copied - before.chunks_copied == 2);
+    EXPECT(std::memcmp(real.data() + off3, descriptor, 32) == 0);
+    EXPECT(std::memcmp(real.data() + 300 * kMockDescriptorInc, descriptor, 32) == 0);
+    EXPECT(real[kBytes - 1] == 0x77);
+    xs::sync_title_heaps();  // nothing changed since
+    EXPECT(xs::title_heap_sync_stats().chunks_copied == after.chunks_copied);
+
+    // Released: no sync looks at it again, and the title memory goes back to the hook.
+    EXPECT(raw(heap, 2) == 0);
+    EXPECT(g_heap_hook.free_calls == 1 && g_heap_hook.last_free_ptr == title.data());
+    EXPECT(xs::title_heap_sync_stats().heaps == 0);
+    title[0] = 0x99;
+    xs::sync_title_heaps();
+    EXPECT(real[0] == 0);
+
+    // Cost: a 1M-descriptor heap (32 MiB), synced with nothing changed, then with 4 chunks changed.
+    {
+        constexpr UINT kBig = 1u << 20;
+        std::vector<std::uint8_t> big_title(std::size_t(kBig) * kMockDescriptorInc), big_real(big_title.size());
+        kMockHeapCpuStart = reinterpret_cast<SIZE_T>(big_real.data());
+        g_heap_hook.next_ptr = big_title.data();
+        D3D12_DESCRIPTOR_HEAP_DESC big_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kBig,
+                                            D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+        void* big = nullptr;
+        EXPECT(SUCCEEDED(hr_of(raw(device, 14, word(&big_desc), word(&iid_heap), word(&big)))));
+        const auto time_sync = [] {
+            const auto t0 = std::chrono::steady_clock::now();
+            xs::sync_title_heaps();
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        };
+        time_sync();  // warm
+        double unchanged = 1e9, changed = 1e9;
+        for (int round = 0; round < 5; ++round) {
+            unchanged = (std::min)(unchanged, time_sync());
+            for (int c = 0; c < 4; ++c) big_title[std::size_t(c) * (big_title.size() / 4) + round] ^= 0xff;
+            changed = (std::min)(changed, time_sync());
+        }
+        std::printf("title heap sync, 1M descriptors (32 MiB): %.2f ms with nothing changed, %.2f ms with 4 chunks "
+                    "changed (best of 5)\n", unchanged, changed);
+        EXPECT(std::memcmp(big_real.data(), big_title.data(), big_title.size()) == 0);
+        EXPECT(raw(big, 2) == 0);
+    }
+
+    EXPECT(raw(device, 2) == 0 && mock->refs == 0);
+    xs::set_descriptor_heap_allocator(nullptr, nullptr);
+    xs::set_title_heap_sync(-1);
+    kMockHeapCpuStart = kMockHeapCpuStartDefault;
+    std::printf("title heap sync: writes untranslated into title memory, changed chunks only copied, released heaps "
+                "dropped: ok\n");
+    return 0;
+}
+
 // ---- Guard-region setup failures: this executable's import table, patched before the first proxy table ----
 
 std::atomic<int> g_injected{0};
@@ -1972,7 +2081,7 @@ int main(int argc, char** argv) {
         check_create_failures() || check_open_shared() || check_alloc_failures() || check_allocators() ||
         check_console_list_reset() || check_xbox_slots() || check_custom_heap_properties() ||
         check_placed_resource_x() || check_view_heap_cap() || check_descriptor_heap_hooks() ||
-        check_console_command_list())
+        check_title_heap_sync() || check_console_command_list())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;
