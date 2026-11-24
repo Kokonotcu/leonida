@@ -876,6 +876,7 @@ struct GraphicsPipeline {
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
+    bool viewport_with_count = false;     // pipeline uses VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -996,14 +997,10 @@ struct ReplayFunctions {
     std::function<const ComputePipeline*(std::uintptr_t)> compute_pipeline;
     PFN_vkCmdBindVertexBuffers2 bind_vertex_buffers2 = nullptr;  // draws
     PFN_vkCmdBindIndexBuffer bind_index_buffer = nullptr;
-    // Graphics pipelines take the viewport and scissor counts as dynamic state (VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT,
-    // SCISSOR_WITH_COUNT): one per draw, or a draw's ViewportArray.
-    PFN_vkCmdSetViewportWithCount set_viewport = nullptr;
-    PFN_vkCmdSetScissorWithCount set_scissor = nullptr;
-    // multiViewport: the viewports a draw may use (VkPhysicalDeviceLimits::maxViewports, at most 16). 1 without the
-    // feature: a draw's ViewportArray is cut to its first viewport, which is what D3D12 uses without
-    // SV_ViewportArrayIndex.
-    std::uint32_t max_viewports = 1;
+    PFN_vkCmdSetViewport set_viewport = nullptr;
+    PFN_vkCmdSetScissor set_scissor = nullptr;
+    PFN_vkCmdSetViewportWithCount set_viewport_with_count = nullptr;
+    PFN_vkCmdSetScissorWithCount set_scissor_with_count = nullptr;
     PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
     PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
@@ -1245,12 +1242,7 @@ struct PreparedDraw {
     VkDeviceSize index_offset = 0;
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     VkExtent2D area{};
-    VkRect2D scissor{};
-    // A draw's ViewportArray (viewport_count > 1): every viewport, y flipped as the first, and its effective scissor.
-    // The first is also in scissor.
-    std::uint32_t viewport_count = 1;
-    std::vector<VkViewport> viewports;
-    std::vector<VkRect2D> scissors;
+    VkRect2D scissor{};  // the first viewport's effective scissor
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
     // What the attachments alone allow (UINT32_MAX: none bound): what a later draw with the same views reuses (I6).
     VkExtent2D target_area{UINT32_MAX, UINT32_MAX};
@@ -1270,9 +1262,6 @@ struct PreparedDraw {
         index_offset = 0;
         index_type = VK_INDEX_TYPE_UINT16;
         area = {};
-        viewport_count = 1;
-        viewports.clear();
-        scissors.clear();
         layers = 1;
         target_area = {UINT32_MAX, UINT32_MAX};
         target_layers = UINT32_MAX;
@@ -2497,6 +2486,19 @@ void round_trip(const ReplayFunctions& vk, VkCommandBuffer command_buffer, const
 
 namespace detail {
 
+// The scissor a viewport draws through: D3D rasterization implicitly scissors to the floored viewport edges
+// (functional spec 15.7). Clip to nonnegative framebuffer coordinates before converting; floor the far edge after
+// adding the origin. Empty for an empty viewport or scissor.
+inline VkRect2D effective_scissor(const Viewport& v, const Rect& s) {
+    const auto edge = [](float value) {
+        return static_cast<std::int32_t>(std::min(double(INT32_MAX), std::max(0.0, double(value))));
+    };
+    const auto left = std::max(s.left, edge(v.x)), top = std::max(s.top, edge(v.y));
+    const auto right = std::min(s.right, edge(v.x + v.width)), bottom = std::min(s.bottom, edge(v.y + v.height));
+    if (!(v.width > 0) || !(v.height > 0) || right <= left || bottom <= top) return VkRect2D{};
+    return VkRect2D{{left, top}, {std::uint32_t(right - left), std::uint32_t(bottom - top)}};
+}
+
 inline ReplayResult finish_draw(const Draw& draw, const ReplayFunctions& vk, PreparedDraw& p, const Draw* previous_draw,
                                 const PreparedDraw* previous);
 
@@ -2581,6 +2583,8 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         return detail::unresolved_site(1);
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
+    if (pipeline->viewport_with_count && (!vk.set_viewport_with_count || !vk.set_scissor_with_count))
+        return ReplayResult::unsupported;
     if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set)) return ReplayResult::unsupported;
     if (pipeline->color_formats.size() > max_render_targets) return ReplayResult::unsupported;
     p.graphics = pipeline;
@@ -2687,40 +2691,20 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
 // p.target_area), the layers, and the index buffer (taken from `previous` when it had the same index view).
 inline ReplayResult finish_draw(const Draw& draw, const ReplayFunctions& vk, PreparedDraw& p, const Draw* previous_draw,
                                 const PreparedDraw* previous) {
-    // D3D rasterization implicitly scissors to the floored viewport edges (functional spec 15.7).
-    // Clip to nonnegative framebuffer coordinates before converting; floor the far edge after adding the origin.
-    const auto edge = [](float value) {
-        return static_cast<std::int32_t>(std::min(double(INT32_MAX), std::max(0.0, double(value))));
-    };
-    // The effective scissor of one viewport; its far corner grows `reach`, the extent every scissor fits in.
+    // The effective scissor of each viewport the draw binds; their far corners grow `reach`, the extent every
+    // scissor fits in.
     VkExtent2D reach{0, 0};
-    const auto effective = [&](const Viewport& v, const Rect& s) {
-        const auto left = std::max(s.left, edge(v.x)), top = std::max(s.top, edge(v.y));
-        const auto right = std::min(s.right, edge(v.x + v.width)), bottom = std::min(s.bottom, edge(v.y + v.height));
-        if (!(v.width > 0) || !(v.height > 0) || right <= left || bottom <= top) return VkRect2D{};
-        reach = {std::max(reach.width, std::uint32_t(right)), std::max(reach.height, std::uint32_t(bottom))};
-        return VkRect2D{{left, top}, {std::uint32_t(right - left), std::uint32_t(bottom - top)}};
+    const auto grow = [&](const VkRect2D& s) {
+        if (!s.extent.width) return;
+        reach = {std::max(reach.width, std::uint32_t(s.offset.x) + s.extent.width),
+                 std::max(reach.height, std::uint32_t(s.offset.y) + s.extent.height)};
     };
-    p.scissor = effective(draw.viewport, draw.scissor);
-    // p is reused from draw to draw (and copied from the previous draw on the shared-state path): one viewport
-    // unless this draw binds an array.
-    p.viewport_count = 1;
-    p.viewports.clear();
-    p.scissors.clear();
-    if (draw.viewports && draw.viewports->count > 1 && vk.max_viewports > 1) {
-        // SV_ViewportArrayIndex picks one of these. An empty viewport (Vulkan needs a positive size) becomes 1x1
-        // behind an empty scissor: nothing is drawn through it, as on D3D12.
-        const ViewportArray& array = *draw.viewports;
-        p.viewport_count = std::min({array.count, vk.max_viewports, ViewportArray::max});
-        p.viewports.resize(p.viewport_count);
-        p.scissors.resize(p.viewport_count);
-        for (std::uint32_t i = 0; i < p.viewport_count; ++i) {
-            const Viewport& v = array.viewports[i];
-            p.scissors[i] = effective(v, array.scissors[i]);
-            p.viewports[i] = v.width > 0 && v.height > 0
-                                 ? VkViewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth}
-                                 : VkViewport{0, 1, 1, -1, 0, 1};
-        }
+    p.scissor = detail::effective_scissor(draw.viewport, draw.scissor);
+    grow(p.scissor);
+    if (draw.viewports && p.graphics && p.graphics->viewport_with_count) {
+        const DrawViewports& set = *draw.viewports;
+        for (std::uint32_t i = 1; i < set.viewport_count && i < DrawViewports::max_count; ++i)
+            grow(detail::effective_scissor(set.viewports[i], i < set.scissor_count ? set.scissors[i] : Rect{}));
     }
     p.area = p.target_area;
     if (p.area.width == UINT32_MAX) {
@@ -3748,12 +3732,15 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 return ReplayResult::invalid_indirect_arguments;
             const VkDeviceSize record_start =
                 signature ? ind->argument_offset - signature->action_offset() : ind->argument_offset;
-            // The span is max_count * stride from the first record's start, the bytes the signature can walk, as
-            // D3D12 measures it: a record that fits at the end of the buffer while its stride runs past it is refused
-            // (`240` with stride `20` in a `256`-byte buffer). A zero max_count still has to name an offset inside the
-            // buffer.
-            if (record_start > p.binding.size || ind->max_count > (p.binding.size - record_start) / ind->stride ||
-                !detail::indirect_range(p.binding, record_start, VkDeviceSize(ind->max_count) * ind->stride))
+            // The range is the bytes the commands read, (max_count - 1) * stride plus one record (arguments_size
+            // with a signature, else record_size), from the first record's start: the rule recording applies
+            // (d3d12_com.cpp, ExecuteIndirect) and the one vkCmdDraw*Indirect states. A zero max_count is a no-op
+            // that recording never passes on; if one arrives it reads nothing and needs no range.
+            const VkDeviceSize record_bytes = signature ? VkDeviceSize(signature->arguments_size) : record_size;
+            if (ind->max_count
+                    ? !detail::indirect_range(p.binding, record_start,
+                                              VkDeviceSize(ind->max_count - 1) * ind->stride + record_bytes)
+                    : (p.binding.buffer_offset | ind->argument_offset) % sizeof(std::uint32_t) != 0)
                 return ReplayResult::invalid_indirect_arguments;
             if (ind->count_buffer) {
                 const ResourceBinding* cnt = resolve(ind->count_buffer);
@@ -5198,17 +5185,46 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // image upright, and winding as D3D12 sees it.
             const Viewport& v = draw->viewport;
             const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
-            const bool several = d.viewport_count > 1;
-            const VkViewport* viewports = several ? d.viewports.data() : &viewport;
-            const VkRect2D* scissors = several ? d.scissors.data() : &d.scissor;
+            std::uint32_t viewport_count = 1;
+            const VkViewport* viewports = &viewport;
+            const VkRect2D* scissors = &d.scissor;  // the first viewport's effective scissor
+            std::array<VkViewport, DrawViewports::max_count> vps;
+            std::array<VkRect2D, DrawViewports::max_count> scs;
+            if (graphics.viewport_with_count && draw->viewports) {
+                // Every viewport and scissor slot the list bound (1..16), for SV_ViewportArrayIndex, each scissor
+                // clipped to its viewport as the first is.
+                const DrawViewports& set = *draw->viewports;
+                const std::uint32_t vp_n = set.viewport_count;
+                const std::uint32_t sc_n = set.scissor_count;
+                viewport_count = std::clamp(std::max(vp_n, sc_n), 1u, DrawViewports::max_count);
+                for (std::uint32_t k = 0; k < viewport_count; ++k) {
+                    const Viewport w = k < vp_n ? set.viewports[k] : Viewport{};
+                    if (k < vp_n && w.width > 0.0f && w.height > 0.0f) {
+                        vps[k] = {w.x, w.y + w.height, w.width, -w.height, w.min_depth, w.max_depth};
+                        scs[k] = detail::effective_scissor(w, k < sc_n ? set.scissors[k] : Rect{});
+                    } else {
+                        // Vulkan forbids width/height == 0; pair a 1x1 dummy viewport with an empty scissor so
+                        // nothing rasterizes into an unbound/empty D3D12 viewport slot.
+                        vps[k] = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+                        scs[k] = {{0, 0}, {0, 0}};
+                    }
+                }
+                viewports = vps.data();
+                scissors = scs.data();
+            }
             if (graphics.bind_shaders) {
-                graphics.bind_shaders(command_buffer, viewports, scissors, d.viewport_count, d.vertex_strides.data(),
+                graphics.bind_shaders(command_buffer, viewports, scissors, viewport_count, d.vertex_strides.data(),
                                       std::uint32_t(d.vertex_strides.size()));
             } else {
                 vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
                 if (graphics.set_state) graphics.set_state(command_buffer);
-                vk.set_viewport(command_buffer, d.viewport_count, viewports);
-                vk.set_scissor(command_buffer, d.viewport_count, scissors);
+                if (graphics.viewport_with_count) {
+                    vk.set_viewport_with_count(command_buffer, viewport_count, viewports);
+                    vk.set_scissor_with_count(command_buffer, viewport_count, scissors);
+                } else {
+                    vk.set_viewport(command_buffer, 0, 1, viewports);
+                    vk.set_scissor(command_buffer, 0, 1, scissors);
+                }
             }
             if (graphics.uses_set0) {
                 const VkDescriptorSet set0 = vk.bindless_set;

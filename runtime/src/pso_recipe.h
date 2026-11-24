@@ -91,6 +91,11 @@ struct Recipe {
     // The pipeline layout: one push-constant range over push_stages, and set 0 when bindless
     std::uint32_t push_stages = 0, push_size = 0;
     bool bindless = false;
+    // The viewport and scissor counts are dynamic (VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT,
+    // counts 0): the device has multiViewport, so a draw binds 1..16 for SV_ViewportArrayIndex
+    // (leonida::GraphicsPipeline::viewport_with_count). Else VIEWPORT / SCISSOR with one each. A recipe written
+    // without the field had dynamic counts.
+    bool viewport_with_count = true;
 };
 
 // ---------------------------------------------------------------- the create info both sides use
@@ -136,10 +141,10 @@ public:
         assembly_.topology = VkPrimitiveTopology(r.topology);
         assembly_.primitiveRestartEnable = r.primitive_restart;
 
-        // Both counts are dynamic (VIEWPORT_WITH_COUNT, SCISSOR_WITH_COUNT): a draw sets one, or the viewports
+        // With dynamic counts (VIEWPORT_WITH_COUNT, SCISSOR_WITH_COUNT) a draw sets one, or the viewports
         // RSSetViewports bound for SV_ViewportArrayIndex (VUID-VkPipelineViewportStateCreateInfo-viewportCount-04135).
-        viewport_.viewportCount = 0;
-        viewport_.scissorCount = 0;
+        viewport_.viewportCount = r.viewport_with_count ? 0 : 1;
+        viewport_.scissorCount = r.viewport_with_count ? 0 : 1;
 
         raster_.depthClampEnable = r.depth_clamp;
         raster_.rasterizerDiscardEnable = r.rasterizer_discard;
@@ -186,21 +191,21 @@ public:
         // from SV_VertexID) leaves it out, since no vkCmdBindVertexBuffers2 would ever set it
         // (VUID-vkCmdDraw-pStrides-04913). A mesh pipeline takes neither the topology nor the strides as dynamic
         // state (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065 and -07066).
-        static constexpr VkDynamicState dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
-            VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-            VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
-        static constexpr VkDynamicState mesh_dynamic_states[] = {
-            VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
-        if (r.mesh) {
-            dynamic_.dynamicStateCount = std::uint32_t(std::size(mesh_dynamic_states));
-            dynamic_.pDynamicStates = mesh_dynamic_states;
-        } else {
-            dynamic_.dynamicStateCount = std::uint32_t(std::size(dynamic_states)) - (r.bindings.empty() ? 1 : 0);
-            dynamic_.pDynamicStates = dynamic_states;
+        std::uint32_t dynamic_count = 0;
+        dynamic_states_[dynamic_count++] =
+            r.viewport_with_count ? VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT : VK_DYNAMIC_STATE_VIEWPORT;
+        dynamic_states_[dynamic_count++] =
+            r.viewport_with_count ? VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT : VK_DYNAMIC_STATE_SCISSOR;
+        if (!r.mesh) {
+            dynamic_states_[dynamic_count++] = VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY;
+            dynamic_states_[dynamic_count++] = VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE;
         }
+        dynamic_states_[dynamic_count++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
+        dynamic_states_[dynamic_count++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
+        if (!r.mesh && !r.bindings.empty())
+            dynamic_states_[dynamic_count++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
+        dynamic_.dynamicStateCount = dynamic_count;
+        dynamic_.pDynamicStates = dynamic_states_;
 
         info.pNext = &rendering_;
         info.stageCount = std::uint32_t(stages_.size());
@@ -241,6 +246,7 @@ private:
     VkPipelineDepthStencilStateCreateInfo depth_{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     std::vector<VkPipelineColorBlendAttachmentState> blends_;
     VkPipelineColorBlendStateCreateInfo blend_{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    VkDynamicState dynamic_states_[7]{};
     VkPipelineDynamicStateCreateInfo dynamic_{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
 };
 
@@ -457,6 +463,7 @@ inline std::string to_json(const Recipe& r) {
     w.key("push_stages"); w.num(r.push_stages);
     w.key("push_size"); w.num(r.push_size);
     w.key("bindless"); w.boolean(r.bindless);
+    w.key("viewport_with_count"); w.boolean(r.viewport_with_count);
     w.close('}');
     return w.out;
 }
@@ -548,6 +555,8 @@ inline bool from_json(const Json& o, Recipe& r, std::string* error = nullptr) {
         !get_u32(o, "push_stages", r.push_stages) || !get_u32(o, "push_size", r.push_size) ||
         !get_bool(o, "bindless", r.bindless))
         return fail("layout");
+    if (o.find("viewport_with_count") && !get_bool(o, "viewport_with_count", r.viewport_with_count))
+        return fail("viewport_with_count");
     return true;
 }
 

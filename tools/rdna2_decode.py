@@ -563,18 +563,18 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 args = [dst_op, s0, s1] if not name.startswith("v_cmpx_") else [s0, s1]
                 return finish(name + "_sdwa", args, mods, 8)
             if is_dpp16 or is_dpp8:
-                # VOPC with DPP (src0 = 0xFA / 0xE9 / 0xEA): 8 bytes, as for VOP1/VOP2. Read as 4 before, the DPP word
-                # became an invalid instruction (lib_cs_01473 of the 1.0.2.1 pipeline library: v_cmp_gt_f32 quad_perm).
+                # A compare with a DPP src0. llvm-mc has no decoding for it on gfx10 (it rejects the word), but 1.0.2.1's
+                # pipeline library holds it; the second word has the layout of a VOP2's (docs/design.md, "DPP on a
+                # VOPC compare"). The result goes to VCC, as for the plain _e32 compare.
                 if not need(8):
                     return None, 4
                 w1 = struct.unpack_from("<I", code, pc + 4)[0]
                 s0 = _vreg(w1 & 0xFF, 1)
                 s1 = _vreg(vsrc1, 1)
                 if is_dpp16:
-                    ctrl = (w1 >> 8) & 0x1FF
                     s0["neg"], s0["abs"] = bool((w1 >> 20) & 1), bool((w1 >> 21) & 1)
                     s1["neg"], s1["abs"] = bool((w1 >> 22) & 1), bool((w1 >> 23) & 1)
-                    mods.append(_format_dpp16_ctrl(ctrl))
+                    mods.append(_format_dpp16_ctrl((w1 >> 8) & 0x1FF))
                     mods.append(f"row_mask:0x{(w1 >> 28) & 0xF:x}")
                     mods.append(f"bank_mask:0x{(w1 >> 24) & 0xF:x}")
                     if (w1 >> 19) & 1:
@@ -582,11 +582,10 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                     if (w1 >> 18) & 1:
                         mods.append("fi:1")
                 else:
-                    lanes = [(w1 >> (8 + 3 * i)) & 7 for i in range(8)]
-                    mods.append(f"dpp8:[{','.join(str(x) for x in lanes)}]")
+                    mods.append(f"dpp8:[{','.join(str((w1 >> (8 + 3 * i)) & 7) for i in range(8))}]")
                     if src0 == 234:
                         mods.append("fi:1")
-                args = [_vcc_operand(wave32), s0, s1] if not name.startswith("v_cmpx_") else [s0, s1]
+                args = [s0, s1] if name.startswith("v_cmpx_") else [_vcc_operand(wave32), s0, s1]
                 return finish(name + "_dpp", args, mods, 8)
             lit = None
             nbytes = 4

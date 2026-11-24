@@ -39,12 +39,18 @@ enum class Part : std::uint32_t {
 // The dynamic states of each part (a part names only its own). Together they are the monolithic path's dynamic
 // states (GraphicsCreateInfo) plus what that path bakes in from the rasterization and depth-stencil state; the replay
 // sets those at every draw (LibraryState::emit).
-inline std::span<const VkDynamicState> library_dynamic_states(Part part, bool vertex_bindings) {
+// `viewport_with_count`: Recipe::viewport_with_count, the pre-rasterization part's viewport and scissor states.
+inline std::span<const VkDynamicState> library_dynamic_states(Part part, bool vertex_bindings,
+                                                              bool viewport_with_count = true) {
     static constexpr VkDynamicState vertex_input[] = {VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
                                                       VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
                                                       VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE};
     static constexpr VkDynamicState pre_raster[] = {
         VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT, VK_DYNAMIC_STATE_CULL_MODE,
+        VK_DYNAMIC_STATE_FRONT_FACE,        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_DEPTH_BIAS,
+        VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_LINE_WIDTH};
+    static constexpr VkDynamicState pre_raster_one_viewport[] = {
+        VK_DYNAMIC_STATE_VIEWPORT,          VK_DYNAMIC_STATE_SCISSOR,    VK_DYNAMIC_STATE_CULL_MODE,
         VK_DYNAMIC_STATE_FRONT_FACE,        VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_DEPTH_BIAS,
         VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_LINE_WIDTH};
     static constexpr VkDynamicState fragment[] = {
@@ -57,7 +63,9 @@ inline std::span<const VkDynamicState> library_dynamic_states(Part part, bool ve
     case Part::vertex_input:
         // As GraphicsCreateInfo: no stride state without vertex bindings (VUID-vkCmdDraw-pStrides-04913).
         return {vertex_input, std::size(vertex_input) - (vertex_bindings ? 0 : 1)};
-    case Part::pre_raster: return pre_raster;
+    case Part::pre_raster:
+        if (!viewport_with_count) return pre_raster_one_viewport;
+        return pre_raster;
     case Part::fragment: return fragment;
     case Part::output: return output;
     }
@@ -106,6 +114,7 @@ inline std::uint64_t library_key(Part part, const Recipe& r, bool per_sample = f
         mix(r.depth_clamp);
         mix(r.polygon_mode);
         mix(r.conservative);
+        if (!r.viewport_with_count) mix(r.viewport_with_count);  // keys of the usual dynamic-count part unchanged
     } else if (part == Part::fragment && per_sample) {
         mix(r.samples);
         mix(r.sample_shading);
@@ -129,7 +138,8 @@ public:
         info.pNext = &library_;
         // Retained so the same parts can be linked again with link-time optimisation (LinkCreateInfo, Link::optimized).
         info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
-        const std::span<const VkDynamicState> dynamic = library_dynamic_states(part, !r.bindings.empty());
+        const std::span<const VkDynamicState> dynamic =
+            library_dynamic_states(part, !r.bindings.empty(), r.viewport_with_count);
         dynamic_.dynamicStateCount = std::uint32_t(dynamic.size());
         dynamic_.pDynamicStates = dynamic.data();
         info.pDynamicState = &dynamic_;
@@ -184,8 +194,8 @@ public:
                 conservative_.conservativeRasterizationMode = VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
                 raster_.pNext = &conservative_;
             }
-            viewport_.viewportCount = 0;  // dynamic, with the count (as GraphicsCreateInfo)
-            viewport_.scissorCount = 0;
+            viewport_.viewportCount = r.viewport_with_count ? 0 : 1;  // as GraphicsCreateInfo
+            viewport_.scissorCount = r.viewport_with_count ? 0 : 1;
             info.pRasterizationState = &raster_;
             info.pViewportState = &viewport_;
             break;

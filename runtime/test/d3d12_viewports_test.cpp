@@ -58,8 +58,8 @@ int main() {
     }
     const rt::d3d12::VulkanDeviceInfo* info = rt::d3d12::vulkan_device_info(device.p);
     EXPECT(info);
-    if (info->max_viewports < 2 || !info->shader_output_viewport_index) {
-        std::printf("SKIP: the GPU has %u viewports, shaderOutputViewportIndex %d\n", info->max_viewports,
+    if (!info->features.multiViewport || !info->shader_output_viewport_index) {
+        std::printf("SKIP: multiViewport %d, shaderOutputViewportIndex %d\n", int(info->features.multiViewport),
                     int(info->shader_output_viewport_index));
         return 77;
     }
