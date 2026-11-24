@@ -1795,6 +1795,14 @@ struct DeviceState {
             if (entry.storage) vk.vkDestroyImageView(info.device, entry.storage, nullptr);
             return false;
         }
+        // Review D11: a key the table cannot take (it would outgrow binding 2, or too many keys share a hash) comes
+        // back as false, not as an exception through the game's call. The T# then keeps what it had: the read-only
+        // entry it replaced, or the fallback. The new entry goes the deferred way, as its descriptor is written.
+        if (!bindless->insert_key(words, entry.index)) {
+            log_once("the descriptor hash table cannot take another T#; entries", int(bindless->table().size()));
+            release(entry);
+            return false;
+        }
         if (existing != image_entries.end()) {
             replaced_images.push_back(existing->second);  // the read-only entry of the same bytes
             existing->second = entry;
@@ -1802,7 +1810,6 @@ struct DeviceState {
             image_entries.emplace(words, entry);
             image_keys.emplace(image.address, words);
         }
-        bindless->insert_key(words, entry.index);
         return true;
     }
 
@@ -2032,11 +2039,18 @@ struct DeviceState {
             context->vk.vkDestroySampler(info.device, vk_sampler, nullptr);
             return nullptr;
         }
+        // Review D11: refused by the hash table (false, not an exception through the game's call). The index was
+        // only queued, no key names it, so it and the sampler go at once, as in release_sampler.
+        if (!bindless->insert_key(key, index)) {
+            log_once("the descriptor hash table cannot take another S#; entries", int(bindless->table().size()));
+            bindless->remove_sampler(index);
+            context->vk.vkDestroySampler(info.device, vk_sampler, nullptr);
+            return nullptr;
+        }
         SamplerEntry entry;
         entry.sampler = vk_sampler;
         entry.index = index;
         sampler_keys[index] = key;
-        bindless->insert_key(key, index);
         return &sampler_entries.emplace(key, entry).first->second;
     }
 

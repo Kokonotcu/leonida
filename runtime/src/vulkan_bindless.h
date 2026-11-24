@@ -475,9 +475,16 @@ public:
     }
 
     // T# and S# keys to the indices above: the table of binding 2 (descriptor_table.h). Changes reach the shaders
-    // at flush().
+    // at flush(). False when the table cannot take the key: it would grow past what binding 2 may address
+    // (maxStorageBufferRange, D10), more keys share a hash than the shaders probe, or memory ran out. The table is then
+    // as it was, and nothing is thrown: the callers are D3D12 entry points the game called (D11).
     bool insert_key(const DescriptorKey& key, std::uint32_t index) {
-        const auto result = table_.insert_or_update(key.data(), index);
+        DescriptorTable::InsertResult result;
+        try {
+            result = table_.insert_or_update(key.data(), index);
+        } catch (const std::exception&) {
+            return false;
+        }
         table_dirty_ |= result != DescriptorTable::InsertResult::unchanged;
         existing_entries_changed_ |= result == DescriptorTable::InsertResult::replaced ||
                                      result == DescriptorTable::InsertResult::added_with_relocation;
