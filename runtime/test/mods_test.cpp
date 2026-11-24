@@ -158,6 +158,20 @@ int main() {
 
     check(load_mods(dir / "missing").mods.empty(), "no mods folder is no mods");
 
+    // A folder name the ANSI code page cannot spell (string() throws for it) loads under its UTF-8 name.
+    const std::filesystem::path wide_dir = dir.parent_path() / "mods_wide";
+    write(wide_dir / std::filesystem::path(L"f_漢") / "mod.json",
+          R"({"archetype_swaps":[{"from":"player_story000_00","to":"cs_mandy"}]})");
+    bool threw = false;
+    LoadResult wide;
+    try {
+        wide = load_mods(wide_dir);
+    } catch (...) {
+        threw = true;
+    }
+    check(!threw && wide.mods.size() == 1 && wide.errors.empty(),
+          "a mod folder with a non-ANSI name loads instead of throwing out of the loader");
+
     std::printf("mods_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }
