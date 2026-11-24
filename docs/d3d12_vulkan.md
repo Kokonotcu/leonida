@@ -460,7 +460,10 @@ What is implemented (all of it testable without the game):
     are logged and refused until the trace shows what the game asks (question 11);
   - Single-sampled `A8_UNORM` 2D textures use one byte per texel in `VK_FORMAT_R8_UNORM`. Their SRVs expose
     (0, 0, 0, A) before applying the caller's component mapping. Format support includes `MIP` when the Vulkan
-    image supports multiple levels. Render-target, depth-stencil and UAV creation are unsupported for this format.
+    image supports multiple levels. Depth-stencil and multisampled A8 textures are refused. Render-target, UAV and
+    non-2D A8 textures are made (R8 images) for the console title, which the PC runtime refuses (UAV and non-2D from
+    PR #8134: the retail executable asks for one and stops when it is refused); a UAV store of alpha lands in R only
+    where the view swizzles it there, logged once.
   - reserved resources and `GetResourceTiling` (section 4.2);
   - query heaps for occlusion, timestamps and pipeline statistics, and `GetTimestampFrequency` on the queue
     (section 4.6);
