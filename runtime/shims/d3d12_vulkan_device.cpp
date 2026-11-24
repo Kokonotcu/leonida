@@ -3231,6 +3231,7 @@ public:
         binding.host = static_cast<const std::uint8_t*>(address);
         binding.host_readable = true;
         binding.va = va_;
+        binding.device_address = buffer_va_;  // replay passes root arguments into it as buffer_va_ - heap_base
         device_.context->add_resource(id(), binding);
         return S_OK;
     }
@@ -5473,6 +5474,15 @@ public:
             graphics_.code_base = offset;
         }
         device_.context->add_graphics_pipeline(id(), graphics_);
+        if (std::getenv("LEONIDA_LOG_PSOS")) {
+            // Which shaders a PSO id stands for, so a draw named by its pipeline (record_draw's log, DRED) can be
+            // traced to its program.
+            std::string names;
+            for (const Stage& stage : stages)
+                if (stage.entry) names += std::string(" ") + stage.name + "=" + stage.entry->name;
+            std::fprintf(stderr, "[rt] d3d12: graphics PSO %llx:%s\n", static_cast<unsigned long long>(id()),
+                         names.c_str());
+        }
         registered_ = true;
         is_graphics_ = true;
         return S_OK;
@@ -8441,7 +8451,7 @@ public:
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
         leonida::gfx10::Buffer buffer{};
-        buffer.address = desc->BufferLocation;
+        buffer.address = state_.context->shader_address(desc->BufferLocation);
         buffer.stride = kConstantBufferRow;
         buffer.num_records = desc->SizeInBytes;
         buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
@@ -8488,7 +8498,7 @@ public:
                 const UINT64 byte_off = desc->Buffer.FirstElement * 4;
                 const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * 4;
                 if (byte_size > width - byte_off || byte_size > UINT32_MAX) return;
-                buffer.address = base_va + byte_off;
+                buffer.address = state_.context->shader_address(base_va + byte_off);
                 buffer.stride = 0;
                 buffer.num_records = std::uint32_t(byte_size);
                 buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
@@ -8500,7 +8510,7 @@ public:
                 const UINT64 byte_off = desc->Buffer.FirstElement * stride;
                 const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
                 if (byte_size > width - byte_off) return;
-                buffer.address = base_va + byte_off;
+                buffer.address = state_.context->shader_address(base_va + byte_off);
                 buffer.stride = std::uint32_t(stride);
                 buffer.num_records = desc->Buffer.NumElements;
                 buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
@@ -8523,7 +8533,7 @@ public:
                 const UINT64 byte_off = desc->Buffer.FirstElement * stride;
                 const UINT64 byte_size = UINT64(desc->Buffer.NumElements) * stride;
                 if (byte_size > width - byte_off) return;
-                buffer.address = base_va + byte_off;
+                buffer.address = state_.context->shader_address(base_va + byte_off);
                 buffer.stride = std::uint32_t(stride);
                 buffer.num_records = desc->Buffer.NumElements;
                 buffer.format = code;
@@ -8687,7 +8697,7 @@ public:
         const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
         if (!va || (counter && !counter_va)) return;
         g::Buffer buffer{};
-        buffer.address = va + view.FirstElement * unit;
+        buffer.address = state_.context->shader_address(va + view.FirstElement * unit);
         buffer.stride = structured || typed ? std::uint32_t(unit) : 0;
         buffer.num_records = std::uint32_t(structured || typed ? view.NumElements : UINT64(view.NumElements) * 4);
         buffer.format = format_code;
@@ -8698,7 +8708,7 @@ public:
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         if (counter) {
             g::Buffer counter_buffer{};
-            counter_buffer.address = counter_va + view.CounterOffsetInBytes;
+            counter_buffer.address = state_.context->shader_address(counter_va + view.CounterOffsetInBytes);
             counter_buffer.num_records = 4;
             counter_buffer.oob_select = g::OobSelect::raw;
             const g::BufferWords counter_words = g::encode(counter_buffer);

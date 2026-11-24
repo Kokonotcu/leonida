@@ -27,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -563,6 +564,38 @@ private:
 // Centralized single-thread fence dispatcher using Vulkan 1.2 vkWaitSemaphores(VK_SEMAPHORE_WAIT_ANY_BIT).
 // Eliminates per-fence OS threads and 10ms polling: a synthetic timeline semaphore (wakeup_sem_) at index 0
 // wakes vkWaitSemaphores immediately whenever a new wait, a released fence, or shutdown arrives while waiting_ == true.
+// The last ID3D12CommandQueue::Signal any queue made, for FenceWaitDispatcher::report_stall.
+namespace detail_stall {
+inline std::atomic<VkSemaphore> last_signal_semaphore{VK_NULL_HANDLE};
+inline std::atomic<std::uint64_t> last_signal_value{0};
+inline std::atomic<bool> last_signal_held{false};
+// LEONIDA_DRED's ring, when configured: a stall names the lists the GPU started and did not finish.
+inline std::atomic<BreadcrumbRing*> breadcrumbs{nullptr};
+// Per queue (its progress timeline): the last submitted ticket and the recent submissions that carried waits, so a
+// stalled GPU queue can be told apart: a wait whose value is never reached, or work that never finishes.
+struct WaitRecord {
+    std::uint64_t ticket = 0;
+    std::vector<std::pair<VkSemaphore, std::uint64_t>> waits;
+};
+struct QueueRecord {
+    std::uint64_t submitted = 0;
+    std::deque<WaitRecord> waited;  // newest last, at most 64
+};
+inline std::mutex queues_mutex;
+inline std::map<VkSemaphore, QueueRecord> queues;
+inline void note_submit(VkSemaphore progress, std::uint64_t ticket, std::span<const VkSemaphore> semaphores,
+                        std::span<const std::uint64_t> values) {
+    std::lock_guard lock(queues_mutex);
+    QueueRecord& q = queues[progress];
+    q.submitted = ticket;
+    if (semaphores.empty()) return;
+    WaitRecord r{ticket, {}};
+    for (std::size_t i = 0; i < semaphores.size() && i < values.size(); ++i) r.waits.emplace_back(semaphores[i], values[i]);
+    q.waited.push_back(std::move(r));
+    if (q.waited.size() > 64) q.waited.pop_front();
+}
+}  // namespace detail_stall
+
 class FenceWaitDispatcher {
 public:
     struct Entry {
@@ -867,11 +900,60 @@ private:
                 return;
             }
             pending_.resize(write);
+            report_stall(ready.empty());
             if (!ready.empty()) {
                 dispatch_outside_lock(lock, ready, signal_event_);
                 if (stop_) return;
             }
         }
+    }
+
+    // A fence wait that has not moved for 10 s is named once per stall, with each pending semaphore's wanted and
+    // current value: a value never reached means the GPU queue stopped (or its Signal was never submitted), which
+    // a title waiting on its frame fence turns into its own watchdog kill. Called under mutex_.
+    void report_stall(bool idle) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!idle || pending_.empty()) {
+            last_progress_ = now;
+            stall_reported_ = false;
+            return;
+        }
+        if (stall_reported_ || now - last_progress_ < std::chrono::seconds(10)) return;
+        stall_reported_ = true;
+        std::fprintf(stderr, "[rt] fence waits: no progress for 10 s, %zu pending:\n", pending_.size());
+        for (std::size_t i = 0; i < pending_.size() && i < 16; ++i) {
+            std::uint64_t done = 0;
+            vk_.vkGetSemaphoreCounterValue(device_, pending_[i].semaphore, &done);
+            std::fprintf(stderr, "[rt]   semaphore %p wants %llu, at %llu (%s)\n",
+                         reinterpret_cast<void*>(pending_[i].semaphore),
+                         static_cast<unsigned long long>(pending_[i].value), static_cast<unsigned long long>(done),
+                         pending_[i].callback ? "callback" : "event");
+        }
+        std::fprintf(stderr, "[rt]   last queue Signal: semaphore %p value %llu%s\n",
+                     reinterpret_cast<void*>(detail_stall::last_signal_semaphore.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(detail_stall::last_signal_value.load(std::memory_order_relaxed)),
+                     detail_stall::last_signal_held.load(std::memory_order_relaxed) ? " (held behind earlier work)" : "");
+        std::lock_guard queues_lock(detail_stall::queues_mutex);
+        for (const auto& [progress, q] : detail_stall::queues) {
+            std::uint64_t done = 0;
+            vk_.vkGetSemaphoreCounterValue(device_, progress, &done);
+            std::fprintf(stderr, "[rt]   queue timeline %p: submitted %llu, completed %llu\n",
+                         reinterpret_cast<void*>(progress), static_cast<unsigned long long>(q.submitted),
+                         static_cast<unsigned long long>(done));
+            for (const detail_stall::WaitRecord& r : q.waited) {
+                if (r.ticket <= done) continue;
+                for (const auto& [sem, value] : r.waits) {
+                    std::uint64_t at = 0;
+                    vk_.vkGetSemaphoreCounterValue(device_, sem, &at);
+                    std::fprintf(stderr, "[rt]     submission %llu waits on %p for %llu, at %llu%s\n",
+                                 static_cast<unsigned long long>(r.ticket), reinterpret_cast<void*>(sem),
+                                 static_cast<unsigned long long>(value), static_cast<unsigned long long>(at),
+                                 at < value ? "  <-- not reached" : "");
+                }
+                break;  // the first incomplete submission with waits
+            }
+        }
+        if (BreadcrumbRing* ring = detail_stall::breadcrumbs.load(std::memory_order_acquire)) ring->report(stderr);
     }
 
     VkDevice device_;
@@ -891,6 +973,8 @@ private:
     std::uint64_t epoch_ = 0;
     bool waiting_ = false;
     bool stop_ = false;
+    std::chrono::steady_clock::time_point last_progress_ = std::chrono::steady_clock::now();  // report_stall
+    bool stall_reported_ = false;
     std::thread thread_;
 };
 
@@ -1034,6 +1118,15 @@ public:
             buffer = b->buffer;
             offset = b->buffer_offset + (va - b->va);
             size = std::min<std::uint64_t>(size, b->size - (va - b->va));
+            return true;
+        };
+        replay_.rebase_outside_arena = [this](std::uint64_t va, std::uint64_t& rebased) {
+            BufferVaIndex<ResourceId>::Hit hit{};
+            std::uint64_t size = 1;
+            if (!buffer_vas_.find(va, hit, size)) return false;
+            const ResourceBinding* b = resolve(hit.id);
+            if (!b || !b->device_address || va < b->va || va - b->va >= b->size) return false;
+            rebased = b->device_address + (va - b->va) - replay_.heap_base;
             return true;
         };
         // Host reads of small CPU-written inputs. Unlike buffer_at, the whole range must be in one CPU-writable
@@ -1354,6 +1447,14 @@ public:
         std::shared_lock lock(resource_mutex_);
         return replay_.heap_base;
     }
+    // The address a shader must be given for `va` so that heap_base + it is the memory: `va` itself for the arena,
+    // device_address - heap_base for a buffer outside it (a title-placed host import). For V# bases the layer writes.
+    std::uint64_t shader_address(std::uint64_t va) {
+        if (va >> 32 == 0) return va;  // arena VAs are offsets below 4 GiB
+        std::shared_lock lock(resource_mutex_);
+        std::uint64_t rebased = 0;
+        return replay_.rebase_outside_arena && replay_.rebase_outside_arena(va, rebased) ? rebased : va;
+    }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
     void add_pipeline(std::uintptr_t id, const ComputePipeline& pipeline) {
@@ -1401,6 +1502,7 @@ public:
             ring->initialize_cpu_only();
         }
         breadcrumbs_ = std::move(ring);
+        detail_stall::breadcrumbs.store(breadcrumbs_.get(), std::memory_order_release);
         return gpu;
     }
     // Where the device-lost report goes (stderr); for tests.
@@ -2473,7 +2575,11 @@ public:
         std::vector<std::shared_ptr<void>> retired;
         {
             std::lock_guard state(state_mutex_);
-            if (must_hold()) {
+            const bool held = must_hold();
+            detail_stall::last_signal_semaphore.store(fence, std::memory_order_relaxed);
+            detail_stall::last_signal_value.store(value, std::memory_order_relaxed);
+            detail_stall::last_signal_held.store(held, std::memory_order_relaxed);
+            if (held) {
                 Deferred op;
                 op.kind = Deferred::Kind::signal;
                 op.fence = fence;
@@ -3806,6 +3912,7 @@ private:
             submit.pSignalSemaphores = signals;
             res = context_.vk.vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
             if (res == VK_SUCCESS) {
+                detail_stall::note_submit(progress_, ticket, semaphores, values);
                 context_.record_submit_locked(progress_, ticket);
                 if (signals_fence) context_.holds().signaled(fence, value);
             }

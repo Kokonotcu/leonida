@@ -1743,6 +1743,20 @@ private:
             return;
         }
         const bool ok = list_.draw(make_draw(indexed, count, instances, first, base_vertex, first_instance));
+        {
+            // The first draws, and any of 16M+ vertices: one such draw kept the GPU busy past the title's watchdog
+            // (retail boot, LEONIDA_DRED: first DrawInstanced of an 8-command list never completed).
+            static std::atomic<int> shown{0};
+            const std::uint64_t work = std::uint64_t(count) * instances;
+            if (work >= (1ull << 24) ? shown.fetch_add(1, std::memory_order_relaxed) < 24
+                                     : shown.load(std::memory_order_relaxed) < 12 &&
+                                           shown.fetch_add(1, std::memory_order_relaxed) < 12)
+                std::fprintf(stderr, "[rt] d3d12: draw%s %u x %u instances from %u (base %d, instance %u), pipeline "
+                                     "%llx, topology %u, viewport %gx%g\n",
+                             indexed ? " indexed" : "", count, instances, first, base_vertex, first_instance,
+                             static_cast<unsigned long long>(graphics_pipeline_), unsigned(topology_),
+                             viewport_.width, viewport_.height);
+        }
         static std::atomic<std::uint64_t> recorded_ok{0}, recorded_bad{0};
         const std::uint64_t n = (ok ? recorded_ok : recorded_bad).fetch_add(1, std::memory_order_relaxed) + 1;
         if ((n & (n - 1)) == 0)
@@ -2101,8 +2115,19 @@ public:
     HRESULT STDMETHODCALLTYPE Signal(ID3D12Fence* fence, UINT64 value) override {
         constexpr auto method = "ID3D12CommandQueue::Signal";
         Fence* f = Fence::from(fence);
-        if (!f || f->context() != &context_ || f->attached_device() != attached_device())
+        if (!f || f->context() != &context_ || f->attached_device() != attached_device()) {
+            note_once("ID3D12CommandQueue::Signal refused: not this device's fence (E_INVALIDARG)");
             return d3d12_trace::result(method, E_INVALIDARG);
+        }
+        {
+            // Matched against "[rt] fence waits: no progress" (FenceWaitDispatcher::report_stall).
+            static std::atomic<std::uint64_t> signals{0};
+            const std::uint64_t n = signals.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: queue Signal %llu: semaphore %p value %llu\n",
+                             static_cast<unsigned long long>(n), reinterpret_cast<void*>(f->semaphore()),
+                             static_cast<unsigned long long>(value));
+        }
         std::lock_guard lock(mutex_);
         return d3d12_trace::result(method, f->queue_signal(value, [&] {
             return queue_.signal(f->semaphore(), value, fence_pin(fence));

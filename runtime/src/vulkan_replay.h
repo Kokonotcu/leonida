@@ -81,6 +81,9 @@ struct ResourceBinding {
     VkDeviceSize size = 0;             // its size in bytes
     const std::uint8_t* host = nullptr;  // mapped CPU-written bytes (UPLOAD/write-back), for small CPU-side reads
     std::uint64_t va = 0;              // a buffer's console VA (GetGPUVirtualAddress), for vertex/index views
+    // A buffer outside the GPU address arena (a title-placed host import, device slot 133): the device address of
+    // `va`. Shaders compute heap_base + VA, so a root argument naming it is passed as device_address - heap_base.
+    std::uint64_t device_address = 0;
     std::uint32_t depth = 1;
     bool volume = false;               // one array layer, including at mips with a single slice
     bool line = false;                 // a 1D image (TEXTURE1D): its attachment views are 1D arrays
@@ -997,6 +1000,9 @@ struct ReplayFunctions {
     // cut to what the buffer holds from there: vertex and index views use what fits, WriteBufferImmediate needs all
     // of it.
     std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer&, VkDeviceSize&)> buffer_at;
+    // A VA inside a buffer that lives outside the arena (ResourceBinding::device_address): the value whose
+    // heap_base + value is its device address. False for arena VAs and VAs that name nothing.
+    std::function<bool(std::uint64_t va, std::uint64_t& rebased)> rebase_outside_arena;
     // Host bytes for a whole console VA range; `not_cpu_written` when it names GPU-writable memory. For small
     // CPU-written inputs, such as the pointer list of an ARRAY_OF_POINTERS TLAS build.
     std::function<HostReadStatus(std::uint64_t va, std::uint64_t bytes, const std::uint8_t*&)> host_at;
@@ -2499,6 +2505,31 @@ inline void count_draw(DrawOutcome outcome, int result = 0) {
                      outcome == DrawOutcome::failed ? (" with ReplayResult " + std::to_string(result)).c_str() : "",
                      static_cast<unsigned long long>(n), static_cast<unsigned long long>(prepared.load()),
                      static_cast<unsigned long long>(stub.load()));
+}
+
+// Root arguments that name a buffer outside the GPU address arena (a title-placed host import has its host address
+// as VA): each 64-bit pair of user-data dwords that is such a VA becomes device_address - heap_base, so the
+// shader's heap_base + VA reaches it (docs/d3d12_vulkan.md 3.3: the bias works for 64-bit root arguments). Arena
+// VAs are offsets below 4 GiB and are never touched; a pair is only rewritten when it lands inside such a buffer.
+// Before this, the retail boot's exe-embedded blit VS read heap_base + host address, a wild pointer that hung
+// the GPU queue for good (no TDR) and with it the title's frame fence and its watchdog.
+template <typename Vk>
+void rebase_user_data(const Vk& vk, std::uint32_t* s, std::size_t n) {
+    if (!vk.rebase_outside_arena) return;
+    for (std::size_t i = 0; i + 1 < n; ++i) {
+        const std::uint64_t va = std::uint64_t(s[i]) | (std::uint64_t(s[i + 1]) << 32);
+        if (va >> 32 == 0) continue;
+        std::uint64_t rebased = 0;
+        if (!vk.rebase_outside_arena(va, rebased)) continue;
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr, "[rt] replay: user data s%zu:s%zu = %#llx (outside the arena) passed as %#llx%s\n", i,
+                         i + 1, static_cast<unsigned long long>(va), static_cast<unsigned long long>(rebased),
+                         rebased >> 48 ? " (above 48 bits: a V# base built from it is truncated)" : "");
+        s[i] = std::uint32_t(rebased);
+        s[i + 1] = std::uint32_t(rebased >> 32);
+        ++i;
+    }
 }
 
 // The unresolved_resource exits of prepare_draw, numbered in source order, each named the first time it is taken
@@ -4825,7 +4856,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments recorded
                 ShaderUserData data{};
-                std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
+                std::copy(ind->user_data.begin(), ind->user_data.end(), data.s); detail::rebase_user_data(vk, data.s, ind->user_data.size());
                 data.heap_base = vk.heap_base;
                 data.code_base = p.pipeline.code_base;
                 bind_compute(p.pipeline, command_buffer, vk.bind_pipeline);
@@ -4941,7 +4972,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             vk.build_acceleration_structures(command_buffer, 1, &info, &range_ptr);
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             ShaderUserData data{};
-            std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s);
+            std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s); detail::rebase_user_data(vk, data.s, dispatch->user_data.size());
             data.heap_base = vk.heap_base;
             data.code_base = p.pipeline.code_base;
             bind_compute(p.pipeline, command_buffer, vk.bind_pipeline);
@@ -5022,7 +5053,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             }
 
             ShaderUserData data{};
-            std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
+            std::copy(draw->user_data.begin(), draw->user_data.end(), data.s); detail::rebase_user_data(vk, data.s, draw->user_data.size());
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
