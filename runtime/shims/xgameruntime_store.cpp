@@ -130,8 +130,9 @@ template <int Slot> HRESULT STDMETHODCALLTYPE offline_failure(void*) {
 // never got an answer and hung. The block is now started and completed with E_FAIL on its queue, as the GDK reports
 // an operation that fails after it starts; the Result partner keeps returning E_FAIL. `AsyncArg` is the 1-based
 // position of the XAsyncBlock* among the arguments after `this`, from the GDK signature (the slot table names each).
-// Arguments past the fourth are on the caller's stack; reading a declared one the caller did not pass reads its
-// argument area, which x64 callers always reserve (32 bytes) and is never written.
+// With `this` in RCX and a1-a3 in RDX/R8/R9, a4-a6 are stack slots past the 32-byte register home area. For a slot
+// whose function takes fewer arguments the caller never wrote them, so they hold whatever is in the caller's frame
+// there (review of #458); that is harmless, as only the word at AsyncArg is ever used and it is one the caller passed.
 template <int Slot, int AsyncArg>
 HRESULT STDMETHODCALLTYPE offline_failure_async(void*, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                                 std::uint64_t a4, std::uint64_t a5, std::uint64_t a6) {
