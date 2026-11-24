@@ -1682,6 +1682,10 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                                      std::uint64_t, std::uint64_t);
             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
             UnwrappedArray heaps;
+            D3D12_CPU_DESCRIPTOR_HANDLE translated_rtvs[8]{};  // slot 50's translated handles, alive for the call
+            D3D12_CPU_DESCRIPTOR_HANDLE translated_dsv{};
+            (void)translated_rtvs;
+            (void)translated_dsv;
             if constexpr (Slot == 9 || Slot == 10 || Slot == 139) {
                 static std::atomic<int> order{0};
                 if (order.fetch_add(1, std::memory_order_relaxed) < 24)
@@ -1707,6 +1711,25 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 self->pin_cursor_at_limit();
             } else if constexpr (Slot == kConsoleExecuteBundle) {
                 a1 = unwrap_object(a1);
+            } else if constexpr (Slot == 50) {
+                // OMSetRenderTargets(count, rtvs, single_range, dsv) (PC 46): CPU handles in a title-placed
+                // descriptor heap are the title's addresses, which the real list would read as descriptors (boot 66:
+                // every draw's render target unknown to replay). Translated as the device's view slots 17-24 do.
+                const UINT count = static_cast<UINT>(a1);
+                const auto* rtvs = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a2);
+                const UINT n = rtvs ? (a3 ? (count ? 1u : 0u) : std::min<UINT>(count, 8)) : 0;
+                for (UINT i = 0; i < n; ++i) translated_rtvs[i] = translate_cpu_handle(self->device, rtvs[i]);
+                if (n) a2 = reinterpret_cast<std::uint64_t>(translated_rtvs);
+                if (const auto* dsv = reinterpret_cast<const D3D12_CPU_DESCRIPTOR_HANDLE*>(a4)) {
+                    translated_dsv = translate_cpu_handle(self->device, *dsv);
+                    a4 = reinterpret_cast<std::uint64_t>(&translated_dsv);
+                }
+            } else if constexpr (Slot == 51 || Slot == 52) {
+                // ClearDepthStencilView / ClearRenderTargetView (PC 47 / 48): the view handle is the first argument.
+                a1 = translate_cpu_handle(self->device, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a1)}).ptr;
+            } else if constexpr (Slot == 53 || Slot == 54) {
+                // ClearUnorderedAccessViewUint / Float (PC 49 / 50): (GPU handle, CPU handle, resource, values, ...).
+                a2 = translate_cpu_handle(self->device, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(a2)}).ptr;
             } else if constexpr (Slot == kConsoleSetDescriptorHeaps) {
                 if (!heaps.fill(a2, a1)) return 0;
                 if (heaps.data()) a2 = heaps.data();

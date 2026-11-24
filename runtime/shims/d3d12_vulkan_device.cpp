@@ -5449,6 +5449,19 @@ public:
                 if (!graphics_.pipeline) return E_FAIL;
             }
             graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
+            if (defer && async_pso_enabled()) {
+                // The base configuration builds on the compile workers at the first draw that needs it; draws are
+                // left out until then (GraphicsPipeline::ready / request).
+                graphics_.ready = [this] { return base_built_.load(std::memory_order_acquire); };
+                graphics_.request = [this] {
+                    if (base_requested_.exchange(true, std::memory_order_acq_rel)) return;
+                    AddRef();
+                    device_.compile_enqueue([this] {
+                        variant(0);
+                        Release();
+                    });
+                };
+            }
         }
 
         if (code_stage) {
@@ -5903,6 +5916,7 @@ private:
             return VK_NULL_HANDLE;
         }
         variants_.emplace(unbound, pipeline);
+        if (unbound == 0) base_built_.store(true, std::memory_order_release);
         return pipeline;
     }
 
@@ -5918,6 +5932,8 @@ private:
     bool layout_bindless_ = false;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
+    std::atomic<bool> base_built_{false};      // variant 0 exists (GraphicsPipeline::ready)
+    std::atomic<bool> base_requested_{false};  // its background build was asked for (GraphicsPipeline::request)
     // Pipeline libraries (docs/aot_pipelines.md step 3): this PSO's vertex input part and its fragment output parts
     // (one per variant), kept with the pipelines linked from them; the shader parts are the device's.
     bool gpl_ = false;
@@ -8180,6 +8196,16 @@ public:
         } else if (resource && state_.context->has_resource(resource_id(resource))) {
             rid = resource_id(resource);
             rd = resource->GetDesc();
+        }
+        if (rid && !state_.context->has_resource(rid)) {
+            // A target replay cannot resolve (prepare_draw's render-target exit): which resource it is.
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] d3d12: RTV on a resource replay does not know: format %d dimension %d "
+                                     "%llux%u flags 0x%x, image %d, title address %p\n",
+                             int(rd.Format), int(rd.Dimension), static_cast<unsigned long long>(rd.Width), rd.Height,
+                             unsigned(rd.Flags), r && r->image() ? 1 : 0,
+                             r ? reinterpret_cast<void*>(const_cast<Resource*>(r)->GetGPUVirtualAddress()) : nullptr);
         }
         if (rid) {
             view = {rid, 0, 0, rd.DepthOrArraySize};

@@ -870,6 +870,12 @@ struct GraphicsPipeline {
     // first use (from danekbiglike's frame-on-demand-graphics patch: the retail title creates ~25,000 native PSOs at
     // start, and building them all at creation took memory at ~130 MB/s).
     bool deferred = false;
+    // A deferred pipeline built in the background (LEONIDA_ASYNC_PSO with LEONIDA_DEFER_GRAPHICS): ready() says
+    // whether its base configuration exists; the first draw that finds it missing calls request() and is left out,
+    // so a long driver compile never stalls a submission (the retail title's watchdog ends a run where a thread
+    // makes no progress for ~30 s; boot 67 died so).
+    std::function<bool()> ready;
+    std::function<void()> request;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
     // Shader objects instead of `pipeline` (LEONIDA_SHADER_OBJECTS=1, docs/aot_pipelines.md): binds the PSO's
     // shaders and sets every state the pipeline would have baked in, the viewport and scissor (with count), and the
@@ -2495,6 +2501,15 @@ inline void count_draw(DrawOutcome outcome, int result = 0) {
                      static_cast<unsigned long long>(stub.load()));
 }
 
+// The unresolved_resource exits of prepare_draw, numbered in source order, each named the first time it is taken
+// (1 pipeline, 2 render target, 3 depth, then vertex/index buffer exits).
+inline ReplayResult unresolved_site(int site) {
+    static std::atomic<std::uint32_t> seen{0};
+    if (!(seen.fetch_or(1u << site, std::memory_order_relaxed) & (1u << site)))
+        std::fprintf(stderr, "[rt] replay: a draw's resource is unknown at prepare_draw exit %d\n", site);
+    return ReplayResult::unresolved_resource;
+}
+
 template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunctions& vk, PreparedDraw& p,
                           const Draw* previous_draw = nullptr, const PreparedDraw* previous = nullptr) {
@@ -2522,7 +2537,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     }
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     if (!pipeline || (!pipeline->pipeline && !pipeline->bind_shaders && !pipeline->deferred))
-        return ReplayResult::unresolved_resource;
+        return detail::unresolved_site(1);
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
     if (draw.mesh && !vk.draw_mesh_tasks) return ReplayResult::unsupported;
     if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set)) return ReplayResult::unsupported;
@@ -2543,7 +2558,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const TargetView& target = draw.views->render_targets[slot];
         if (!target.resource) continue;
         const ResourceBinding* binding = resolve(target.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
+        if (!binding) return detail::unresolved_site(2);
         auto& a = p.colors[slot];
         a.binding = *binding;
         a.id = target.resource;
@@ -2560,7 +2575,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     }
     if (draw.depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED) {
         const ResourceBinding* binding = resolve(draw.depth.resource);
-        if (!binding) return ReplayResult::unresolved_resource;
+        if (!binding) return detail::unresolved_site(3);
         auto& a = p.depth;
         a.binding = *binding;
         a.id = draw.depth.resource;
@@ -2606,7 +2621,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const bool bound = draw.views && slot < draw.views->vertex_buffers.size() &&
                            draw.views->vertex_buffers[slot].va;
         if (!bound) {
-            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+            if (!vk.zero_buffer) return detail::unresolved_site(4);
             p.vertex_buffers[slot] = vk.zero_buffer;
             p.vertex_offsets[slot] = vk.zero_offset;
             p.vertex_sizes[slot] = vk.zero_size;
@@ -2616,7 +2631,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         const VertexBufferView& view = draw.views->vertex_buffers[slot];
         std::uint64_t size = view.size;
         if (!vk.buffer_at(view.va, size, p.vertex_buffers[slot], p.vertex_offsets[slot]))
-            return ReplayResult::unresolved_resource;
+            return detail::unresolved_site(5);
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
     }
@@ -2682,13 +2697,13 @@ inline ReplayResult finish_draw(const Draw& draw, const ReplayFunctions& vk, Pre
         else if (draw.index.format == 42) p.index_type = VK_INDEX_TYPE_UINT32;
         else if (draw.index.va) return ReplayResult::unsupported;
         if (!draw.index.va) {  // no index buffer: every index reads 0
-            if (!vk.zero_buffer) return ReplayResult::unresolved_resource;
+            if (!vk.zero_buffer) return detail::unresolved_site(6);
             p.index_buffer = vk.zero_buffer;
             p.index_offset = vk.zero_offset;
         } else {
             std::uint64_t size = draw.index.size;
             if (!vk.buffer_at(draw.index.va, size, p.index_buffer, p.index_offset))
-                return ReplayResult::unresolved_resource;
+                return detail::unresolved_site(7);
         }
     }
     return ReplayResult::success;
@@ -3850,6 +3865,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                    draw && vk.graphics_pipeline && draw->pipeline && vk.graphics_pipeline(draw->pipeline) &&
                    vk.graphics_pipeline(draw->pipeline)->pending) {
             p.skip = true;  // its PSO has no shader to draw with (LEONIDA_MISSING_SHADER_STUB): the draw is left out
+            detail::count_draw(detail::DrawOutcome::stub);
+        } else if (const GraphicsPipeline* gp = draw && vk.graphics_pipeline && draw->pipeline
+                                                    ? vk.graphics_pipeline(draw->pipeline) : nullptr;
+                   gp && gp->deferred && gp->ready && !gp->ready()) {
+            if (gp->request) gp->request();  // built in the background; this draw is left out meanwhile
+            p.skip = true;
             detail::count_draw(detail::DrawOutcome::stub);
         } else if (draw) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
