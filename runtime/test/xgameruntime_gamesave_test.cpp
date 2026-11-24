@@ -10,6 +10,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,7 @@ struct Blob {
 };
 
 constexpr HRESULT E_GS_INVALID_CONTAINER_NAME = static_cast<HRESULT>(0x80830001);
+constexpr HRESULT E_GS_OUT_OF_LOCAL_STORAGE = static_cast<HRESULT>(0x80830003);
 constexpr HRESULT E_GS_UPDATE_TOO_BIG = static_cast<HRESULT>(0x80830005);
 constexpr HRESULT E_GS_PROVIDED_BUFFER_TOO_SMALL = static_cast<HRESULT>(0x80830007);
 constexpr HRESULT E_GS_BLOB_NOT_FOUND = static_cast<HRESULT>(0x80830008);
@@ -277,6 +279,32 @@ int main() {
     check(at<ReadResult>(save, 22)(save, &async, needed, aout, &acount) == S_OK && acount == 1 &&
               std::strcmp(aout[0].info.name, "story") == 0 && std::memcmp(aout[0].data, story.data(), story.size()) == 0,
           "ReadBlobDataResult fills the title's buffer with one blob");
+
+    // ---- a submit that fails part way changes nothing ----
+    // "story" is held open without delete sharing, so moving it aside fails after "profile/main" (first in name
+    // order) was already replaced: the update must be rolled back, not left half applied.
+    {
+        HANDLE held = CreateFileW((dir / L"story").c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0,
+                                  nullptr);
+        check(held != INVALID_HANDLE_VALUE, "hold the story blob open without delete sharing");
+        Handle failing = nullptr;
+        check(at<Create>(save, 23)(save, container, nullptr, &failing) == S_OK, "an update that will fail");
+        const std::string fresh = "new profile";
+        at<Write>(save, 25)(save, failing, "profile/main", reinterpret_cast<const uint8_t*>(fresh.data()), fresh.size());
+        at<Write>(save, 25)(save, failing, "story", reinterpret_cast<const uint8_t*>("new story"), 9);
+        check(at<Submit>(save, 27)(save, failing) == E_GS_OUT_OF_LOCAL_STORAGE, "the submit fails");
+        at<Close>(save, 24)(save, failing);
+        if (held != INVALID_HANDLE_VALUE) CloseHandle(held);
+        std::ifstream pf(dir / L"profile%2Fmain", std::ios::binary);
+        const std::string profile_now((std::istreambuf_iterator<char>(pf)), std::istreambuf_iterator<char>());
+        pf.close();
+        bool leftovers = false;
+        for (const auto& e : std::filesystem::directory_iterator(dir))
+            leftovers |= e.path().filename().wstring().back() == L'~' ||
+                         e.path().filename().wstring().ends_with(L"~old");
+        check(profile_now == profile && std::filesystem::file_size(dir / L"story") == story.size() && !leftovers,
+              "the blob already replaced is rolled back, the other is untouched, and no temporary file is left");
+    }
 
     // ---- delete a blob, async submit ----
     check(at<Create>(save, 23)(save, container, nullptr, &update) == S_OK, "a second update");
