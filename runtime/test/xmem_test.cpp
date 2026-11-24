@@ -24,6 +24,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "title_memory.h"
 #include "xmem.h"
 
 namespace {
@@ -109,14 +110,22 @@ void test_working_set(XMemGetWorkingSetStatisticsFn get_stats) {
     std::memcpy(&total_memory, stats + 0, sizeof(total_memory));
     check(ok != FALSE && total_memory != 0, "XMemGetWorkingSetStatistics writes a non-zero total memory at +0");
 
+    // +0 is the title's budget (title_memory.h), the same value XSystemGetAppMemoryUsageLimit answers: the console's
+    // 13.5 GiB capped by what the host can back, never the host's whole RAM.
+    check(ok != FALSE && total_memory == rt::title_memory::limit(),
+          "XMemGetWorkingSetStatistics total memory (+0) is the title budget");
     MEMORYSTATUSEX ms{sizeof(ms)};
-    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys != 0) {
-        check(ok != FALSE && total_memory == ms.ullTotalPhys,
-              "XMemGetWorkingSetStatistics total memory (+0) matches GlobalMemoryStatusEx ullTotalPhys");
-    } else {
-        check(ok != FALSE && total_memory == 12ULL * 1024 * 1024 * 1024,
-              "XMemGetWorkingSetStatistics total memory (+0) falls back to 12 GiB title limit");
-    }
+    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys != 0)
+        check(total_memory < ms.ullTotalPhys, "the title budget leaves the host part of its RAM");
+    constexpr uint64_t GiB = rt::title_memory::kGiB;
+    using rt::title_memory::budget_for;
+    check(budget_for(32 * GiB, 0) == 27 * GiB / 2, "budget: a 32 GiB host gives the console's 13.5 GiB");
+    check(budget_for(16 * GiB, 0) == 12 * GiB, "budget: a 16 GiB host keeps 4 GiB back (12 GiB)");
+    check(budget_for(64 * GiB, 0) == 27 * GiB / 2, "budget: never more than the console's 13.5 GiB");
+    check(budget_for(8 * GiB, 0) == 4 * GiB, "budget: an 8 GiB host gives 4 GiB");
+    check(budget_for(4 * GiB, 0) == 2 * GiB, "budget: never below 2 GiB");
+    check(budget_for(32 * GiB, 6144) == 6 * GiB, "budget: LEONIDA_TITLE_MEMORY_MB overrides it");
+    check(budget_for(0, 0) == 12 * GiB, "budget: no answer from the host keeps the old 12 GiB fallback");
 
     uint64_t working_set = 0;
     std::memcpy(&working_set, stats + 8, sizeof(working_set));

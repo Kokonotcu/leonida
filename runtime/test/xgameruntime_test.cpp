@@ -23,6 +23,7 @@
 
 #include "file_system.h"
 #include "shims.h"
+#include "title_memory.h"
 
 namespace {
 
@@ -943,6 +944,13 @@ int main() {
     check(init() == S_OK, "a second XGameRuntimeInitialize also returns S_OK (reference counted)");
 
     check(get<DeviceTypeFn>("XSystemGetDeviceType")() == 7, "XSystemGetDeviceType reports XboxScarlettAnaconda (7)");
+
+    // XSystemGetAppMemoryUsageLimit answers the title budget (title_memory.h), not the host's whole RAM.
+    using MemoryLimitFn = uint64_t(__stdcall*)();
+    check(get<MemoryLimitFn>("XSystemGetAppMemoryUsageLimit")() == rt::title_memory::limit(),
+          "XSystemGetAppMemoryUsageLimit answers the title budget");
+    check(rt::title_memory::limit() <= rt::title_memory::kConsoleTitleBudget,
+          "the title budget is at most the console's 13.5 GiB");
 
     auto console_id = get<ConsoleIdFn>("XSystemGetConsoleId");
     char id[64] = {};

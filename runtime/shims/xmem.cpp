@@ -35,6 +35,7 @@
 
 #include "shims.h"
 #include "startup_trace.h"
+#include "title_memory.h"
 #include "xmem.h"
 
 namespace {
@@ -140,8 +141,8 @@ SIZE_T __stdcall XMemVirtualQuery(HANDLE process, const void* address, void* out
 // pointer from the first argument wrote to address 0x20000001.
 // The measured FSR sites establish argument shape, kind and the 64-bit working-set read at +8; +0's title-total memory
 // limit interpretation is inferred from other Series implementations (xcl, xbox-emulator) and title engine telemetry
-// sizing memory pools (RT-220). Note that if GlobalMemoryStatusEx reports 0 physical memory, XMem falls back to the
-// 12 GiB title limit, whereas XSystemGetAppMemoryUsageLimit remains 0.
+// sizing memory pools (RT-220). +0 is the same title budget XSystemGetAppMemoryUsageLimit answers (title_memory.h), not
+// the host's physical RAM.
 BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
     if (!stats) {
         static std::atomic<bool> warned{false};
@@ -154,11 +155,7 @@ BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
     PROCESS_MEMORY_COUNTERS pmc{};
     if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return FALSE;
 
-    MEMORYSTATUSEX ms{sizeof(ms)};
-    uint64_t total_memory = 12ULL * 1024 * 1024 * 1024;
-    if (GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys != 0) {
-        total_memory = ms.ullTotalPhys;
-    }
+    const uint64_t total_memory = rt::title_memory::limit();
 
     uint8_t* bytes = static_cast<uint8_t*>(stats);
     std::memset(bytes, 0, 16);
