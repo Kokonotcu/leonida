@@ -1766,6 +1766,17 @@ struct DeviceState {
                                : (aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT
                                                                        : VK_IMAGE_ASPECT_COLOR_BIT),
             image.first_mip, image.mip_count, image.first_layer, image.layer_count};
+        // A 3D view has one layer; a sliced one's W range goes on its storage view only (below). Its sampled view is
+        // the whole volume, which the translator's reads offset by the T#'s first slice (rdna2spirv.py,
+        // sliced_3d_offset).
+        if (image.type == g::ImageType::image_3d) {
+            view_info.subresourceRange.baseArrayLayer = 0;
+            view_info.subresourceRange.layerCount = 1;
+        }
+        if (image.sliced && (!storage || !info.image_sliced_view_of_3d)) {
+            log_once("a W range of a 3D UAV needs VK_EXT_image_sliced_view_of_3d; first slice", int(image.first_layer));
+            return false;
+        }
         ImageEntry entry{dimension, 0, VK_NULL_HANDLE, VK_NULL_HANDLE, image.address};
         if (vk.vkCreateImageView(info.device, &view_info, nullptr, &entry.sampled) != VK_SUCCESS) return false;
         leonida::StorageViews views{};
@@ -1774,10 +1785,19 @@ struct DeviceState {
             storage_info.components = {};
             VkImageViewUsageCreateInfo storage_usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
             const VkFormat storage_format = uint_backed ? image_format : view_format;
-            if (uint_backed) {
+            // A sliced view may only be used as a storage image (VUID-VkImageViewSlicedCreateInfoEXT-None-07871).
+            const bool storage_only = uint_backed || image.sliced;
+            if (storage_only) {
                 storage_info.format = storage_format;
                 storage_usage.usage = VK_IMAGE_USAGE_STORAGE_BIT;
                 storage_info.pNext = &storage_usage;
+            }
+            VkImageViewSlicedCreateInfoEXT sliced{VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT};
+            if (image.sliced) {
+                sliced.sliceOffset = image.first_layer;
+                sliced.sliceCount = image.layer_count;
+                sliced.pNext = storage_info.pNext;
+                storage_info.pNext = &sliced;
             }
             if (vk.vkCreateImageView(info.device, &storage_info, nullptr, &entry.storage) != VK_SUCCESS) {
                 vk.vkDestroyImageView(info.device, entry.sampled, nullptr);
@@ -5381,6 +5401,9 @@ struct TextureView {
     UINT mapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     UINT plane = 0;
     float min_lod = 0.0f;
+    // A 3D UAV's W range at its mip (FirstWSlice, WSize; ~0: to the last slice). All slices: a plain 3D view.
+    UINT first_w = 0;
+    UINT w_count = ~0u;
 };
 
 // In-memory pipeline library (docs/d3d12_vulkan.md sections 3.6 and 4). D3D12 cached blobs are driver-specific
@@ -5969,6 +5992,21 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     if (!out.mip_count || !out.layer_count) {
         log_once("view of no mips or no layers; type", int(view.type));
         return false;
+    }
+    if (volume) {
+        // A W range of the view's mip (a RWTexture3D UAV): all of it is a plain 3D view, part of it a sliced one
+        // (gfx10::Image::sliced; VK_EXT_image_sliced_view_of_3d in bind_image).
+        const UINT slices = std::max<UINT>(1, UINT(desc.DepthOrArraySize) >> view.first_mip);
+        if (view.first_w >= slices) {
+            log_once("3D view starts past the slices of its mip; first slice", int(view.first_w));
+            return false;
+        }
+        const UINT count = std::min<UINT>(view.w_count, slices - view.first_w);
+        if (view.first_w || count != slices) {
+            out.sliced = true;
+            out.first_layer = view.first_w;
+            out.layer_count = count;
+        }
     }
     // D3D12's component mapping picks, for each of R, G, B, A, a channel of the format or a constant; the T#
     // says the same about the hardware's channels, which the format places.
@@ -8010,7 +8048,10 @@ public:
         view.mip_count = 1;
         if (!desc) {
             const bool array = r->desc().DepthOrArraySize > 1;
-            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
+            if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+                view.type = leonida::gfx10::ImageType::image_3d;  // mip 0, every slice
+                view.layer_count = 1;
+            } else if (r->desc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D && !array) {
                 view.type = leonida::gfx10::ImageType::image_1d;
                 view.layer_count = 1;
             } else if (array)
@@ -8034,6 +8075,14 @@ public:
                 view.first_layer = desc->Texture2DArray.FirstArraySlice;
                 view.layer_count = desc->Texture2DArray.ArraySize;
                 view.plane = desc->Texture2DArray.PlaneSlice;
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE3D:
+                // One mip; all its slices, or the W range FirstWSlice..+WSize (WSize ~0: to the last).
+                view.type = leonida::gfx10::ImageType::image_3d;
+                view.first_mip = desc->Texture3D.MipSlice;
+                view.layer_count = 1;
+                view.first_w = desc->Texture3D.FirstWSlice;
+                view.w_count = desc->Texture3D.WSize;
                 break;
             default:
                 log_once("unordered-access view dimension not supported:", desc->ViewDimension);
@@ -10930,6 +10979,12 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 has_gpl = true;
             } else if (!std::strcmp(e.extensionName, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME)) {
                 has_pipeline_library = true;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME)) {
+                VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT sliced{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT};
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &sliced};
+                vkGetPhysicalDeviceFeatures2(info.physical, &features);
+                info.image_sliced_view_of_3d = sliced.imageSlicedViewOf3D == VK_TRUE;
             }
         }
         // docs/aot_pipelines.md step 3: graphics PSOs linked from per-shader pipeline libraries, where shader objects
@@ -11007,6 +11062,13 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         std::fprintf(stderr, "[rt] d3d12: graphics PSOs are linked from pipeline libraries%s (docs/aot_pipelines.md; "
                              "LEONIDA_GPL=0 builds them whole)\n",
                      info.gpl_fast_linking ? "" : " without fast linking (LEONIDA_GPL=1)");
+    }
+    VkPhysicalDeviceImageSlicedViewOf3DFeaturesEXT enable_sliced{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_SLICED_VIEW_OF_3D_FEATURES_EXT};
+    enable_sliced.imageSlicedViewOf3D = VK_TRUE;
+    if (info.image_sliced_view_of_3d) {  // RWTexture3D UAVs of a W range
+        enable_sliced.pNext = ext_chain;
+        ext_chain = &enable_sliced;
     }
     if (info.ray_tracing) {
         enable_rq.pNext = ext_chain;
@@ -11448,6 +11510,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         device_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
         device_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
     }
+    if (info.image_sliced_view_of_3d) device_extensions.push_back(VK_EXT_IMAGE_SLICED_VIEW_OF_3D_EXTENSION_NAME);
     if (info.buffer_marker) device_extensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
 #if defined(VK_EXT_device_fault)
     if (info.device_fault) device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);

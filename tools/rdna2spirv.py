@@ -13097,6 +13097,21 @@ class Gen:
             return t
         raise Unsupported("descriptor operand")
 
+    def sliced_3d_z(self, tsharp, z):
+        """The volume slice of a read through the sampled 3D array (which views the whole volume) at view slice `z`:
+        a T# of a W range of a 3D UAV (a sliced view, RADV's GFX10 form) has ARRAY_PITCH (word 5 [3:0]) = 1 and its
+        first slice in BASE_ARRAY (word 4 [28:16]), which the hardware adds; any other T# adds nothing. Stores,
+        atomics and coherent loads go through the storage view, which the runtime makes sliced, so they need no
+        offset (runtime/src/gfx10_descriptors.h, Image::sliced)."""
+        w4, w5 = self.sgpr_word(tsharp, 4), self.sgpr_word(tsharp, 5)
+        pitch, first, sliced, off, out = (self.tmp() for _ in range(5))
+        self.emit(f"{pitch} = OpBitFieldUExtract %uint {w5} {self.cu(0)} {self.cu(4)}")
+        self.emit(f"{first} = OpBitFieldUExtract %uint {w4} {self.cu(16)} {self.cu(13)}")
+        self.emit(f"{sliced} = OpIEqual %bool {pitch} {self.cu(1)}")
+        self.emit(f"{off} = OpSelect %uint {sliced} {first} {self.cu(0)}")
+        self.emit(f"{out} = OpIAdd %int {z} {self.as_int(off)}")
+        return out
+
     def sgpr_words(self, a, n):
         if a["k"] == "sgpr" and a.get("n", 1) >= n:
             return [self.load_reg("sgpr", a["r"] + i) for i in range(n)]
@@ -13222,6 +13237,8 @@ class Gen:
             if len(coords) < ncoord:
                 raise Unsupported("image_load coords")
             ints = [self.as_int(c) for c in coords[:ncoord]]
+            if is3d and not coherent:
+                ints[2] = self.sliced_3d_z(a[2], ints[2])   # a W-range UAV's first slice (sampled array: whole volume)
             if ncoord == 1:
                 iv = ints[0]
             else:
@@ -14091,6 +14108,7 @@ class Gen:
             self.dynamic_sampled_access(ip, "%_ptr_UC_img3", "%images_3d", idx)
             self.emit(f"{img} = OpLoad %img3d {ip}")
             xs = [self.as_int(self.load_reg("vgpr", r)) for r in addr[:4]]
+            xs[2] = self.sliced_3d_z(a[2], xs[2])        # a W-range UAV's first slice (sampled array: whole volume)
             self.emit(f"{iv} = OpCompositeConstruct %v3int {xs[0]} {xs[1]} {xs[2]}")
             dm = next((m for m in mods if m.startswith("dmask:")), "dmask:0x1")
             self.image_load_typed(dim, self.sgpr_word(a[2], 1), iv, img, idx, int(dm.split(":")[1], 0),

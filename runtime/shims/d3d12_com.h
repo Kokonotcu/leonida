@@ -161,6 +161,9 @@ struct VulkanDeviceInfo {
     // pipelineCreationCacheControl is enabled: a linked PSO first asks the pipeline cache for its optimised link
     // (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) before it fast-links.
     bool pipeline_creation_cache_control = false;
+    // VK_EXT_image_sliced_view_of_3d and imageSlicedViewOf3D are enabled: a RWTexture3D UAV of a W range (FirstWSlice,
+    // WSize short of the whole mip) gets a sliced 3D storage view. Without it such a view is refused (logged).
+    bool image_sliced_view_of_3d = false;
     bool tessellation_shader = false;  // tessellationShader enabled: a shader-object draw binds those stages to null
     // Opt in only for shader libraries whose InnerCoverage input contract uses FullyCoveredEXT. The device
     // still checks physical Tier 2 and fullyCoveredFragmentShaderInputVariable properties. The standalone
