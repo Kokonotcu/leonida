@@ -2117,6 +2117,13 @@ without recorded inputs. In that case the runtime accepts any input layout when 
 
 ### 3.6 Shader identity, PSOs and feature selection
 
+The Xbox native graphics pipeline descriptor identifies stages by the digest in a DXBC HASH part (see
+`docs/fspx.md`, kind 7). The shaders stage writes `<work>/shaders/spirv/native_hashes.txt` from the user's
+carved DXBC containers and translation index. After the version header, each line contains the 16-byte digest
+in lowercase hex, the translated stage and a container path relative to the index, separated by tabs.
+Containers sharing a digest must agree on stage and FSSM hash. A collision fails the stage and preserves the
+previous catalog. Existing translated workspaces can build the catalog by rerunning the shaders stage.
+
 A D3D12 PSO carries DXBC containers, not SPIR-V. The layer identifies a shader by hashing the **FSSM payload** (the
 native RDNA2 program inside the container) and looking it up in a build-time table keyed by `(stage, hash)`. The
 build emits that hash for every translation; the runtime extracts the FSSM chunk from the DXBC container the same
