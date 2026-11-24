@@ -31,6 +31,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_alloc_size.h"
 #include "presentx_capture.h"
+#include "xg_linear_layout.h"  // slots 25 and 108 cover the texture computer's layout
 #include "../src/frame_pacer.h"     // leonida::FrameTokenSource: the tokens slots 78/79/80 and PresentX share
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 
@@ -883,7 +884,28 @@ struct ChildProxy {
     unsigned slot_count;    // public slots the real object implements; the rest of the table is refused
     std::atomic<unsigned long> refs;
     std::atomic<FenceMirror*> mirror{nullptr};  // fence: slot 12's completed value, made on its first call
+    // Queue: made through the console's CreateCommandQueueX (device slot 48), the way the retail title makes its
+    // queues, so its slots follow the console layout (console_queue_slot). A queue from the PC slots (8, 75) keeps
+    // the PC layout: the runtime's own code and the tests call those through d3d12.h.
+    bool console_layout = false;
 };
+
+// Where a console-layout queue's slot goes on the PC queue (PR #8134, measured on the retail executable 1.0.2.1):
+//   - 35 is ExecuteCommandLists(count, lists, ...) (#7286): the first frame's lists go in with (1, lists, 1,
+//     0x100000000);
+//   - 16..20 sit two past the PC's 14..18: the title calls slot 16 with (fence, 1) and (fence, 2) where it signals,
+//     so 16 Signal, 17 Wait, 18 GetTimestampFrequency (an 8-byte out and an HRESULT, the value used as 1 / frequency),
+//     19 GetClockCalibration, 20 GetDesc. Forwarded by number, PC slot 16 wrote the frequency over the fence proxy's
+//     vtable, and PC slot 18 (GetDesc) 16 bytes over the caller's saved RBX.
+//   - 14 and 15 are console methods that are not measured: refused (kNoPcSlot), not sent to PC Signal/Wait.
+// Every other slot keeps its PC number.
+constexpr unsigned kNoPcSlot = ~0u;
+constexpr unsigned console_queue_slot(unsigned slot) {
+    return slot == 35                 ? 10u
+           : slot >= 16 && slot <= 20 ? slot - 2u
+           : slot == 14 || slot == 15 ? kNoPcSlot
+                                      : slot;
+}
 
 template <ChildKind K>
 struct ChildStats {
@@ -1592,12 +1614,6 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             d3d12_trace::record(child_trace_name<K>(Slot));
             return hr_to_u64(S_OK);
         }
-        // ExecuteCommandLists takes an array of lists; unwrap any list proxy before the PC queue sees it.
-        if constexpr (K == ChildKind::queue && Slot == 10) {
-            UnwrappedArray array;
-            if (!array.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
-            if (array.data()) a2 = array.data();
-        }
         note_child_slot<K>(Slot);
         // Console list slot 139 is the retail title's Reset(allocator, pso), measured immediately after Close (slot 9)
         // and before recording: it is PC slot 10. The allocator (and a pipeline state) the title hands over are
@@ -1736,26 +1752,50 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
             d3d12_trace::record(child_trace_name<K>(Slot));
             return fence_completed_value_address(self, a1, a2, a3);
         }
-        if (Slot >= self->slot_count) {
+        // The PC slot this call goes to: its own number, except on a queue made through the console's slot 48
+        // (console_queue_slot).
+        unsigned fwd = Slot;
+        if constexpr (K == ChildKind::queue) {
+            if (self->console_layout) fwd = console_queue_slot(Slot);
+        }
+        if (fwd >= self->slot_count) {
             bool expected = false;
             if (ChildStats<K>::beyond_warned[Slot].compare_exchange_strong(expected, true,
                                                                             std::memory_order_relaxed)) {
-                std::fprintf(stderr,
-                             "[rt] d3d12_xs: %s slot %u is beyond the PC %s vtable (%u slots); returning E_NOTIMPL "
-                             "(args 0x%llx 0x%llx 0x%llx 0x%llx)\n",
-                             child_kind_name<K>(), Slot, child_kind_name<K>(), self->slot_count,
-                             static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
-                             static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
+                if (fwd == kNoPcSlot)
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: %s slot %u is an unmeasured console method; returning E_NOTIMPL "
+                                 "(args 0x%llx 0x%llx 0x%llx 0x%llx)\n",
+                                 child_kind_name<K>(), Slot, static_cast<unsigned long long>(a1),
+                                 static_cast<unsigned long long>(a2), static_cast<unsigned long long>(a3),
+                                 static_cast<unsigned long long>(a4));
+                else
+                    std::fprintf(stderr,
+                                 "[rt] d3d12_xs: %s slot %u is beyond the PC %s vtable (%u slots); returning E_NOTIMPL "
+                                 "(args 0x%llx 0x%llx 0x%llx 0x%llx)\n",
+                                 child_kind_name<K>(), Slot, child_kind_name<K>(), self->slot_count,
+                                 static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                                 static_cast<unsigned long long>(a3), static_cast<unsigned long long>(a4));
             }
             d3d12_trace::record(child_trace_name<K>(Slot), "unsupported");
             return hr_to_u64(E_NOTIMPL);
         }
         d3d12_trace::record(child_trace_name<K>(Slot));  // "called": the real object's result is not inspected
-        if constexpr (K == ChildKind::queue && (Slot == kQueueSignal || Slot == kQueueWait)) a1 = unwrap_object(a1);
         UnwrappedArray unwrapped_lists;
-        if constexpr (K == ChildKind::queue && Slot == 10) {
-            if (!unwrapped_lists.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
-            if (unwrapped_lists.data()) a2 = unwrapped_lists.data();
+        if constexpr (K == ChildKind::queue) {
+            if (fwd == kQueueSignal || fwd == kQueueWait) a1 = unwrap_object(a1);
+            // ExecuteCommandLists takes an array of lists; unwrap any list proxy before the PC queue sees it.
+            if (fwd == 10) {
+                if (!unwrapped_lists.fill(a2, a1)) return hr_to_u64(E_OUTOFMEMORY);
+                if (unwrapped_lists.data()) a2 = unwrapped_lists.data();
+                // The console's slot 35 passes two more words (1, 0x100000000 in the retail title's first frame),
+                // which the PC ExecuteCommandLists(count, lists) does not take: they are not passed on.
+                if (fwd != Slot) {
+                    a1 = static_cast<std::uint32_t>(a1);
+                    a3 = 0;
+                    a4 = 0;
+                }
+            }
         }
 
         // The PC vtable entry with the real object as `this`; integer/pointer arguments, the hidden struct-return
@@ -1764,7 +1804,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
                                                  std::uint64_t, std::uint64_t, std::uint64_t);
-        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
+        auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[fwd]);
         const std::uint64_t result = fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
         // A CPU Signal through the proxy moves the completed value before the title can read it through slot 12.
         if constexpr (K == ChildKind::fence && Slot == kFenceSignal) {
@@ -1828,7 +1868,7 @@ void** get_child_vtable() {
 // Wraps `created` (one reference, owned by the proxy on success, released on failure) and returns `riid` from the
 // proxy through `out`.
 template <ChildKind K>
-HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void** out) {
+HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void** out, bool console_layout = false) {
     if (!created) return E_FAIL;
     ChildProxy* proxy = new (std::nothrow) ChildProxy;
     if (!proxy) {
@@ -1838,6 +1878,7 @@ HRESULT wrap_child(IUnknown* created, DeviceProxy* device, const IID* riid, void
     proxy->vtable = get_child_vtable<K>();
     proxy->real = created;
     proxy->device = device;
+    proxy->console_layout = K == ChildKind::queue && console_layout;
     proxy->real_vtable = *reinterpret_cast<void***>(created);
     if constexpr (K == ChildKind::queue) {
         proxy->slot_count = kQueuePublicSlots;
@@ -1936,7 +1977,8 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     void* created = nullptr;
     const HRESULT hr = self->real->CreateCommandQueue(desc, __uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
-    return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
+    // A console-route queue (slot 48) is called in the console's slot layout (console_queue_slot).
+    return wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out, console_route);
 }
 
 // Device slot 41 is handled in the early dispatch chain: it maps the console signature IID and, for a console
@@ -3010,6 +3052,14 @@ HRESULT proxy_create_state_object(DeviceProxy* self, const D3D12_STATE_OBJECT_DE
 // The retail executable calls struct-returning device methods with the C ABI (return buffer in RCX, device proxy in
 D3D12_RESOURCE_ALLOCATION_INFO fallback_allocation(const D3D12_RESOURCE_DESC& d);  // defined below slot 25's helper
 
+// A console caller's texture is sized at least as xg_xs's texture computer lays it out (xg_linear_layout.h), so
+// memory the title sizes with slots 25 and 108 holds what the computer's CopyIntoSubresource writes into it.
+void cover_linear_layout(const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_ALLOCATION_INFO& info) {
+    if (info.SizeInBytes == UINT64_MAX) return;
+    rt::xg::ResourceLayout layout;
+    if (rt::xg::linear_layout(desc, layout) && layout.size_bytes > info.SizeInBytes) info.SizeInBytes = layout.size_bytes;
+}
+
 // RDX); a PC C++ caller passes the proxy in RCX and the return buffer in RDX. Both orders are accepted. Each resource
 // description's Xbox layout word (e.g. 0x101, 0x105) and console flag bits above the PC D3D12_RESOURCE_FLAGS are
 // normalized on a copy before the PC call, with SamplerFeedbackMipRegion zeroed so 56-byte D3D12_RESOURCE_DESC inputs
@@ -3045,11 +3095,14 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
 
     std::vector<D3D12_RESOURCE_DESC1> cleaned;
     const D3D12_RESOURCE_DESC1* descs_to_pass = raw_descs;
+    // The title's descriptions are the console's 0x38-byte D3D12_RESOURCE_DESC, one after another (PR #8134, measured
+    // at the retail executable's call); a PC caller passes D3D12_RESOURCE_DESC1, 0x50 bytes apart.
+    const std::size_t stride = console_abi ? sizeof(D3D12_RESOURCE_DESC) : sizeof(D3D12_RESOURCE_DESC1);
     if (raw_descs && count > 0 && count <= 1024) {
         cleaned.resize(count);
         for (UINT i = 0; i < count; ++i) {
             D3D12_RESOURCE_DESC1 d{};
-            std::memcpy(&d, reinterpret_cast<const std::uint8_t*>(raw_descs) + i * sizeof(D3D12_RESOURCE_DESC1),
+            std::memcpy(&d, reinterpret_cast<const std::uint8_t*>(raw_descs) + i * stride,
                         sizeof(D3D12_RESOURCE_DESC));
             d.SamplerFeedbackMipRegion = {};
             if (static_cast<std::uint32_t>(d.Layout) >
@@ -3073,6 +3126,12 @@ std::uint64_t proxy_get_resource_allocation_info2(DeviceProxy* self, std::uint64
         D3D12_RESOURCE_DESC base{};
         std::memcpy(&base, reinterpret_cast<const std::uint8_t*>(descs_to_pass), sizeof(base));
         *ret = fallback_allocation(base);
+    }
+    if (console_abi && descs_to_pass && count == 1) {
+        D3D12_RESOURCE_DESC base{};
+        std::memcpy(&base, reinterpret_cast<const std::uint8_t*>(descs_to_pass), sizeof(base));
+        cover_linear_layout(base, *ret);
+        if (info1 && info1->SizeInBytes < ret->SizeInBytes) info1->SizeInBytes = ret->SizeInBytes;
     }
     return reinterpret_cast<std::uint64_t>(ret);
 }
@@ -3306,7 +3365,22 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
                          va, static_cast<unsigned long long>(pc_desc.Width), GetLastError());
         }
     }
-    return handler(self->real, va, pc_desc, state, *riid, out);
+    const HRESULT hr = handler(self->real, va, pc_desc, state, *riid, out);
+    // The description of the first refusals (PR #8134 logged them on its retail runs): which kind of placement the
+    // title needs that the handler does not make.
+    if (FAILED(hr)) {
+        static std::atomic<unsigned> failed{0};
+        if (failed.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: slot 133 failed 0x%08lx: va=%p dimension %d %llux%ux%u mips %u format %u "
+                         "samples %u xbox layout 0x%x xbox flags 0x%x\n",
+                         static_cast<unsigned long>(hr), va, static_cast<int>(pc_desc.Dimension),
+                         static_cast<unsigned long long>(pc_desc.Width), pc_desc.Height,
+                         static_cast<unsigned>(pc_desc.DepthOrArraySize), static_cast<unsigned>(pc_desc.MipLevels),
+                         static_cast<unsigned>(pc_desc.Format), pc_desc.SampleDesc.Count,
+                         static_cast<unsigned>(xbox_desc->Layout), xbox_flags);
+    }
+    return hr;
 }
 
 template <unsigned Slot>
@@ -3607,6 +3681,7 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
     // a >32-bit size. A PC-ABI caller keeps the host's refusal, as the PC runtime gives it.
     if (call.console_abi && info.SizeInBytes == UINT64_MAX && descs && desc_count)
         info = fallback_allocation(descs[0]);
+    if (call.console_abi && descs && desc_count == 1) cover_linear_layout(descs[0], info);
     static std::atomic<unsigned> alloc_logs{0};
     const unsigned alloc_call = alloc_logs.fetch_add(1, std::memory_order_relaxed);
     if (alloc_call < 40 || (info.SizeInBytes >> 32) != 0 || info.Alignment != D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT) {

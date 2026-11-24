@@ -273,6 +273,7 @@ void test_trace(const fs::path& dir) {
     check(has(e, "\"at\":" + mod + hex_rva(kFaultRva) + "\""), "exception address is module+RVA");
     check(has(e, "\"access\":\"read\"") && has(e, "\"address\":\"0x0\""), "access kind and faulting address");
     check(has(e, "\"stack\":[" + mod.substr(0) + hex_rva(kFaultRva)), "stack starts at the faulting instruction");
+    check(has(e, "\"regs\":\"rax=0x") && has(e, " rsp=0x"), "the fault's registers (PR #8134)");
 
     check(find_line(lines, "exit") == &lines.back(), "exit comes last");
 }
