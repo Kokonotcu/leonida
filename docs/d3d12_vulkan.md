@@ -2216,9 +2216,12 @@ Pipeline creation:
   shader, root signature content or state, a changed byte, a truncated blob or a pointer with size 0 give
   `E_INVALIDARG`; a null pointer with a size is ignored; another adapter gives `D3D12_ERROR_ADAPTER_NOT_FOUND` and
   another driver `D3D12_ERROR_DRIVER_VERSION_MISMATCH`. `ID3D12PipelineLibrary` is an in-memory map plus the Vulkan
-  cache. Its arguments answer as the host's (`d3d12_pipeline_library_host_test`, 74 values from 46 calls that need no
-  PSO, each run on the host in a process of its own, since a call it faults on leaves its runtime broken and the next
-  one failing fast; RTX 3060, driver 610.88):
+  cache. `d3d12_pipeline_library_host_test` compares public argument checks with the host. It runs each host
+  call in a separate process because a fault can leave the device unusable. It reports serialized sizes and the
+  result of flipping a trailing byte for each device's own format. `d3d12_pipeline_library_test` checks that the
+  layer rejects a nonzero reserved field in its `LPL1` header. On Windows 11 build 26100 (RTX 5070 Ti,
+  driver 610.74), all 72 public-argument comparisons matched. The previous 74-value run (RTX 3060, driver
+  610.88) included the two results from the trailing-byte case.
   - `CreatePipelineLibrary`: a foreign, truncated or corrupt blob, the other device's blob, or a null pointer with a
     size is `E_INVALIDARG`, and `*ppPipelineLibrary` is left as it was. One of the layer's own blobs from another
     format version is `D3D12_ERROR_DRIVER_VERSION_MISMATCH`, the documented code for a cache from another driver.
@@ -3214,6 +3217,14 @@ queue they came on (one `VkQueue` behind all of them).
   keeps the app's sync interval.
   `GetFrameStatisticsX` keeps the last 64 frames and reports the event, present and display times (not render;
   `PercentScanned` only for a frame shown at once by `ImmediateThresholdPercent`, else 0); `S_FALSE` with count 0 for what it does not have.
+  *Pacing drift reporting (BL-6):* `FramePacer` keeps fixed-capacity ring buffers (`frame_pacing_window = 1024`) of
+  present-to-present frame intervals and origin-to-present latencies (clearing the last-present anchor across
+  `SuspendX`/`ResumeX` so suspended pauses are excluded), computing nearest-rank `p50`/`p95`/`p99` and the mean drift
+  against the active target interval (`FramePacer::pacing_summary()`). On teardown after at least one present,
+  `XboxPresentation` logs a single `[rt] present: pacing summary ...` line on stderr, which `tools/boot_trace.py`
+  surfaces beside the D3D12 call counts. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
+  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode) and by
+  `tests/test_boot_trace.py`.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
   single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
   (bilinear, so the rectangle's outer texels blend with their neighbours). The blit converts between formats; an sRGB
