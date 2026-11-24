@@ -651,6 +651,38 @@ void test_motion(IGameInput* input) {
     check(input->GetCurrentReading(GameInputKindGamepad, mdev, &r) == S_OK && r && !r->GetMotionState(nullptr) &&
               (r->GetInputKind() & GameInputKindMotion),
           "motion: GetMotionState(nullptr) is false; the gyro pad's reading kind includes Motion");
+
+    // Review B14: the plain pad's held button stays the current gamepad reading although the idle gyro pad keeps
+    // streaming motion readings; a motion query still takes the gyro pad's newest reading.
+    {
+        if (r) r->Release();
+        r = nullptr;
+        SDL_SetJoystickVirtualButton(plain.js, SDL_GAMEPAD_BUTTON_EAST, true);
+        rt::gameinput::poll();
+        for (int i = 0; i < 4; ++i) {  // motion ticks: one reading each from the gyro pad, nothing else changes
+            send_motion(gyro_pad, 0.0f, 0.0f, 9.80665f, 1.0f + i, 0.0f, 0.0f);
+            Sleep(12);
+            rt::gameinput::poll();
+        }
+        IGameInputDevice* owner = nullptr;
+        const bool got_pad = input->GetCurrentReading(GameInputKindGamepad, nullptr, &r) == S_OK && r;
+        if (r) r->GetDevice(&owner);
+        check(got_pad && owner == pdev && (buttons_of(r) & GameInputGamepadB),
+              "motion: an idle pad streaming motion does not hide another pad's held button (kind Gamepad)");
+        if (owner) owner->Release();
+        if (r) r->Release();
+        r = nullptr;
+        owner = nullptr;
+        const bool got_motion = input->GetCurrentReading(GameInputKindMotion, nullptr, &r) == S_OK && r;
+        if (r) r->GetDevice(&owner);
+        check(got_motion && owner == mdev, "motion: kind Motion with no device takes the gyro pad's newest reading");
+        if (owner) owner->Release();
+        if (r) r->Release();
+        r = nullptr;
+        SDL_SetJoystickVirtualButton(plain.js, SDL_GAMEPAD_BUTTON_EAST, false);
+        rt::gameinput::poll();
+        check(input->GetCurrentReading(GameInputKindGamepad, mdev, &r) == S_OK && r, "motion: gyro pad reading again");
+    }
     if (r) r->Release();
     unused = {};
     check(input->GetCurrentReading(GameInputKindGamepad, pdev, &r) == S_OK && r &&

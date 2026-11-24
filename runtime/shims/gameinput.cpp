@@ -520,6 +520,10 @@ public:
     std::deque<Reading*> history;  // one reference each, oldest first; the newest is the current reading
     uint64_t evicted_order = 0;    // order of the newest reading dropped from history
     Reading* latest() const { return history.empty() ? nullptr : history.back(); }
+    // When its input other than motion last changed (or it connected). A pad with sensors makes a reading every
+    // ~8 ms while idle; GetCurrentReading(kind, nullptr) for a kind other than motion picks the device by this, so
+    // that stream does not hide another device's held input (review B14). Under g().mu.
+    uint64_t last_change_us = 0;
     uint64_t seq = 0;
     Rumble wanted;
     float motor_gain = 1.0f;                     // SetForceFeedbackMotorGain, 0..1
@@ -1559,6 +1563,7 @@ void open_pad(SDL_JoystickID jid, uint64_t ts) {
 
     const Snapshot snap = read_pad(d);
     d->last_snap = snap;
+    d->last_change_us = ts;
     push_reading(d, snap, ts);
     queue_event({CbType::Device, d, nullptr, ts, status, GameInputDeviceNoStatus, false, 0});
     std::fprintf(stderr, "[rt] gameinput: connected %s (%04x:%04x, player %d%s%s%s%s)\n", d->name.c_str(),
@@ -2071,6 +2076,7 @@ void poll_once() {
         const bool motion_tick = snap.has_motion && now - d->last_reading_us >= kMotionReadingUs;
         if (changed || motion_tick) {
             std::lock_guard lock(s.mu);
+            if (changed) d->last_change_us = now;
             queue_event({CbType::Reading, d, push_reading(d, snap, now), now, 0, 0, false, 0});
         }
         if (guide_changed) {
@@ -2475,16 +2481,28 @@ public:
         if (kind != GameInputKindUnknown && !(kind & kSupportedKinds)) return GAMEINPUT_E_READING_NOT_FOUND;
         std::lock_guard lock(g().mu);
         Reading* best = nullptr;
+        // Across devices, the newest is the one whose input of this kind changed last. For motion that is every
+        // reading; for any other kind, a pad streaming motion readings while idle must not win over a device whose
+        // buttons or sticks really moved (review B14), so the device's last non-motion change decides.
+        const bool by_reading = (kind & GameInputKindMotion) != 0;
+        uint64_t best_key = 0;
+        const auto consider = [&](Device* cd) {
+            Reading* r = cd->latest();
+            if (!r) return;
+            const uint64_t key = by_reading ? r->GetTimestamp() : cd->last_change_us;
+            if (!best || key >= best_key) {
+                best = r;
+                best_key = key;
+            }
+        };
         if (device) {
             Device* d = as_device(device);
             if (d->info.deviceFamily == GameInputFamilyAggregate) {
                 if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
                     return GAMEINPUT_E_READING_NOT_FOUND;
                 const uint32_t effective_kind = (kind != GameInputKindUnknown) ? (kind & d->info.supportedInput) : d->info.supportedInput;
-                for (Device* cd : g().connected) {
-                    if (!(effective_kind & cd->info.supportedInput)) continue;
-                    if (Reading* r = cd->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
-                }
+                for (Device* cd : g().connected)
+                    if (effective_kind & cd->info.supportedInput) consider(cd);
             } else {
                 if (d->status == GameInputDeviceNoStatus) return GAMEINPUT_E_DEVICE_DISCONNECTED;
                 if (kind != GameInputKindUnknown && !(kind & d->info.supportedInput))
@@ -2492,8 +2510,9 @@ public:
                 best = d->latest();
             }
         } else {
-            for (Device* d : g().connected)  // the most recent reading from any gamepad
-                if (Reading* r = d->latest(); r && (!best || r->GetTimestamp() >= best->GetTimestamp())) best = r;
+            // The most recent reading from any device that does this kind (motion only from pads with sensors).
+            for (Device* d : g().connected)
+                if (kind == GameInputKindUnknown || (kind & d->info.supportedInput)) consider(d);
         }
         if (!best) return GAMEINPUT_E_READING_NOT_FOUND;
         best->AddRef();
