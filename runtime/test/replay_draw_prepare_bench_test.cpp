@@ -40,6 +40,7 @@ VKAPI_ATTR void VKAPI_CALL bind_sets(VkCommandBuffer, VkPipelineBindPoint, VkPip
                                      const VkDescriptorSet*, std::uint32_t, const std::uint32_t*) {}
 VKAPI_ATTR void VKAPI_CALL push(VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t,
                                 const void*) {}
+// vkCmdSetViewportWithCount / vkCmdSetScissorWithCount, what the replay binds since the viewport arrays (M4).
 VKAPI_ATTR void VKAPI_CALL viewport(VkCommandBuffer, std::uint32_t, const VkViewport*) {}
 VKAPI_ATTR void VKAPI_CALL scissor(VkCommandBuffer, std::uint32_t, const VkRect2D*) {}
 VKAPI_ATTR void VKAPI_CALL topology(VkCommandBuffer, VkPrimitiveTopology) {}

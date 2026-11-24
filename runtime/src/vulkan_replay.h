@@ -2577,7 +2577,11 @@ inline ReplayResult finish_draw(const Draw& draw, const ReplayFunctions& vk, Pre
         return VkRect2D{{left, top}, {std::uint32_t(right - left), std::uint32_t(bottom - top)}};
     };
     p.scissor = effective(draw.viewport, draw.scissor);
+    // p is reused from draw to draw (and copied from the previous draw on the shared-state path): one viewport
+    // unless this draw binds an array.
     p.viewport_count = 1;
+    p.viewports.clear();
+    p.scissors.clear();
     if (draw.viewports && draw.viewports->count > 1 && vk.max_viewports > 1) {
         // SV_ViewportArrayIndex picks one of these. An empty viewport (Vulkan needs a positive size) becomes 1x1
         // behind an empty scissor: nothing is drawn through it, as on D3D12.
