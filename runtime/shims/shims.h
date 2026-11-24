@@ -54,6 +54,8 @@ void add_module_lookup(void* ctx, ModuleLookup fn);
 // "a.dll+0x1234" for an address inside a mapped module, "host:ntdll.dll+0x1234" inside a host module, else the bare
 // address in hex. Used by the startup trace (startup_trace.h).
 std::string module_offset(uint64_t address);
+// The base of the mapped image (a Loader's, through the module lookups) that holds `address`, or null.
+void* mapped_module_base(uint64_t address);
 void remove_module_lookup(void* ctx);
 
 // The base of the mapped module holding `address`, through the same lookups. False if no live Loader maps it.

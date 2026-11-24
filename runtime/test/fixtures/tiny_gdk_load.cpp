@@ -6,6 +6,7 @@
 // LoadLibraryW goes to Windows and either fails or loads the PC's Gaming Services runtime, and this never prints
 // PASS. Ordinary test code; no game data.
 #include <windows.h>
+#include <psapi.h>
 
 #include <cstdio>
 #include <cstring>
@@ -26,6 +27,17 @@ using Uninit = HRESULT(WINAPI*)();
 using Report = HRESULT(WINAPI*)(HRESULT, const char*);
 
 HRESULT g_reported = S_OK;  // what the XErrorSetCallback callback last received
+
+// True when the Windows loader holds `module`: K32EnumProcessModules lists only its modules, and no shim serves it
+// (GetModuleHandleEx answers for mapped and owned modules too, as on the console).
+bool host_loaded(HMODULE module) {
+    HMODULE modules[1024];
+    DWORD needed = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) return false;
+    for (DWORD i = 0; i < needed / sizeof(HMODULE) && i < 1024; ++i)
+        if (modules[i] == module) return true;
+    return false;
+}
 
 int fail(const char* stage, unsigned long value) {
     std::printf("tiny_gdk_load: FAIL %s (0x%08lx)\n", stage, value);
@@ -65,8 +77,7 @@ int main() {
     HMODULE runtime = LoadLibraryW(L"xgameruntime.dll");
     if (!runtime) return fail("LoadLibraryW(xgameruntime.dll)", GetLastError());
     // The loader shim hands out a pseudo-handle for a module it owns: not an image the host loaded.
-    HMODULE host_view = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"xgameruntime.dll", &host_view) && host_view == runtime)
+    if (host_loaded(runtime))
         return fail("xgameruntime.dll came from the host loader, not the shims", 0);
 
     // XErrorReport too: the thunks look it up with the five entry points and refuse the runtime when it is missing.

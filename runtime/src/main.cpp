@@ -397,7 +397,8 @@ int wmain(int argc, wchar_t** argv) {
         const DWORD n = GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size()));
         if (n && n < self.size()) mods_dir = std::filesystem::path(self.substr(0, n)).parent_path() / L"mods";
     }
-    {
+    // Mods are optional: whatever goes wrong reading them is reported and the run goes on without them.
+    try {
         const leonida::mods::LoadResult mods = leonida::mods::load_mods(mods_dir);
         for (const std::string& e : mods.errors) std::fprintf(stderr, "[rt] mods: skipped %s\n", e.c_str());
         for (const auto& m : mods.mods) {
@@ -417,6 +418,8 @@ int wmain(int argc, wchar_t** argv) {
             std::fprintf(stderr, archetype_lookup_rva ? "[rt] mods: %zu archetype swap(s) loaded\n"
                                  : "[rt] mods: %zu archetype swap(s) loaded; not applied: no --archetype-lookup RVA for "
                                    "this executable (docs/modding.md)\n", leonida::mods::active().size());
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[rt] mods: not loaded (%s); running without mods\n", e.what());
     }
     rt::d3d12_trace::set_enabled(trace_d3d12);
     AddVectoredExceptionHandler(1, &crash_logger);

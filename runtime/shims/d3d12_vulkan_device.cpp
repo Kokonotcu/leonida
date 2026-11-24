@@ -55,6 +55,9 @@
 #include <bit>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <climits>
 #include <cstdlib>
 #include <filesystem>
@@ -1430,6 +1433,7 @@ struct DeviceState {
     std::mutex gpl_mutex;
     std::map<std::uint64_t, VkPipeline> gpl_libraries;  // shared parts by pso::library_key
     std::atomic<std::uint32_t> gpl_parts_made{0}, gpl_parts_cached{0}, gpl_links{0}, gpl_links_cached{0};
+    bool gpl_cached_link = true;  // LEONIDA_GPL_CACHED_LINK (gpl_ready)
 
     bool gpl_ready() {
         if (!info.graphics_pipeline_library || info.shader_objects) return false;
@@ -1450,6 +1454,10 @@ struct DeviceState {
                 gpl_layout = VK_NULL_HANDLE;
                 return;
             }
+            // LEONIDA_GPL_CACHED_LINK=0: a PSO does not ask the pipeline cache for its optimised link at creation, so
+            // it is always fast-linked first and optimised in the background (for tests: a driver's own disk cache
+            // can otherwise answer that question on a machine that ran the same shaders before).
+            gpl_cached_link = environment_text(L"LEONIDA_GPL_CACHED_LINK") != L"0";
             gpl_ok = true;
         });
         return gpl_ok;
@@ -1463,17 +1471,73 @@ struct DeviceState {
 
     // Creates one pipeline (a part or a link) through the device's cache; `cached` says whether the cache answered it
     // (VkPipelineCreationFeedback). Counted like every other pipeline creation.
-    VkPipeline gpl_create(const VkGraphicsPipelineCreateInfo& create, bool& cached) {
+    // `result` (optional) receives what Vulkan answered: VK_PIPELINE_COMPILE_REQUIRED for a cache-only creation
+    // (pso::Link::cached) the cache could not answer.
+    VkPipeline gpl_create(const VkGraphicsPipelineCreateInfo& create, bool& cached, VkResult* result = nullptr) {
         VkPipeline pipeline = VK_NULL_HANDLE;
         const std::uint32_t hits_before = pipeline_cache_hits.load();
-        if (create_pipeline(
-                [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& i) {
-                    return context->vk.vkCreateGraphicsPipelines(info.device, cache, 1, &i, nullptr, &pipeline);
-                },
-                create) != VK_SUCCESS)
+        const VkResult r = create_pipeline(
+            [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& i) {
+                return context->vk.vkCreateGraphicsPipelines(info.device, cache, 1, &i, nullptr, &pipeline);
+            },
+            create);
+        if (result) *result = r;
+        if (r != VK_SUCCESS) {
+            if (pipeline) context->vk.vkDestroyPipeline(info.device, pipeline, nullptr);  // not made, by the spec
             return VK_NULL_HANDLE;
+        }
         cached = pipeline_cache_hits.load() != hits_before;
         return pipeline;
+    }
+
+    // The optimised links (pso::Link::optimized) run here: one worker thread below normal priority, made on first use,
+    // taking jobs in order. A job checks itself whether its PSO still exists (PipelineState::GplUpgrade).
+    std::atomic<std::uint32_t> gpl_optimized_at_creation{0}, gpl_optimized_linked{0}, gpl_optimized_swapped{0};
+    std::mutex gpl_worker_mutex;
+    std::condition_variable gpl_worker_wake, gpl_worker_idle;
+    std::deque<std::function<void()>> gpl_jobs;
+    bool gpl_worker_stop = false, gpl_worker_busy = false;
+    std::thread gpl_worker;
+
+    void gpl_enqueue(std::function<void()> job) {
+        std::lock_guard lock(gpl_worker_mutex);
+        if (gpl_worker_stop) return;
+        gpl_jobs.push_back(std::move(job));
+        if (!gpl_worker.joinable()) {
+            gpl_worker = std::thread([this] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                std::unique_lock lock(gpl_worker_mutex);
+                for (;;) {
+                    gpl_worker_wake.wait(lock, [this] { return gpl_worker_stop || !gpl_jobs.empty(); });
+                    if (gpl_jobs.empty()) return;  // stopping, nothing left
+                    std::function<void()> next = std::move(gpl_jobs.front());
+                    gpl_jobs.pop_front();
+                    gpl_worker_busy = true;
+                    lock.unlock();
+                    next();
+                    lock.lock();
+                    gpl_worker_busy = false;
+                    if (gpl_jobs.empty()) gpl_worker_idle.notify_all();
+                }
+            });
+        }
+        gpl_worker_wake.notify_one();
+    }
+
+    bool gpl_wait_idle(std::chrono::milliseconds timeout) {
+        std::unique_lock lock(gpl_worker_mutex);
+        return gpl_worker_idle.wait_for(lock, timeout, [this] { return gpl_jobs.empty() && !gpl_worker_busy; });
+    }
+
+    // At teardown, before the shared parts go: the jobs not started are dropped (their PSOs are gone by now).
+    void stop_gpl_worker() {
+        {
+            std::lock_guard lock(gpl_worker_mutex);
+            gpl_worker_stop = true;
+            gpl_jobs.clear();
+        }
+        gpl_worker_wake.notify_all();
+        if (gpl_worker.joinable()) gpl_worker.join();
     }
 
     // The shared pre-rasterization or fragment shader part for `recipe` (modules[i] for recipe.stages[i]), made on
@@ -1500,14 +1564,17 @@ struct DeviceState {
 
     // At teardown, once no PSO links with them.
     void destroy_gpl_libraries() {
+        stop_gpl_worker();
         std::lock_guard lock(gpl_mutex);
         if (context)
             for (const auto& [key, library] : gpl_libraries) context->vk.vkDestroyPipeline(info.device, library, nullptr);
         if (!gpl_libraries.empty() || gpl_links.load())
             std::fprintf(stderr, "[rt] d3d12: pipeline libraries: %zu shared shader parts (%u of %u made from the "
-                                 "pipeline cache), %u PSOs linked (%u from the cache)\n",
+                                 "pipeline cache), %u PSOs linked (%u from the cache); optimised links: %u taken from "
+                                 "the pipeline cache at creation, %u linked in the background, %u swapped in\n",
                          gpl_libraries.size(), gpl_parts_cached.load(), gpl_parts_made.load(), gpl_links.load(),
-                         gpl_links_cached.load());
+                         gpl_links_cached.load(), gpl_optimized_at_creation.load(), gpl_optimized_linked.load(),
+                         gpl_optimized_swapped.load());
         gpl_libraries.clear();
         if (gpl_layout && context) context->vk.vkDestroyPipelineLayout(info.device, gpl_layout, nullptr);
         gpl_layout = VK_NULL_HANDLE;
@@ -4158,6 +4225,13 @@ public:
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
         if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
+        if (gpl_upgrade_) {
+            // Waits for a running optimised link; one not started yet finds itself cancelled.
+            std::lock_guard lock(gpl_upgrade_->mutex);
+            gpl_upgrade_->cancelled = true;
+            if (gpl_upgrade_->optimized) vk.vkDestroyPipeline(dev, gpl_upgrade_->optimized, nullptr);
+            if (gpl_upgrade_->retired_fast) graphics_.pipeline = VK_NULL_HANDLE;  // the deletion queue destroys it
+        }
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         for (VkPipeline output : gpl_outputs_) vk.vkDestroyPipeline(dev, output, nullptr);
@@ -5137,7 +5211,7 @@ private:
         const leonida::pso::Recipe recipe = to_recipe(unbound);
         std::vector<VkShaderModule> modules;
         for (const VkPipelineShaderStageCreateInfo& s : recipe_.stages) modules.push_back(s.module);
-        if (gpl_) return link(recipe, modules);
+        if (gpl_) return link(recipe, modules, unbound == 0);
         const leonida::pso::GraphicsCreateInfo create(recipe, modules, graphics_.layout);
         VkPipeline pipeline = VK_NULL_HANDLE;
         if (device_.create_pipeline(
@@ -5156,7 +5230,11 @@ private:
     // and fragment output parts are this PSO's (cheap: no shader); the two shader parts are the device's shared ones,
     // which --prebuild-shaders has put in the pipeline cache. The recipe is recorded as for a whole pipeline, so
     // --prebuild-pipelines still has it. Called under variants_mutex_ for a variant, from create_graphics otherwise.
-    VkPipeline link(const leonida::pso::Recipe& recipe, const std::vector<VkShaderModule>& modules) {
+    // `base` (the PSO's own pipeline, not a variant for unbound slots): the optimised link (pso::Link) is taken from
+    // the pipeline cache when an earlier run left it there; otherwise the fast link is returned and the optimised one
+    // is made in the background after its first draw (graphics_.upgrade, start_upgrade).
+    VkPipeline link(const leonida::pso::Recipe& recipe, const std::vector<VkShaderModule>& modules, bool base) {
+        using leonida::pso::Link;
         using leonida::pso::Part;
         auto& vk = device_.context->vk;
         bool cached = false;
@@ -5174,14 +5252,69 @@ private:
             return VK_NULL_HANDLE;
         }
         gpl_outputs_.push_back(output);
-        const leonida::pso::LinkCreateInfo create({gpl_input_, pre_raster, fragment, output}, graphics_.layout);
+        const std::array<VkPipeline, 4> parts{gpl_input_, pre_raster, fragment, output};
+        if (leonida::pso::Recorder* recorder = device_.pso_recorder()) recorder->record(recipe);
+        if (base && device_.info.pipeline_creation_cache_control && device_.gpl_cached_link) {
+            const leonida::pso::LinkCreateInfo cached_create(parts, graphics_.layout, Link::cached);
+            VkResult result = VK_SUCCESS;
+            if (const VkPipeline optimized = device_.gpl_create(cached_create.info, cached, &result)) {
+                ++device_.gpl_links;
+                ++device_.gpl_links_cached;
+                ++device_.gpl_optimized_at_creation;
+                device_.pipeline_created();
+                return optimized;
+            }
+            if (result != VK_PIPELINE_COMPILE_REQUIRED) log_once("a cache-only optimised link failed; VkResult", int(result));
+        }
+        const leonida::pso::LinkCreateInfo create(parts, graphics_.layout);
         const VkPipeline pipeline = device_.gpl_create(create.info, cached);
         if (!pipeline) return VK_NULL_HANDLE;
         ++device_.gpl_links;
         if (cached) ++device_.gpl_links_cached;
-        if (leonida::pso::Recorder* recorder = device_.pso_recorder()) recorder->record(recipe);
         device_.pipeline_created();
+        if (base) start_upgrade(parts, pipeline);
         return pipeline;
+    }
+
+    // What the background optimised link shares with this PSO. The job holds `mutex` while it links and swaps; the
+    // destructor takes it to cancel, so a job never touches a PSO that is gone.
+    struct GplUpgrade {
+        std::mutex mutex;
+        bool cancelled = false;
+        VkPipeline optimized = VK_NULL_HANDLE;  // made by the job; destroyed with the PSO
+        bool retired_fast = false;              // the fast pipeline went to the deferred deletion queue
+    };
+
+    // The fast-linked `fast` gets an optimised replacement: the first draw that prepares it queues the optimised link of
+    // the same parts on the device's worker (one thread, below normal priority), which goes through the pipeline cache
+    // (so the next run takes it at creation), and swaps it in for every later draw while retiring `fast` through the
+    // deferred deletion queue (VulkanContext::replace_graphics_pipeline).
+    void start_upgrade(const std::array<VkPipeline, 4>& parts, VkPipeline fast) {
+        gpl_upgrade_ = std::make_shared<GplUpgrade>();
+        graphics_.upgrade = std::make_shared<leonida::GraphicsPipeline::Upgrade>();
+        DeviceState* device = &device_;
+        const std::shared_ptr<GplUpgrade> state = gpl_upgrade_;
+        // The slot lives while the PSO does, and the job checks `cancelled` (set by the destructor) before using it.
+        leonida::GraphicsPipeline::Upgrade* slot = graphics_.upgrade.get();
+        const VkPipelineLayout layout = graphics_.layout;
+        graphics_.upgrade->request = [device, state, slot, parts, layout, fast] {
+            device->gpl_enqueue([device, state, slot, parts, layout, fast] {
+                std::lock_guard lock(state->mutex);
+                if (state->cancelled) return;
+                const leonida::pso::LinkCreateInfo create(parts, layout, leonida::pso::Link::optimized);
+                bool cached = false;
+                const VkPipeline optimized = device->gpl_create(create.info, cached);
+                if (!optimized) {
+                    log_once("an optimised pipeline-library link failed; the fast link stays", 0);
+                    return;
+                }
+                ++device->gpl_optimized_linked;
+                state->optimized = optimized;
+                device->context->replace_graphics_pipeline(slot->pipeline, optimized, fast);
+                state->retired_fast = true;
+                ++device->gpl_optimized_swapped;
+            });
+        };
     }
 
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
@@ -5215,6 +5348,7 @@ private:
     bool gpl_per_sample_ = false;
     VkPipeline gpl_input_ = VK_NULL_HANDLE;
     std::vector<VkPipeline> gpl_outputs_;
+    std::shared_ptr<GplUpgrade> gpl_upgrade_;  // null unless the base pipeline is a fast link with an upgrade pending
     VkShaderModule module_ = VK_NULL_HANDLE;
     std::vector<VkShaderModule> modules_;
     VkDeviceSize code_base_ = 0;
@@ -10259,8 +10393,17 @@ PipelineLibraryStats pipeline_library_stats(ID3D12Device* device) {
     const Device* d = Device::from<Device>(real);
     if (!d) return {};
     const DeviceState& state = d->state();
-    return {state.gpl_parts_made.load(), state.gpl_parts_cached.load(), state.gpl_links.load(),
-            state.gpl_links_cached.load()};
+    return {state.gpl_parts_made.load(),           state.gpl_parts_cached.load(),    state.gpl_links.load(),
+            state.gpl_links_cached.load(),         state.gpl_optimized_at_creation.load(),
+            state.gpl_optimized_linked.load(),     state.gpl_optimized_swapped.load()};
+}
+
+bool wait_pipeline_library_work(ID3D12Device* device, unsigned timeout_ms) {
+    if (!device) return false;
+    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+    if (!real) real = device;
+    Device* d = Device::from<Device>(real);
+    return d && d->mutable_state().gpl_wait_idle(std::chrono::milliseconds(timeout_ms));
 }
 
 namespace {
@@ -10743,6 +10886,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                              "extensions; %s\n",
                      v13.extended_dynamic_state ? "extended dynamic state through VK_EXT_extended_dynamic_state(2)"
                                                 : "no extended dynamic state, so no graphics pipelines");
+    info.pipeline_creation_cache_control = v13.pipeline_creation_cache_control;
 
     // VK_EXT_conditional_rendering for SetPredication, VK_KHR_swapchain for DXGI presentation, and optional
     // VK_KHR_acceleration_structure + VK_KHR_ray_query for hardware BVH builds (BLAS + TLAS).

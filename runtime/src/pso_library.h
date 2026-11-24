@@ -8,7 +8,9 @@
 // Everything else the monolithic pipeline bakes in is dynamic here (core Vulkan 1.3 state: cull mode, front face,
 // depth bias, rasterizer discard, line width, the depth and stencil tests), so the two shader parts depend on the
 // shader alone and are shared by every PSO that uses it: `gta6rt --prebuild-shaders` compiles one per translated
-// shader into the pipeline cache, and a PSO is a fast link (no link-time optimisation) of four parts.
+// shader into the pipeline cache, and a PSO is a fast link (no link-time optimisation) of four parts. After its first
+// draw the same parts are linked again with link-time optimisation in the background and that pipeline replaces the
+// fast one; it goes into the pipeline cache, so the next run's PSO takes it at creation (Link).
 // The runtime and the prebuild make their create infos through LibraryCreateInfo below, so a part the prebuild put in
 // the pipeline cache is found there again (the cache is keyed by the whole create info).
 #pragma once
@@ -125,7 +127,8 @@ public:
                       bool per_sample = false) {
         library_.flags = VkGraphicsPipelineLibraryFlagsEXT(part);
         info.pNext = &library_;
-        info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+        // Retained so the same parts can be linked again with link-time optimisation (LinkCreateInfo, Link::optimized).
+        info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
         const std::span<const VkDynamicState> dynamic = library_dynamic_states(part, !r.bindings.empty());
         dynamic_.dynamicStateCount = std::uint32_t(dynamic.size());
         dynamic_.pDynamicStates = dynamic.data();
@@ -252,15 +255,26 @@ private:
     VkPipelineColorBlendStateCreateInfo blend_{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
 };
 
-// The pipeline linked from four parts, without link-time optimisation (graphicsPipelineLibraryFastLinking makes that
-// cheap). `libraries` holds the vertex input, pre-rasterization, fragment shader and fragment output parts.
+// How a PSO's parts are linked:
+//   fast       no link-time optimisation: cheap with graphicsPipelineLibraryFastLinking, the pipeline a PSO starts with;
+//   optimized  with VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT: the whole-pipeline-speed one, linked on the
+//              device's background worker after the fast one's first draw, and kept by the pipeline cache;
+//   cached     optimized, but only if the pipeline cache has it (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT,
+//              which answers VK_PIPELINE_COMPILE_REQUIRED otherwise): a later run's PSO takes it at creation.
+enum class Link { fast, optimized, cached };
+
+// The pipeline linked from four parts. `libraries` holds the vertex input, pre-rasterization, fragment shader and
+// fragment output parts.
 class LinkCreateInfo {
 public:
-    LinkCreateInfo(const std::array<VkPipeline, 4>& libraries, VkPipelineLayout layout) : libraries_(libraries) {
+    LinkCreateInfo(const std::array<VkPipeline, 4>& libraries, VkPipelineLayout layout, Link link = Link::fast)
+        : libraries_(libraries) {
         link_.libraryCount = std::uint32_t(libraries_.size());
         link_.pLibraries = libraries_.data();
         info.pNext = &link_;
         info.layout = layout;
+        if (link != Link::fast) info.flags |= VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
+        if (link == Link::cached) info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
     }
     LinkCreateInfo(const LinkCreateInfo&) = delete;
     LinkCreateInfo& operator=(const LinkCreateInfo&) = delete;

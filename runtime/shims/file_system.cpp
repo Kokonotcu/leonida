@@ -198,6 +198,27 @@ bool device_name(const std::wstring& part) {
     return (n >= L'1' && n <= L'9') || n == L'\u00b9' || n == L'\u00b2' || n == L'\u00b3';
 }
 
+// The overlay's folder names below the package root when the overlay lies inside the package (gta6rt's default is
+// <game>\overlay), else none. The title must neither list nor reach it through GAME: (review B4): a recursive walk
+// would descend into the overlay's copies and markers, and a write there would land in <overlay>\overlay.
+std::vector<std::wstring> overlay_in_package(const Roots& r) {
+    if (r.game.empty() || r.overlay.empty() || !lies_under(r.overlay.native(), r.game)) return {};
+    std::vector<std::wstring> rel;
+    for (const auto& c : r.overlay.lexically_relative(r.game)) {
+        if (c.native() == L"." || c.native() == L"..") return {};
+        rel.push_back(c.native());
+    }
+    return rel;
+}
+
+// True when `parts` (a console path below GAME:) is the overlay folder or lies below it.
+bool names_overlay(const std::vector<std::wstring>& rel, const std::vector<std::wstring>& parts) {
+    if (rel.empty() || parts.size() < rel.size()) return false;
+    for (size_t i = 0; i < rel.size(); ++i)
+        if (!same_name(parts[i].c_str(), rel[i].c_str())) return false;
+    return true;
+}
+
 Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts) {
     size_t prefix_length = 0;
     const Drive drive = console_drive(path, prefix_length);
@@ -214,6 +235,15 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     const size_t floor = parts.size();  // ".." may not climb out of the drive's own root
     std::wstring part;
     auto flush = [&]() -> bool {
+        // Win32 drops a component's trailing dots and spaces ("a." and "a " are "a"), so the checks below must see the
+        // name the host will use: otherwise ".gta6rt-deleted." passes internal_dir and still names that folder.
+        // "." and ".." keep their meaning; a component that is nothing but dots and spaces names nothing.
+        // A search pattern keeps them: FindFirstFile reads "*." as "names with no extension".
+        if (part != L"." && part != L".." && part.find_first_of(L"*?<>\"") == std::wstring::npos) {
+            const bool had = !part.empty();
+            while (!part.empty() && (part.back() == L'.' || part.back() == L' ')) part.pop_back();
+            if (had && part.empty()) return false;
+        }
         if (part.empty() || part == L".") {
             part.clear();
             return true;
@@ -242,6 +272,7 @@ Parsed parse_console(const std::wstring& path, std::vector<std::wstring>& parts)
     // refused as an explicit path too, in every spelling the loop above normalises (case, slashes, "." and "..").
     // T: still names the scratch folder: its first part is pushed above, not parsed from the title's path.
     if (drive == Drive::Game && !parts.empty() && internal_dir(parts.front().c_str())) return Parsed::Refused;
+    if (drive == Drive::Game && names_overlay(overlay_in_package(roots()), parts)) return Parsed::Refused;
     return Parsed::Console;
 }
 
@@ -641,6 +672,11 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
     std::set<std::wstring, NoCase> seen;
     for (const auto& e : out) seen.insert(e.cFileName);
 
+    // The overlay itself, when it sits inside the package (overlay_in_package): its folder is not a package entry.
+    const std::vector<std::wstring> overlay_rel = overlay_in_package(r);
+    bool lists_overlay_parent = !overlay_rel.empty() && dirs.size() + 1 == overlay_rel.size();
+    for (size_t i = 0; lists_overlay_parent && i < dirs.size(); ++i)
+        lists_overlay_parent = same_name(dirs[i].c_str(), overlay_rel[i].c_str());
     auto add_root = [&](const std::filesystem::path& root, bool overlay_root) {
         if (root.empty()) return;
         WIN32_FIND_DATAW found{};
@@ -648,6 +684,7 @@ bool collect(const std::wstring& pattern, const std::vector<std::wstring>& parts
         if (h == INVALID_HANDLE_VALUE) return;
         do {
             if (overlay_root && internal_dir(found.cFileName)) continue;
+            if (!overlay_root && lists_overlay_parent && same_name(found.cFileName, overlay_rel.back().c_str())) continue;
             const bool dot = same_name(found.cFileName, L".") || same_name(found.cFileName, L"..");
             if (!overlay_root && !dot && entry_deleted(found.cFileName)) continue;
             if (seen.insert(found.cFileName).second) out.push_back(found);
@@ -1407,6 +1444,36 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
     return set_file_attributes_w(wide.c_str(), attributes);
 }
 
+// GetDiskFreeSpaceEx (review M9): the title checks free space before it writes. A console path (GAME:, G:, T:) has no
+// host volume of its own; every write to it lands in the overlay, so the answer is the overlay's volume. A null name
+// and host paths are the host's answer.
+BOOL WINAPI get_disk_free_space_ex_w(LPCWSTR name, PULARGE_INTEGER available, PULARGE_INTEGER total,
+                                     PULARGE_INTEGER free_total) {
+    if (!name) return ::GetDiskFreeSpaceExW(name, available, total, free_total);
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(name, parts);
+    if (parsed == Parsed::Host) return ::GetDiskFreeSpaceExW(name, available, total, free_total);
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+    const Roots r = roots();
+    const std::filesystem::path& volume_of = r.overlay.empty() ? r.game : r.overlay;
+    if (volume_of.empty()) return fail_bool(ERROR_PATH_NOT_FOUND);
+    // The overlay folder may not exist before the first write; its nearest existing parent is on the same volume.
+    std::filesystem::path probe = volume_of;
+    std::error_code ec;
+    while (!probe.empty() && !std::filesystem::exists(probe, ec) && probe.has_parent_path() && probe != probe.parent_path())
+        probe = probe.parent_path();
+    std::wstring dir = probe.native();
+    if (dir.empty() || (dir.back() != L'\\' && dir.back() != L'/')) dir += L'\\';
+    return ::GetDiskFreeSpaceExW(dir.c_str(), available, total, free_total);
+}
+
+BOOL WINAPI get_disk_free_space_ex_a(LPCSTR name, PULARGE_INTEGER available, PULARGE_INTEGER total,
+                                     PULARGE_INTEGER free_total) {
+    if (!name) return ::GetDiskFreeSpaceExA(name, available, total, free_total);
+    const std::wstring wide = widen_ansi(name);
+    return get_disk_free_space_ex_w(wide.c_str(), available, total, free_total);
+}
+
 }  // namespace rt::fs
 
 namespace {
@@ -1448,7 +1515,9 @@ using namespace rt::fs;
         {dll, "CopyFileExW", reinterpret_cast<void*>(&copy_file_ex_w)},                                  \
         {dll, "CopyFile2", reinterpret_cast<void*>(&copy_file2)},                                        \
         {dll, "SetFileAttributesA", reinterpret_cast<void*>(&set_file_attributes_a)},                    \
-        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)}
+        {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)},                    \
+        {dll, "GetDiskFreeSpaceExA", reinterpret_cast<void*>(&get_disk_free_space_ex_a)},                \
+        {dll, "GetDiskFreeSpaceExW", reinterpret_cast<void*>(&get_disk_free_space_ex_w)}
 }  // namespace
 
 SHIM_TABLE(file_system,

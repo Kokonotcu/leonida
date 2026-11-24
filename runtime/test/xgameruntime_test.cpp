@@ -436,6 +436,25 @@ void check_run_time_load() {
         const HRESULT reported = reinterpret_cast<Report>(slot(e, 3))(e, E_FAIL, "offline test");
         check(reported == S_OK && seen.hr == E_FAIL && std::strcmp(seen.msg, "offline test") == 0,
               "slot 3 is XErrorReport and reaches the callback slot 4 (XErrorSetCallback) set");
+        // A callback that reports another error re-enters XErrorReport on its own thread (XCurl and libHttpClient
+        // report from their callbacks); that must not deadlock on the shim's lock. Run on a thread, with a timeout.
+        static Report s_report = nullptr;
+        static void* s_error = nullptr;
+        static int s_depth = 0;
+        s_report = reinterpret_cast<Report>(slot(e, 3));
+        s_error = e;
+        s_depth = 0;
+        Callback reentrant = [](HRESULT, const char*, void*) {
+            if (s_depth++ == 0) s_report(s_error, E_ABORT, "nested");
+            return true;
+        };
+        reinterpret_cast<SetCallback>(slot(e, 4))(e, reentrant, nullptr);
+        HANDLE reporter = CreateThread(
+            nullptr, 0, [](void*) -> DWORD { return static_cast<DWORD>(s_report(s_error, E_FAIL, "outer")); }, nullptr,
+            0, nullptr);
+        const bool returned = reporter && WaitForSingleObject(reporter, 5000) == WAIT_OBJECT_0;
+        check(returned && s_depth == 2, "a callback that reports another error re-enters XErrorReport without a deadlock");
+        if (reporter) CloseHandle(reporter);
         reinterpret_cast<SetCallback>(slot(e, 4))(e, nullptr, nullptr);
         using SetOptions = void(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t);  // void, per Microsoft's page
         reinterpret_cast<SetOptions>(slot(e, 5))(e, 0x01, 0x00);  // OutputDebugStringOnError / None
@@ -539,6 +558,35 @@ void check_run_time_load() {
                                   unregister_hint(n, late_hint, false) && unregister_port(n, late_port, false);
         while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
         check(unregistered && late.calls == 0, "a registration ended before its queue is dispatched sends nothing");
+        // A notification that unregisters itself with wait = true must not wait for itself. Dispatched on a thread,
+        // with a timeout, so a deadlock fails the check instead of hanging the test.
+        static Unregister s_unregister = nullptr;
+        static void* s_net = nullptr;
+        static XTaskQueueRegistrationToken s_self{};
+        static int s_self_calls = 0;
+        static bool s_self_result = true;
+        s_unregister = unregister_port;
+        s_net = n;
+        s_self_calls = 0;
+        PortCallback self_unregister = [](void*, uint16_t) {
+            ++s_self_calls;
+            s_self_result = s_unregister(s_net, s_self, true);
+        };
+        const bool self_registered = register_port(n, manual, nullptr, self_unregister, &s_self) == S_OK;
+        static XTaskQueueHandle s_manual = nullptr;
+        s_manual = manual;
+        HANDLE dispatcher = CreateThread(
+            nullptr, 0,
+            [](void*) -> DWORD {
+                while (XTaskQueueDispatch(s_manual, XTaskQueuePort::Completion, 0)) {}
+                return 0;
+            },
+            nullptr, 0, nullptr);
+        const bool dispatched = dispatcher && WaitForSingleObject(dispatcher, 5000) == WAIT_OBJECT_0;
+        check(self_registered && dispatched && s_self_calls == 1 && !s_self_result,
+              "a notification that unregisters itself with wait = true returns (false: it cannot wait for itself)");
+        if (dispatcher) CloseHandle(dispatcher);
+        check(unregister_port(n, s_self, true), "and the registration is gone once the notification has ended");
         XTaskQueueCloseHandle(manual);
         uint16_t port = 7;
         using QueryPort = HRESULT(STDMETHODCALLTYPE*)(void*, uint16_t*);

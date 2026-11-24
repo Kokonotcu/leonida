@@ -15,8 +15,10 @@
 // can collide with (an encoded name never starts with '.'). Names ending in '~' are temporary files of an update in
 // progress; an encoded name never ends in '~' either.
 //
-// An update buffers its writes and deletes; SubmitUpdate writes every new blob to "<blob>~", then renames each over
-// its blob and removes the deleted ones, so a failed write leaves the container as it was.
+// An update buffers its writes and deletes; SubmitUpdate writes every new blob to "<blob>~", moves each blob it
+// replaces or deletes aside to "<blob>~old", moves the new ones in and only then removes the old ones, so a failed
+// write or rename leaves the container exactly as it was (commit), and a commit a crash cut short is put right on the
+// next one (recover_interrupted_commit).
 //
 // ASSUMPTION (no executable yet): the quota is a fixed 1 GiB (the GDK says the per-user quota "is not a fixed size");
 // a blob name is at most 256 bytes (GS_MAX_BLOB_NAME_SIZE is not on the public pages); GetContainerInfo of a
@@ -388,6 +390,28 @@ HRESULT read_blobs(const XGameSaveContainer* c, const char* const* names, uint32
 
 // ---- Committing an update ----
 
+// What a commit cut short by a crash left in a container: "<blob>~" temporaries are removed; a "<blob>~old" whose blob
+// is there was superseded (the commit got past its renames) and is removed, one whose blob is missing goes back. A
+// blob that commit was deleting can come back that way: kept data over lost data.
+void recover_interrupted_commit(const fs::path& dir) {
+    std::error_code ec;
+    std::vector<fs::path> entries;
+    for (const auto& e : fs::directory_iterator(dir, ec))
+        if (e.is_regular_file(ec)) entries.push_back(e.path());
+    for (const fs::path& p : entries) {
+        const std::wstring name = p.filename().wstring();
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, L"~old") == 0) {
+            const fs::path final_path = p.parent_path() / name.substr(0, name.size() - 4);
+            if (GetFileAttributesW(final_path.c_str()) == INVALID_FILE_ATTRIBUTES)
+                MoveFileExW(p.c_str(), final_path.c_str(), MOVEFILE_WRITE_THROUGH);
+            else
+                DeleteFileW(p.c_str());
+        } else if (!name.empty() && name.back() == L'~') {
+            DeleteFileW(p.c_str());
+        }
+    }
+}
+
 HRESULT commit(XGameSaveUpdate* u) {
     XGameSaveContainer* c = u->container;
     const fs::path dir = c->dir();
@@ -404,6 +428,7 @@ HRESULT commit(XGameSaveUpdate* u) {
     std::error_code ec;
     fs::create_directories(dir, ec);
     if (ec) return E_GS_OUT_OF_LOCAL_STORAGE;
+    recover_interrupted_commit(dir);
     std::vector<std::pair<fs::path, fs::path>> renames;   // temporary -> final
     for (const auto& [name, op] : u->ops) {
         if (!op.write) continue;
@@ -417,11 +442,54 @@ HRESULT commit(XGameSaveUpdate* u) {
         }
         renames.emplace_back(temp, final_path);
     }
-    for (const auto& [temp, final_path] : renames)
-        if (!MoveFileExW(temp.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    // All or nothing: every blob this update replaces or deletes is moved aside to "<blob>~old" first (a name that
+    // decodes to no blob, so it is never listed), the new ones are moved in, and only then are the old ones removed.
+    // If any step fails, what was applied is undone and the container is left exactly as it was.
+    struct Applied {
+        fs::path final_path, old_path;
+        bool had_old = false;
+        bool placed_new = false;
+    };
+    std::vector<Applied> applied;
+    const auto old_of = [](const fs::path& p) {
+        fs::path o = p;
+        o += L"~old";
+        return o;
+    };
+    const auto roll_back = [&] {
+        for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
+            if (it->placed_new) DeleteFileW(it->final_path.c_str());
+            if (it->had_old) MoveFileExW(it->old_path.c_str(), it->final_path.c_str(), MOVEFILE_REPLACE_EXISTING);
+        }
+        for (const auto& r : renames) fs::remove(r.first, ec);
+    };
+    const auto set_aside = [&](const fs::path& final_path) {
+        Applied a{final_path, old_of(final_path)};
+        if (GetFileAttributesW(final_path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            if (!MoveFileExW(final_path.c_str(), a.old_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+                return false;
+            a.had_old = true;
+        }
+        applied.push_back(a);
+        return true;
+    };
+    for (const auto& [temp, final_path] : renames) {
+        if (!set_aside(final_path) ||
+            !MoveFileExW(temp.c_str(), final_path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            roll_back();
             return E_GS_OUT_OF_LOCAL_STORAGE;
-    for (const auto& [name, op] : u->ops)
-        if (!op.write) fs::remove(dir / widen(encode_name(name)), ec);
+        }
+        applied.back().placed_new = true;
+    }
+    for (const auto& [name, op] : u->ops) {
+        if (op.write) continue;
+        if (!set_aside(dir / widen(encode_name(name)))) {
+            roll_back();
+            return E_GS_OUT_OF_LOCAL_STORAGE;
+        }
+    }
+    for (const Applied& a : applied)
+        if (a.had_old) DeleteFileW(a.old_path.c_str());
     if (u->has_display_name) write_file(dir / L".display", u->display_name.data(), u->display_name.size());
     return S_OK;
 }

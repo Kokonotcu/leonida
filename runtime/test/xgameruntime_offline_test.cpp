@@ -290,9 +290,10 @@ int main() {
           "XHighContrastGetMode reports Off");
     check(at<SetEnabled>(acc, 4)(acc, true) == S_OK, "XClosedCaptionSetEnabled is accepted");
     check(FAILED(at<NoArgs>(acc, 3)(acc)), "the closed-caption properties are not available offline");
-    check(at<EnumVoices>(acc, 8)(acc, reinterpret_cast<void*>(&on_state), nullptr) == S_OK &&
-              at<EnumVoices>(acc, 8)(acc, nullptr, nullptr) == E_INVALIDARG,
-          "XSpeechSynthesizerEnumerateInstalledVoices: no voices, S_OK (a callback is required)");
+    // (context, callback), the GDK reference's order: a null context is fine, a missing callback is refused.
+    check(at<EnumVoices>(acc, 8)(acc, nullptr, reinterpret_cast<void*>(&on_state)) == S_OK &&
+              at<EnumVoices>(acc, 8)(acc, reinterpret_cast<void*>(&on_state), nullptr) == E_INVALIDARG,
+          "XSpeechSynthesizerEnumerateInstalledVoices(context, callback): no voices, S_OK (a callback is required)");
     void* synth = reinterpret_cast<void*>(1);
     check(at<SpeechCreate>(acc, 9)(acc, &synth) == E_FAIL && synth == nullptr,
           "XSpeechSynthesizerCreate fails offline and nulls the handle");

@@ -246,8 +246,16 @@ HRESULT STDMETHODCALLTYPE error_report(void*, HRESULT hr, const char* message) {
     if (s_logged.fetch_add(1) < 64)
         std::fprintf(stderr, "[rt] xgameruntime: XErrorReport(0x%08lx, %s)\n", static_cast<unsigned long>(hr),
                      message ? message : "(null)");
-    std::lock_guard<std::mutex> lock(g_error_mutex);
-    if (XErrorCallback cb = g_error_callback.load()) cb(hr, message, g_error_context.load());
+    // The pair is read under the lock and the title's callback runs without it: a callback that reports another
+    // error, or sets a new callback, re-enters this lock on the same thread, and std::mutex would deadlock there.
+    XErrorCallback cb;
+    void* context;
+    {
+        std::lock_guard<std::mutex> lock(g_error_mutex);
+        cb = g_error_callback.load();
+        context = g_error_context.load();
+    }
+    if (cb) cb(hr, message, context);
     return S_OK;
 }
 
@@ -342,6 +350,7 @@ using HintChangedCallback = void(CALLBACK*)(void* context, const ConnectivityHin
 struct NetRegistration {
     bool running = false;
     bool unregistered = false;
+    DWORD running_thread = 0;  // the thread inside the initial notification while `running`
 };
 std::mutex g_net_mu;
 std::condition_variable g_net_cv;
@@ -371,6 +380,7 @@ template <class Callback> struct InitialNotification {
             const auto it = g_net_registrations.find(n->token);
             if (canceled || it == g_net_registrations.end()) return;
             it->second.running = true;
+            it->second.running_thread = GetCurrentThreadId();
         }
         notify(n->callback, n->context);
         {
@@ -420,6 +430,9 @@ bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken token, 
         return true;
     }
     it->second.unregistered = true;
+    // Called from inside its own notification: waiting would wait for this very call to return. The notification
+    // removes the registration when it ends, and no notification follows, so it does not wait (and says so).
+    if (it->second.running_thread == GetCurrentThreadId()) return false;
     if (wait) g_net_cv.wait(lock, [&] { return !g_net_registrations.contains(token.token); });
     return wait;
 }

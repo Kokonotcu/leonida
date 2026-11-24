@@ -538,6 +538,14 @@ void test_imports() {
         if (!own_path || *own_path != m.path)
             return failed("GetModuleFileName(module) names the module's own load path", "it did not");
         pass("GetModuleHandle(nullptr)/GetModuleFileName answer for mapped images through the bundled ops");
+        // GetModuleHandleEx(FROM_ADDRESS) for code inside a mapped image (a statically linked CRT asks for its own
+        // module that way) finds that image's base through the module lookups; a host address finds none.
+        static int host_marker = 0;
+        if (rt::shims::mapped_module_base(reinterpret_cast<uint64_t>(m.base) + 0x10) != m.base ||
+            rt::shims::mapped_module_base(reinterpret_cast<uint64_t>(&host_marker)) != nullptr)
+            return failed("an address inside a mapped image resolves to its base, a host address to none",
+                          "it did not");
+        pass("an address inside a mapped image resolves to its base (GetModuleHandleEx FROM_ADDRESS)");
     } catch (const std::exception& e) {
         failed("the bundled-module ops answer module identity for mapped images", e.what());
     }

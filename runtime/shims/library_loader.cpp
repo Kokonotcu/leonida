@@ -243,6 +243,38 @@ HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
     return GetModuleHandleW(name);
 }
 
+// GetModuleHandleEx for the mapped images: FROM_ADDRESS inside a mapped image (a statically linked CRT asks for its
+// own module that way) is that image's base, and a name or null resolves as GetModuleHandle does. Mapped and owned
+// modules live until the Loader goes, so the reference-count flags change nothing for them. Everything else, host
+// modules and failures included, is the host's answer.
+template <class Char>
+BOOL get_module_handle_ex(DWORD flags, const Char* name, HMODULE* out, HMODULE(WINAPI* by_name)(const Char*),
+                          BOOL(WINAPI* host)(DWORD, const Char*, HMODULE*)) {
+    HMODULE mine = nullptr;
+    if (flags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) {
+        void* base = mapped_module_base(reinterpret_cast<uint64_t>(name));
+        if (base && owns_bundled_module_handle(base)) mine = reinterpret_cast<HMODULE>(base);
+    } else {
+        const HMODULE h = by_name(name);
+        if (h && (pseudo(h) || owns_bundled_module_handle(h))) mine = h;
+    }
+    if (!mine) return host(flags, name, out);
+    if (!out) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    *out = mine;
+    return TRUE;
+}
+
+BOOL WINAPI get_module_handle_ex_w(DWORD flags, LPCWSTR name, HMODULE* out) {
+    return get_module_handle_ex<wchar_t>(flags, name, out, &get_module_handle_w, &GetModuleHandleExW);
+}
+
+BOOL WINAPI get_module_handle_ex_a(DWORD flags, LPCSTR name, HMODULE* out) {
+    return get_module_handle_ex<char>(flags, name, out, &get_module_handle_a, &GetModuleHandleExA);
+}
+
 // The Win32 spelling of a stored module path: backslashes throughout, and a unix-absolute path (a leading "/", only
 // possible under Wine) becomes Z:\..., the drive Wine maps at the filesystem root. A relative stored path is made
 // absolute through the host first, so the result is always drive-qualified.
@@ -376,6 +408,8 @@ BOOL WINAPI disable_thread_calls(HMODULE module) {
     {dll, "LoadLibraryExW", reinterpret_cast<void*>(&rt::shims::library_loader::load_library_ex_w)},                   \
     {dll, "GetModuleHandleA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_a)},               \
     {dll, "GetModuleHandleW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_w)},               \
+    {dll, "GetModuleHandleExA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_ex_a)},          \
+    {dll, "GetModuleHandleExW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_handle_ex_w)},          \
     {dll, "GetModuleFileNameA", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_a)},          \
     {dll, "GetModuleFileNameW", reinterpret_cast<void*>(&rt::shims::library_loader::get_module_file_name_w)},          \
     {dll, "GetProcAddress", reinterpret_cast<void*>(&rt::shims::library_loader::get_proc_address)},                    \

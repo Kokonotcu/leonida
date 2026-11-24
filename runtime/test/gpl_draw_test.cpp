@@ -4,7 +4,10 @@
 //   2. LEONIDA_GPL=1, an empty cache directory: prebuild_shader_binaries() makes the shared shader parts of every
 //      translated shader into the pipeline cache and saves it.
 //   3. LEONIDA_GPL=1: a new device loads that cache, links the same PSOs and draws: the same pixels, and every shared
-//      part came from the cache (VkPipelineCreationFeedback: 0 compiled).
+//      part came from the cache (VkPipelineCreationFeedback: 0 compiled). The first draws ask for the optimised links;
+//      once the background worker has made and swapped them in, the list runs again: the same pixels.
+//   4. Another device on the cache the third saved: every PSO takes its optimised link from the cache at creation
+//      (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT), none is fast-linked, and the pixels are the same.
 // The PSOs differ in what the libraries make dynamic: depth test and write, cull mode, depth bias and blending, so a
 // state the linked pipeline failed to set would change the pixels. 77 (skip) without a Vulkan device, or one without
 // graphicsPipelineLibrary. Shader objects stay off (LEONIDA_SHADER_OBJECTS=0): they would take the PSOs instead.
@@ -47,6 +50,9 @@ struct Shaders {
 
 struct Run {
     std::vector<std::uint8_t> pixels;
+    // The same list again once the background optimised links are done (draw_once's `again`): drawn with the
+    // optimised pipelines that replaced the fast-linked ones.
+    std::vector<std::uint8_t> pixels_again;
     bool linked = false;  // the device linked its PSOs from pipeline libraries
     rt::d3d12::PipelineLibraryStats stats;
 };
@@ -56,7 +62,9 @@ struct Run {
 //   draw 2: flat depth 0.5, LESS without writes, additive blending, depth bias pushing it 0.0625 nearer: it lands where
 //           draw 1 is farther than 0.4375 (the right side) and adds its colour there;
 //   draw 3: as draw 1 but culling front faces: the triangle is front facing, so nothing is drawn.
-bool draw_once(const Shaders& shaders, Run& run) {
+// `again`: after the first execution, wait for the device's background work (the optimised links the first draws
+// asked for) and execute the list once more into Run::pixels_again.
+bool draw_once(const Shaders& shaders, Run& run, bool again = false) {
     Ref<ID3D12Device> device;
     CHECK(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&device.p))));
     const rt::d3d12::VulkanDeviceInfo* info = rt::d3d12::vulkan_device_info(device.p);
@@ -150,51 +158,62 @@ bool draw_once(const Shaders& shaders, Run& run) {
     Ref<ID3D12GraphicsCommandList> list;
     CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, first.p,
                                               IID_PPV_ARGS(&list.p))));
-    const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    list->ClearRenderTargetView(rtv, clear, 0, nullptr);
-    list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
-    list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
-    list->SetGraphicsRootSignature(root.p);
-    list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    const D3D12_VIEWPORT viewport{0, 0, float(kSize), float(kSize), 0, 1};
-    const D3D12_RECT scissor{0, 0, LONG(kSize), LONG(kSize)};
-    list->RSSetViewports(1, &viewport);
-    list->RSSetScissorRects(1, &scissor);
-    const auto constants = [&](float centre, float slope) {
-        UINT values[2];
-        std::memcpy(&values[0], &centre, 4);
-        std::memcpy(&values[1], &slope, 4);
-        list->SetGraphicsRoot32BitConstants(0, 2, values, 0);
-    };
-    constants(0.5f, 0.25f);
-    list->DrawInstanced(3, 1, 0, 0);
-    list->SetPipelineState(second.p);
-    constants(0.5f, 0.0f);
-    list->DrawInstanced(3, 1, 0, 0);
-    list->SetPipelineState(culled.p);
-    constants(0.0f, 0.0f);
-    list->DrawInstanced(3, 1, 0, 0);
-    const auto barrier = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    list->ResourceBarrier(1, &barrier);
-    D3D12_TEXTURE_COPY_LOCATION dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, kSize, kSize, 1, UINT(row)};
-    D3D12_TEXTURE_COPY_LOCATION src{target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
-    list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    CHECK(SUCCEEDED(list->Close()));
-    ID3D12CommandList* lists[] = {list.p};
-    queue->ExecuteCommandLists(1, lists);
-    CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
     Ref<ID3D12Fence> fence;
     CHECK(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
-    CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
-    const HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, done)));
-    CHECK(WaitForSingleObject(done, 10000) == WAIT_OBJECT_0);
-    CloseHandle(done);
-    void* mapped = nullptr;
-    CHECK(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
-    run.pixels.assign(static_cast<std::uint8_t*>(mapped), static_cast<std::uint8_t*>(mapped) + bytes);
-    readback->Unmap(0, nullptr);
+    UINT64 fence_value = 0;
+    for (int pass = 0; pass < (again ? 2 : 1); ++pass) {
+        if (pass) {
+            CHECK(rt::d3d12::wait_pipeline_library_work(device.p, 60000));
+            CHECK(SUCCEEDED(allocator->Reset()));
+            CHECK(SUCCEEDED(list->Reset(allocator.p, first.p)));
+            const auto back = transition(target.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &back);
+        }
+        const float clear[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        list->ClearRenderTargetView(rtv, clear, 0, nullptr);
+        list->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        list->OMSetRenderTargets(1, &rtv, FALSE, &dsv);
+        list->SetGraphicsRootSignature(root.p);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const D3D12_VIEWPORT viewport{0, 0, float(kSize), float(kSize), 0, 1};
+        const D3D12_RECT scissor{0, 0, LONG(kSize), LONG(kSize)};
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        const auto constants = [&](float centre, float slope) {
+            UINT values[2];
+            std::memcpy(&values[0], &centre, 4);
+            std::memcpy(&values[1], &slope, 4);
+            list->SetGraphicsRoot32BitConstants(0, 2, values, 0);
+        };
+        constants(0.5f, 0.25f);
+        list->DrawInstanced(3, 1, 0, 0);
+        list->SetPipelineState(second.p);
+        constants(0.5f, 0.0f);
+        list->DrawInstanced(3, 1, 0, 0);
+        list->SetPipelineState(culled.p);
+        constants(0.0f, 0.0f);
+        list->DrawInstanced(3, 1, 0, 0);
+        const auto barrier = transition(target.p, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        list->ResourceBarrier(1, &barrier);
+        D3D12_TEXTURE_COPY_LOCATION dst{readback.p, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+        dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, kSize, kSize, 1, UINT(row)};
+        D3D12_TEXTURE_COPY_LOCATION src{target.p, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        CHECK(SUCCEEDED(list->Close()));
+        ID3D12CommandList* lists[] = {list.p};
+        queue->ExecuteCommandLists(1, lists);
+        CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+        CHECK(SUCCEEDED(queue->Signal(fence.p, ++fence_value)));
+        const HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        CHECK(SUCCEEDED(fence->SetEventOnCompletion(fence_value, done)));
+        CHECK(WaitForSingleObject(done, 10000) == WAIT_OBJECT_0);
+        CloseHandle(done);
+        void* mapped = nullptr;
+        CHECK(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        (pass ? run.pixels_again : run.pixels)
+            .assign(static_cast<std::uint8_t*>(mapped), static_cast<std::uint8_t*>(mapped) + bytes);
+        readback->Unmap(0, nullptr);
+    }
     run.stats = rt::d3d12::pipeline_library_stats(device.p);
     return true;
 }
@@ -254,12 +273,22 @@ int main() {
         return 77;
     }
 
-    // 3. A new device: linked PSOs from the cache the prebuild saved.
-    if (!draw_once(shaders, linked)) return 1;
+    // 3. A new device: linked PSOs from the cache the prebuild saved, fast-linked; their first draws ask for the
+    //    optimised links, which the background worker makes, puts in the pipeline cache and swaps in; the list again.
+    // LEONIDA_GPL_CACHED_LINK=0: a driver's own disk cache (NVIDIA's keeps pipelines across processes) could otherwise
+    // already answer the optimised links at creation on a machine that ran this test before, and nothing would be left
+    // to do in the background.
+    _wputenv_s(L"LEONIDA_GPL_CACHED_LINK", L"0");
+    if (!draw_once(shaders, linked, true)) return 1;
+    _wputenv_s(L"LEONIDA_GPL_CACHED_LINK", L"1");
     if (!linked.linked) {
         std::puts("SKIP: this device has no graphicsPipelineLibrary");
         return 77;
     }
+
+    // 4. Another device, on the cache the third one saved: every PSO takes its optimised link at creation.
+    Run reopened;
+    if (!draw_once(shaders, reopened)) return 1;
 
     // The reference is not trivial: the right side has draw 2 added, the left side does not, and draw 3 drew nothing.
     const std::uint8_t* left = at(whole.pixels, 2, kSize / 2);
@@ -269,23 +298,30 @@ int main() {
                      left[1], left[2], right[0], right[1], right[2]);
         return 1;
     }
-    for (UINT y = 0; y < kSize; ++y)
-        if (std::memcmp(at(whole.pixels, 0, y), at(linked.pixels, 0, y), kSize * 4) != 0) {
-            std::fprintf(stderr, "row %u differs between the whole and the linked pipelines\n", y);
-            for (UINT x = 0; x < kSize; ++x) {
-                const std::uint8_t* w = at(whole.pixels, x, y);
-                const std::uint8_t* l = at(linked.pixels, x, y);
-                if (std::memcmp(w, l, 4) != 0) {
-                    std::fprintf(stderr, "  x %u: whole %u,%u,%u,%u linked %u,%u,%u,%u\n", x, w[0], w[1], w[2], w[3],
-                                 l[0], l[1], l[2], l[3]);
-                    break;
+    const auto same = [&](const std::vector<std::uint8_t>& got, const char* what) {
+        for (UINT y = 0; y < kSize; ++y)
+            if (std::memcmp(at(whole.pixels, 0, y), at(got, 0, y), kSize * 4) != 0) {
+                std::fprintf(stderr, "row %u differs between the whole pipelines and the %s\n", y, what);
+                for (UINT x = 0; x < kSize; ++x) {
+                    const std::uint8_t* w = at(whole.pixels, x, y);
+                    const std::uint8_t* l = at(got, x, y);
+                    if (std::memcmp(w, l, 4) != 0) {
+                        std::fprintf(stderr, "  x %u: whole %u,%u,%u,%u %s %u,%u,%u,%u\n", x, w[0], w[1], w[2], w[3],
+                                     what, l[0], l[1], l[2], l[3]);
+                        break;
+                    }
                 }
+                return false;
             }
-            return 1;
-        }
+        return true;
+    };
+    if (!same(linked.pixels, "fast-linked pipelines") || !same(linked.pixels_again, "optimised links") ||
+        !same(reopened.pixels, "optimised links from the pipeline cache"))
+        return 1;
     const rt::d3d12::PipelineLibraryStats& s = linked.stats;
-    std::printf("linked PSOs: %u shared shader parts made (%u from the pipeline cache), %u links (%u from the cache)\n",
-                s.parts_made, s.parts_cached, s.links, s.links_cached);
+    std::printf("linked PSOs: %u shared shader parts made (%u from the pipeline cache), %u links (%u from the cache); "
+                "%u optimised links made in the background, %u swapped in\n",
+                s.parts_made, s.parts_cached, s.links, s.links_cached, s.optimized_linked, s.optimized_swapped);
     if (s.links < 3 || s.parts_made == 0) {
         std::fprintf(stderr, "the PSOs were not linked from shared parts\n");
         return 1;
@@ -294,7 +330,20 @@ int main() {
         std::fprintf(stderr, "%u shared shader parts were compiled after the prebuild\n", s.parts_made - s.parts_cached);
         return 1;
     }
+    if (s.optimized_linked != 3 || s.optimized_swapped != 3 || s.optimized_at_creation != 0) {
+        std::fprintf(stderr, "expected 3 optimised links made in the background and swapped in\n");
+        return 1;
+    }
+    const rt::d3d12::PipelineLibraryStats& r = reopened.stats;
+    std::printf("the next device: %u PSOs took their optimised link from the pipeline cache at creation, %u fast links, "
+                "%u optimised links made in the background\n",
+                r.optimized_at_creation, r.links - r.optimized_at_creation, r.optimized_linked);
+    if (r.optimized_at_creation != 3 || r.links != 3 || r.optimized_linked != 0 || r.parts_cached != r.parts_made) {
+        std::fprintf(stderr, "the next device's PSOs did not take their optimised links from the pipeline cache\n");
+        return 1;
+    }
     std::filesystem::remove_all(scratch, ec);
-    std::puts("pipeline libraries: the same pixels as whole pipelines, every shader part from the prebuilt cache");
+    std::puts("pipeline libraries: the same pixels as whole pipelines, fast-linked, optimised in the background and "
+              "optimised from the cache; every shader part from the prebuilt cache");
     return 0;
 }

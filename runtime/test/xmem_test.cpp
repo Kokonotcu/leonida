@@ -98,6 +98,27 @@ void test_alloc(XMemAllocFn alloc, XMemFreeFn free_mem) {
     }
     check(pattern_ok, "XMemAlloc(4096, 0x5e50000) block holds a write/read pattern");
 
+    // 64 KiB and up: 64 KiB aligned (GPU-visible data and host-pointer imports need page alignment), writable to the
+    // end, and released by XMemFree like any other block.
+    {
+        void* const large = alloc(256 * 1024 + 17, 0xf0814000);
+        check(large && (reinterpret_cast<uintptr_t>(large) & 0xFFFF) == 0,
+              "XMemAlloc of 256 KiB + 17 returns a 64 KiB aligned block");
+        if (large) {
+            auto* bytes = static_cast<uint8_t*>(large);
+            bytes[0] = 1;
+            bytes[256 * 1024 + 16] = 2;
+            check(bytes[0] == 1 && bytes[256 * 1024 + 16] == 2, "the large block is writable to its last byte");
+            MEMORY_BASIC_INFORMATION info{};
+            free_mem(large, 0xf0814000);
+            check(VirtualQuery(large, &info, sizeof info) && info.State == MEM_FREE,
+                  "XMemFree releases the large block's pages");
+        }
+        void* const small = alloc(1024, 0xf0814000);
+        check(small && aligned_64(small), "a small block still comes from the 64-byte aligned heap");
+        free_mem(small, 0xf0814000);
+    }
+
     free_mem(zero, 0);
     free_mem(big, 0x5e50000);
     check(true, "XMemFree accepts both blocks (no crash)");

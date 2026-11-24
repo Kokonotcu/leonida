@@ -207,11 +207,17 @@ inline LoadResult load_mods(const std::filesystem::path& dir) {
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec)) return result;
     std::vector<std::filesystem::path> folders;
-    for (const auto& entry : std::filesystem::directory_iterator(dir, ec))
-        if (entry.is_directory(ec)) folders.push_back(entry.path());
+    // increment(ec), not the range-for: an error while listing ends the scan instead of throwing out of main.
+    std::filesystem::directory_iterator it(dir, ec);
+    for (const std::filesystem::directory_iterator end; !ec && it != end; it.increment(ec)) {
+        std::error_code kind_ec;
+        if (it->is_directory(kind_ec)) folders.push_back(it->path());
+    }
     std::sort(folders.begin(), folders.end());
     for (const auto& folder : folders) {
-        const std::string name = folder.filename().string();
+        // UTF-8: string() throws for a folder name the ANSI code page cannot spell (RT-84).
+        const std::u8string u8 = folder.filename().u8string();
+        const std::string name(u8.begin(), u8.end());
         std::ifstream f(folder / "mod.json", std::ios::binary);
         if (!f) continue;  // a folder without a manifest is not a mod (notes, assets of another tool)
         const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());

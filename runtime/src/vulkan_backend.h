@@ -435,6 +435,7 @@ public:
         acceleration_structure,
         framebuffer,
         release,  // handle: a DeferredRelease*
+        pipeline,
     };
 
     struct Item {
@@ -529,6 +530,9 @@ public:
             case Kind::release:
                 if (auto* release = reinterpret_cast<DeferredRelease*>(item.handle); release->release)
                     release->release(release);
+                break;
+            case Kind::pipeline:
+                vk.vkDestroyPipeline(device, reinterpret_cast<VkPipeline>(item.handle), nullptr);
                 break;
             }
         }
@@ -1603,6 +1607,18 @@ public:
         std::lock_guard lock(submit_mutex_);
         const std::uint64_t safe_ticket = submitted_ticket_.load(std::memory_order_acquire) + 1;
         deletion_queue_.push(safe_ticket, kind, raw_handle);
+    }
+
+    // Replaces a graphics PSO's pipeline for every later draw (GraphicsPipeline::Upgrade, the optimised pipeline-library
+    // link) and destroys the one it replaces once the work submitted so far is done. Under resource_mutex_ (which every
+    // execute holds shared from prepare until just before its submit) and tracker_mutex_ (held from there through the
+    // submit): no list is between choosing its pipeline and submitting, so every list either recorded `retired` and is
+    // submitted already, which the deferred deletion waits for, or will see `replacement`.
+    void replace_graphics_pipeline(std::atomic<VkPipeline>& slot, VkPipeline replacement, VkPipeline retired) {
+        std::unique_lock resource_lock(resource_mutex_);
+        std::lock_guard tracker_lock(tracker_mutex_);
+        slot.store(replacement, std::memory_order_release);
+        defer_destroy(DeferredDeletionQueue::Kind::pipeline, retired);
     }
 
     // Waits (not for the device: for the queues' timelines) until every submission up to `ticket` is done, then

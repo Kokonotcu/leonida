@@ -267,6 +267,54 @@ void run_checks(const std::filesystem::path& root) {
         check(delete_w(L"GAME:\\data\\nullable.aux"), "and it can be deleted again");
     }
 
+    // Win32 drops trailing dots and spaces, so ".gta6rt-deleted." would be the overlay's marker folder: the internal
+    // folders stay unreachable through such an alias, and an ordinary name with a trailing dot is the file itself.
+    for (const wchar_t* alias : {L"GAME:\\.gta6rt-deleted.\\data\\hello.txt", L"GAME:\\.gta6rt-copy \\x",
+                                 L"GAME:\\.gta6rt-persistent. .\\x", L"GAME:\\data\\...\\hello.txt"}) {
+        HANDLE h = create_w(alias, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, 0, nullptr);
+        check(h == INVALID_HANDLE_VALUE, "an internal folder or a dots-only component is refused, trailing dots or not");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+    {
+        HANDLE h = create_w(L"GAME:\\data\\hello.txt.", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && read_handle(h) == "package",
+              "a trailing dot names the same package file, as on Win32");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+    }
+
+    // GetDiskFreeSpaceEx on a console path answers for the overlay's volume (review M9); the host would refuse it.
+    {
+        using FreeSpaceFn = BOOL(WINAPI*)(LPCWSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER);
+        const auto free_space = resolve<FreeSpaceFn>("api-ms-win-core-file-l1-1-0.dll", "GetDiskFreeSpaceExW");
+        ULARGE_INTEGER avail{}, total{}, free_total{}, host_total{};
+        const BOOL game_ok = free_space && free_space(L"GAME:\\", &avail, &total, &free_total);
+        const BOOL host_ok = ::GetDiskFreeSpaceExW(root.c_str(), nullptr, &host_total, nullptr);
+        check(game_ok && total.QuadPart > 0 && host_ok && total.QuadPart == host_total.QuadPart,
+              "GetDiskFreeSpaceExW(GAME:\\) answers for the overlay's volume");
+        const BOOL scratch_ok = free_space && free_space(L"T:\\", &avail, nullptr, nullptr);
+        check(scratch_ok && avail.QuadPart > 0, "and T:\\ too");
+    }
+
+    // gta6rt's default overlay is <game>\overlay, inside the package: GAME: neither lists nor reaches it (review B4).
+    {
+        const std::filesystem::path inner = package / "overlay";
+        rt::fs::configure(package, inner);
+        HANDLE h = create_w(L"GAME:\\data\\made_here.txt", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        check(h != INVALID_HANDLE_VALUE && std::filesystem::exists(inner / "data" / "made_here.txt"),
+              "with the overlay inside the package, a new console file still lands in the overlay");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(!contains(list(first_w, next_w, find_close, L"GAME:\\*"), L"overlay"),
+              "the overlay's own folder is not listed at GAME:\\");
+        h = create_w(L"GAME:\\overlay\\data\\made_here.txt", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0,
+                     nullptr);
+        check(h == INVALID_HANDLE_VALUE, "and a path into it through GAME: is refused");
+        if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+        check(delete_w(L"GAME:\\data\\made_here.txt"), "the console file is deleted again");
+        rt::fs::configure(package, overlay);
+        std::error_code remove_ec;
+        std::filesystem::remove_all(inner, remove_ec);
+    }
+
     // --trace: a failed open of a guest path is a "file_open_failed" event, a successful one is not, and with the
     // trace off nothing is written.
     {
