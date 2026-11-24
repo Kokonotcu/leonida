@@ -214,6 +214,22 @@ private:
     std::size_t size_ = 0;
 };
 
+// Launch time: one line per device-creation step with the process's age and the time since the previous step, so a
+// slow start names its step (the retail boot spent seconds here before its first frame).
+void startup_mark(const char* step) {
+    static std::mutex mutex;
+    static double previous = 0;
+    FILETIME created{}, exited{}, kernel{}, user{}, now{};
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return;
+    GetSystemTimePreciseAsFileTime(&now);
+    const auto ticks = [](const FILETIME& t) { return (std::uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+    const double age = double(ticks(now) - ticks(created)) / 1e7;
+    std::lock_guard lock(mutex);
+    std::fprintf(stderr, "[rt] d3d12: startup %.2f s: %s (+%.0f ms)\n", age, step,
+                 previous ? (age - previous) * 1000.0 : 0.0);
+    previous = age;
+}
+
 std::wstring environment_text(const wchar_t* name) {
     const DWORD size = GetEnvironmentVariableW(name, nullptr, 0);
     if (!size) return {};
@@ -804,6 +820,13 @@ struct DeviceState {
     bool checkpoint_pipeline_cache() {
         using leonida::pipeline_cache::Saved;
         const auto result = write_pipeline_cache();
+        if (result.saved == Saved::unchanged) {
+            static std::once_flag unchanged_logged;  // a quiet run still says the worker ran
+            std::call_once(unchanged_logged, [&] {
+                std::fprintf(stderr, "[rt] d3d12: checkpoint: the pipeline cache holds nothing new (%zu bytes)\n",
+                             result.bytes);
+            });
+        }
         if (result.saved == Saved::written || result.saved == Saved::failed) {
             std::uint64_t skipped = 0;
             if (pipeline_cache_checkpoint_log.take(std::chrono::steady_clock::now(), skipped)) {
@@ -1121,7 +1144,16 @@ struct DeviceState {
             ++arena.allocations;
             arena.in_use += bytes;
             arena.peak_in_use = std::max(arena.peak_in_use, arena.in_use);
-            arena.peak_end = std::max(arena.peak_end, start + bytes);
+            if (start + bytes > arena.peak_end) {
+                // Each new 256 MiB of the arena reached says so: the size it needs (runs end by kill, so teardown's
+                // report_arena is never printed).
+                constexpr VkDeviceSize step = VkDeviceSize(256) << 20;
+                if ((start + bytes) / step > arena.peak_end / step)
+                    std::fprintf(stderr, "[rt] d3d12: GPU address arena reached %llu of %llu MiB (%llu MiB in use)\n",
+                                 (unsigned long long)((start + bytes) >> 20), (unsigned long long)(arena.size >> 20),
+                                 (unsigned long long)(arena.in_use >> 20));
+                arena.peak_end = start + bytes;
+            }
             arena.use_in_use[use] += bytes;
             arena.use_peak[use] = std::max(arena.use_peak[use], arena.use_in_use[use]);
             if (arena.log)
@@ -1246,10 +1278,6 @@ struct DeviceState {
         }
         return shader_library.loaded() ? &shader_library : nullptr;
     }
-    // Loads the library on its own thread from device creation on: parsing the corpus index (57 MB of JSON, 29,267
-    // entries, 2.65 s measured) then overlaps the title's own start instead of stalling its first pipeline creation.
-    // Joined before the members above go (declared after them).
-    std::jthread library_preload;
 
     bool depth_usable(VkFormat format) const {
         VkFormatProperties properties{};
@@ -1729,6 +1757,9 @@ struct DeviceState {
             return VK_NULL_HANDLE;
         }
         cached = pipeline_cache_hits.load() != hits_before;
+        // Parts, fast links and optimised links all land in the cache; without this the checkpoint worker never woke
+        // under pipeline libraries, and a run that ends by being killed (every retail run so far) kept nothing new.
+        pipeline_created();
         return pipeline;
     }
 
@@ -2414,7 +2445,17 @@ struct DeviceState {
         allocate.allocationSize = size;
         allocate.memoryTypeIndex = type;
         VkDeviceMemory out = VK_NULL_HANDLE;
-        return context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out) == VK_SUCCESS ? out : VK_NULL_HANDLE;
+        const auto start = std::chrono::steady_clock::now();
+        const VkResult result = context->vk.vkAllocateMemory(info.device, &allocate, nullptr, &out);
+        // Large allocations (the arena) say where they went and how long the driver took: a host-visible one that
+        // falls back to system memory is not a spill by spilled_to_host's rule, so nothing else would tell.
+        if (size >= (VkDeviceSize(256) << 20)) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            std::fprintf(stderr, "[rt] d3d12: vkAllocateMemory %llu MiB, type %u (flags 0x%x, heap %u): %d in %.0f ms\n",
+                         static_cast<unsigned long long>(size >> 20), type, memory.memoryTypes[type].propertyFlags,
+                         memory.memoryTypes[type].heapIndex, int(result), ms);
+        }
+        return result == VK_SUCCESS ? out : VK_NULL_HANDLE;
     }
 
     void note_spill(VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred, std::uint32_t type,
@@ -7224,7 +7265,7 @@ public:
         // The translated shader index (26k entries for the retail corpus) is read off the title's thread from now
         // on: read cold at the first pipeline it outlasted the retail watchdog (about 30 s; PR #8134's boot runs).
         // library() is locked, so a pipeline that comes first waits only for what is left of the read.
-        library_preload_ = std::thread([this] { state_.library(); });
+        library_preload_ = std::thread([this] { state_.library(); startup_mark("shader library read (its own thread)"); });
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
@@ -7349,7 +7390,11 @@ public:
                                                                       info.buffer_device_address);
         state_.context->mesh_queries = info.mesh_shader_queries;
         state_.context->set_depth_range_unrestricted(info.depth_range_unrestricted);
-        state_.library_preload = std::jthread([this] { state_.library(); });
+        // The pipeline cache (with the file an earlier session saved: 130 MB on the retail boot) is created off the
+        // title's thread too: made lazily it cost the first PSO the file read and vkCreatePipelineCache on the render
+        // thread, and its checkpoint clock only started there. pipeline_cache() is call_once: a PSO that comes first
+        // waits for this load instead of starting its own.
+        pipeline_cache_preload_ = std::thread([this] { state_.pipeline_cache(); startup_mark("pipeline cache loaded (its own thread)"); });
         if (info.physical && state_.format_properties) {
             state_.context->set_color_attachment_format(
                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
@@ -7373,8 +7418,10 @@ public:
                                  "a StartInstanceLocation other than 0 are invalid\n");
         dred_.attach(static_cast<ID3D12Device*>(this), state_.context.get(), &removed_, &state_.arena.address,
                      dred_requested());
+        startup_mark("Vulkan context");
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
+        startup_mark("GPU address arena");
         if (info.conditional_rendering) {
             const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
@@ -7430,9 +7477,12 @@ public:
                 return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             }, max_storage_range);
         }
+        startup_mark("conditional rendering, depth24");
         if (info.bindless && state_.context->loaded() && !create_bindless(get_device))
             std::fprintf(stderr, "[rt] d3d12: the bindless set 0 could not be created\n");
+        startup_mark("bindless set");
         query_luid_and_clock(get_device);
+        startup_mark("LUID and clock calibration");
         // Timestamps: the device's timestampPeriod, enabled when the graphics family (info.queue_family) has
         // timestampValidBits.
         VkPhysicalDeviceProperties properties{};
@@ -7464,6 +7514,7 @@ public:
             if (family.queueFlags & VK_QUEUE_COMPUTE_BIT)
                 state_.context->set_occlusion_resolve_memory(state_.memory);
         }
+        startup_mark("timestamps, occlusion resolve memory");
         state_.context->set_device_fault_enabled(info.device_fault);  // the loss summary asks it, DRED or not
         if ((dred_requested() || info.buffer_marker) &&
             !state_.context->configure_breadcrumbs(state_.memory, info.buffer_marker, info.device_fault,
@@ -7505,6 +7556,7 @@ public:
                     state_.sparse_buffer_memory_types = requirements.memoryTypeBits;
             }
         }
+        startup_mark("breadcrumbs, labels, sparse checks");
     }
 
     // Set 0 of every translated shader that declares bindings: images, samplers and the descriptor hash table
@@ -7646,6 +7698,23 @@ public:
     // LEONIDA_ARENA_MB sets its size (default 256, at most 4095, and no more than the device's maxBufferSize and
     // maxMemoryAllocationSize allow: src/arena_size.h): it holds every default-heap buffer, shader-visible
     // descriptor heap and shader program. M0-M3 keep it host-visible (section 3.3, memory type policy).
+    // The memory types that are DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT in a heap larger than the 256 MiB BAR
+    // window (Resizable BAR); 0 without.
+    std::uint32_t host_visible_vram_types() const {
+        constexpr VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        const VkPhysicalDeviceMemoryProperties& memory = state_.memory;
+        std::uint32_t bits = 0;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount && i < VK_MAX_MEMORY_TYPES; ++i) {
+            const VkMemoryType& type = memory.memoryTypes[i];
+            if ((type.propertyFlags & wanted) != wanted || type.heapIndex >= memory.memoryHeapCount) continue;
+            const VkMemoryHeap& heap = memory.memoryHeaps[type.heapIndex];
+            if ((heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) && heap.size > leonida::kBarWindowBytes) bits |= 1u << i;
+        }
+        return bits;
+    }
+
     bool create_arena() {
         auto& vk = state_.context->vk;
         if (!vk.vkGetBufferDeviceAddress) return false;
@@ -7690,6 +7759,46 @@ public:
                 vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
                 arena.buffer = VK_NULL_HANDLE;
                 return false;
+            }
+        }
+        // The arena must be in VRAM (the GPU reads every default-heap buffer from it). NVIDIA (617.42, RTX 3080 Laptop,
+        // 8 GiB) leaves its DEVICE_LOCAL | HOST_VISIBLE type out of memoryTypeBits for a buffer this large (4000 MiB
+        // in, 4095 MiB out, whatever the usage bits), and the arena went to system memory: GPU reads over PCIe, and
+        // the 4 GiB pinned at creation cost the retail boot 3-11 s. Then the arena is made as large as can still be
+        // in that type (found with throwaway buffers, a few ms), when that keeps at least half of what was asked.
+        if (const std::uint32_t vram_bits = host_visible_vram_types();
+            vram_bits && !(requirements.memoryTypeBits & vram_bits)) {
+            const auto fits_vram = [&](VkDeviceSize bytes) {
+                VkBufferCreateInfo probe = info;
+                probe.size = bytes;
+                VkBuffer buffer = VK_NULL_HANDLE;
+                if (vk.vkCreateBuffer(state_.info.device, &probe, nullptr, &buffer) != VK_SUCCESS) return false;
+                VkMemoryRequirements r{};
+                vk.vkGetBufferMemoryRequirements(state_.info.device, buffer, &r);
+                vk.vkDestroyBuffer(state_.info.device, buffer, nullptr);
+                return (r.memoryTypeBits & vram_bits) != 0;
+            };
+            constexpr VkDeviceSize step = VkDeviceSize(16) << 20;
+            VkDeviceSize low = 0, high = info.size / step;  // in steps: low fits (or is 0), high does not
+            while (high - low > 1) {
+                const VkDeviceSize middle = (low + high) / 2;
+                (fits_vram(middle * step) ? low : high) = middle;
+            }
+            const VkDeviceSize fitting = low * step;
+            if (fitting > kArenaPrefix && fitting >= info.size / 2) {
+                std::fprintf(stderr, "[rt] d3d12: GPU address arena: %llu MiB instead of %llu MiB, the largest buffer "
+                                     "the driver lets into host-visible VRAM (the asked size would be in system "
+                                     "memory)\n",
+                             static_cast<unsigned long long>(fitting >> 20),
+                             static_cast<unsigned long long>(info.size >> 20));
+                vk.vkDestroyBuffer(state_.info.device, arena.buffer, nullptr);
+                info.size = fitting;
+                size.bytes = fitting;
+                if (!create_buffer()) return false;
+            } else {
+                std::fprintf(stderr, "[rt] d3d12: GPU address arena: the driver keeps a %llu MiB buffer out of "
+                                     "host-visible VRAM; it goes to system memory\n",
+                             static_cast<unsigned long long>(info.size >> 20));
             }
         }
         if (size.capped)
@@ -7760,6 +7869,7 @@ public:
 
     ~Device() override {
         if (library_preload_.joinable()) library_preload_.join();
+        if (pipeline_cache_preload_.joinable()) pipeline_cache_preload_.join();
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
@@ -11420,6 +11530,7 @@ private:
     std::vector<std::uint32_t> copy_users_;
     DeviceState state_;
     std::thread library_preload_;  // state_.library() at creation (see the constructor)
+    std::thread pipeline_cache_preload_;  // state_.pipeline_cache() at creation, once the context exists
     // What the command allocators take spill arrays from (DeviceArenaPages); null without an arena.
     std::shared_ptr<ArenaPages> arena_pages_;
     std::atomic<bool> removed_{false};
@@ -12152,6 +12263,7 @@ HRESULT create_dxgi_factory(ID3D12Device* device, REFIID riid, void** out) {
 HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettings queue_test_settings) {
     if (!out) return E_POINTER;
     *out = nullptr;
+    startup_mark("Vulkan device requested");
     static const HMODULE library = LoadLibraryA("vulkan-1.dll");
     const auto get = library ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(
                                    reinterpret_cast<void*>(GetProcAddress(library, "vkGetInstanceProcAddr")))
@@ -12290,6 +12402,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         }
         shared = process_instance;
     }
+    startup_mark("Vulkan instance ready");
     const VkInstance instance = shared.instance;
     const bool surface_maintenance1_khr = shared.surface_maintenance1_khr;
     const bool surface_maintenance1_ext = shared.surface_maintenance1_ext;
@@ -12980,8 +13093,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
     device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
     device_info.ppEnabledExtensionNames = device_extensions.empty() ? nullptr : device_extensions.data();
+    startup_mark("physical device picked");
     if (vkCreateDevice(info.physical, &device_info, nullptr, &owned.device) != VK_SUCCESS)
         return fail("vkCreateDevice failed");
+    startup_mark("vkCreateDevice");
     info.device = owned.device;
     owned.destroy_device = reinterpret_cast<PFN_vkDestroyDevice>(vkGetDeviceProcAddr(owned.device, "vkDestroyDevice"));
     info.command_queues.resize(command_queue_count);
@@ -13022,7 +13137,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                      chosen.limits.maxPushConstantsSize);
     }
 
+    startup_mark("queues and features");
     auto* device = new Device(info);
+    startup_mark("D3D12 device made");
     device->own(owned);  // destroyed with the device from here on, even on failure
     if (!device->ok()) {
         device->Release();

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <set>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -26,17 +27,24 @@ struct FakeDevice {
     std::set<VkShaderModule> alive;
     std::size_t created = 0;
     bool fail = false;
+    // vkCreateShaderModule and vkDestroyShaderModule may be called from any thread; the cache calls them outside its
+    // lock, so the fake keeps its own.
+    std::mutex mutex;
 
     leonida::ShaderModuleCache cache() {
         return leonida::ShaderModuleCache(
             [this](const std::vector<std::uint32_t>&) {
+                std::lock_guard lock(mutex);
                 if (fail) return VkShaderModule(VK_NULL_HANDLE);
                 const auto module = reinterpret_cast<VkShaderModule>(next++);
                 alive.insert(module);
                 ++created;
                 return module;
             },
-            [this](VkShaderModule module) { alive.erase(module); });
+            [this](VkShaderModule module) {
+                std::lock_guard lock(mutex);
+                alive.erase(module);
+            });
     }
 };
 

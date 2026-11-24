@@ -124,10 +124,10 @@ constexpr DWORD kDbgPrintWide = 0x4001000A;  // DBG_PRINTEXCEPTION_WIDE_C
 constexpr DWORD kCppException = 0xE06D7363;  // MSVC throw: logged with its address, never its payload
 constexpr int kMaxFrames = 16;
 
-inline std::string stack_from(const CONTEXT& start_context) {
+inline std::string stack_from(const CONTEXT& start_context, int max_frames = kMaxFrames) {
     CONTEXT c = start_context;
     std::string out = "[";
-    for (int i = 0; i < kMaxFrames && c.Rip; ++i) {
+    for (int i = 0; i < max_frames && c.Rip; ++i) {
         if (i) out += ',';
         out += quote(where(c.Rip));
         DWORD64 image_base = 0;
@@ -337,7 +337,7 @@ inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
 }
 
 inline void log_thread_stack(DWORD tid, const CONTEXT& c) {
-    event("thread_stack", "\"tid\":" + std::to_string(tid) + ",\"stack\":" + stack_from(c));
+    event("thread_stack", "\"tid\":" + std::to_string(tid) + ",\"stack\":" + stack_from(c, 64));  // deep: driver frames
 }
 
 // No C++ objects here, so the SEH frame is allowed under /EHsc (as in handler()).
@@ -383,14 +383,28 @@ inline void dump_thread_stacks() {
 }
 
 inline void start_hang_dump() {
-    wchar_t value[32] = {};
-    if (!GetEnvironmentVariableW(L"LEONIDA_HANG_DUMP", value, 32)) return;
-    const long seconds = std::wcstol(value, nullptr, 10);
-    if (seconds <= 0) return;
-    std::fprintf(stderr, "[rt] LEONIDA_HANG_DUMP: thread stacks in %ld s\n", seconds);
-    std::thread([seconds] {
-        Sleep(static_cast<DWORD>(seconds) * 1000);
-        if (enabled()) dump_thread_stacks();
+    // One time ("20") or several, comma-separated and rising ("3,6,9,12"): one dump at each, from one run.
+    wchar_t value[128] = {};
+    if (!GetEnvironmentVariableW(L"LEONIDA_HANG_DUMP", value, 128)) return;
+    std::vector<long> times;
+    for (const wchar_t* p = value; *p;) {
+        wchar_t* end = nullptr;
+        const long seconds = std::wcstol(p, &end, 10);
+        if (end == p) break;
+        if (seconds > 0 && (times.empty() || seconds > times.back())) times.push_back(seconds);
+        p = *end == L',' ? end + 1 : end;
+        if (*end != L',') break;
+    }
+    if (times.empty()) return;
+    std::fprintf(stderr, "[rt] LEONIDA_HANG_DUMP: thread stacks at %zu time(s), the first in %ld s\n", times.size(),
+                 times.front());
+    std::thread([times] {
+        long slept = 0;
+        for (const long seconds : times) {
+            Sleep(static_cast<DWORD>(seconds - slept) * 1000);
+            slept = seconds;
+            if (enabled()) dump_thread_stacks();
+        }
     }).detach();
 }
 }  // namespace detail

@@ -62,25 +62,36 @@ public:
     }
 
     // The module for these words, created on first use. VK_NULL_HANDLE when creation fails (nothing is cached).
+    // The driver's vkCreateShaderModule runs outside the lock: under it, every pipeline creation on every thread
+    // waited for the one in front (the retail boot's game threads sat in this lock for most of a 15 s startup gap).
+    // Two threads that miss on the same words both create a module; the second to insert takes the first's and
+    // destroys its own.
     VkShaderModule acquire(const std::vector<std::uint32_t>& words) {
         const std::uint64_t hash = hash_words(words);
-        std::lock_guard lock(mutex_);
-        std::vector<Entry>& bucket = by_hash_[hash];
-        for (Entry& entry : bucket) {
-            if (entry.words == words) {
-                ++entry.references;
-                ++shared_;
-                return entry.module;
+        if (const VkShaderModule found = find_and_reference(hash, words)) return found;
+        const VkShaderModule created = create_(words);
+        if (created == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+        VkShaderModule duplicate = VK_NULL_HANDLE;
+        VkShaderModule result = created;
+        {
+            std::lock_guard lock(mutex_);
+            std::vector<Entry>& bucket = by_hash_[hash];
+            for (Entry& entry : bucket) {
+                if (entry.words == words) {  // another thread inserted it meanwhile
+                    ++entry.references;
+                    ++shared_;
+                    duplicate = created;
+                    result = entry.module;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                bucket.push_back(Entry{words, created, 1});
+                owner_[created] = hash;
             }
         }
-        const VkShaderModule module = create_(words);
-        if (module == VK_NULL_HANDLE) {
-            if (bucket.empty()) by_hash_.erase(hash);
-            return VK_NULL_HANDLE;
-        }
-        bucket.push_back(Entry{words, module, 1});
-        owner_[module] = hash;
-        return module;
+        if (duplicate) destroy_(duplicate);
+        return result;
     }
 
     // One release per acquire that returned `module`; the last one destroys it. Unknown modules are ignored.
@@ -113,6 +124,21 @@ public:
     }
 
 private:
+    // The cached module for these words with one more reference, or VK_NULL_HANDLE.
+    VkShaderModule find_and_reference(std::uint64_t hash, const std::vector<std::uint32_t>& words) {
+        std::lock_guard lock(mutex_);
+        const auto bucket = by_hash_.find(hash);
+        if (bucket == by_hash_.end()) return VK_NULL_HANDLE;
+        for (Entry& entry : bucket->second) {
+            if (entry.words == words) {
+                ++entry.references;
+                ++shared_;
+                return entry.module;
+            }
+        }
+        return VK_NULL_HANDLE;
+    }
+
     struct Entry {
         std::vector<std::uint32_t> words;
         VkShaderModule module;
