@@ -1458,6 +1458,11 @@ public:
         std::unique_lock lock(resource_mutex_);
         title_buffer_at_ = std::move(lookup);
     }
+    // ReplayFunctions::map_title: called while commands are recorded (resource_mutex_ held); must not take it.
+    void set_title_mapper(std::function<void(std::uint64_t)> mapper) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.map_title = std::move(mapper);
+    }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
     void add_pipeline(std::uintptr_t id, const ComputePipeline& pipeline) {

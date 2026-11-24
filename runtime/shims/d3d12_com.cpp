@@ -7,6 +7,7 @@
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "log_seen.h"
+#include "../src/debug_targets.h"
 #include "../src/gfx10_descriptors.h"
 
 #include <algorithm>
@@ -1743,14 +1744,24 @@ private:
             return;
         }
         const bool ok = list_.draw(make_draw(indexed, count, instances, first, base_vertex, first_instance));
+        for (const auto& target : render_targets_) leonida::debug_targets::note(target.resource);  // LEONIDA_DUMP_TARGETS
         {
             // The first draws, and any of 16M+ vertices: one such draw kept the GPU busy past the title's watchdog
             // (retail boot, LEONIDA_DRED: first DrawInstanced of an 8-command list never completed).
             static std::atomic<int> shown{0};
+            // Also the first draw of every pipeline (up to 256 pipelines): what each kind of draw targets.
+            static std::mutex seen_mutex;
+            static std::unordered_set<std::uintptr_t> seen;
+            bool first_of_pipeline = false;
+            {
+                std::lock_guard lock(seen_mutex);
+                if (seen.size() < 256) first_of_pipeline = seen.insert(graphics_pipeline_).second;
+            }
             const std::uint64_t work = std::uint64_t(count) * instances;
-            if (work >= (1ull << 24) ? shown.fetch_add(1, std::memory_order_relaxed) < 24
-                                     : shown.load(std::memory_order_relaxed) < 12 &&
-                                           shown.fetch_add(1, std::memory_order_relaxed) < 12)
+            if (first_of_pipeline ||
+                (work >= (1ull << 24) ? shown.fetch_add(1, std::memory_order_relaxed) < 24
+                                      : shown.load(std::memory_order_relaxed) < 12 &&
+                                            shown.fetch_add(1, std::memory_order_relaxed) < 12))
                 std::fprintf(stderr, "[rt] d3d12: draw%s %u x %u instances from %u (base %d, instance %u), pipeline "
                                      "%llx, topology %u, viewport %gx%g at %g,%g, scissor %d,%d..%d,%d (%u), rt0 %llx\n",
                              indexed ? " indexed" : "", count, instances, first, base_vertex, first_instance,

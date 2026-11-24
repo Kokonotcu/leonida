@@ -7531,6 +7531,28 @@ public:
             [state = &state_](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
                 return state->title_buffer_at(va, size, buffer, offset);
             });
+        // A title address in a draw's or dispatch's root arguments: the MiB from its 64 KiB page gets page-table
+        // entries (committed pages only) before the command runs.
+        state_.context->set_title_mapper([state = &state_](std::uint64_t va) {
+            const bool mapped = state->map_title_memory(va & ~std::uint64_t(0xFFFF), 1ull << 20);
+            // The first title addresses seen in root arguments, with the words there (what the shader will read).
+            static std::mutex m;
+            static std::vector<std::uint64_t> shown;
+            std::lock_guard lock(m);
+            if (shown.size() >= 12 || std::find(shown.begin(), shown.end(), va) != shown.end()) return;
+            shown.push_back(va);
+            MEMORY_BASIC_INFORMATION info{};
+            const bool readable = VirtualQuery(reinterpret_cast<const void*>(va), &info, sizeof(info)) &&
+                                  info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD));
+            char words[200] = "unreadable";
+            if (readable) {
+                const auto* w = reinterpret_cast<const std::uint32_t*>(va & ~std::uint64_t(3));
+                std::snprintf(words, sizeof words, "%08x %08x %08x %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3],
+                              w[4], w[5], w[6], w[7]);
+            }
+            std::fprintf(stderr, "[rt] title address in root arguments: %#llx (%s): %s\n",
+                         static_cast<unsigned long long>(va), mapped ? "mapped" : "not mapped", words);
+        });
         arena_pages_ = std::make_shared<DeviceArenaPages>(state_);
         return true;
     }

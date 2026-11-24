@@ -47,6 +47,9 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <bit>
+#include <mutex>
+#include <string>
 #include <atomic>
 #include <memory>
 #include <span>
@@ -1009,6 +1012,9 @@ struct ReplayFunctions {
     // cut to what the buffer holds from there: vertex and index views use what fits, WriteBufferImmediate needs all
     // of it.
     std::function<bool(std::uint64_t va, std::uint64_t& size, VkBuffer&, VkDeviceSize&)> buffer_at;
+    // Makes the title memory around a title address (at or above 4 GiB) reachable through the page table, importing
+    // it when no entry covers it yet (the device's map_title_memory). Null without a page table.
+    std::function<void(std::uint64_t va)> map_title;
     // Host bytes for a whole console VA range; `not_cpu_written` when it names GPU-writable memory. For small
     // CPU-written inputs, such as the pointer list of an ARRAY_OF_POINTERS TLAS build.
     std::function<HostReadStatus(std::uint64_t va, std::uint64_t bytes, const std::uint8_t*&)> host_at;
@@ -2518,6 +2524,19 @@ inline void count_draw(DrawOutcome outcome, int result = 0) {
                      static_cast<unsigned long long>(stub.load()));
 }
 
+// Every 64-bit pair of user-data dwords that is a title address (4 GiB up to 2^47) gets its memory mapped in the
+// page table before the command runs (ReplayFunctions::map_title): the root arguments the title gives a shader
+// name its own memory directly (the exe's fill VS fetches its vertices through s8:s9), and the page table held only
+// the pages of title-placed buffers, so such a fetch read the scratch page: zero positions, no pixels.
+inline void map_title_user_data(const ReplayFunctions& vk, const std::uint32_t* s, std::size_t n) {
+    if (!vk.map_title) return;
+    for (std::size_t i = 0; i + 1 < n; ++i) {
+        const std::uint64_t va = std::uint64_t(s[i]) | (std::uint64_t(s[i + 1]) << 32);
+        if (va >> 32 == 0 || va >> 47) continue;
+        vk.map_title(va);
+    }
+}
+
 // The unresolved_resource exits of prepare_draw, numbered in source order, each named the first time it is taken
 // (1 pipeline, 2 render target, 3 depth, then vertex/index buffer exits).
 inline ReplayResult unresolved_site(int site) {
@@ -3927,12 +3946,25 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
             detail::count_draw(detail::DrawOutcome::prepared);
             if (const GraphicsPipeline* named = vk.graphics_pipeline ? vk.graphics_pipeline(draw->pipeline) : nullptr;
-                named && named->debug_name.find("Bink") != std::string::npos) {
-                static std::atomic<std::uint64_t> bink{0};
-                const std::uint64_t n = bink.fetch_add(1, std::memory_order_relaxed) + 1;
-                if ((n & (n - 1)) == 0)
-                    std::fprintf(stderr, "[rt] replay: Bink draws prepared %llu (%s)\n",
-                                 static_cast<unsigned long long>(n), named->debug_name.c_str());
+                named && !named->debug_name.empty()) {
+                // LEONIDA_LOG_PSOS: prepared draws per shader pair, the top 20 listed at 4096, 16384, 65536, ... draws,
+                // so what the title draws over a run is known beyond the first draws' log.
+                static std::mutex mutex;
+                static std::map<std::string, std::uint64_t> by_name;
+                static std::uint64_t total = 0;
+                std::lock_guard lock(mutex);
+                ++by_name[named->debug_name];
+                ++total;
+                if (total >= 4096 && (total & (total - 1)) == 0 && (std::countr_zero(total) % 2) == 0) {
+                    std::vector<std::pair<std::uint64_t, std::string>> top;
+                    for (const auto& [name, n] : by_name) top.emplace_back(n, name);
+                    std::sort(top.rbegin(), top.rend());
+                    std::fprintf(stderr, "[rt] replay: %llu named draws, %zu shader pairs; most drawn:\n",
+                                 static_cast<unsigned long long>(total), top.size());
+                    for (std::size_t i = 0; i < top.size() && i < 20; ++i)
+                        std::fprintf(stderr, "[rt]   %8llu %s\n", static_cast<unsigned long long>(top[i].first),
+                                     top[i].second.c_str());
+                }
             }
             previous_draw = draw;
             previous_draw_slot = p.draw;
@@ -4887,6 +4919,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             if (ind->kind == IndirectKind::dispatch && ind->pipeline) {  // the pipeline and root arguments recorded
                 ShaderUserData data{};
                 std::copy(ind->user_data.begin(), ind->user_data.end(), data.s);
+                detail::map_title_user_data(vk, data.s, ind->user_data.size());
                 data.heap_base = vk.heap_base;
                 data.code_base = p.pipeline.code_base;
                 bind_compute(p.pipeline, command_buffer, vk.bind_pipeline);
@@ -5003,6 +5036,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
             ShaderUserData data{};
             std::copy(dispatch->user_data.begin(), dispatch->user_data.end(), data.s);
+            detail::map_title_user_data(vk, data.s, dispatch->user_data.size());
             data.heap_base = vk.heap_base;
             data.code_base = p.pipeline.code_base;
             bind_compute(p.pipeline, command_buffer, vk.bind_pipeline);
@@ -5084,6 +5118,7 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
 
             ShaderUserData data{};
             std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
+            detail::map_title_user_data(vk, data.s, draw->user_data.size());
             data.heap_base = vk.heap_base;
             data.code_base = graphics.code_base;
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the

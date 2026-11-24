@@ -26,6 +26,7 @@
 // tear mode or FIFO, vulkan_present_mode.h), since a chained mode also holds for the presents after it. Without the
 // extension, or without either mode, a request is ignored and the frame waits for the vblank.
 
+#include "debug_targets.h"
 #include "vulkan_backend.h"
 #include "vulkan_present_compose.h"
 #include "vulkan_present_mode.h"
@@ -692,6 +693,7 @@ private:
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
             ++presented_;
+            if (debug_targets::dump_at() && presented_ == debug_targets::dump_at()) dump_targets();
             if (planes) ++composed_;
             if (tearing) {
                 last_tore_ = true;
@@ -1115,6 +1117,201 @@ private:
         capture_buffer_ = VK_NULL_HANDLE;
         capture_ptr_ = nullptr;
         captured_ = false;
+    }
+
+    // LEONIDA_DUMP_TARGETS (src/debug_targets.h): every colour target the title drew into, mip 0 / layer 0, copied
+    // to host memory and written as <capture dir>/target_<id>_<w>x<h>_f<format>.ppm with its mean RGBA logged.
+    // Synchronous (it waits for the copy): a diagnostic for one present, not for every frame.
+    static bool texel_rgba(VkFormat f, const std::uint8_t* p, float out[4]) {
+        const auto half = [](std::uint16_t h) {
+            const std::uint32_t s = h >> 15, e = (h >> 10) & 31, m = h & 1023;
+            float v = e == 0 ? std::ldexp(float(m), -24) : e == 31 ? 65504.0f : std::ldexp(float(m | 1024), int(e) - 25);
+            return s ? -v : v;
+        };
+        const auto small_float = [](std::uint32_t bits, int mantissa) {  // unsigned 5-bit exponent floats
+            const std::uint32_t e = bits >> mantissa, m = bits & ((1u << mantissa) - 1);
+            if (e == 0) return std::ldexp(float(m), -14 - mantissa);
+            if (e == 31) return 65504.0f;
+            return std::ldexp(float(m | (1u << mantissa)), int(e) - 15 - mantissa);
+        };
+        std::uint32_t w;
+        switch (f) {
+        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
+            for (int i = 0; i < 4; ++i) out[i] = p[i] / 255.0f;
+            return true;
+        case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+            out[0] = p[2] / 255.0f, out[1] = p[1] / 255.0f, out[2] = p[0] / 255.0f, out[3] = p[3] / 255.0f;
+            return true;
+        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
+            std::memcpy(&w, p, 4);
+            out[0] = (w & 1023) / 1023.0f, out[1] = ((w >> 10) & 1023) / 1023.0f, out[2] = ((w >> 20) & 1023) / 1023.0f;
+            out[3] = (w >> 30) / 3.0f;
+            return true;
+        case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+            std::memcpy(&w, p, 4);
+            out[0] = small_float(w & 2047, 6), out[1] = small_float((w >> 11) & 2047, 6),
+            out[2] = small_float(w >> 22, 5), out[3] = 1.0f;
+            return true;
+        case VK_FORMAT_R16G16B16A16_SFLOAT:
+            for (int i = 0; i < 4; ++i) {
+                std::uint16_t h;
+                std::memcpy(&h, p + 2 * i, 2);
+                out[i] = half(h);
+            }
+            return true;
+        case VK_FORMAT_R8_UNORM: out[0] = out[1] = out[2] = p[0] / 255.0f, out[3] = 1.0f; return true;
+        case VK_FORMAT_R16_UINT:          // the R16_UINT backing of a B5G5R5A1 UAV texture (uint_backed): A1R5G5B5
+        case VK_FORMAT_A1R5G5B5_UNORM_PACK16: {
+            std::uint16_t v;
+            std::memcpy(&v, p, 2);
+            out[0] = ((v >> 10) & 31) / 31.0f, out[1] = ((v >> 5) & 31) / 31.0f, out[2] = (v & 31) / 31.0f;
+            out[3] = float(v >> 15);
+            return true;
+        }
+        case VK_FORMAT_R16_SFLOAT: {
+            std::uint16_t h;
+            std::memcpy(&h, p, 2);
+            out[0] = out[1] = out[2] = half(h), out[3] = 1.0f;
+            return true;
+        }
+        case VK_FORMAT_R32_SFLOAT: std::memcpy(&out[0], p, 4); out[1] = out[2] = out[0], out[3] = 1.0f; return true;
+        default: return false;
+        }
+    }
+    static std::uint32_t texel_bytes(VkFormat f) {
+        switch (f) {
+        case VK_FORMAT_R8_UNORM: return 1;
+        case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UINT: case VK_FORMAT_A1R5G5B5_UNORM_PACK16: return 2;
+        case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
+        default: return 4;
+        }
+    }
+    void dump_targets() {
+        auto& vk = context_.vk;
+        const ReplayFunctions& fn = context_.replay_;
+        const VkDevice device = context_.device();
+        std::vector<ResourceId> ids = debug_targets::snapshot();
+        std::fprintf(stderr, "[rt] dump: %zu render target(s) at present %llu\n", ids.size(),
+                     static_cast<unsigned long long>(presented_));
+        VkPhysicalDeviceMemoryProperties memory{};
+        vkGetPhysicalDeviceMemoryProperties_(physical_, &memory);
+        for (const ResourceId id : ids) {
+            ResourceBinding b;
+            {
+                std::shared_lock lock(context_.resource_mutex_);
+                const ResourceBinding* found = context_.resolve(id);
+                if (!found || !found->image || found->aspects != VK_IMAGE_ASPECT_COLOR_BIT || found->samples > 1) {
+                    std::fprintf(stderr, "[rt] dump: target %llx skipped: %s\n", static_cast<unsigned long long>(id),
+                                 !found ? "unknown" : !found->image ? "no image" : found->samples > 1 ? "multisampled"
+                                                                                                    : "not colour");
+                    if (found && found->samples > 1)
+                        std::fprintf(stderr, "[rt] dump:   %ux%u format %d, %u samples\n", found->width, found->height,
+                                     int(found->format), found->samples);
+                    continue;
+                }
+                b = *found;
+            }
+            float probe[4];
+            const std::uint8_t zeros[8] = {};
+            if (!texel_rgba(b.format, zeros, probe)) {
+                std::fprintf(stderr, "[rt] dump: target %llx %ux%u format %d not dumped (format)\n",
+                             static_cast<unsigned long long>(id), b.width, b.height, int(b.format));
+                continue;
+            }
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            const VkImageLayout common = image_layout(b, VK_IMAGE_LAYOUT_GENERAL);
+            auto pieces = detail::current(&context_.tracker_, id, range, common);
+            bool undefined = false;
+            for (const auto& piece : pieces) undefined |= piece.layout == VK_IMAGE_LAYOUT_UNDEFINED;
+            if (undefined) {
+                std::fprintf(stderr, "[rt] dump: target %llx never written (UNDEFINED)\n", static_cast<unsigned long long>(id));
+                continue;
+            }
+            const VkDeviceSize bytes = VkDeviceSize(b.width) * b.height * texel_bytes(b.format);
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+            info.size = bytes;
+            info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            if (vk.vkCreateBuffer(device, &info, nullptr, &buffer) != VK_SUCCESS) continue;
+            VkMemoryRequirements req{};
+            vk.vkGetBufferMemoryRequirements(device, buffer, &req);
+            std::uint32_t type = UINT32_MAX;
+            for (std::uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; ++i)
+                if ((req.memoryTypeBits & (1u << i)) &&
+                    (memory.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+                    type = i;
+            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocate.allocationSize = req.size;
+            allocate.memoryTypeIndex = type;
+            void* mapped = nullptr;
+            VkCommandBuffer cmd = VK_NULL_HANDLE;
+            VkFence fence = VK_NULL_HANDLE;
+            VkCommandBufferAllocateInfo cba{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            cba.commandPool = pool_;
+            cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cba.commandBufferCount = 1;
+            VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+            const bool ready = type != UINT32_MAX && vk.vkAllocateMemory(device, &allocate, nullptr, &mem) == VK_SUCCESS &&
+                               vk.vkBindBufferMemory(device, buffer, mem, 0) == VK_SUCCESS &&
+                               vk.vkMapMemory(device, mem, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS &&
+                               vk.vkAllocateCommandBuffers(device, &cba, &cmd) == VK_SUCCESS &&
+                               vkCreateFence_(device, &fci, nullptr, &fence) == VK_SUCCESS;
+            if (ready) {
+                VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vk.vkBeginCommandBuffer(cmd, &begin);
+                for (const auto& piece : pieces)
+                    detail::image_barrier(fn, cmd, b, piece.range, piece.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                          VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                          VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                VkBufferImageCopy region{};
+                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                region.imageExtent = {b.width, b.height, 1};
+                fn.copy_image_to_buffer(cmd, b.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
+                for (const auto& piece : pieces)
+                    detail::image_barrier(fn, cmd, b, piece.range, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, piece.layout,
+                                          VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                vk.vkEndCommandBuffer(cmd);
+                VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                submit.commandBufferCount = 1;
+                submit.pCommandBuffers = &cmd;
+                {
+                    std::lock_guard lock(context_.submit_mutex());
+                    vk.vkQueueSubmit(queue_, 1, &submit, fence);
+                }
+                vkWaitForFences_(device, 1, &fence, VK_TRUE, UINT64_MAX);
+                const std::uint32_t bpp = texel_bytes(b.format);
+                const auto* src = static_cast<const std::uint8_t*>(mapped);
+                std::vector<std::uint8_t> rgb(std::size_t(b.width) * b.height * 3);
+                double sum[4] = {};
+                for (std::size_t i = 0; i < std::size_t(b.width) * b.height; ++i) {
+                    float t[4];
+                    texel_rgba(b.format, src + i * bpp, t);
+                    for (int c = 0; c < 4; ++c) sum[c] += t[c];
+                    for (int c = 0; c < 3; ++c) rgb[i * 3 + c] = std::uint8_t(std::clamp(t[c], 0.0f, 1.0f) * 255.0f + 0.5f);
+                }
+                const double n = double(b.width) * b.height;
+                char name[160];
+                std::snprintf(name, sizeof name, "target_%llx_%ux%u_f%d.ppm", static_cast<unsigned long long>(id),
+                              b.width, b.height, int(b.format));
+                const std::string path = (capture_dir_.empty() ? std::string(".") : capture_dir_) + "/" + name;
+                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                    std::fprintf(f, "P6\n%u %u\n255\n", b.width, b.height);
+                    std::fwrite(rgb.data(), 1, rgb.size(), f);
+                    std::fclose(f);
+                }
+                std::fprintf(stderr, "[rt] dump: target %llx %ux%u format %d mean rgba %.3f %.3f %.3f %.3f -> %s\n",
+                             static_cast<unsigned long long>(id), b.width, b.height, int(b.format), sum[0] / n,
+                             sum[1] / n, sum[2] / n, sum[3] / n, name);
+            }
+            if (fence) vkDestroyFence_(device, fence, nullptr);
+            if (mem) vk.vkFreeMemory(device, mem, nullptr);
+            vk.vkDestroyBuffer(device, buffer, nullptr);
+        }
     }
 
     // The name VkFormat has in the index; the few formats a capture can be written from, else its number.
