@@ -719,6 +719,31 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::CopyTextureRegion");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!dst || !src) return check(false);
+        // LEONIDA_LOG_TSHARP=<GPU address>: the copies into the texture at that address (glyph atlas hunt).
+        if (static const std::uint64_t want = [] {
+                const char* v = std::getenv("LEONIDA_LOG_TSHARP");
+                return v ? std::strtoull(v, nullptr, 16) : 0ull;
+            }();
+            want && dst->pResource && [&] {
+                // A texture's T# address is the runtime's own key (Resource::image_address), not its VA: matched
+                // by the glyph atlas's description instead (2048x2048 R8, retail 1.0.2.1).
+                const D3D12_RESOURCE_DESC dd = dst->pResource->GetDesc();
+                return dd.Width == 2048 && dd.Height == 2048 && dd.Format == DXGI_FORMAT_R8_UNORM;
+            }()) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1) < 64) {
+                const D3D12_RESOURCE_DESC sd = src->pResource ? src->pResource->GetDesc() : D3D12_RESOURCE_DESC{};
+                std::fprintf(stderr, "[rt] d3d12: copy into %#llx sub %u at (%u,%u,%u) from %s dim %d fmt %d "
+                                     "footprint %llux%u pitch %u offset %llu, box %s %u,%u-%u,%u\n",
+                             static_cast<unsigned long long>(want), dst->SubresourceIndex, x, y, z,
+                             src->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT ? "buffer" : "texture",
+                             int(sd.Dimension), int(src->PlacedFootprint.Footprint.Format),
+                             static_cast<unsigned long long>(src->PlacedFootprint.Footprint.Width),
+                             src->PlacedFootprint.Footprint.Height, src->PlacedFootprint.Footprint.RowPitch,
+                             static_cast<unsigned long long>(src->PlacedFootprint.Offset), box ? "yes" : "no",
+                             box ? box->left : 0, box ? box->top : 0, box ? box->right : 0, box ? box->bottom : 0);
+            }
+        }
         leonida::CopyTexture copy{location(*dst), x, y, z, location(*src), box != nullptr, {}};
         if (box) copy.box = {box->left, box->top, box->front, box->right, box->bottom, box->back};
         check(list_.copy_texture(copy));

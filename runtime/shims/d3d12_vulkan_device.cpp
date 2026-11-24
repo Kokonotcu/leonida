@@ -3700,7 +3700,21 @@ public:
     // the host runtime refuses a non-empty read range that ends past the buffer. A texture in a CPU-visible heap has
     // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
     // WriteToSubresource/ReadFromSubresource.
+    // LEONIDA_LOG_TSHARP: CPU access to the glyph atlas's description (2048x2048 R8, retail 1.0.2.1), first 32 calls.
+    void log_atlas_access(const char* what, UINT subresource, const D3D12_BOX* box) const {
+        static const bool on = std::getenv("LEONIDA_LOG_TSHARP") != nullptr;
+        if (!on || !image_ || desc_.Width != 2048 || desc_.Height != 2048 || desc_.Format != DXGI_FORMAT_R8_UNORM)
+            return;
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) >= 32) return;
+        std::fprintf(stderr, "[rt] d3d12: atlas %s sub %u box %s %u,%u-%u,%u, va %#llx, image address %#llx\n", what,
+                     subresource, box ? "yes" : "no", box ? box->left : 0, box ? box->top : 0, box ? box->right : 0,
+                     box ? box->bottom : 0, static_cast<unsigned long long>(va_),
+                     static_cast<unsigned long long>(image_address_));
+    }
+
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
+        log_atlas_access(data ? "Map" : "Map(null)", subresource, nullptr);
         // A texture the title placed on its own pages (Xbox slot 133, set_title_address) maps to those pages, as on the
         // console: the subresource's place in the layout the texture computer gave the title (shims/xg_linear_layout.h),
         // which is also how the pages are read into the image at each submission. The PC refusal (E_INVALIDARG) sent
@@ -3735,6 +3749,7 @@ public:
     // the application to keep the GPU off the subresource meanwhile, so a blocking copy is the whole contract.
     HRESULT STDMETHODCALLTYPE WriteToSubresource(UINT subresource, const D3D12_BOX* box, const void* data,
                                                  UINT row_pitch, UINT depth_pitch) override {
+        log_atlas_access("WriteToSubresource", subresource, box);
         return cpu_copy(true, subresource, box, const_cast<void*>(data), row_pitch, depth_pitch);
     }
     HRESULT STDMETHODCALLTYPE ReadFromSubresource(void* data, UINT row_pitch, UINT depth_pitch, UINT subresource,
@@ -10852,6 +10867,13 @@ private:
         leonida::gfx10::Image image{};
         if (!image_descriptor(resource, view, image)) return;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
+        if (const char* v = std::getenv("LEONIDA_LOG_TSHARP"); v && std::strtoull(v, nullptr, 16) == image.address) {
+            const D3D12_RESOURCE_DESC& d = resource.desc();
+            std::fprintf(stderr, "[rt] d3d12: view of %#llx: %llux%u fmt %d flags %#x layout %d, memory flags %#x, "
+                                 "storage %d\n", static_cast<unsigned long long>(image.address),
+                         static_cast<unsigned long long>(d.Width), d.Height, int(d.Format), unsigned(d.Flags),
+                         int(d.Layout), unsigned(resource.memory_flags()), int(storage));
+        }
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),
                                                   resource.uint_backed());
