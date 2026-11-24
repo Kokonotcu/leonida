@@ -91,6 +91,9 @@ Useful switches:
   `int3_skipped` event, so a boot can be followed past soft asserts (an int3 followed by code that carries on).
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
+* `LEONIDA_HANG_DUMP=<seconds>` (with `--trace`) writes a `thread_stack` event for every thread that many seconds
+  after the trace opens: each thread is suspended only to read its registers, and its stack is walked after it
+  resumes. For a title that hangs, or whose watchdog gives up after a fixed time, it shows where each thread waits.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their

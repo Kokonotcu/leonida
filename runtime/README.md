@@ -474,6 +474,7 @@ from the ANSI code page.
 | `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
 | `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
+| `thread_stack` | with `LEONIDA_HANG_DUMP=<seconds>` set: once, that many seconds after `trace_open`, one per thread of the process | `tid`, `stack` (up to 16 frames) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
 | `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |
 | `exit` / `error` | `--run` returns, or the loader throws | `code` / `what` |
