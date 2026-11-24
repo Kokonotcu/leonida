@@ -10,6 +10,7 @@ method, scope and caveats. No game data is included.
 |---|---|
 | [design.md](design.md) | Overall project design, asset status, translator contract and open blockers. |
 | [related_projects.md](related_projects.md) | Prior art we may read and the licence boundaries on it. |
+| [boot_leads.md](boot_leads.md) | Open leads that may move the retail boot further (TLS at module index 0, feature level at device creation, command-list replay, descriptor words, shader corpus count, frame pacing), each with where it lands, how to implement it and how to test it. Hypotheses, not measurements. |
 | [rpf.md](rpf.md) | RPF9 archive layout, the carve tools and the unreadable encrypted TOC. |
 | [linux.md](linux.md) | Linux in one page: what runs natively and what runs under Wine or Proton, the Ubuntu packages, `Build.sh`, the runtime cross-build, and why there is no native Linux `gta6rt`. |
 | [testing.md](testing.md) | Running the GPU tests on your own GPU: setup per OS, wave64 emulation, running without a GPU on Mesa llvmpipe, and known problems. |
