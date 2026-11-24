@@ -2995,7 +2995,8 @@ struct TitleTexture {
     bool copied = false;
     std::uint64_t hash = 0;    // of the title bytes at the last copy
     std::chrono::steady_clock::time_point watch_until{};
-    std::chrono::steady_clock::time_point next_check{};  // watched textures are hashed at most this often
+    std::chrono::steady_clock::time_point first_watch_until{};  // hashed on every submission until then
+    std::chrono::steady_clock::time_point next_check{};         // then at most this often, from a byte budget
 };
 
 std::mutex& title_texture_mutex() {
@@ -4076,7 +4077,9 @@ std::uint64_t title_hash(const std::uint8_t* p, std::size_t bytes) {
 // How long after each copy a texture without render-target or UAV usage is hashed (see "Title-placed textures").
 // Glyph caches (the UI font atlas) get new glyphs written by the CPU whenever a screen shows text it has not drawn
 // before, long after the first copy: one second dropped those letters (LEGAL NOTICES drew "C py ight"). So the watch
-// lasts for the texture's life by default, and each texture is hashed at most every kTitleTextureRecheck.
+// lasts for the texture's life by default. For kTitleTextureFirstWatch after each copy a texture is hashed on every
+// submission; after that at most every kTitleTextureRecheck, round robin, from a byte budget of
+// kTitleTextureRecheckRate (a few textures per frame, whatever the number the title placed).
 // LEONIDA_TITLE_TEXTURE_WATCH=<seconds> sets a finite window again (0 = only the copy after each texture computer
 // write).
 std::chrono::steady_clock::duration title_texture_watch() {
@@ -4088,7 +4091,24 @@ std::chrono::steady_clock::duration title_texture_watch() {
     }();
     return watch;
 }
-constexpr auto kTitleTextureRecheck = std::chrono::milliseconds(50);
+constexpr auto kTitleTextureFirstWatch = std::chrono::seconds(1);
+constexpr auto kTitleTextureRecheck = std::chrono::milliseconds(250);
+constexpr double kTitleTextureRecheckRate = 64.0 * 1024 * 1024;            // bytes hashed per second, at most
+constexpr std::size_t kTitleTextureRecheckBurst = 8ull * 1024 * 1024;       // budget kept across idle time
+
+// LEONIDA_DUMP_MISSING=<dir>: the bytecode the title passed for a shader the library has no translation of, as
+// <dir>/<stage>_<program sha256>.dxbc (once per file), for translating it offline.
+void dump_missing_shader(const char* stage, const std::string& hash, std::span<const std::uint8_t> bytecode) {
+    static const char* dir = std::getenv("LEONIDA_DUMP_MISSING");
+    if (!dir || !*dir || bytecode.empty()) return;
+    const std::string path = std::string(dir) + "\\" + stage + "_" + hash + ".dxbc";
+    if (GetFileAttributesA(path.c_str()) != INVALID_FILE_ATTRIBUTES) return;
+    CreateDirectoryA(dir, nullptr);
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(bytecode.data(), 1, bytecode.size(), f);
+        std::fclose(f);
+    }
+}
 
 // DXGI -> Vulkan for vertex attributes, with each element's size for D3D12_APPEND_ALIGNED_ELEMENT.
 bool vertex_format(DXGI_FORMAT format, VkFormat& out, UINT& bytes) {
@@ -5110,6 +5130,7 @@ public:
             });
             if (!stage.entry) {
                 std::fprintf(stderr, "[rt] d3d12: no translated %s for FSSM sha256 %s\n", stage.name, hash.c_str());
+                dump_missing_shader(stage.name, hash, bytecode);
                 if (missing_shader_stub_enabled()) {
                     // A graphics PSO without that shader: registered pending, so its draws are skipped
                     // (GraphicsPipeline::pending), instead of a failure the title reads through as null.
@@ -5739,6 +5760,8 @@ public:
                 std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
                              fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
                              leonida::sha256_hex(program.bytes).c_str());
+            dump_missing_shader("cs", leonida::sha256_hex(program.bytes),
+                                {static_cast<const std::uint8_t*>(desc.CS.pShaderBytecode), desc.CS.BytecodeLength});
             if (missing_shader_stub_enabled()) {
                 // A PSO that never gets a pipeline: registered pending, so its dispatches are skipped, and the title
                 // keeps an object rather than a failure it would read through (retail boot 5 died on such a null).
@@ -11298,10 +11321,31 @@ void sync_title_textures() {
     if (!g_title_texture_count.load(std::memory_order_acquire)) return;  // one load when nothing is registered
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard lock(title_texture_mutex());
-    for (const auto& t : title_textures()) {
-        const bool watching = t->watch && t->copied && now < t->watch_until && now >= t->next_check;
+    // The long watch is paid from a byte budget that refills at kTitleTextureRecheckRate: hashing every texture
+    // the title placed on every submission ran the boot at 1 frame per second (retail 1.0.2.1).
+    static auto refilled = now;
+    static std::size_t budget = 0;
+    static std::size_t cursor = 0;
+    const auto elapsed = std::chrono::duration<double>(now - refilled).count();
+    budget = std::min<std::size_t>(kTitleTextureRecheckBurst,
+                                   budget + static_cast<std::size_t>(elapsed * kTitleTextureRecheckRate));
+    refilled = now;
+    auto& textures = title_textures();
+    const std::size_t count = textures.size();
+    for (std::size_t n = 0; n < count; ++n) {
+        const auto& t = textures[(cursor + n) % count];
+        bool watching = false;
+        if (!t->dirty && t->watch && t->copied && now < t->watch_until) {
+            if (now < t->first_watch_until) {
+                watching = true;  // the first second after a copy: every submission, as before
+            } else if (now >= t->next_check && budget >= t->bytes) {
+                watching = true;
+                budget -= t->bytes;
+                t->next_check = now + kTitleTextureRecheck;
+                cursor = (cursor + n + 1) % count;  // the next call starts after the last one checked
+            }
+        }
         if (!t->dirty && !watching) continue;
-        t->next_check = now + kTitleTextureRecheck;
         if (!title_range_readable(t->title, t->bytes)) continue;  // reserved pages: a later submission copies it
         const std::uint64_t hash = title_hash(t->title, t->bytes);
         if (t->copied && hash == t->hash) {  // nothing new since the last copy
@@ -11317,6 +11361,7 @@ void sync_title_textures() {
         }
         t->copied = true;
         t->hash = hash;
+        t->first_watch_until = now + kTitleTextureFirstWatch;
         t->watch_until = now + title_texture_watch();
     }
 }
