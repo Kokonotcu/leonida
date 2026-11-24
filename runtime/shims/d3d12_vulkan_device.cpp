@@ -17,6 +17,7 @@
 #include "d3d12_dred.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
+#include "d3d12_xs_native_pso.h"
 #include "dxgi_com.h"
 #include "log_seen.h"
 #include "xg_linear_layout.h"  // title-placed textures: the texture computer's layout
@@ -6649,6 +6650,11 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        // Device slot 57 finds the title's shader containers through <shaders>/native_hashes.txt.
+        rt::d3d12_xs::set_native_shader_directory_provider([]() -> std::filesystem::path {
+            std::string error;
+            return configured_shader_directory(&error);
+        });
         rt::d3d12_xs::set_stub_pipeline_handler(&create_stub_pipeline_state);
         // LEONIDA_TITLE_HEAP_SYNC: sampler-heap slots the title (or a sync) filled get their S#s' samplers.
         rt::d3d12_xs::set_title_sampler_slots_handler(&title_sampler_slots);

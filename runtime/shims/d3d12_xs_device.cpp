@@ -26,6 +26,8 @@
 // (XboxPresentation needs a WindowPresenter, and there is no vblank source behind the device before the first frame)
 // they answer from the device's frame-token source, and WaitFrameEventX returns at once with a fresh non-zero token.
 #include "d3d12_xs_device.h"
+#include "d3d12_xs_native_pso.h"
+#include "d3d12_xs_pso_stream.h"
 #include "d3d12_xs_desc_clean.h"
 #include "d3d12_console_feature.h"
 #include "d3d12_trace.h"
@@ -402,7 +404,8 @@ const char* slot_name(unsigned slot) {
         case 46: return "SetResidencyPriority (proxies unwrapped)";
         case 48: return "Xbox CreateCommandQueueX (32-byte desc) -> queue proxy";
         case 50: return "EnqueueMakeResident (proxies unwrapped)";
-        case 55: return "Xbox derived pipeline state (answered with the base)";
+        case 55: return "Xbox CreateDerivedPipelineState (over kept streams)";
+        case 57: return "Xbox native graphics pipeline";
         case 56: return "GetResourceAllocationInfo1 (C or PC form)";
         case 61: return "Xbox CreateSamplerX -> PC CreateSampler";
         case 62: return "Xbox CreateComputePipelineState";
@@ -3281,15 +3284,81 @@ D3D12_HEAP_PROPERTIES* proxy_get_custom_heap_properties(D3D12_HEAP_PROPERTIES* o
     return out;
 }
 
+// Keeps a copy of the stream a PSO was created from, on the PSO, so slot 55 can derive from it. A stream the module
+// does not model is logged once: the PSO is still returned, and slot 55 answers with that PSO as it is.
+void keep_pso_stream(IUnknown* pso, const D3D12_PIPELINE_STATE_STREAM_DESC& desc) {
+    ID3D12Object* object = nullptr;
+    if (FAILED(pso->QueryInterface(__uuidof(ID3D12Object), reinterpret_cast<void**>(&object))) || !object) return;
+    auto record = PsoStreamRecord::capture(desc);
+    static std::atomic<bool> logged{false};
+    if (!record || !attach_pso_record(object, std::move(record))) {
+        if (!logged.exchange(true, std::memory_order_relaxed))
+            std::fprintf(stderr, "[rt] d3d12_xs: a pipeline state stream is not kept for derivation (unmodelled "
+                                 "subobject or allocation failure)\n");
+    }
+    object->Release();
+}
+
+// The PC CreatePipelineState (PC slot 47) that slots 86, 57 and 55 share: on success the stream is kept on the PSO.
+HRESULT create_pso_from_stream(DeviceProxy* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const IID* riid,
+                               void** out) {
+    if (!riid) return E_POINTER;
+    // Through the queried ID3D12Device2 (#8517): supporting an interface does not make its pointer or vtable the
+    // base device's.
+    ID3D12Device2* device2 = nullptr;
+    const HRESULT query = self->real->QueryInterface(__uuidof(ID3D12Device2), reinterpret_cast<void**>(&device2));
+    if (FAILED(query) || !device2) return FAILED(query) ? query : E_NOINTERFACE;
+    const HRESULT hr = device2->CreatePipelineState(desc, *riid, out);
+    device2->Release();
+    if (SUCCEEDED(hr) && out && *out && desc) keep_pso_stream(static_cast<IUnknown*>(*out), *desc);
+    return hr;
+}
+
 // Xbox slot 86: CreatePipelineState(desc, riid, out), forwarded to PC ID3D12Device2::CreatePipelineState (PC slot 47).
 HRESULT proxy_create_pipeline_state(DeviceProxy* self, const D3D12_PIPELINE_STATE_STREAM_DESC* desc, const IID* riid,
                                     void** out) {
     note_slot(86);
     if (out) *out = nullptr;
     if (self->slot_count <= 47) return refuse_beyond_device(86, self->slot_count);  // predates ID3D12Device2
-    if (!riid) return E_POINTER;
-    using Fn = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, const IID*, void**);
-    return reinterpret_cast<Fn>(self->real_vtable[47])(self->real, desc, riid, out);
+    return create_pso_from_stream(self, desc, riid, out);
+}
+
+// Logs a slot 55 refusal once per reason, and returns the HRESULT.
+HRESULT refuse_derived(unsigned reason, const char* why, HRESULT hr) {
+    static std::atomic<bool> logged[4]{};
+    if (!logged[reason].exchange(true, std::memory_order_relaxed))
+        std::fprintf(stderr, "[rt] d3d12_xs: derived pipeline state (device slot 55) refused: %s\n", why);
+    return hr;
+}
+
+// Xbox slot 55: CreateDerivedPipelineState(pBasePSO, n, pRecords, riid, ppv) (measured in the title at
+// game_scarlett_master.exe+0x2479f40). The base must be a PSO that slot 86, 57 or 55 created with a kept stream; n is
+// 1..4 records of 0x14c bytes (d3d12_xs_pso_stream.h). The patched stream goes through the slot 86 path. A base
+// without a kept stream (a stub) is answered with the base itself, which keeps its draws skipped; any other refusal
+// leaves *ppv null. From the integration tree (ASTROWwwW/Leonida@1812e0bd, via danekbiglike's bring-up patches).
+HRESULT proxy_create_derived_pso(DeviceProxy* self, ID3D12PipelineState* base, std::uint32_t count,
+                                 const unsigned char* records, const IID* riid, void** out) {
+    note_slot(55);
+    if (out) *out = nullptr;
+    if (self->slot_count <= 47) return refuse_beyond_device(55, self->slot_count);  // predates ID3D12Device2
+    if (!out || !riid || !records) return E_POINTER;
+    if (!base) return E_INVALIDARG;
+    const PsoStreamRecord* base_record = find_pso_record(base);
+    if (!base_record) {
+        refuse_derived(0, "base PSO has no kept stream; answered with the base", S_OK);
+        return base->QueryInterface(*riid, out);
+    }
+    std::vector<unsigned char> patched;
+    switch (derive_stream(*base_record, records, count, patched)) {
+        case DeriveStatus::ok: break;
+        case DeriveStatus::unknown_tag: return refuse_derived(1, "record tag not known", E_INVALIDARG);
+        case DeriveStatus::missing_state: return refuse_derived(2, "base has no subobject for a record", E_INVALIDARG);
+        case DeriveStatus::malformed: return refuse_derived(3, "record count or base stream malformed", E_INVALIDARG);
+    }
+    D3D12_PIPELINE_STATE_STREAM_DESC desc{};
+    desc.SizeInBytes = patched.size();
+    desc.pPipelineStateSubobjectStream = patched.data();
+    return create_pso_from_stream(self, &desc, riid, out);
 }
 
 // Xbox slot 101: CreateStateObject(desc, riid, out), forwarded to PC ID3D12Device5::CreateStateObject (PC slot 62,
@@ -3696,50 +3765,73 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
     } else if constexpr (Slot == 57) {
         // The title's native graphics PSO (desc, riid, out): a stub pipeline state when one is registered and
         // LEONIDA_MISSING_SHADER_STUB=1 (set_stub_pipeline_handler); else the PC slot as before (CreateLifetimeTracker).
+        // LEONIDA_DUMP_SLOT57=N: the first N descriptions, 0x200 bytes each, and 0x100 bytes behind each word of them
+        // that points at readable memory, to <LEONIDA_DUMP_DIR or cwd>/slot57_<i>.bin, for working out the layout. Format: the description, then per pointer {u32 offset in the description, u32 0, 0x100 bytes}.
+        if (const char* dump = std::getenv("LEONIDA_DUMP_SLOT57"); dump && a1) {
+            static std::atomic<int> dumped{0};
+            const int index = dumped.fetch_add(1, std::memory_order_relaxed);
+            if (index < std::atoi(dump)) {
+                auto readable = [](std::uint64_t at, std::size_t bytes) {
+                    MEMORY_BASIC_INFORMATION mi{};
+                    if (at < 0x10000 || VirtualQuery(reinterpret_cast<void*>(at), &mi, sizeof(mi)) != sizeof(mi) ||
+                        mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+                        return false;
+                    return at + bytes <= reinterpret_cast<std::uint64_t>(mi.BaseAddress) + mi.RegionSize;
+                };
+                char name[MAX_PATH];
+                const char* dir = std::getenv("LEONIDA_DUMP_DIR");
+                std::snprintf(name, sizeof(name), "%s%sslot57_%03d.bin", dir ? dir : "", dir ? "\\" : "", index);
+                if (FILE* f = std::fopen(name, "wb"); f && readable(a1, 0x200)) {
+                    std::fwrite(reinterpret_cast<const void*>(a1), 1, 0x200, f);
+                    for (std::uint32_t off = 0; off < 0x200; off += 8) {
+                        const std::uint64_t p = *reinterpret_cast<const std::uint64_t*>(a1 + off);
+                        if (!readable(p, 0x100)) continue;
+                        const std::uint32_t head[2] = {off, 0};
+                        std::fwrite(head, sizeof(head), 1, f);
+                        std::fwrite(reinterpret_cast<const void*>(p), 1, 0x100, f);
+                    }
+                    std::fclose(f);
+                } else if (f) {
+                    std::fclose(f);
+                }
+            }
+        }
+        // The native graphics pipeline (desc, riid, out): decoded by the integration tree's slot-57 path (enx;
+        // ASTROWwwW/Leonida@1812e0bd, d3d12_xs_native_pso.h), each stage's container found by its HASH digest in
+        // <shaders>/native_hashes.txt, created through slot 86's stream path so slot 55 can derive from it. A call it
+        // cannot resolve gets the stub PSO (draws skipped) when LEONIDA_MISSING_SHADER_STUB=1: a null PSO took the
+        // title down before (retail boot 5).
+        note_slot(57);
+        const PipelineStreamCreator stream = [](void* proxy, const D3D12_PIPELINE_STATE_STREAM_DESC* desc,
+                                                const IID* riid, void** out) {
+            auto* device = static_cast<DeviceProxy*>(proxy);
+            return device->slot_count <= 47 ? E_NOTIMPL : create_pso_from_stream(device, desc, riid, out);
+        };
+        const HRESULT hr = create_native_graphics_pipeline(stream, self, reinterpret_cast<const void*>(a1),
+                                                           reinterpret_cast<const IID*>(a2),
+                                                           reinterpret_cast<void**>(a3));
+        if (SUCCEEDED(hr)) return hr_to_u64(hr);
         const StubPipelineHandler stub = g_stub_pipeline.load(std::memory_order_acquire);
         const char* enabled = std::getenv("LEONIDA_MISSING_SHADER_STUB");
         if (stub && enabled && enabled[0] == '1' && a2 && a3) {
-            note_slot(57);
             static std::atomic<unsigned> logged{0};
             if (logged.fetch_add(1, std::memory_order_relaxed) < 4)
                 std::fprintf(stderr,
-                             "[rt] d3d12_xs: device slot 57 (native graphics PSO, desc %p): a stub pipeline state that "
-                             "draws nothing (LEONIDA_MISSING_SHADER_STUB)\n",
-                             reinterpret_cast<void*>(a1));
+                             "[rt] d3d12_xs: device slot 57 (native graphics PSO, desc %p) not built (0x%08lx): a stub "
+                             "pipeline state that draws nothing (LEONIDA_MISSING_SHADER_STUB)\n",
+                             reinterpret_cast<void*>(a1), static_cast<unsigned long>(hr));
             void** out = reinterpret_cast<void**>(a3);
             *out = nullptr;
             return hr_to_u64(stub(self->real, *reinterpret_cast<const IID*>(a2), out));
         }
-        using Fn = std::uint64_t(WINAPI*)(void*, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                          std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t,
-                                          std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);
-        return reinterpret_cast<Fn>(self->real_vtable[57])(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11,
-                                                           a12, a13, a14);
+        return hr_to_u64(hr);
     } else if constexpr (Slot == 55) {
-        // Xbox derived pipeline state (measured in the title, game_scarlett_master.exe+0x2479f40): (base PSO, record
-        // count, records, riid, out). A record is 0x14c bytes, a u32 type then a D3D12 state struct: 0 =
-        // D3D12_DEPTH_STENCIL_DESC, 1 = D3D12_RASTERIZER_DESC, 2 = D3D12_BLEND_DESC, 5 = stencil masks only.
-        // Forwarding it reached PC slot 55 (CreateReservedResource1) and wrote through a stack word. Until the base's
-        // description is kept, the answer is the base itself: a stub base stays a stub (its draws are skipped), a real
-        // one draws with its own state instead of the overrides.
-        note_slot(55);
-        auto* base = reinterpret_cast<IUnknown*>(a1);
-        const auto count = static_cast<std::uint32_t>(a2);
-        const auto* records = reinterpret_cast<const std::uint8_t*>(a3);
-        void** out = reinterpret_cast<void**>(a5);
-        if (!out || !a4) return hr_to_u64(E_POINTER);
-        *out = nullptr;
-        if (!base) return hr_to_u64(E_INVALIDARG);
-        static std::atomic<bool> shown{false};
-        if (!shown.exchange(true, std::memory_order_relaxed)) {
-            std::uint32_t types[8] = {};
-            for (std::uint32_t i = 0; i < count && i < 8 && records; ++i)
-                std::memcpy(&types[i], records + std::size_t(i) * 0x14c, sizeof(std::uint32_t));
-            std::fprintf(stderr, "[rt] d3d12_xs: device slot 55 (Xbox derived PSO): base %p, %u override record(s), "
-                         "types %u %u %u %u; answered with the base (overrides not applied yet)\n",
-                         static_cast<void*>(base), count, types[0], types[1], types[2], types[3]);
-        }
-        return hr_to_u64(base->QueryInterface(*reinterpret_cast<const IID*>(a4), out));
+        // Xbox derived pipeline state (base PSO, record count, records, riid, out). Forwarding it by number reached PC
+        // slot 55 (CreateReservedResource1) and wrote through a stack word.
+        return hr_to_u64(proxy_create_derived_pso(self, reinterpret_cast<ID3D12PipelineState*>(a1),
+                                                  static_cast<std::uint32_t>(a2),
+                                                  reinterpret_cast<const unsigned char*>(a3),
+                                                  reinterpret_cast<const IID*>(a4), reinterpret_cast<void**>(a5)));
     } else if constexpr (Slot == 48) {
         return hr_to_u64(proxy_create_command_queue_xbox(self, reinterpret_cast<const std::uint32_t*>(a1),
                                                          reinterpret_cast<const IID*>(a2),
@@ -4308,7 +4400,7 @@ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* devic
 bool device_slot_overridden(unsigned slot) {
     if (slot <= 2 || slot == 8 || slot == 9 || slot == 13 || slot == 14 || (slot >= 17 && slot <= 24) || slot == 25 || slot == 26 ||
         slot == 31 || slot == 32 || slot == 34 || slot == 35 || slot == 36 || slot == 41 || slot == 45 || slot == 46 ||
-        slot == 50 || slot == 56 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 || slot == 75 ||
+        slot == 50 || slot == 55 || slot == 56 || slot == 57 || slot == 61 || slot == 62 || slot == 67 || slot == 70 || slot == 74 || slot == 75 ||
         slot == 76 || slot == 86 || slot == 101 || slot == 108 || slot == kCreateCommittedResource3X || slot == 133)
         return true;
     const XboxDeviceSlotRoutes& routes = xbox_device_slot_routes();
