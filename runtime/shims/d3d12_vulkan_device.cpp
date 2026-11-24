@@ -3110,6 +3110,13 @@ public:
             MEMORY_BASIC_INFORMATION region{};
             if (!VirtualQuery(static_cast<const char*>(base_address) + at, &region, sizeof(region)) ||
                 region.State != MEM_COMMIT || (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE))) {
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 6)
+                    std::fprintf(stderr, "[rt] d3d12: title-placed buffer %p (+0x%llx of 0x%llx) not importable: region "
+                                         "%p size 0x%llx state 0x%lx type 0x%lx protect 0x%lx\n",
+                                 address, static_cast<unsigned long long>(at), static_cast<unsigned long long>(bytes),
+                                 region.BaseAddress, static_cast<unsigned long long>(region.RegionSize), region.State,
+                                 region.Type, region.Protect);
                 importable = false;
                 break;
             }
@@ -3133,13 +3140,34 @@ public:
         VkMemoryRequirements requirements{};
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
         VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-        if (device_.get_host_pointer_properties(device_.info.device,
-                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, base_address,
-                                                &host) != VK_SUCCESS)
+        if (const VkResult r = device_.get_host_pointer_properties(
+                device_.info.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, base_address, &host);
+            r != VK_SUCCESS) {
+            log_once("title-placed buffer: vkGetMemoryHostPointerPropertiesEXT refused the pages; VkResult", int(r));
             return E_NOTIMPL;
+        }
+        // The title places buffers 16 bytes apart (…FFF0, …5A0), and a buffer binds only at its own alignment (64 on
+        // NVIDIA): such a buffer starts at the aligned offset below and is longer by the difference, which the
+        // binding's buffer_offset puts back. Before this every such buffer took the fallback, whose contents the
+        // title's writes never reach (retail boot 39: all sampled imports refused, offsets 0x570..0xff0).
+        VkDeviceSize bind_offset = offset, lead = 0;
+        if (requirements.alignment > 1 && offset % requirements.alignment) {
+            lead = offset % requirements.alignment;
+            bind_offset = offset - lead;
+            vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
+            buffer_ = VK_NULL_HANDLE;
+            info.size = desc_.Width + lead;
+            if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
+            vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
+        }
         const std::uint32_t types = host.memoryTypeBits & requirements.memoryTypeBits;
-        // An offset off the buffer's own alignment cannot be bound: the fallback answers.
-        if (!types || (offset % requirements.alignment) || bytes < offset + requirements.size) return E_NOTIMPL;
+        if (!types || (bind_offset % requirements.alignment) || bytes < bind_offset + requirements.size) {
+            std::fprintf(stderr, "[rt] d3d12: title-placed buffer %p not importable: host types 0x%x buffer types 0x%x "
+                                 "offset 0x%llx alignment 0x%llx\n",
+                         address, host.memoryTypeBits, requirements.memoryTypeBits,
+                         static_cast<unsigned long long>(offset), static_cast<unsigned long long>(requirements.alignment));
+            return E_NOTIMPL;
+        }
         VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
         import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         import.pHostPointer = base_address;
@@ -3164,19 +3192,21 @@ public:
             if (memory_) break;
         }
         if (!memory_) return E_OUTOFMEMORY;
-        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_.memory, offset) != VK_SUCCESS) return E_OUTOFMEMORY;
+        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_.memory, bind_offset) != VK_SUCCESS)
+            return E_OUTOFMEMORY;
         mapped_ = address;
         host_import_ = true;
         va_ = start;
         if (need_bda && vk.vkGetBufferDeviceAddress) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             bda.buffer = buffer_;
-            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
+            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda) + lead;
             gpu_va_ = buffer_va_;
         }
         device_.log_va("title-placed buffer", va_, desc_.Width);
         leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
+        binding.buffer_offset = lead;
         binding.size = desc_.Width;
         binding.host = static_cast<const std::uint8_t*>(address);
         binding.host_readable = true;
