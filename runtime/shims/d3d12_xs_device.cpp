@@ -3131,8 +3131,25 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             }
         }
     }
-    if (!console_extended)
-        hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
+    if (!console_extended) {
+        // The title does use descriptors past the PC limit: its per-draw tables come from a linear allocator that
+        // runs to the end of the 1,245,184-descriptor heap, and a table past descriptor 1,000,000 was never synced
+        // (the glyph-cache programs read shader code as their T#: missing letters on every screen). A device that
+        // takes the whole heap (this runtime's Vulkan device has no size limit) gets it; the cap is the fallback.
+        if (desc == &capped) {
+            hr = self->real->CreateDescriptorHeap(requested, __uuidof(ID3D12DescriptorHeap), &created);
+            if (SUCCEEDED(hr) && created) {
+                desc = requested;
+                static std::atomic<bool> told{false};
+                if (!told.exchange(true))
+                    std::fprintf(stderr, "[rt] d3d12_xs: slot 14: the device took the whole %u-descriptor heap; "
+                                         "no cap\n", requested->NumDescriptors);
+            } else {
+                created = nullptr;
+            }
+        }
+        if (!created) hr = self->real->CreateDescriptorHeap(desc, __uuidof(ID3D12DescriptorHeap), &created);
+    }
     if (FAILED(hr) || !created) {
         static std::atomic<int> refused_logs{0};
         if (desc && FAILED(hr) && refused_logs.fetch_add(1, std::memory_order_relaxed) < 8)

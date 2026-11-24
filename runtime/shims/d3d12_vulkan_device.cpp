@@ -11479,7 +11479,7 @@ void sync_title_textures() {
         if (static const char* dir = std::getenv("LEONIDA_DUMP_TITLE_TEXTURE"); dir && *dir) {
             const D3D12_RESOURCE_DESC& d = t->resource->desc();
             static int dumped = 0;
-            if (d.Width == 2048 && d.Height == 2048 &&
+            if (((d.Width == 2048 && d.Height == 2048) || (d.Width == 256 && d.Height == 128)) &&
                 (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM) && dumped < 24) {
                 char path[512];
                 std::snprintf(path, sizeof path, "%s\\%p_%02d.bin", dir, static_cast<const void*>(t->title), dumped++);
