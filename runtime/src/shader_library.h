@@ -905,7 +905,7 @@ public:
         } catch (...) {
             return fail("index.json could not be read");
         }
-        for (const char* sub_folder : {"fspx", "bvh", "library", "exe", "missing"}) {
+        for (const char* sub_folder : {"fspx", "bvh", "library", "exe", "missing", "missing_ps"}) {
             try {
                 const auto ignore = [](const std::string&) { return false; };
                 const std::filesystem::path sub = folder / sub_folder;
@@ -1137,7 +1137,7 @@ private:
             if (by_fspx) fspx_entries_[{e.stage, e.fspx_code_sha256}].push_back(e);
             if (by_fssm) entries_[{e.stage, e.fssm_sha256}].push_back(std::move(e));
             if (by_fspx && (prefix == "fspx/" || prefix == "library/" || prefix == "missing/")) ++fspx_count_;
-            if (prefix == "bvh/" || prefix == "exe/" || (prefix == "missing/" && !by_fspx)) ++bvh_count_;
+            if (prefix == "bvh/" || prefix == "exe/" || ((prefix == "missing/" || prefix == "missing_ps/") && !by_fspx)) ++bvh_count_;
             ++count_;
         }
         return true;
