@@ -161,6 +161,9 @@ struct VulkanDeviceInfo {
     // VK_EXT_conservative_rasterization is enabled on the logical device. Tier 1/2 depend on the physical
     // precision/overestimation properties; Tier 2 also requires post-snap degenerate triangles.
     bool conservative_rasterization = false;
+    // VK_EXT_depth_range_unrestricted is enabled: a depth clear outside 0..1 (or NaN) is stored as given, as D3D12
+    // stores it in a float depth format. Without it the value is clamped (NaN to 0): Vulkan forbids it otherwise.
+    bool depth_range_unrestricted = false;
     // VK_EXT_shader_object and its shaderObject feature are enabled (LEONIDA_SHADER_OBJECTS=1 on a device that has
     // them, docs/aot_pipelines.md step 2): graphics PSOs bind shader objects, made from the build's stored driver
     // binaries where they fit, and set their fixed-function state dynamically, so no graphics pipeline is compiled.

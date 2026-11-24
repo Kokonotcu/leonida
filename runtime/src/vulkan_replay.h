@@ -954,6 +954,8 @@ struct ReplayFunctions {
     // feature: a draw's ViewportArray is cut to its first viewport, which is what D3D12 uses without
     // SV_ViewportArrayIndex.
     std::uint32_t max_viewports = 1;
+    // VK_EXT_depth_range_unrestricted is enabled: depth clears outside 0..1 go through as given, else clamped.
+    bool depth_range_unrestricted = false;
     PFN_vkCmdSetPrimitiveTopology set_primitive_topology = nullptr;
     PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
@@ -4298,10 +4300,14 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
             // together, clearing depth alone leaves the stencil to be zeroed.
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker,
                                p.rects.empty() && !(range.aspectMask & ~p.range.aspectMask));
-            const float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
-                                : p.binding.format == VK_FORMAT_D16_UNORM
-                                    ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
-                                    : depth_clear_value(depth_clear->depth);  // a denormal clears to 0
+            float depth = p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
+                          : p.binding.format == VK_FORMAT_D16_UNORM
+                              ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
+                              : depth_clear_value(depth_clear->depth);  // a denormal clears to 0
+            // D3D12 stores a float depth clear outside 0..1 (and NaN) as given; Vulkan allows that only with
+            // VK_EXT_depth_range_unrestricted (VUID-VkClearDepthStencilValue-depth-00022). Clamped otherwise.
+            if (!vk.depth_range_unrestricted && !(depth >= 0.0f && depth <= 1.0f))
+                depth = depth > 1.0f ? 1.0f : 0.0f;  // NaN and negatives to 0
             const VkClearDepthStencilValue value{depth, depth_clear->stencil};
             if (p.rects.empty()) {
                 detail::round_trip(vk, command_buffer, p.binding, pieces, image_layout(p.binding, transfer_dst.layout),
