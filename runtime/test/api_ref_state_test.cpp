@@ -3,9 +3,67 @@
 
 #include <cstdio>
 #include <atomic>
+#include <functional>
 #include <thread>
 
 static int failures = 0;
+
+// Every thread of the test runs above normal priority (see main): a new thread starts at normal priority.
+static void RaisePriority()
+{
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+}
+
+// One contender thread for all the race rounds: a round posts its contender's body and waits for it to finish. A new
+// thread per round started at normal priority and waited a scheduler quantum to run whenever every core was busy.
+class Contender
+{
+public:
+    Contender() : thread_([this] { Loop(); }) {}
+
+    ~Contender()
+    {
+        Post(nullptr);
+        thread_.join();
+    }
+
+    // Runs `body` on the contender thread; Finish() waits for it.
+    void Post(std::function<void()> body)
+    {
+        body_ = std::move(body);
+        posted_.fetch_add(1, std::memory_order_release);
+        posted_.notify_one();
+    }
+
+    void Finish()
+    {
+        const int target = posted_.load(std::memory_order_relaxed);
+        for (int seen = finished_.load(std::memory_order_acquire); seen != target;
+             seen = finished_.load(std::memory_order_acquire))
+            finished_.wait(seen, std::memory_order_acquire);
+    }
+
+private:
+    void Loop()
+    {
+        RaisePriority();
+        for (int seen = 0;;)
+        {
+            posted_.wait(seen, std::memory_order_acquire);
+            seen = posted_.load(std::memory_order_acquire);
+            if (!body_)
+                return;
+            body_();
+            finished_.store(seen, std::memory_order_release);
+            finished_.notify_one();
+        }
+    }
+
+    std::function<void()> body_;
+    std::atomic<int> posted_{ 0 };
+    std::atomic<int> finished_{ 0 };
+    std::thread thread_;
+};
 
 void Check(bool condition, const char* name)
 {
@@ -59,6 +117,7 @@ void CheckPinWinsBeforeFinalRelease()
 {
     constexpr int rounds = 200;
     int failuresLocal = 0;
+    Contender contender;
 
     for (int i = 0; i < rounds; ++i)
     {
@@ -71,28 +130,25 @@ void CheckPinWinsBeforeFinalRelease()
         bool acquired = false;
         ApiRefState::ReleaseResult pinRelease{ 0, false };
 
-        std::thread contender([&]
+        // The two handshakes only order the steps (the pin comes first by construction), so they block rather than
+        // spin: a yield loop costs a scheduler quantum per wait when every core is busy (ctest -j), which made the
+        // 1200 rounds take minutes.
+        contender.Post([&]
         {
             acquired = state.TryAddRef();
 
             pinFinished.store(true, std::memory_order_release);
+            pinFinished.notify_one();
 
             if (acquired)
             {
-                while (!allowPinRelease.load(
-                    std::memory_order_acquire))
-                {
-                    std::this_thread::yield();
-                }
+                allowPinRelease.wait(false, std::memory_order_acquire);
 
                 pinRelease = state.Release();
             }
         });
 
-        while (!pinFinished.load(std::memory_order_acquire))
-        {
-            std::this_thread::yield();
-        }
+        pinFinished.wait(false, std::memory_order_acquire);
 
         const auto ownerRelease = state.Release();
 
@@ -104,8 +160,9 @@ void CheckPinWinsBeforeFinalRelease()
             !state.IsDying();
 
         allowPinRelease.store(true, std::memory_order_release);
+        allowPinRelease.notify_one();
 
-        contender.join();
+        contender.Finish();
 
         valid =
             valid &&
@@ -134,6 +191,7 @@ void CheckFinalReleaseRace()
     int badRundown = 0;
     int badFinalState = 0;
     int successfulPins = 0;
+    Contender contender;
 
     for (int i = 0; i < rounds; ++i)
     {
@@ -145,12 +203,16 @@ void CheckFinalReleaseRace()
         std::atomic<int> rundownCount{ 0 };
         std::atomic<bool> pinned{ false };
 
-        std::thread contender([&]
+        contender.Post([&]
         {
             ready.store(true, std::memory_order_release);
+            ready.notify_one();
 
-            while (!go.load(std::memory_order_acquire))
-                std::this_thread::yield();
+            // Spin a bounded while so the pin races the final Release closely when the thread runs, then block: an
+            // unbounded yield loop cost a scheduler quantum per round when every core was busy (ctest -j).
+            for (int spin = 0; spin < (1 << 16) && !go.load(std::memory_order_acquire); ++spin)
+                YieldProcessor();
+            go.wait(false, std::memory_order_acquire);
 
             if (state.TryAddRef())
             {
@@ -161,15 +223,15 @@ void CheckFinalReleaseRace()
             }
         });
 
-        while (!ready.load(std::memory_order_acquire))
-            std::this_thread::yield();
+        ready.wait(false, std::memory_order_acquire);
 
         go.store(true, std::memory_order_release);
+        go.notify_one();
 
         if (state.Release().startRundown)
             rundownCount.fetch_add(1);
 
-        contender.join();
+        contender.Finish();
 
         if (pinned.load(std::memory_order_relaxed))
             ++successfulPins;
@@ -203,6 +265,12 @@ void CheckFinalReleaseRace()
 int main()
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // The 1200 race rounds hand off between two threads each round. With every core busy (ctest -j) each handoff waited
+    // a scheduler quantum behind the other tests' threads, and the run took minutes (160 s measured with 20 CPU-bound
+    // processes on 16 logical cores, 0.2 s idle); the races themselves need no particular timing, so the test's
+    // threads run above normal priority and get the core when they are woken.
+    RaisePriority();
 
     std::puts("api_ref_state_test");
 
