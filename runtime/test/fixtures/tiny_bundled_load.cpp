@@ -4,6 +4,7 @@
 // load to rt::Loader so the DLL's xmem.dll imports bind to the shim registry instead of failing under the host loader.
 // Ordinary test code; no game data.
 #include <windows.h>
+#include <psapi.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,17 @@ using AttachCountFn = int(__stdcall*)();
 using AllocSumFn = uint32_t(__stdcall*)();
 using XMemAllocFn = void*(__stdcall*)(size_t, uint64_t);
 using XMemFreeFn = void(__stdcall*)(void*, uint64_t);
+
+// True when the Windows loader holds `module`: K32EnumProcessModules lists only its modules, and no shim serves it
+// (GetModuleHandleEx answers for mapped and owned modules too, as on the console).
+bool host_loaded(HMODULE module) {
+    HMODULE modules[1024];
+    DWORD needed = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &needed)) return false;
+    for (DWORD i = 0; i < needed / sizeof(HMODULE) && i < 1024; ++i)
+        if (modules[i] == module) return true;
+    return false;
+}
 
 int fail(const char* stage, unsigned long value) {
     std::printf("tiny_bundled_load: FAIL %s (0x%08lx)\n", stage, value);
@@ -40,9 +52,7 @@ int main() {
     if (!mod) return fail("LoadLibraryW(tiny_bundled_dll.dll)", GetLastError());
 
     // Must be mapped by rt::Loader, not by the host Windows loader.
-    HMODULE host_view = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, L"tiny_bundled_dll.dll", &host_view) &&
-        host_view == mod) {
+    if (host_loaded(mod)) {
         return fail("tiny_bundled_dll.dll came from the host loader, not rt::Loader", 0);
     }
 
