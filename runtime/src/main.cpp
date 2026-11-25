@@ -509,6 +509,11 @@ int wmain(int argc, wchar_t** argv) {
     }
     rt::d3d12_trace::set_enabled(trace_d3d12);
     AddVectoredExceptionHandler(1, &crash_logger);
+    // No modal "Application Error" box when the title faults (its GPU watchdog writes to address 0 on purpose): the
+    // dialog sat on the user's screen after run 29 until clicked away. crash_logger has already written the fault and
+    // its stack to the log; the process just ends. LEONIDA_CRASH_DIALOG=1 keeps the box (to attach a debugger).
+    if (const char* v = std::getenv("LEONIDA_CRASH_DIALOG"); !(v && v[0] == '1'))
+        SetErrorMode(GetErrorMode() | SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS);
     {
         // A minimum working set the size of what the title keeps resident anyway (it runs at 10-17 GB): the GPU's host
         // imports of title memory lock its pages, which Windows counts against the process's lockable pages (bounded by
