@@ -38,6 +38,9 @@
 #include "d3d12_xs_desc_clean.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 #include "../src/debug_targets.h"   // title_heap_of: hang reports look at the title's bytes behind a table
+#include "xmem.h"                   // the address-space lock counters for the rate report
+
+#include <chrono>
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -311,6 +314,9 @@ struct DirtyWatch {
     SRWLOCK lock = SRWLOCK_INIT;
 };
 DirtyWatch g_dirty_watches[16];
+// Address-space lock users of the dirty watch, for the rate report (sync_title_heaps): pages opened by a write fault,
+// and pages protected again by a sync. Each is a VirtualProtect, which takes the address-space lock exclusively.
+std::atomic<std::uint64_t> g_heap_faults{0}, g_heap_reprotects{0};
 
 LONG CALLBACK title_heap_write_fault(EXCEPTION_POINTERS* info) {
     const EXCEPTION_RECORD* r = info ? info->ExceptionRecord : nullptr;
@@ -322,6 +328,7 @@ LONG CALLBACK title_heap_write_fault(EXCEPTION_POINTERS* info) {
         if (!begin || at < begin || at >= w.end.load(std::memory_order_acquire)) continue;
         const std::size_t page = (at - begin) / kTitleDirtyPage;
         AcquireSRWLockExclusive(&w.lock);  // against the sync's clear + re-protect (DirtyWatch::lock)
+        g_heap_faults.fetch_add(1, std::memory_order_relaxed);
         w.dirty[page].store(1, std::memory_order_release);  // before the page opens (see above)
         DWORD old = 0;
         const bool opened =
@@ -493,6 +500,7 @@ void sync_title_heap(TitleHeapSync& s, TitleSamplerSlotsFn sampler_slots, TitleH
             AcquireSRWLockExclusive(&watch->lock);  // a fault's mark + open cannot land between these two
             const bool was_dirty = watch->dirty[page].exchange(0) != 0;
             if (was_dirty) {
+                g_heap_reprotects.fetch_add(1, std::memory_order_relaxed);
                 DWORD old = 0;
                 VirtualProtect(reinterpret_cast<void*>(watch_begin + page * kTitleDirtyPage), kTitleDirtyPage,
                                watch->readonly, &old);
@@ -5053,6 +5061,32 @@ void sync_title_heaps() {
     if (title_syncs().empty()) return;
     ++g_title_sync_stats.syncs;
     for (const auto& sync : title_syncs()) sync_title_heap(*sync, sampler_slots, g_title_sync_stats);
+    {
+        // Every 10 s: the calls per second that take the process's address-space lock exclusively (rt::xmem's counters
+        // and the dirty watch's), and how long one VirtualQuery takes now. A host import's driver calls took 15-30 ms
+        // each in the game against 0.001-0.05 ms alone (D:\GTA6\analysis\tools\heapimport).
+        static auto last = std::chrono::steady_clock::now();
+        static std::uint64_t prev[6] = {};
+        const auto now = std::chrono::steady_clock::now();
+        const double seconds = std::chrono::duration<double>(now - last).count();
+        if (seconds >= 10.0) {
+            const std::uint64_t cur[6] = {g_heap_faults.load(), g_heap_reprotects.load(),
+                                          rt::xmem::g_commits_on_touch.load(), rt::xmem::g_view_maps.load(),
+                                          rt::xmem::g_view_unmaps.load(), rt::xmem::g_placeholder_splits.load()};
+            MEMORY_BASIC_INFORMATION info{};
+            const auto q0 = std::chrono::steady_clock::now();
+            VirtualQuery(reinterpret_cast<void*>(&last), &info, sizeof(info));
+            const double query_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - q0).count();
+            std::fprintf(stderr, "[rt] address-space lock users per second: heap write faults %.0f, heap re-protects %.0f, "
+                                 "commits on touch %.0f, view maps %.0f, unmaps %.0f, placeholder splits %.0f; one "
+                                 "VirtualQuery %.2f ms\n",
+                         (cur[0] - prev[0]) / seconds, (cur[1] - prev[1]) / seconds, (cur[2] - prev[2]) / seconds,
+                         (cur[3] - prev[3]) / seconds, (cur[4] - prev[4]) / seconds, (cur[5] - prev[5]) / seconds,
+                         query_ms);
+            std::copy(std::begin(cur), std::end(cur), std::begin(prev));
+            last = now;
+        }
+    }
     // LEONIDA_SCAN_HEAP_TSHARP=<word 2 hex>: every 2000 syncs, the descriptors of the shader-visible heaps whose word 2
     // (a T#'s extent) is that value: how many, and the first indices with their word 0.
     static const std::uint32_t scan = [] {

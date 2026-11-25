@@ -1433,6 +1433,8 @@ struct DeviceState {
         struct {
             std::chrono::steady_clock::duration properties{};
         } import_timing;
+        // Never beside a sparse bind in the driver (VulkanContext::driver_heavy_mutex).
+        std::unique_lock heavy(context->driver_heavy_mutex());
         bool ok = vk.vkCreateBuffer(device, &create, nullptr, &buffer) == VK_SUCCESS;
         if (ok) {
             vk.vkGetBufferMemoryRequirements(device, buffer, &requirements);
@@ -1493,6 +1495,7 @@ struct DeviceState {
                 if (last_import_result != VK_SUCCESS) imported = VK_NULL_HANDLE;
             }
         }
+        heavy.unlock();
         VkDeviceAddress device_address = 0;
         if (imported && vk.vkBindBufferMemory(device, buffer, imported, 0) == VK_SUCCESS) {
             VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};

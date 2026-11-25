@@ -1012,6 +1012,37 @@ public:
     bool closed() const { return closed_; }
     std::span<const Command> commands() const { return commands_; }
 
+    // Whether a query begun before command `at` is still open there (a list cannot be cut there: Vulkan begins and ends
+    // a query in one command buffer).
+    bool query_open_at(std::size_t at) const {
+        std::vector<std::pair<QueryHeapId, std::uint32_t>> open;
+        for (std::size_t i = 0; i < at && i < commands_.size(); ++i) {
+            if (const auto* b = std::get_if<BeginQuery>(&commands_[i])) {
+                open.emplace_back(b->heap, b->index);
+            } else if (const auto* e = std::get_if<EndQuery>(&commands_[i])) {
+                const auto it = std::find(open.begin(), open.end(), std::make_pair(e->heap, e->index));
+                if (it != open.end()) open.erase(it);
+            }
+        }
+        return !open.empty();
+    }
+
+    // The closed list of the commands [begin, end) of `source`, for running a list in pieces (a console memory wait
+    // inside it: d3d12_com.cpp). Every draw and dispatch carries its own state; the predication set before `begin`,
+    // which carries within a list, is set again at its start.
+    static CommandList slice(const CommandList& source, std::size_t begin, std::size_t end) {
+        CommandList out;
+        end = std::min(end, source.commands_.size());
+        const Predication* predication = nullptr;
+        for (std::size_t i = 0; i < begin && i < end; ++i)
+            if (const auto* p = std::get_if<Predication>(&source.commands_[i])) predication = p;
+        if (predication && predication->buffer) out.commands_.push_back(*predication);
+        if (begin < end)
+            out.commands_.insert(out.commands_.end(), source.commands_.begin() + begin, source.commands_.begin() + end);
+        out.closed_ = true;
+        return out;
+    }
+
 private:
     static bool valid(const TargetView& target) { return target.resource && target.layer_count; }
 

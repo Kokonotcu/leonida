@@ -1964,6 +1964,10 @@ public:
             if (event) SetEvent(event);
             return S_OK;
         }
+        // The title is about to wait on the CPU for GPU work that may stand behind a batch held on a console memory
+        // wait whose cell this same thread writes later: released now, as at a present (run 23: cells at 0 for 5 s
+        // until the watcher's limit, frame after frame; five-star-recomp releases a queue's waits before blocking too).
+        release_memory_waits("fence wait");
         if (!event) return fence_.wait(value, UINT64_MAX) ? S_OK : E_FAIL;
         context_.enqueue_fence_wait(fence_.semaphore(), value, event);
         return S_OK;
@@ -1975,6 +1979,7 @@ public:
             waiter->hit();
             return;
         }
+        release_memory_waits("fence wait");  // as in SetEventOnCompletion
         context_.enqueue_fence_callback(fence_.semaphore(), value, [w = std::move(waiter)] { w->hit(); });
     }
 
@@ -2197,8 +2202,19 @@ void unmet_memory_waits(const GraphicsCommandList& list, std::vector<ListMemoryW
     const auto& waits = list.memory_waits();
     if (waits.empty()) return;
     const auto& commands = list.commands().commands();
+    // A wait recorded after commands stops only what follows it (the console's queue runs what precedes it, which may
+    // be the work another queue's writer waits for): the list is cut there (ExecuteCommandLists' segments). Not where a
+    // query is open across the cut (one command buffer must begin and end it): such a wait is counted and dropped.
+    static std::atomic<std::uint64_t> uncuttable{0};
     for (const ListMemoryWait& w : waits) {
         if (w.op == D3D12_COMPARISON_FUNC_NEVER || w.op == D3D12_COMPARISON_FUNC_ALWAYS) continue;
+        if (w.position > 0 && w.position < commands.size() && list.commands().query_open_at(w.position)) {
+            const std::uint64_t n = ++uncuttable;
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: %llu console memory waits inside an open query, not waited for\n",
+                             static_cast<unsigned long long>(n));
+            continue;
+        }
         bool written = false;
         for (std::size_t i = 0; i < w.position && i < commands.size() && !written; ++i)
             if (const auto* write = std::get_if<leonida::WriteImmediate>(&commands[i]))
@@ -2286,15 +2302,15 @@ public:
         // the sync is device-wide and coalesced (one sync serves every call that arrived before it began), so the
         // title's submitting threads no longer queue behind each other's syncs on a queue lock. Textures these lists
         // copy into are the GPU's from now on, and are left out of it (note_title_textures_copied).
-        // The console memory waits these lists make that do not hold yet (unmet_memory_waits): the batch is held until
-        // they do (MemoryWaitWatcher), below.
-        std::vector<ListMemoryWait> memory_waits;
+        // The console memory waits these lists make that do not hold yet (unmet_memory_waits), per list: each list is cut
+        // at them and what follows a cut is held until they hold (MemoryWaitWatcher), below.
+        std::vector<std::vector<ListMemoryWait>> memory_waits(count);
         {
             std::vector<std::uintptr_t> copied_into;
             for (UINT i = 0; i < count && lists; ++i) {
                 const GraphicsCommandList* list = GraphicsCommandList::from(lists[i]);
                 if (!list) continue;
-                unmet_memory_waits(*list, memory_waits);
+                unmet_memory_waits(*list, memory_waits[i]);
                 for (const auto& command : list->commands().commands()) {
                     if (const auto* copy = std::get_if<leonida::CopyTexture>(&command)) {
                         if (!copy->dst.footprint) copied_into.push_back(static_cast<std::uintptr_t>(copy->dst.resource));
@@ -2394,13 +2410,66 @@ public:
                     std::fprintf(stderr, "[rt] d3d12_xs: list order: execute list %p with %zu commands\n",
                                  static_cast<void*>(lists[i]), recorded[i]->commands().size());
         }
-        if (!memory_waits.empty()) {
-            if (!mem_waits_) mem_waits_ = std::make_shared<MemoryWaitQueue>(context_);
-            const std::uint64_t value = ++mem_waits_->next;
-            queue_.wait(mem_waits_->fence.semaphore(), value);  // no Signal submitted for it: the batch is held
-            MemoryWaitWatcher::get().hold(mem_waits_, {std::move(memory_waits), value, slow_clock::now()});
+        // Segments: the lists in order, cut at each unmet memory wait; a segment after a cut runs once its waits hold
+        // (held behind the queue's memory-wait fence, released by the watcher). The pieces of a cut list live as long as
+        // a held segment needs them (the pin).
+        struct Segment {
+            std::vector<const leonida::CommandList*> lists;
+            std::vector<ListMemoryWait> waits;  // to hold before this segment
+        };
+        std::vector<Segment> segments(1);
+        auto pieces = std::make_shared<std::vector<std::unique_ptr<leonida::CommandList>>>();
+        for (UINT i = 0; i < count; ++i) {
+            const leonida::CommandList* whole = recorded[i];
+            auto& waits = memory_waits[i];
+            if (waits.empty()) {
+                segments.back().lists.push_back(whole);
+                continue;
+            }
+            std::stable_sort(waits.begin(), waits.end(),
+                             [](const ListMemoryWait& a, const ListMemoryWait& b) { return a.position < b.position; });
+            const std::size_t size = whole->commands().size();
+            std::size_t from = 0;
+            for (std::size_t w = 0; w < waits.size();) {
+                const std::size_t at = std::min(waits[w].position, size);
+                if (at > from) {
+                    pieces->push_back(std::make_unique<leonida::CommandList>(leonida::CommandList::slice(*whole, from, at)));
+                    segments.back().lists.push_back(pieces->back().get());
+                    from = at;
+                }
+                // A new segment for what follows, holding for every wait at this position.
+                if (!segments.back().lists.empty()) segments.emplace_back();
+                for (; w < waits.size() && std::min(waits[w].position, size) == at; ++w)
+                    segments.back().waits.push_back(waits[w]);
+            }
+            if (from < size) {
+                if (from == 0) {
+                    segments.back().lists.push_back(whole);
+                } else {
+                    pieces->push_back(std::make_unique<leonida::CommandList>(leonida::CommandList::slice(*whole, from, size)));
+                    segments.back().lists.push_back(pieces->back().get());
+                }
+            }
         }
-        last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
+        const auto pin = [&graphics, pieces] {
+            struct Pins {
+                std::shared_ptr<void> lists;
+                std::shared_ptr<std::vector<std::unique_ptr<leonida::CommandList>>> pieces;
+            };
+            return std::shared_ptr<void>(std::make_shared<Pins>(Pins{pin_lists(graphics), pieces}));
+        };
+        last_result_ = leonida::ReplayResult::success;
+        for (Segment& segment : segments) {
+            if (!segment.waits.empty()) {
+                if (!mem_waits_) mem_waits_ = std::make_shared<MemoryWaitQueue>(context_);
+                const std::uint64_t value = ++mem_waits_->next;
+                queue_.wait(mem_waits_->fence.semaphore(), value);  // no Signal submitted for it: what follows is held
+                MemoryWaitWatcher::get().hold(mem_waits_, {std::move(segment.waits), value, slow_clock::now()});
+            }
+            if (segment.lists.empty()) continue;  // waits at the very end: they hold whatever the queue is given next
+            const leonida::ReplayResult r = queue_.execute(segment.lists, pin);
+            if (last_result_ == leonida::ReplayResult::success) last_result_ = r;
+        }
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         {
             const auto done = slow_clock::now();

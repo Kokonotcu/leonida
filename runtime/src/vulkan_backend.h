@@ -1312,6 +1312,14 @@ public:
         std::unique_lock lock(resource_mutex_);
         set_resource_locked(id, binding);
     }
+    // Held around every vkQueueBindSparse call (bind_title_pages) and every host-memory import (d3d12_vulkan_device.cpp,
+    // import_host): never both at once. With a bind on the bind thread and an import on a recording thread inside the
+    // NVIDIA driver together, the import spun at one instruction (nvoglv64+0xa6a4ce) for over 10 s while the bind thread
+    // and a staging submit waited on a driver lock, and every queue stalled into the title's watchdog (runs 20, 22:
+    // stacks_1). Apart, an import costs 0.05-1 ms (D:\GTA6\analysis\tools\heapimport); in the game each call took 15-30 ms,
+    // about one 16-image bind call.
+    std::mutex& driver_heavy_mutex() { return driver_heavy_mutex_; }
+
     // Staging buffers a batched texture-sync copy reads (d3d12_vulkan_device.cpp, flush_staged_batch): resolvable while
     // their list is recorded, without resource_mutex_. Registering them as resources took it exclusively, which waited
     // for every queue's recording and submission (they hold it shared): 140-650 ms per sync, with the queue lock held
@@ -2343,6 +2351,7 @@ private:
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     mutable std::mutex transient_mutex_;  // after resource_mutex_ when both are held (resolve)
+    std::mutex driver_heavy_mutex_;       // driver_heavy_mutex(): a leaf lock, held only around the driver calls
     std::unordered_map<ResourceId, ResourceBinding> transient_bindings_;  // add_transient_binding
     std::atomic<std::size_t> transient_count_{0};
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
@@ -2541,6 +2550,7 @@ private:
             info.pImageOpaqueBinds = opaque_infos.data();
             info.signalSemaphoreCount = 1;
             info.pSignalSemaphores = &signal;
+            std::lock_guard heavy(driver_heavy_mutex_);  // never beside a host import (driver_heavy_mutex)
             result = vk.vkQueueBindSparse(binder_.queue, 1, &info, VK_NULL_HANDLE);
         }
         const std::size_t image_infos_size = image_info_count, opaque_infos_size = opaque_info_count;

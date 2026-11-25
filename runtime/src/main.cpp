@@ -509,6 +509,23 @@ int wmain(int argc, wchar_t** argv) {
     }
     rt::d3d12_trace::set_enabled(trace_d3d12);
     AddVectoredExceptionHandler(1, &crash_logger);
+    {
+        // A minimum working set the size of what the title keeps resident anyway (it runs at 10-17 GB): the GPU's host
+        // imports of title memory lock its pages, which Windows counts against the process's lockable pages (bounded by
+        // the minimum working set, VirtualLock's rule; MmProbeAndLockPages raises STATUS_WORKING_SET_QUOTA past it). The
+        // driver refused imports at 0.4-3.4 GB in all, at no fixed size (runs 17-23). Soft limits (the *_DISABLE flags):
+        // nothing is trimmed or capped that would not be otherwise. LEONIDA_MIN_WORKING_SET_GB=0 leaves the default.
+        double gb = 6.0;
+        if (const char* v = std::getenv("LEONIDA_MIN_WORKING_SET_GB")) gb = std::strtod(v, nullptr);
+        if (gb > 0) {
+            const SIZE_T min_bytes = static_cast<SIZE_T>(gb * (1ull << 30));
+            const SIZE_T max_bytes = min_bytes + (SIZE_T{16} << 30);
+            const BOOL ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), min_bytes, max_bytes,
+                                                       QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+            std::fprintf(stderr, "[rt] working set: minimum %.1f GB %s (error %lu)\n", gb, ok ? "set" : "refused",
+                         ok ? 0ul : GetLastError());
+        }
+    }
     rt::write_watch::start_from_environment();  // LEONIDA_WATCH_WRITE (src/write_watch.cpp), added after: runs first
     // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);

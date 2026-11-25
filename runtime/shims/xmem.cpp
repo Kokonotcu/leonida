@@ -778,13 +778,16 @@ bool join_placeholders(uintptr_t start, uintptr_t end) {
         const uintptr_t base = reinterpret_cast<uintptr_t>(info.AllocationBase);  // the placeholder's start
         const uintptr_t region_end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
         const uintptr_t to = region_end < end ? region_end : end;
-        if ((base < cursor || region_end > to) &&
-            !VirtualFree(reinterpret_cast<void*>(cursor), to - cursor, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
-            return false;
+        if (base < cursor || region_end > to) {
+            rt::xmem::g_placeholder_splits.fetch_add(1, std::memory_order_relaxed);
+            if (!VirtualFree(reinterpret_cast<void*>(cursor), to - cursor, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+                return false;
+        }
         cursor = to;
     }
-    return pieces <= 1 ||
-           VirtualFree(reinterpret_cast<void*>(start), end - start, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != FALSE;
+    if (pieces <= 1) return true;
+    rt::xmem::g_placeholder_splits.fetch_add(1, std::memory_order_relaxed);
+    return VirtualFree(reinterpret_cast<void*>(start), end - start, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS) != FALSE;
 }
 
 // With g_phys_mutex and the fault lock held: `pages` pages of `section` from `offset` at `address`, as one view.
@@ -792,6 +795,7 @@ bool map_view_run(uintptr_t address, uint64_t pages, const std::shared_ptr<Secti
                   DWORD protect) {
     const uint64_t bytes = pages * kPhysicalPageSize;
     if (!join_placeholders(address, address + bytes)) return false;
+    rt::xmem::g_view_maps.fetch_add(1, std::memory_order_relaxed);
     if (!placeholder_api().map_view3(section->handle, GetCurrentProcess(), reinterpret_cast<void*>(address), offset,
                                      bytes, MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0))
         return false;
@@ -813,6 +817,7 @@ bool unmap_range(uintptr_t start, uintptr_t end, bool notify, std::vector<uintpt
             const uintptr_t at = it->first;
             const View view = it->second;
             const uintptr_t view_end = at + view.bytes;
+            rt::xmem::g_view_unmaps.fetch_add(1, std::memory_order_relaxed);
             if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(at),
                                                MEM_PRESERVE_PLACEHOLDER)) {
                 ok = false;
@@ -975,6 +980,7 @@ PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& prot
         return PageCommit::committed_before;
     }
     void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
+    rt::xmem::g_commits_on_touch.fetch_add(1, std::memory_order_relaxed);
     return VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE) ? PageCommit::committed_now
                                                                                  : PageCommit::failed;
 }
