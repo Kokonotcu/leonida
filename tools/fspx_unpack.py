@@ -318,7 +318,8 @@ def main(argv=None) -> int:
                     # every branch inside the code is the program's end.
                     end = branch_closed_end(blob[6], start, a.mcpu, disasm) or end
                     meta["code"]["end"] = end
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, compute=True)
+                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, compute=True,
+                                                  wave32=meta.get("wave32", True))
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)

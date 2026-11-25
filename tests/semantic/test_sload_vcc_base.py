@@ -134,7 +134,7 @@ class SloadVccBaseTest(unittest.TestCase):
             "v_mov_b32 v4, s10",
             "exp mrt0 v4, v4, v4, v4 done vm",
             "s_endpgm",
-        ])
+        ], page_table=False)
         _assemble_and_validate(spv)
         got = support.mrt0_words(spv, memory={
             0x00000003_00002004: 0xCAFEBABE,
@@ -156,7 +156,7 @@ class SloadVccBaseTest(unittest.TestCase):
             "v_mov_b32 v7, vcc_hi",
             "exp mrt0 v4, v5, v6, v7 done vm",
             "s_endpgm",
-        ])
+        ], page_table=False)
         _assemble_and_validate(spv)
         got = support.mrt0_words(spv, memory={
             0x00000002_00004010: 0x11223344,

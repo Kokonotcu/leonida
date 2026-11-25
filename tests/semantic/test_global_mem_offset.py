@@ -180,7 +180,12 @@ class GlobalOffsetTests(unittest.TestCase):
     def run_line(self, line, memory=None, active=True, heap_base=0):
         ins = parse_line(line)
         g = rdna2spirv.Gen("cs")
-        g.global_mem(ins["op"], ins["args"], ins["mods"])
+        prev_pt = rdna2spirv.PAGE_TABLE
+        rdna2spirv.PAGE_TABLE = False
+        try:
+            g.global_mem(ins["op"], ins["args"], ins["mods"])
+        finally:
+            rdna2spirv.PAGE_TABLE = prev_pt
         if memory is None:
             memory = {a: tagged(a) for a in range(self.BASE - 0x1010, self.BASE + 0x1010, 4)}
         ev = GlobalBodyEvaluator(g, self.SGPR, {**self.VGPR, 10: 0xEEEEEEEE, 11: 0xEEEEEEEE}, memory,

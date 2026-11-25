@@ -806,7 +806,7 @@ class RawBufferTailBounds(unittest.TestCase):
                  f"v_mov_b32 v1, {offset:#x}", *extra, *load_lines, "s_waitcnt vmcnt(0)"]
         lines += [f"buffer_store_dword v{2 + i}, off, s[0:3], 0 offset:{4 * i}" for i in range(n)]
         lines.append("s_endpgm")
-        spv = support.translate_lines("cs_vec_tail", lines, fssm=CS_BOUNDS_FSSM)
+        spv = support.translate_lines("cs_vec_tail", lines, fssm=CS_BOUNDS_FSSM, page_table=False)
         memory = ReadLog({VEC_REGION + k: _pattern_word(k - base_low) for k in range(-4, 0x40)})
         support.run_fragment(spv, inputs={"%wg_id": (0, 0, 0), "%local_id": (0, 0, 0)},
                              push_constants=[0, 0, 0x100, 0x31016FAC] + [0] * 28, memory=memory)

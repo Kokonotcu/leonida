@@ -134,7 +134,12 @@ class ScalarAluAndSmemFoldingTests(unittest.TestCase):
         g.sgpr_imm[7] = 0x31000FAC
 
         ins = parse_line("s_buffer_load_dword s0, s[4:7], 0x10")
-        g.scalar_load(ins["op"], ins["args"], ins["mods"])
+        prev_pt = rdna2spirv.PAGE_TABLE
+        rdna2spirv.PAGE_TABLE = False
+        try:
+            g.scalar_load(ins["op"], ins["args"], ins["mods"])
+        finally:
+            rdna2spirv.PAGE_TABLE = prev_pt
         text = "\n".join(g.body)
 
         # No dynamic limit calculation instructions

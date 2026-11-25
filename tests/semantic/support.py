@@ -22,7 +22,19 @@ from spirv_mini_interp import run_fragment  # noqa: E402
 STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
 
 
-def translate_fixture(name, dxbc=STUB_DXBC, fssm=None):
+class flat_memory:
+    """Temporarily disable rdna2spirv.PAGE_TABLE for synthetic flat-memory tests."""
+
+    def __enter__(self):
+        self._prev = rdna2spirv.PAGE_TABLE
+        rdna2spirv.PAGE_TABLE = False
+        return self
+
+    def __exit__(self, *_):
+        rdna2spirv.PAGE_TABLE = self._prev
+
+
+def translate_fixture(name, dxbc=STUB_DXBC, fssm=None, page_table=None):
     """SPIR-V assembly text for tests/semantic/fixtures/disasm/<name>.s, translated by the translator under test.
 
     `dxbc` overrides the empty input signature; pixel shaders that read attributes need a real ISG1 part.
@@ -32,16 +44,16 @@ def translate_fixture(name, dxbc=STUB_DXBC, fssm=None):
     if not os.path.isfile(src):
         raise AssertionError(f"missing fixture {src}")        # a missing fixture is a failure, never a skip
     with open(src, "rb") as f:
-        return translate_listing(name, f.read(), dxbc, fssm)
+        return translate_listing(name, f.read(), dxbc, fssm, page_table=page_table)
 
 
-def translate_lines(name, lines, dxbc=STUB_DXBC, fssm=None):
+def translate_lines(name, lines, dxbc=STUB_DXBC, fssm=None, page_table=None):
     """Like translate_fixture for a hand-written program given as instruction lines (no fixture file)."""
     text = f"; {name}  hand-written test program\n" + "".join("\t" + ln.strip() + "\n" for ln in lines)
-    return translate_listing(name, text.encode("utf-8"), dxbc, fssm)
+    return translate_listing(name, text.encode("utf-8"), dxbc, fssm, page_table=page_table)
 
 
-def translate_listing(name, data, dxbc=STUB_DXBC, fssm=None):
+def translate_listing(name, data, dxbc=STUB_DXBC, fssm=None, page_table=None):
     """SPIR-V assembly text for a listing in the translator's input format (bytes of a .s file)."""
     with tempfile.TemporaryDirectory() as tmp:
         os.mkdir(os.path.join(tmp, "disasm"))
@@ -56,7 +68,13 @@ def translate_listing(name, data, dxbc=STUB_DXBC, fssm=None):
         with warnings.catch_warnings():
             # translate() leaves its .dxbc handle to the garbage collector; harmless, and not ours to change here.
             warnings.simplefilter("ignore", ResourceWarning)
-            result = rdna2spirv.translate(os.path.join(tmp, "disasm", name + ".s"))
+            prev_pt = rdna2spirv.PAGE_TABLE
+            if page_table is not None:
+                rdna2spirv.PAGE_TABLE = page_table
+            try:
+                result = rdna2spirv.translate(os.path.join(tmp, "disasm", name + ".s"))
+            finally:
+                rdna2spirv.PAGE_TABLE = prev_pt
             gc.collect()        # release the handle before the temporary directory is removed (Windows)
         return result
 

@@ -272,6 +272,52 @@ document names.
 | `LEONIDA_CONTENT_PACKAGES` | unset | The content packages `XPackageMount` can mount: `id1=path1;id2=path2` (up to 1,023 characters). The mount path of a listed identifier is its path, as written; any other identifier is `ERROR_NOT_FOUND`, and a path longer than 259 characters is `ERROR_INSUFFICIENT_BUFFER`. |
 | `LEONIDA_PACKAGED` | `1` | `0`, or text that is not a number, makes `XPackageIsPackagedProcess` return false. Any other number keeps it true. |
 
+### Runtime, D3D12, and diagnostic environment variables
+
+| variable | default | what it changes |
+|---|---|---|
+| `LEONIDA_ASSERTS` | unset | Soft `int 3` instructions in the title's own code are stepped over once per address; set to `stop` to keep them fatal. |
+| `LEONIDA_ASYNC_PSO` | unset | `1` compiles compute pipelines on background workers and skips their dispatches until ready. |
+| `LEONIDA_BCPACK_TABLES` | unset | Path to the BCPack static probability-table file read by the DirectStorage BCPack decoder (default `bcpack-tables.bin` beside `gta6rt.exe`). |
+| `LEONIDA_CHAIN_SUBMIT` | `1` | `0` disables chaining consecutive command-queue submissions; any other value keeps it on. |
+| `LEONIDA_COMPUTE_WAIT` | `1` | `0` skips waiting before replay for pending async/lazy compute pipelines used by the submitted command lists. |
+| `LEONIDA_CONSOLE_DETILE` | `1` | `0` reads title-placed texture memory as linear instead of detiling console-tiled layouts. |
+| `LEONIDA_DEFER_GRAPHICS` | unset | `1` defers building graphics PSOs and their shader modules until the first draw that uses them. |
+| `LEONIDA_DUMP_DIR` | cwd | Output directory for `LEONIDA_DUMP_SLOT57` dumps. |
+| `LEONIDA_DUMP_KIND6` | unset | Directory to write each distinct kind-6 compute program passed to slot 67 as `<fnv64>.kind6`. |
+| `LEONIDA_DUMP_MISSING` | unset | Directory to dump bytecode for shaders missing from the translated library (`<stage>_<sha256>.dxbc`, once per file). |
+| `LEONIDA_DUMP_SLOT57` | unset | Integer `N`: dumps the first `N` slot-57 native graphics PSO descriptions (0x200 bytes plus 0x100 bytes per readable pointer) to `<LEONIDA_DUMP_DIR or cwd>/slot57_<i>.bin`. |
+| `LEONIDA_DUMP_TARGETS` | unset | Present number at which to dump the 32 most recently drawn colour render targets as PPM images into the `LEONIDA_CAPTURE` folder. |
+| `LEONIDA_DUMP_TITLE_TEXTURE` | unset | Directory to dump the title bytes of copied 2048×2048 8-bit textures (glyph-atlas diagnostics; also enables `LEONIDA_LOG_TSHARP` logging when `LEONIDA_LOG_TSHARP` is unset). |
+| `LEONIDA_EVICT_SUPERSEDED` | `1` | `0` keeps older title-placed textures whose memory is overlapped by a newer one instead of evicting their Vulkan images. |
+| `LEONIDA_FALLBACK_MAGENTA` | unset | `1` fills fallback bindless descriptors with opaque magenta instead of zero. |
+| `LEONIDA_FIND_TSHARP` | unset | Hex dword: logs each graphics pipeline (up to 64 keys) whose user-data descriptor tables contain a `T#` matching that word. |
+| `LEONIDA_FIND_TSHARP_WORD` | `0` | Descriptor word index (`0..7`, masked with `7`) matched by `LEONIDA_FIND_TSHARP` (for example `2` for extent). |
+| `LEONIDA_LAZY_COMPUTE` | unset | `1` defers starting async compute PSO compilation until a dispatch actually references the pipeline. |
+| `LEONIDA_LENIENT_LISTS` | unset | `1` drops individual refused command-list commands instead of marking the whole command list invalid. |
+| `LEONIDA_LOG_BIG_ALLOCS` | unset | `1` installs a hook logging process-wide virtual reservations/commits of 256 MiB or more. |
+| `LEONIDA_LOG_DESC` | unset | Substring of a graphics pipeline's debug name: logs user data and pointed-to descriptor tables for matching draws. |
+| `LEONIDA_LOG_DESC_AFTER` | unset | Seconds (`>= 0`) after the first matching `LEONIDA_LOG_DESC` draw before logging distinct `s8+0` texture descriptors and vertex streams. |
+| `LEONIDA_LOG_PSOS` | unset | Set to any value to log graphics shader pair names and prepared draw counts. |
+| `LEONIDA_LOG_TSHARP` | unset | Hex GPU address: logs `T#` registrations, copies, and CPU accesses for the texture at that address. |
+| `LEONIDA_LOG_TSHARP_8BIT` | unset | Set to any value to log each newly registered 8-bit (`GFX10` format 1) `T#` with its image address, size, and Vulkan handle. |
+| `LEONIDA_MISSING_SHADER_STUB` | unset | `1` returns a no-op stub PSO instead of failing creation when a pipeline's shader has no translation. |
+| `LEONIDA_NATIVE_PSO` | `1` | `0` refuses slot-57 native graphics PSO creation calls. |
+| `LEONIDA_NATIVE_PSO_DEBUG` | unset | Integer `N`: logs the pointer/size layout and `HASH`/`0x43` digest hits of the first `N` slot-57 descriptions. |
+| `LEONIDA_NATIVE_PSO_DUMP` | unset | Directory to write raw `state_a`, `state_b`, `code`, and `records` blocks for the calls logged by `LEONIDA_NATIVE_PSO_DEBUG`. |
+| `LEONIDA_NATIVE_STATE` | `1` | `0` keeps the fixed default blend/depth/raster state on slot-57 native PSOs; `blend` applies decoded blend and write-mask state only. |
+| `LEONIDA_PAGEABLE` | `1` | `0` disables enabling `VK_EXT_pageable_device_local_memory`. |
+| `LEONIDA_PLANE1_OVERLAY` | unset | `1` composes `PresentX` plane 1 over plane 0 even when its overlay flag is clear. |
+| `LEONIDA_SCAN_HEAP_TSHARP` | unset | Hex word-2 extent: every 2,000 title-heap syncs, logs matching `T#` descriptors in shader-visible heaps. |
+| `LEONIDA_SKIP_PSO` | unset | Comma-separated substrings: turns matching compute PSO entries into no-op stubs. |
+| `LEONIDA_TITLE_HEAP_DIRTY` | `1` | `0` disables page-protection dirty tracking on title-backed descriptor heaps and compares whole heaps every sync. |
+| `LEONIDA_TITLE_PAGES` | `1` | `0` disables sparse 64 KiB shared-page backing for title-placed textures and uses committed images instead. |
+| `LEONIDA_TITLE_PAGES_MB` | `3584` | Sparse title-texture page budget in MiB (`0` disables the cap); past the budget, new streamed textures omit top mips. |
+| `LEONIDA_TITLE_TEXTURE_WATCH` | `1` | Seconds (or `life`) to keep hashing non-RT/non-UAV title-placed textures after a copy. |
+| `LEONIDA_VRAM_OVERCOMMIT` | unset | `1` disables the VRAM budget check in `allocate_type`, allowing device-local allocations past the driver's budget. |
+| `LEONIDA_WATCH_EXEC` | unset | Hex address: installs a hardware execute breakpoint logging the argument registers on the first 16 hits. |
+| `LEONIDA_WATCH_WRITE` | unset | `<size hex>:<offset hex>`: watches writes to an 8-byte word at that offset in newly allocated blocks of that size. |
+
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
 imports are unknown until it is available.

@@ -259,14 +259,16 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
             std::fprintf(stderr, "\n");
         }
     }
-    // Diagnostic: the retail frame path reads through 0x100000000 (the synthetic-VA base). Commit one guard page
-    // there so a read of that address is a value, not a fault, while the caller is being identified.
-    __try {
-        void* probe = VirtualAlloc(reinterpret_cast<void*>(0x100000000ull), 0x10000,
-                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        std::fprintf(stderr, "[rt] crash-pad: 0x100000000 -> %p\n", probe);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        std::fprintf(stderr, "[rt] crash-pad: failed\n");
+    if (std::getenv("LEONIDA_CRASH_PAD_ZERO")) {
+        // Optional diagnostic: commit zeroed memory at 0x100000000 when explicitly requested. Kept opt-in so the
+        // 0x100000000 fault handler below can catch reads and populate the thread context slot cleanly.
+        __try {
+            void* probe = VirtualAlloc(reinterpret_cast<void*>(0x100000000ull), 0x10000,
+                                       MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            std::fprintf(stderr, "[rt] crash-pad: 0x100000000 -> %p\n", probe);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            std::fprintf(stderr, "[rt] crash-pad: failed\n");
+        }
     }
     // Diagnostic: the faulting thread's TEB TLS slots (the console main image reads slot 0 directly).
     __try {
@@ -367,8 +369,15 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
     // answer S_OK (RAX = 0), popping its return address. Bounded and logged, so the next real stop is visible.
     if (r.ExceptionCode == 0xC0000005 && info->ContextRecord && info->ContextRecord->Rip == 0) {
         static std::atomic<int> skipped{0};
-        const auto ret = *reinterpret_cast<const std::uint64_t*>(info->ContextRecord->Rsp);
-        if (ret >= 0x140000000ull && ret < 0x150000000ull && skipped.fetch_add(1) < 16) {
+        std::uint64_t ret = 0;
+        bool readable = false;
+        __try {
+            ret = *reinterpret_cast<const std::uint64_t*>(info->ContextRecord->Rsp);
+            readable = true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            readable = false;
+        }
+        if (readable && ret >= 0x140000000ull && ret < 0x150000000ull && skipped.fetch_add(1) < 16) {
             std::fprintf(stderr, "[rt] nullcall-skip: return=%p rcx=%p rdx=%p\n",
                          reinterpret_cast<void*>(ret),
                          reinterpret_cast<void*>(info->ContextRecord->Rcx),

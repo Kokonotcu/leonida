@@ -66,7 +66,7 @@ def translate_cs(lines, *, wave64=False, emulate=False):
     prev = rdna2spirv.WAVE64_EMULATE
     rdna2spirv.WAVE64_EMULATE = emulate
     try:
-        return support.translate_lines("cs_global_x3", [*lines, "s_endpgm"], fssm=fssm)
+        return support.translate_lines("cs_global_x3", [*lines, "s_endpgm"], fssm=fssm, page_table=False)
     finally:
         rdna2spirv.WAVE64_EMULATE = prev
 
@@ -75,6 +75,7 @@ def translate_ps(lines):
     return support.translate_lines(
         "ps_global_x3",
         [*lines, "exp mrt0 v10, v11, v12, v13 done vm", "s_endpgm"],
+        page_table=False,
     )
 
 

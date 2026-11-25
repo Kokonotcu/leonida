@@ -335,6 +335,11 @@ bool protect_pages(std::uintptr_t first, std::size_t pages, DWORD protect) {
     return true;
 }
 
+std::mutex& dirty_watch_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
 // A watch slot for [title, title + bytes) with its pages read-only, or -1 (the heap keeps the whole compare).
 int start_dirty_watch(std::uint8_t* title, std::size_t bytes) {
     if (!title_heap_dirty_enabled() || !bytes) return -1;
@@ -352,6 +357,7 @@ int start_dirty_watch(std::uint8_t* title, std::size_t bytes) {
     const DWORD writable = info.Protect;
     const DWORD readonly = (info.Protect & ~DWORD(0xFF)) | PAGE_READONLY;
     const std::size_t pages = (end - begin) / kTitleDirtyPage;
+    std::lock_guard lock(dirty_watch_mutex());
     for (int slot = 0; slot < int(std::size(g_dirty_watches)); ++slot) {
         DirtyWatch& w = g_dirty_watches[slot];
         if (w.begin.load(std::memory_order_acquire)) continue;
@@ -366,6 +372,9 @@ int start_dirty_watch(std::uint8_t* title, std::size_t bytes) {
         if (!protect_pages(begin, pages, readonly)) {
             protect_pages(begin, pages, writable);
             w.begin.store(0, std::memory_order_release);
+            w.end.store(0, std::memory_order_release);
+            w.dirty = nullptr;
+            delete[] dirty;
             return -1;
         }
         static std::atomic<bool> logged{false};
@@ -380,6 +389,7 @@ int start_dirty_watch(std::uint8_t* title, std::size_t bytes) {
 // The heap goes: its pages writable again, then the slot is free (a fault meanwhile still finds it).
 void stop_dirty_watch(int slot) {
     if (slot < 0) return;
+    std::lock_guard lock(dirty_watch_mutex());
     DirtyWatch& w = g_dirty_watches[slot];
     const std::uintptr_t begin = w.begin.load(std::memory_order_acquire);
     if (!begin) return;
@@ -415,6 +425,7 @@ bool register_title_sync(const HeapProxy* heap, ID3D12Device* real_device, SIZE_
         g_title_sync_count.store(title_syncs().size(), std::memory_order_release);
         return true;
     } catch (const std::bad_alloc&) {
+        stop_dirty_watch(sync->watch);
         return false;
     }
 }
@@ -2737,14 +2748,34 @@ void fill_console_list_tail(void** copy, std::size_t from, std::index_sequence<I
      ...);
 }
 
+std::mutex& extended_list_vtable_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+
+std::vector<void**>& extended_list_vtables() {
+    static auto* v = new std::vector<void**>;
+    return *v;
+}
+
+bool is_extended_list_vtable(void** table) {
+    std::lock_guard lock(extended_list_vtable_mutex());
+    return std::find(extended_list_vtables().begin(), extended_list_vtables().end(), table) !=
+           extended_list_vtables().end();
+}
+
+void record_extended_list_vtable(void** table) {
+    std::lock_guard lock(extended_list_vtable_mutex());
+    extended_list_vtables().push_back(table);
+}
+
 // Give a real PC list the console entries the title calls. The copy is private to the object and never freed; lists
 // are long-lived and there are a handful, so the leak is bounded. Entries 0..79 are the object's own PC prefix, 80 too
 // when it is an ID3D12GraphicsCommandList7 (Barrier); index 159 keeps the original table.
 void extend_console_list_slots(void* list) {
     if (!list) return;
     void** original = *reinterpret_cast<void***>(list);
-    if (!original) return;
-    if (original[kConsoleListReset]) return;  // already extended
+    if (!original || is_extended_list_vtable(original)) return;  // already extended
     auto** copy = static_cast<void**>(std::calloc(160, sizeof(void*)));
     if (!copy) return;
     std::memcpy(copy, original, 80 * sizeof(void*));
@@ -2759,6 +2790,7 @@ void extend_console_list_slots(void* list) {
     copy[146] = reinterpret_cast<void*>(&console_list_slot146);
     fill_console_list_tail(copy, pc_slots, std::make_index_sequence<159>{});
     copy[159] = original;
+    record_extended_list_vtable(copy);
     *reinterpret_cast<void***>(list) = copy;
     static std::atomic<bool> logged{false};
     if (first_call(logged))

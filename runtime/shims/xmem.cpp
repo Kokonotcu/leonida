@@ -1163,6 +1163,7 @@ BOOL WINAPI TitleVirtualFree(LPVOID address, SIZE_T size, DWORD free_type) {
                 cursor = region_end < end ? region_end : end;
             }
             forget_window_range(start, end);
+            drop_mirrors(start, end);
             g_reservations.erase(it);
             return TRUE;
         }

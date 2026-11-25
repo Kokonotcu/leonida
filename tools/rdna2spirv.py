@@ -404,6 +404,7 @@ class Gen:
         self.blocks = []      # per basic block: list of SPIR-V lines (dispatch-loop form), empty = straight-line
         self.succ = []        # per basic block: the blocks it can go to next (none = the program ends there)
         self.desc_fn = None   # lines of the descriptor-lookup function, once an instruction needs it
+        self.host_addr_fn = None  # lines of %host_addr_fn (two-level page table + <4 GiB fast path)
         self.tbuffer_norm_fns: dict[int, list[str]] = {}  # one exact quotient per used magnitude width
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
         self.fmt_norm_fn = None    # lines of the shared exact norm quotient for a run-time width (SHADER-849)
@@ -1613,13 +1614,16 @@ class Gen:
         self.emit(f"{poff} = OpShiftLeftLogical %ulong {page_idx} {self.cl(3)}")
         eaddr = add(add(add("%heap_base", self.cl(PAGE_TABLE_DIR + PAGE_TABLE_DIR_BYTES)), coff), poff)
         lo, hi_word = load_u32(eaddr), load_u32(add(eaddr, self.cl(4)))
-        lo64, hi64, hish, entry, mapped_ok, ok, low, mapped, r = (t() for _ in range(9))
+        lo64, hi64, hish, entry, mapped_ok, hi_top, in_48, dir_ok, ok, low, mapped, r = (t() for _ in range(12))
         self.emit(f"{lo64} = OpUConvert %ulong {lo}")
         self.emit(f"{hi64} = OpUConvert %ulong {hi_word}")
         self.emit(f"{hish} = OpShiftLeftLogical %ulong {hi64} %c64_32")
         self.emit(f"{entry} = OpBitwiseOr %ulong {hish} {lo64}")
         self.emit(f"{mapped_ok} = OpINotEqual %bool {entry} {self.cl(0)}")
-        self.emit(f"{ok} = OpLogicalAnd %bool {has} {mapped_ok}")
+        self.emit(f"{hi_top} = OpShiftRightLogical %uint {hi32} {self.cu(16)}")
+        self.emit(f"{in_48} = OpIEqual %bool {hi_top} {self.cu(0)}")
+        self.emit(f"{dir_ok} = OpLogicalAnd %bool {has} {in_48}")
+        self.emit(f"{ok} = OpLogicalAnd %bool {dir_ok} {mapped_ok}")
         self.emit(f"{low} = OpBitwiseAnd %ulong {xbox_va} {self.cl(0xFFFF)}")
         paged = add(entry, low)
         null = add(add("%heap_base", self.cl(PAGE_TABLE_SCRATCH)), low)
@@ -1846,7 +1850,11 @@ class Gen:
             self.set_exec(self.mask_src(s))
             return
         if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
-            self.emit(f"OpStore %vcc {self.mask_src(s)}")
+            if not self.wave64 and s["k"] == "sgpr" and s.get("n") == 2 and not self.holds_lane_mask(s):
+                self.emit(f"OpStore %vcc {self.load_reg('sgpr', s['r'])}")
+                self.emit(f"OpStore %vcc_hi {self.load_reg('sgpr', s['r'] + 1)}")
+            else:
+                self.emit(f"OpStore %vcc {self.mask_src(s)}")
             return
         if d["k"] != "sgpr" or d.get("n") != 2:
             raise Unsupported("s_mov_b64 destination")
@@ -1865,8 +1873,13 @@ class Gen:
             lit_hi = (v >> 32) & 0xFFFFFFFF
             lo, hi = self.cu(lit_lo), self.cu(lit_hi)
         elif s["k"] == "special" and s["t"] == "vcc":
-            lo = hi = self.tmp()            # this lane's bit in both halves, as for EXEC
+            lo = self.tmp()
             self.emit(f"{lo} = OpLoad %uint %vcc")
+            if self.wave64 and "vcc" in self.cur_masks:
+                hi = lo                  # this lane's bit in both halves, as for EXEC
+            else:
+                hi = self.tmp()
+                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
         else:
             raise Unsupported("s_mov_b64 source")
         self.store_reg("sgpr", d["r"], lo)
@@ -2392,16 +2405,19 @@ class Gen:
         vd = a[0]
         addr, _, in_b, raw_parts, step = self.buffer_address(a, mods, parts=True)
         act = self.active_b()
-        ptr, host = self.tmp(), self.host_addr(addr)
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
 
-        def guarded(cond, dwords):
+        def guarded(cond, dwords, host_ptr=None):
             """One selection construct that loads these dwords when cond holds; the phis give 0 otherwise."""
             lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
             pre_label = self.current_label_placeholder()
             self.emit(f"OpSelectionMerge {lbl_end} None")
             self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
             self.emit(f"{lbl_do} = OpLabel")
+            if host_ptr is None:
+                ptr, host = self.tmp(), self.host_addr(addr)
+                self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
+            else:
+                ptr, host = host_ptr
             loaded = []
             for i in dwords:
                 p, v_do = self.buf_dword_ptr(ptr, host, step, i), self.tmp()
@@ -2420,12 +2436,37 @@ class Gen:
             cond = self.tmp()
             self.emit(f"{cond} = OpLogicalAnd %bool {act} {in_b}")
             phis = guarded(cond, range(n))
-        else:                               # mode 0/3 (or a run-time V#): each dword checks its own end
-            phis = []
+        elif n == 1:                        # mode 0/3 single dword: guard wraps host_addr and the load
+            cond = self.tmp()
+            self.emit(f"{cond} = OpLogicalAnd %bool {act} {raw_parts(0)}")
+            phis = guarded(cond, [0])
+        else:                               # mode 0/3 (or a run-time V#): skip host_addr when inactive or all OOB
+            in_dwords = [raw_parts(i) for i in range(n)]
+            any_in = in_dwords[0]
+            for ok in in_dwords[1:]:
+                nxt = self.tmp()
+                self.emit(f"{nxt} = OpLogicalOr %bool {any_in} {ok}")
+                any_in = nxt
+            cond = self.tmp()
+            self.emit(f"{cond} = OpLogicalAnd %bool {act} {any_in}")
+            lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
+            pre_label = self.current_label_placeholder()
+            self.emit(f"OpSelectionMerge {lbl_end} None")
+            self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+            self.emit(f"{lbl_do} = OpLabel")
+            ptr, host = self.tmp(), self.host_addr(addr)
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
+            inner = []
             for i in range(n):
-                cond = self.tmp()
-                self.emit(f"{cond} = OpLogicalAnd %bool {act} {raw_parts(i)}")
-                phis += guarded(cond, [i])
+                inner += guarded(in_dwords[i], [i], host_ptr=(ptr, host))
+            done_lbl = self.current_label_placeholder()
+            self.emit(f"OpBranch {lbl_end}")
+            self.emit(f"{lbl_end} = OpLabel")
+            phis = []
+            for v_do in inner:
+                v = self.tmp()
+                self.emit(f"{v} = OpPhi %uint {v_do} {done_lbl} {self.cu(0)} {pre_label}")
+                phis.append(v)
         for i, v in enumerate(phis):
             self.dst({"k": "vgpr", "r": vd["r"] + i, "n": 1}, v)
 
@@ -4510,19 +4551,33 @@ class Gen:
             words = None
         if words is not None and per is not None and len(words) > 1:
             # modes 0 and 3: every dword is stored only if it ends inside (measured: a store that straddles the edge
-            # writes the dwords before it); a store past the end of the buffer is a host-memory hazard otherwise
+            # writes the dwords before it); a store past the end of the buffer is a host-memory hazard otherwise.
+            # Skip host_addr completely when the lane is inactive or every dword is out of bounds.
+            pers = [per(i) for i in range(len(words))]
+            any_in = pers[0]
+            for ok in pers[1:]:
+                nxt = self.tmp()
+                self.emit(f"{nxt} = OpLogicalOr %bool {any_in} {ok}")
+                any_in = nxt
+            outer_cond = self.tmp()
+            self.emit(f"{outer_cond} = OpLogicalAnd %bool {self.active_b()} {any_in}")
+            outer_do, outer_end = self.tmp() + "_do", self.tmp() + "_end"
+            self.emit(f"OpSelectionMerge {outer_end} None")
+            self.emit(f"OpBranchConditional {outer_cond} {outer_do} {outer_end}")
+            self.emit(f"{outer_do} = OpLabel")
             ptr, host = self.tmp(), self.host_addr(addr)
             self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
             for i, w in enumerate(words):
-                cond, lbl_do, lbl_end = self.tmp(), self.tmp() + "_do", self.tmp() + "_end"
-                self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {per(i)}")
+                lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
                 self.emit(f"OpSelectionMerge {lbl_end} None")
-                self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
+                self.emit(f"OpBranchConditional {pers[i]} {lbl_do} {lbl_end}")
                 self.emit(f"{lbl_do} = OpLabel")
                 p = self.buf_dword_ptr(ptr, host, step, i)
                 self.emit(f"OpStore {p} {w} Aligned 4")
                 self.emit(f"OpBranch {lbl_end}")
                 self.emit(f"{lbl_end} = OpLabel")
+            self.emit(f"OpBranch {outer_end}")
+            self.emit(f"{outer_end} = OpLabel")
             return
         if fixed_fmt is not None:
             # A V# whose FORMAT is 0 (INVALID) disables the store, though MTBUF brings its own format (measured natively
@@ -4627,8 +4682,9 @@ class Gen:
                         sh24 = self.tmp()
                         self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
                         # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
-                        dword_arr = self.tmp()
-                        self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
+                        host_al, dword_arr = self.tmp(), self.tmp()
+                        self.emit(f"{host_al} = OpISub %ulong {host} {lo64}")
+                        self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {host_al}")
                         self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
                         self.emit(f"{mk} = OpCopyObject %uint {self.cu((1 << (8 * size)) - 1)}")
                         self.emit(f"{mks} = OpShiftLeftLogical %uint {mk} {sh24}")
@@ -4670,8 +4726,9 @@ class Gen:
                 sh24 = self.tmp()
                 self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
                 # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
-                dword_arr = self.tmp()
-                self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
+                host_al, dword_arr = self.tmp(), self.tmp()
+                self.emit(f"{host_al} = OpISub %ulong {host} {lo64}")
+                self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {host_al}")
                 self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
                 self.emit(f"{one} = OpIEqual %bool {size} {self.cu(1)}")
                 self.emit(f"{mk} = OpSelect %uint {one} {self.cu(0xFF)} {self.cu(0xFFFF)}")
@@ -7372,11 +7429,13 @@ class Gen:
                 raise Unsupported("DPP compare with lanes that keep their mask bit")
         elif args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
             raise Unsupported("DPP destination")
-        if args[1].get("n", 1) != 1:
+        src_idx = 2 if (base_op(ins["op"]) in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32")
+                        and len(args) > 3) else 1
+        if args[src_idx].get("n", 1) != 1:
             raise Unsupported("DPP 64-bit source")
-        if args[1].get("sext"):
+        if args[src_idx].get("sext"):
             raise Unsupported("DPP sext")
-        src = args[1]
+        src = args[src_idx]
         src_val = self.src_u(src)    # neg/abs are lane-uniform, so before or after the shuffle is the same
 
         lane = self.wave_lane()
@@ -7548,7 +7607,7 @@ class Gen:
         else:
             write = self.tmp()
             self.emit(f"{write} = OpLogicalAnd %bool {enabled} {src_ok}")
-        args[1] = {"k": "ssa", "v": src0}
+        args[src_idx] = {"k": "ssa", "v": src0}
         if compare:
             # Every lane is enabled and an invalid source reads 0 (checked above), so the compare's own EXEC guard
             # is the only one: the mask write is the plain compare's.
@@ -7962,25 +8021,30 @@ class Gen:
                 if any(m != "clamp" for m in mods) or ins["op"].endswith(("_dpp", "_sdwa")) or any(
                         s.get("neg") or s.get("abs") for s in a):
                     raise Unsupported(op + " modifiers")
+                sel, selhi = [0, 0, 0], [1, 1, 1]
                 x, y, acc = self.src_u(a[1]), self.src_u(a[2]), self.src_u(a[0])
             else:
                 def bits(name, default):
                     m = next((m for m in mods if m.startswith(name + ":")), None)
                     return [int(v) for v in m.split("[")[1].rstrip("]").split(",")] if m else default
                 other = [m for m in mods if m != "clamp" and not m.startswith(("op_sel:", "op_sel_hi:"))]
+                sel, selhi = bits("op_sel", [0, 0, 0]), bits("op_sel_hi", [1, 1, 1])
                 if (other or ins["op"].endswith(("_dpp", "_sdwa")) or any(s.get("neg") or s.get("abs") for s in a) or
-                        bits("op_sel", [0, 0, 0]) != [0, 0, 0] or bits("op_sel_hi", [1, 1, 1]) != [1, 1, 1]):
+                        len(sel) != 3 or len(selhi) != 3 or any(v not in (0, 1) for v in sel + selhi) or
+                        sel[2] != 0 or selhi[2] != 1):
                     raise Unsupported(op + " modifiers")
                 x, y, acc = self.src_u(a[1]), self.src_u(a[2]), self.src_u(a[3])
             width = 16 if ("_dot2_" in op or "_dot2c_" in op) else (8 if "_dot4" in op else 4)
             signed = op.endswith(("i16", "i4"))
             clamp = "clamp" in mods
             ext = "OpBitFieldSExtract" if signed else "OpBitFieldUExtract"
+            x_offs = [16 * sel[0] + b for b in range(0, 16, width)] + [16 * selhi[0] + b for b in range(0, 16, width)]
+            y_offs = [16 * sel[1] + b for b in range(0, 16, width)] + [16 * selhi[1] + b for b in range(0, 16, width)]
             prods = []
-            for off in range(0, 32, width):
+            for xo, yo in zip(x_offs, y_offs):
                 xe, ye, p = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{xe} = {ext} %uint {x} {self.cu(off)} {self.cu(width)}")
-                self.emit(f"{ye} = {ext} %uint {y} {self.cu(off)} {self.cu(width)}")
+                self.emit(f"{xe} = {ext} %uint {x} {self.cu(xo)} {self.cu(width)}")
+                self.emit(f"{ye} = {ext} %uint {y} {self.cu(yo)} {self.cu(width)}")
                 self.emit(f"{p} = OpIMul %uint {xe} {ye}")
                 prods.append(p)
             if not clamp:
@@ -12682,9 +12746,6 @@ class Gen:
         self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
         self.emit(f"{addr} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{full} = OpIAdd %ulong {addr} {o64}")
-        ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
-        self.uses_psb = True
         lim = None
         lim_val = None
         if sbuf:
@@ -12704,6 +12765,13 @@ class Gen:
                 self.emit(f"{prod} = OpIMul %ulong {nr64} {st64}")
                 self.emit(f"{raw} = OpIEqual %bool {stride} {self.cu(0)}")
                 self.emit(f"{lim} = OpSelect %ulong {raw} {nr64} {prod}")
+
+        def emit_ptr():
+            self.uses_psb = True
+            p_arr = self.tmp()
+            self.emit(f"{p_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+            return p_arr
+
         guarded = {}
         if lim is not None and not (lim_val is not None and reg is None):
             # A run-time bound: dword i is in range when off + 4*i + 4 <= limit, and out of range it is 0 with memory
@@ -12726,6 +12794,7 @@ class Gen:
             self.emit(f"OpSelectionMerge {lbl_end} None")
             self.emit(f"OpBranchConditional {oks[0]} {lbl_do} {lbl_end}")
             self.emit(f"{lbl_do} = OpLabel")
+            ptr = emit_ptr()
             got_in = []
             for i in range(n):
                 idx, p, got, val = (self.tmp() for _ in range(4))
@@ -12746,17 +12815,22 @@ class Gen:
                 v = self.tmp()
                 self.emit(f"{v} = OpPhi %uint {got_in[i]} {lbl_do} {self.cu(0)} {pre}")
                 guarded[i] = v
+        static_ptr = None
         for i in range(n):
             p, v = self.tmp(), self.tmp()
             if i in guarded:
                 v = guarded[i]
             elif lim is None:
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                if static_ptr is None:
+                    static_ptr = emit_ptr()
+                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {static_ptr} {self.cu(i)}")
                 self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
             else:                   # a bound known at translate time (lim_val, constant offset): fold each dword
                 end_val = imm + 4 * i + 4
                 if lim_val >= end_val:
-                    self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                    if static_ptr is None:
+                        static_ptr = emit_ptr()
+                    self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {static_ptr} {self.cu(i)}")
                     self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
                 else:
                     v = self.cu(0)
@@ -14904,6 +14978,11 @@ class Gen:
         e(f"{nm} = OpBitwiseAnd %ulong {node} {self.cl(0xFFFFFFFFFFFFFFF8)}")
         e(f"{off} = OpShiftLeftLogical %ulong {nm} {self.cl(3)}")
         e(f"{addr} = OpIAdd %ulong {base} {off}")
+        act = self.active_b()
+        lbl_bvh_do, lbl_bvh_end = T() + "_do", T() + "_end"
+        e(f"OpSelectionMerge {lbl_bvh_end} None")
+        e(f"OpBranchConditional {act} {lbl_bvh_do} {lbl_bvh_end}")
+        e(f"{lbl_bvh_do} = OpLabel")
         ptr = T()
         e(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
 
@@ -15147,6 +15226,8 @@ class Gen:
         e(f"{L['end2']} = OpLabel")
         e(f"OpBranch {L['end1']}")
         e(f"{L['end1']} = OpLabel")
+        e(f"OpBranch {lbl_bvh_end}")
+        e(f"{lbl_bvh_end} = OpLabel")
 
     def ms_export(self, tgt, ins):
         """NGG export in a mesh shader: thread t exports vertex t (pos/param) and primitive t (prim). The values are
@@ -19265,6 +19346,8 @@ def main():
                     help="a shader whose structured control flow nests deeper than N is emitted in the dispatch-loop "
                          "form instead (default %(default)s; 0 = never): that form validates faster at great depth "
                          "but compiles 1.7-2x slower on NVIDIA (SHADER-427, docs/design.md \"Control flow\")")
+    ap.add_argument("--no-page-table", action="store_true",
+                    help="emit direct heap_base + VA addressing instead of two-level page-table lookups")
     ap.add_argument("--opt", action="store_true",
                     help="run basic-block SPIR-V peephole optimization (tools/spirv_opt.py: register store-to-load "
                          "forwarding, OpAccessChain CSE, dead-store elimination, OpSelect/CopyObject folding, DCE)")
@@ -19286,9 +19369,10 @@ def main():
         ap.error(f"cannot create {a.out}: {ancestor} is a file, not a folder")
     MAX_SHARED_BYTES = a.max_shared_memory
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
-    global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
+    global STRUCTURED, PAGE_TABLE, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global PC_TAIL_UBO
     PC_TAIL_UBO = a.pc_tail_ubo
+    PAGE_TABLE = not a.no_page_table
     global FMA_EXACT
     FMA_KHR = a.fma == "khr"
     SHADER_CLOCK = a.shader_clock == "khr"

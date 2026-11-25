@@ -121,7 +121,8 @@ TID_LOADS = [
 
 class BufferSwizzle(unittest.TestCase):
     def translate(self, lines, prologue=("v_cmpx_eq_u32_e32 0, v0",)):
-        return support.translate_lines("cs_buf_swizzle_t", [*prologue, *lines, "s_endpgm"], fssm=tv.CS_BOUNDS_FSSM)
+        return support.translate_lines("cs_buf_swizzle_t", [*prologue, *lines, "s_endpgm"], fssm=tv.CS_BOUNDS_FSSM,
+                                       page_table=False)
 
     def run_spv(self, spv, lane=0):
         memory = PatternMemory()

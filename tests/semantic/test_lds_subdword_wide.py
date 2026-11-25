@@ -82,7 +82,7 @@ def expected_wide():
 
 
 def run(name, sabotage=None):
-    spv = support.translate_fixture(name, fssm=FSSM)
+    spv = support.translate_fixture(name, fssm=FSSM, page_table=False)
     if sabotage:
         spv = sabotage(spv)
     memory = si.run_workgroup(

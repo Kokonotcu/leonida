@@ -212,6 +212,7 @@ void trace_call(const char* api, std::string_view detail = {}) noexcept try {
 // ---- Genuine APU Heap Implementation ----
 
 constexpr uint32_t kApuBaseAddress = 0x40000000u;
+constexpr uint32_t kShapeContextApuBase = 0xE0000000u;
 constexpr uint64_t kApuRegionAlignment = 0x10000u;
 
 uint64_t align_apu_region(uint64_t size) {
@@ -1015,13 +1016,13 @@ HRESULT __stdcall AcpHalAllocateShapeContexts(SHAPE_CONTEXTS* ctx) {
         result.pcmContextArray = static_cast<SHAPE_PCM_CONTEXT*>(
             alloc_array(result.numPcmContexts, sizeof(SHAPE_PCM_CONTEXT)));
 
-        // Assign synthetic APU addresses to the host-side context arrays.
-        result.apuSrcContextArray = {result.srcContextArray ? kApuBaseAddress : 0};
-        result.apuEqCompContextArray = {result.eqCompContextArray ? kApuBaseAddress + 0x1000 : 0};
-        result.apuFiltVolContextArray = {result.filtVolContextArray ? kApuBaseAddress + 0x2000 : 0};
-        result.apuDmaContextArray = {result.dmaContextArray ? kApuBaseAddress + 0x3000 : 0};
-        result.apuXmaContextArray = {result.xmaContextArray ? kApuBaseAddress + 0x4000 : 0};
-        result.apuPcmContextArray = {result.pcmContextArray ? kApuBaseAddress + 0x5000 : 0};
+        // Assign synthetic APU addresses in a dedicated range disjoint from g_cached_heap / g_noncached_heap.
+        result.apuSrcContextArray = {result.srcContextArray ? kShapeContextApuBase : 0};
+        result.apuEqCompContextArray = {result.eqCompContextArray ? kShapeContextApuBase + 0x1000 : 0};
+        result.apuFiltVolContextArray = {result.filtVolContextArray ? kShapeContextApuBase + 0x2000 : 0};
+        result.apuDmaContextArray = {result.dmaContextArray ? kShapeContextApuBase + 0x3000 : 0};
+        result.apuXmaContextArray = {result.xmaContextArray ? kShapeContextApuBase + 0x4000 : 0};
+        result.apuPcmContextArray = {result.pcmContextArray ? kShapeContextApuBase + 0x5000 : 0};
 
         g_shape_allocations.reserve(g_shape_allocations.size() + 1);
         if (result.xmaContextArray) g_xma_engine.bind(result.xmaContextArray, result.numXmaContexts);
@@ -1119,23 +1120,17 @@ HRESULT __stdcall ApuAlloc(void** virtualAddress, uint32_t* physicalAddress,
     // If non-cached heap wasn't created or has no room, fall back to cached heap
     // because PC memory is unified and cache-coherent.
     const bool prefer_noncached = (flags == 2);
-    ApuRegion* target = prefer_noncached ? &g_noncached_heap : &g_cached_heap;
+    ApuRegion* target = (prefer_noncached && g_noncached_heap.base) ? &g_noncached_heap : &g_cached_heap;
 
     if (!target->base) {
-        if (!prefer_noncached) {
-            if (g_apu_heap_created) return E_OUTOFMEMORY;
-            // Lazy default cached heap if ApuCreateHeap wasn't called yet
-            constexpr uint32_t kDefaultHeapSize = 64 * 1024 * 1024;
-            target->base = VirtualAlloc(nullptr, kDefaultHeapSize,
-                                        MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-            if (!target->base) return E_OUTOFMEMORY;
-            target->size = kDefaultHeapSize;
-            g_apu_heap_created = true;
-        } else {
-            // Fall back to cached heap
-            target = &g_cached_heap;
-            if (!target->base) return E_OUTOFMEMORY;
-        }
+        if (g_apu_heap_created) return E_OUTOFMEMORY;
+        // Lazy default cached heap if ApuCreateHeap wasn't called yet
+        constexpr uint32_t kDefaultHeapSize = 64 * 1024 * 1024;
+        target->base = VirtualAlloc(nullptr, kDefaultHeapSize,
+                                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!target->base) return E_OUTOFMEMORY;
+        target->size = kDefaultHeapSize;
+        g_apu_heap_created = true;
     }
 
     uint32_t offset = 0;

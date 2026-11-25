@@ -1000,7 +1000,9 @@ private:
     // The BCPack format's constant tables (VIctory's bcpack-tables.bin, 77,982 bytes: not part of the repository, its
     // licence does not cover it), from LEONIDA_BCPACK_TABLES or bcpack-tables.bin beside the runtime, read once.
     static const leonida::bcpack_victory::Tables* bcpack_tables() {
-        static const leonida::bcpack_victory::TablesPtr tables = [] {
+        static std::once_flag once;
+        static const leonida::bcpack_victory::Tables* ptr = nullptr;
+        std::call_once(once, [] {
             wchar_t path[MAX_PATH * 2] = {};
             DWORD n = GetEnvironmentVariableW(L"LEONIDA_BCPACK_TABLES", path, MAX_PATH * 2);
             if (n == 0 || n >= MAX_PATH * 2) {
@@ -1025,12 +1027,14 @@ private:
             const char* why = "the table file could not be read";
             leonida::bcpack_victory::TablesPtr parsed;
             if (!bytes.empty()) parsed = leonida::bcpack_victory::parse_tables(bytes, &why);
-            if (!parsed)
+            if (!parsed) {
                 log_once("bcpack-tables", std::string("BCPack requests fail (E_NOTIMPL): ") + (why ? why : "") +
                                               " (bcpack-tables.bin beside gta6rt.exe, or LEONIDA_BCPACK_TABLES)");
-            return parsed;
-        }();
-        return tables.get();
+            } else {
+                ptr = parsed.release();
+            }
+        });
+        return ptr;
     }
 
     void set_pending(int delta) {

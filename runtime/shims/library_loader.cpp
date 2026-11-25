@@ -216,7 +216,8 @@ HMODULE WINAPI get_module_handle_a(LPCSTR name) {
 }
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
-    if (getenv("LEONIDA_HEAP_PROBE")) {
+    static const bool heap_probe = getenv("LEONIDA_HEAP_PROBE") != nullptr;
+    if (heap_probe) {
         std::fprintf(stderr, "[rt] heap-probe: GetModuleHandleW entry tid=%lu\n", GetCurrentThreadId());
         std::fflush(stderr);
         const BOOL ok = HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr);
@@ -332,7 +333,7 @@ DWORD WINAPI get_module_file_name_a(HMODULE module, LPSTR buffer, DWORD size) {
 }
 
 FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
-    const bool heap_probe = getenv("LEONIDA_HEAP_PROBE") != nullptr;
+    static const bool heap_probe = getenv("LEONIDA_HEAP_PROBE") != nullptr;
     if (heap_probe)
         std::fprintf(stderr, "[rt] heap-probe: GetProcAddress entry tid=%lu module=%p ok=%d\n",
                      GetCurrentThreadId(), module, crt_heap_ok());

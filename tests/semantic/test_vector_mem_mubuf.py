@@ -367,7 +367,12 @@ class MubufSpirvHarness:
             f.write(asm)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ResourceWarning)
-            spv = rdna2spirv.translate(self.src_path)
+            prev_pt = rdna2spirv.PAGE_TABLE
+            rdna2spirv.PAGE_TABLE = False
+            try:
+                spv = rdna2spirv.translate(self.src_path)
+            finally:
+                rdna2spirv.PAGE_TABLE = prev_pt
         mem = {} if memory is None else dict(memory)
         res = si.run_fragment(spv, memory=mem)
         mrt0 = res.get("%out_mrt0", (0, 0, 0, 0))

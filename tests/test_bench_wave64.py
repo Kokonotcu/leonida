@@ -119,7 +119,7 @@ class HarnessError(unittest.TestCase):
                 )
                 self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
                 self.assertIn(f"ms_tri: {mode} build did not produce a SPIR-V module", run.stderr)
-                self.assertIn("not built (need a DXBC container with signatures): ms_tri", run.stderr)
+                self.assertIn('not built (mesh shaders without a "psv0:" header): ms_tri', run.stderr)
                 self.assertNotIn("Traceback", run.stderr)
 
     def test_harness_is_found_in_a_cmake_configuration_subdirectory(self):

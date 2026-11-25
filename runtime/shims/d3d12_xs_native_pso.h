@@ -252,11 +252,11 @@ inline D3D12_STENCIL_OP stencil_op(std::uint32_t op) {
 inline D3D12_COMPARISON_FUNC compare(std::uint32_t f) { return static_cast<D3D12_COMPARISON_FUNC>((f & 7) + 1); }
 
 inline const char* mode() {
-    static const char* const m = [] {
+    static const std::string* const m = new std::string([] {
         const char* v = std::getenv("LEONIDA_NATIVE_STATE");
         return v ? v : "1";
-    }();
-    return m;
+    }());
+    return m->c_str();
 }
 
 inline void apply(const np::StateA& a, D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc) {

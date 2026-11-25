@@ -72,7 +72,7 @@ class OobTypedLoadDstSelTests(unittest.TestCase):
         wave64: bool = False,
         name: str = "cs_oob_dst_sel",
     ) -> tuple[tv.ReadLog, str]:
-        spv = support.translate_lines(name, lines, fssm=CS_12_USER_FSSM)
+        spv = support.translate_lines(name, lines, fssm=CS_12_USER_FSSM, page_table=False)
         mem = tv.ReadLog(preload if preload is not None else {
             BASE: 0x3F000000,
             BASE + 4: 0x40000000,
@@ -127,7 +127,7 @@ class OobTypedLoadDstSelTests(unittest.TestCase):
             "buffer_store_dword v12, off, s[0:3], 0 offset:32",
             "s_endpgm",
         ]
-        spv = support.translate_lines("cs_oob_all_fmts", lines, fssm=CS_12_USER_FSSM)
+        spv = support.translate_lines("cs_oob_all_fmts", lines, fssm=CS_12_USER_FSSM, page_table=False)
         for code, (_, kind, _) in sorted(rdna2spirv.Gen.FORMATS.items()):
             is_int = kind in ("u32", "i32", "uint", "sint")
             one32 = 1 if is_int else 0x3F800000
@@ -168,7 +168,7 @@ class OobTypedLoadDstSelTests(unittest.TestCase):
             "buffer_store_dwordx2 v[4:5], off, s[0:3], 0",
             "s_endpgm",
         ]
-        spv = support.translate_lines("cs_oob_128_fmts", lines, fssm=CS_12_USER_FSSM)
+        spv = support.translate_lines("cs_oob_128_fmts", lines, fssm=CS_12_USER_FSSM, page_table=False)
         for code in range(128):
             is_flt = GFX10_FORMAT_NAMES.get(code, "").endswith(FLOAT_SUFFIXES)
             want32 = 0x3F800000 if is_flt else 1
@@ -309,7 +309,7 @@ class OobTypedLoadDstSelTests(unittest.TestCase):
         old_emu = rdna2spirv.WAVE64_EMULATE
         try:
             rdna2spirv.WAVE64_EMULATE = True
-            spv_emu = support.translate_lines("cs_w64_emu_oob_dst_sel", lines, fssm=CS_12_USER_FSSM)
+            spv_emu = support.translate_lines("cs_w64_emu_oob_dst_sel", lines, fssm=CS_12_USER_FSSM, page_table=False)
         finally:
             rdna2spirv.WAVE64_EMULATE = old_emu
         self.assertIn("%x_buf", spv_emu)

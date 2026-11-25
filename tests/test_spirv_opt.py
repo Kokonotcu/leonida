@@ -566,6 +566,39 @@ class SpirvOptTests(unittest.TestCase):
         for dead in ("%dead_grp", "%dead_only", "%dead_str", "%dead_g", "%dead_id"):
             self.assertNotIn(dead, opt)
 
+    def test_quote_in_comment_and_decorate_id_operand_cleanup(self):
+        spv = "\n".join([
+            "               OpCapability Shader",
+            "               OpMemoryModel Logical GLSL450",
+            '               OpEntryPoint Fragment %main "main" %out0',
+            "               OpExecutionMode %main OriginUpperLeft",
+            "               OpDecorate %out0 Location 0",
+            "               OpDecorateId %live CounterBuffer %dead_op",
+            "       %void = OpTypeVoid",
+            "       %fn_t = OpTypeFunction %void",
+            "       %uint = OpTypeInt 32 0",
+            "     %v4uint = OpTypeVector %uint 4",
+            " %ptr_out_v4 = OpTypePointer Output %v4uint",
+            "       %out0 = OpVariable %ptr_out_v4 Output",
+            "         %c0 = OpConstant %uint 0",
+            "         %c1 = OpConstant %uint 1",
+            "       %main = OpFunction %void None %fn_t",
+            "      %entry = OpLabel",
+            "       %live = OpIAdd %uint %c1 %c0",
+            '     %folded = OpIAdd %uint %c1 %c0 ; keeps "quoted" comment from hiding %c1 fold',
+            "    %dead_op = OpIAdd %uint %c1 %c0 ; dead id referenced only as OpDecorateId operand",
+            "        %vec = OpCompositeConstruct %v4uint %live %folded %folded %folded",
+            "               OpStore %out0 %vec",
+            "               OpReturn",
+            "               OpFunctionEnd",
+            "",
+        ])
+        opt = spirv_opt.optimize(spv)
+        self.assertNotIn("%dead_op", opt)
+        self.assertNotIn("OpDecorateId %live CounterBuffer %dead_op", opt)
+        self.assertNotIn("%folded", opt)
+        self.assertIn("OpCompositeConstruct %v4uint %live %c1 %c1 %c1", opt)
+
 
 if __name__ == "__main__":
     unittest.main()

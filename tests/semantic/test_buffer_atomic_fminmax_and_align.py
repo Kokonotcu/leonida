@@ -56,7 +56,12 @@ def translate(body):
             f.write("; cs_atom\n" + "".join(f"\t{ln}\n" for ln in body) + "\ts_endpgm\n")
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", ResourceWarning)
-            return rdna2spirv.translate(src)
+            prev_pt = rdna2spirv.PAGE_TABLE
+            rdna2spirv.PAGE_TABLE = False
+            try:
+                return rdna2spirv.translate(src)
+            finally:
+                rdna2spirv.PAGE_TABLE = prev_pt
 
 
 def run(body, memory, nlanes=1):

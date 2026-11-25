@@ -722,7 +722,12 @@ def run_one(name, prog):
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", ResourceWarning)
-                spvasm = rdna2spirv.translate(path)
+                prev_pt = rdna2spirv.PAGE_TABLE
+                rdna2spirv.PAGE_TABLE = False
+                try:
+                    spvasm = rdna2spirv.translate(path)
+                finally:
+                    rdna2spirv.PAGE_TABLE = prev_pt
                 gc.collect()
         except rdna2spirv.Unsupported as e:
             return "skip", f"translator unsupported: {e}"

@@ -37,6 +37,19 @@ import rdna2spirv  # noqa: E402
 from shader_ir import parse_line  # noqa: E402
 import spirv_mini_interp as si  # noqa: E402
 
+_PREV_PAGE_TABLE = None
+
+
+def setUpModule():
+    global _PREV_PAGE_TABLE
+    _PREV_PAGE_TABLE = rdna2spirv.PAGE_TABLE
+    rdna2spirv.PAGE_TABLE = False
+
+
+def tearDownModule():
+    if _PREV_PAGE_TABLE is not None:
+        rdna2spirv.PAGE_TABLE = _PREV_PAGE_TABLE
+
 MASK32 = 0xFFFFFFFF
 MASK64 = 0xFFFFFFFFFFFFFFFF
 

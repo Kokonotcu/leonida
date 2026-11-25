@@ -221,7 +221,7 @@ def defines_a_test(source, require_test_case=False):
     though pytest would collect it.
     """
     tree = ast.parse(source)
-    bases, case_aliases = {}, set()
+    bases, class_methods, case_aliases = {}, {}, set()
     # Recognize bare aliases introduced by a direct import; this is not a general name resolver.
     for node in tree.body:
         if isinstance(node, ast.ClassDef):
@@ -229,6 +229,10 @@ def defines_a_test(source, require_test_case=False):
                 "TestCase" if isinstance(b, ast.Name) and b.id in case_aliases else ast.unparse(b).rsplit(".", 1)[-1]
                 for b in node.bases
             ]
+            class_methods[node.name] = any(
+                isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test")
+                for item in node.body
+            )
             case_aliases.discard(node.name)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for item in node.names:
@@ -246,25 +250,31 @@ def defines_a_test(source, require_test_case=False):
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             case_aliases.discard(node.name)
 
-    def is_test_case(name):
+    def ancestors(name):
         seen, stack = set(), [name]
         while stack:
-            for base in bases.get(stack.pop(), []):
-                if base in seen:
-                    continue
-                seen.add(base)
-                if base == "TestCase":
-                    return True
-                stack.append(base)
+            cur = stack.pop()
+            for base in bases.get(cur, []):
+                if base not in seen:
+                    seen.add(base)
+                    yield base
+                    stack.append(base)
+
+    def is_test_case(name):
+        return any(base == "TestCase" for base in ancestors(name))
+
+    def has_inherited_test(name):
+        for base in ancestors(name):
+            if class_methods.get(base):
+                return True
+            # a mixin imported from another module (tests/semantic/f16_unary_cases.py's UnaryF16) brings its tests
+            if base not in bases and base not in ("TestCase", "object"):
+                return True
         return False
 
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and is_test_case(node.name):
-            if any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test")
-                   for item in node.body):
-                return True
-            # a mixin imported from another module (tests/semantic/f16_unary_cases.py's UnaryF16) brings its tests
-            if any(b not in bases and b not in ("TestCase", "object") for b in bases[node.name]):
+            if class_methods[node.name] or has_inherited_test(node.name):
                 return True
         if not require_test_case and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
                 and node.name.startswith("test"):
@@ -388,6 +398,8 @@ class RepositoryRegistrationTest(unittest.TestCase):
             ("annotated assignment after class", import_alias + direct + "Parent: type = object\n", True),
             ("local shadow", import_alias + "class Parent: pass\n" + direct, False),
             ("reimported", import_alias + "from types import SimpleNamespace as Parent\n" + direct, False),
+            ("local mixin with test", import_alias + "class Mixin:\n    def test_one(self): pass\nclass Example(Mixin, Parent):\n    pass\n", True),
+            ("local empty mixin", import_alias + "class Mixin:\n    pass\nclass Example(Mixin, Parent):\n    pass\n", False),
         )
         for kind, source, expected in cases:
             with self.subTest(kind=kind):

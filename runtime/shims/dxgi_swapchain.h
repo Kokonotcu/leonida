@@ -300,6 +300,15 @@ public:
         std::uint32_t count = std::max(exposed_count_, caps.minImageCount);
         if (caps.maxImageCount > 0) count = std::min(count, caps.maxImageCount);
         VkSwapchainCreateInfoKHR ci = native_info_;
+        ci.pNext = nullptr;
+#ifdef LEONIDA_SWAPCHAIN_MAINTENANCE1
+        VkSwapchainPresentModesCreateInfoEXT switchable_info{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT};
+        if (switchable_count_ > 1) {
+            switchable_info.presentModeCount = switchable_count_;
+            switchable_info.pPresentModes = switchable_.data();
+            ci.pNext = &switchable_info;
+        }
+#endif
         ci.surface = surface_;
         ci.minImageCount = count;
         ci.imageExtent = ext;
@@ -696,6 +705,7 @@ private:
         VkSwapchainKHR next = VK_NULL_HANDLE;
         if (fn_.create_swapchain(device_, &ci, nullptr, &next) != VK_SUCCESS) return false;
         native_info_ = ci;  // what recreate_native() repeats, with a new extent and minImageCount
+        native_info_.pNext = nullptr;  // switchable_info is stack-local; recreate_native() rebuilds it
         native_info_.oldSwapchain = VK_NULL_HANDLE;
         if (swapchain_) fn_.destroy_swapchain(device_, swapchain_, nullptr);
         destroy_offscreen();

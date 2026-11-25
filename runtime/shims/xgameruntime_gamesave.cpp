@@ -253,11 +253,14 @@ struct BlobFile {
 std::vector<BlobFile> list_blobs(const fs::path& dir) {
     std::vector<BlobFile> out;
     std::error_code ec;
-    for (const auto& e : fs::directory_iterator(dir, ec)) {
-        if (!e.is_regular_file(ec)) continue;
+    for (auto it = fs::directory_iterator(dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        const auto& e = *it;
+        std::error_code entry_ec;
+        if (!e.is_regular_file(entry_ec)) continue;
         std::string name;
         if (!decode_name(narrow(e.path().filename().wstring()), name)) continue;
-        out.push_back({name, static_cast<uint64_t>(e.file_size(ec)), e.path()});
+        const uint64_t sz = e.file_size(entry_ec);
+        out.push_back({name, entry_ec ? 0 : sz, e.path()});
     }
     std::sort(out.begin(), out.end(), [](const BlobFile& a, const BlobFile& b) { return a.name < b.name; });
     return out;
@@ -306,8 +309,10 @@ ContainerRecord describe(const std::string& name, const fs::path& dir) {
 std::vector<ContainerRecord> list_containers(const fs::path& user_dir, std::string_view prefix) {
     std::vector<ContainerRecord> out;
     std::error_code ec;
-    for (const auto& e : fs::directory_iterator(user_dir, ec)) {
-        if (!e.is_directory(ec)) continue;
+    for (auto it = fs::directory_iterator(user_dir, ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+        const auto& e = *it;
+        std::error_code entry_ec;
+        if (!e.is_directory(entry_ec)) continue;
         std::string name;
         if (!decode_name(narrow(e.path().filename().wstring()), name)) continue;
         if (name.compare(0, prefix.size(), prefix) != 0) continue;

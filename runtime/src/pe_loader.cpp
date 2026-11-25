@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,11 @@
 #include "../shims/startup_trace.h"
 #include "base_reservation.h"
 #include "cpu_patch.h"
+
+extern "C" {
+extern unsigned long _tls_index;
+__declspec(thread) int _Init_thread_epoch;
+}
 
 namespace rt {
 
@@ -653,6 +659,7 @@ void install_host_tls() {
     void* saved = slots[g_host_tls.index];
     slots[g_host_tls.index] = block;
     TlsSetValue(g_host_tls.saved_slot, saved);
+    if (_tls_index == g_host_tls.index) _Init_thread_epoch = INT_MIN;
 }
 
 void uninstall_host_tls() {
@@ -1402,6 +1409,7 @@ void* Loader::load_runtime_module_w(const std::wstring& basename, uint32_t flags
         if (prefer_host_copy(narrow)) return nullptr;
 
     std::lock_guard lock(mutex_);
+    const RuntimeLoadScope dynamic(runtime_loads_);
     Module* existing = find_wide_module(basename);
     const std::filesystem::path candidate = game_dir_ / basename;
     std::error_code ec;
@@ -1830,6 +1838,7 @@ void Loader::initialize_tls(Module& m) {
             init_host_tls(host_index);
             install_host_tls();
             _tls_index = host_index;
+            _Init_thread_epoch = INT_MIN;
         }
         // The index lives in a writable section and protect_sections() has not run yet, so the write needs no
         // VirtualProtect dance.
@@ -1859,6 +1868,10 @@ void Loader::initialize_tls(Module& m) {
         install_thread_block(m);
     } catch (...) {
         ExclusiveTlsLock lock;
+        if (host_owns_slot_zero) {
+            _tls_index = 0;
+            uninstall_host_tls();
+        }
         m.tls_index = kNoTlsIndex;
         m.tls_slot = kNoTlsIndex;
         m.tls_generation = 0;
@@ -2046,7 +2059,8 @@ void* Loader::resolve(Module& m, const std::string& dll, const std::string& name
     }
     // Bundled game module (an Xbox build that ships beside the game)?
     auto bundled = game_dir_ / dll;
-    if (!prefer_host_copy(key) && std::filesystem::exists(bundled)) {
+    std::error_code bundled_ec;
+    if (!prefer_host_copy(key) && std::filesystem::is_regular_file(bundled, bundled_ec)) {
         Module& dep = load(bundled);
         if (auto it = dep.exports.find(sym); it != dep.exports.end()) {
             m.imports.push_back({dll, sym, Binding::Module});

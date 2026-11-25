@@ -588,7 +588,7 @@ MODE_EXTRACT = re.compile(r"OpBitFieldUExtract %uint %t\d+ %c1c %c2\b")     # wo
 class OobSelect(unittest.TestCase):
     def translate(self, lines):
         return support.translate_lines("cs_oob_select_t", ["v_cmpx_eq_u32_e32 0, v0", *lines, "s_endpgm"],
-                                       fssm=tv.CS_BOUNDS_FSSM)
+                                       fssm=tv.CS_BOUNDS_FSSM, page_table=False)
 
     def run_spv(self, spv, preload=True):
         memory = tv.ReadLog({BASE + k: tv._pattern_word(k) for k in range(-4, 0x80)} if preload else {})

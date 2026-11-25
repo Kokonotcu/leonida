@@ -233,7 +233,7 @@ class BvhStage(unittest.TestCase):
         self.assertEqual(self.run_step(), [])
         self.assertFalse(os.path.exists(index))
         self.assertFalse(os.path.exists(settings))
-        self.assertEqual(self.logs, [f"shaders: no {make_game.BVH_DLL} in the game folder, so no BVH builder "
+        self.assertEqual(self.logs, [f"shaders: no {make_game.BVH_DLL} in the game folder, so none of its embedded "
                                      "programs to translate"])
         self.assertEqual(self.run_step(), [])                      # and again, with nothing left to remove
         self.write_dll()

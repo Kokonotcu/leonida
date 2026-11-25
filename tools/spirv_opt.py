@@ -91,12 +91,12 @@ _PURE_GLSL_EXT = frozenset((
 
 def _parse_line(line: str):
     """Return (res_id_or_None, opname, args_list) for one SPIR-V assembly line, or None if blank/comment."""
-    if '"' not in line:
-        semi = line.find(";")
-        toks = (line[:semi] if semi >= 0 else line).split()
-    else:
-        # Lines with quotes only appear in module header (OpExtension, OpEntryPoint, OpName, OpString).
+    semi = line.find(";")
+    quote = line.find('"')
+    if quote >= 0 and (semi < 0 or quote < semi):
+        # Quoted string literals only appear in module headers (OpExtension, OpEntryPoint, OpName, OpString).
         return None
+    toks = (line[:semi] if semi >= 0 else line).split()
     if not toks:
         return None
     if len(toks) >= 3 and toks[1] == "=":
@@ -520,6 +520,22 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
 
         # 2. Build CFG + dominator tree and run dominator-tree preorder optimization pass.
         blocks, _succs, all_preds, rpo, idom, dom_children = _build_cfg_and_dom(insts)
+        rpo_num = {blk: pos for pos, blk in enumerate(rpo)}
+        block_writes: list[tuple[set[tuple], set[str]]] = []
+        for b_insts in blocks:
+            ws: set[tuple] = set()
+            dr: set[str] = set()
+            for inst_i in b_insts:
+                _r, op, args, _ = insts[inst_i]
+                if op == "OpStore" and len(args) >= 2:
+                    root = ptr_root.get(args[0])
+                    if root in trackable:
+                        sl = ptr_slot.get(args[0])
+                        if sl is not None:
+                            ws.add(sl)
+                        else:
+                            dr.add(root)
+            block_writes.append((ws, dr))
         def_block: dict[str, int] = {}
         for blk_i, b_insts in enumerate(blocks):
             for inst_i in b_insts:
@@ -892,6 +908,29 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                     for ch in reversed(dom_children[b]):
                         if all_preds[ch] == {b}:
                             dfs.append(("enter", ch, dict(sv), dict(nz)))
+                        elif all(p in rpo_num and rpo_num[p] < rpo_num[ch] for p in all_preds[ch]):
+                            between: set[int] = set()
+                            work = [p for p in all_preds[ch] if p != b]
+                            while work:
+                                u = work.pop()
+                                if u != b and u not in between:
+                                    between.add(u)
+                                    work.extend(all_preds[u])
+                            killed_slots: set[tuple] = set()
+                            killed_roots: set[str] = set()
+                            for u in between:
+                                ws, dr = block_writes[u]
+                                killed_slots.update(ws)
+                                killed_roots.update(dr)
+                            merged_sv = {
+                                k: v for k, v in sv.items()
+                                if k[0] not in trackable or (k not in killed_slots and k[0] not in killed_roots)
+                            }
+                            merged_nz = {
+                                r: z for r, z in nz.items()
+                                if r not in killed_roots and all(s[0] != r for s in killed_slots)
+                            }
+                            dfs.append(("enter", ch, merged_sv, merged_nz))
                         else:
                             dfs.append(("enter", ch, dict(readonly_slot_val), dict(readonly_null_zero)))
                 else:
@@ -1154,10 +1193,16 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
         if all_deleted:
             stripped = raw.lstrip()
             op_tok = stripped.split(None, 1)[0] if stripped else ""
-            if op_tok in ("OpDecorate", "OpName", "OpDecorateId", "OpDecorateString",
-                          "OpDecorateStringGOOGLE"):
+            if op_tok in ("OpDecorate", "OpName", "OpDecorateString", "OpDecorateStringGOOGLE"):
                 toks = stripped.split(None, 2)
                 if len(toks) >= 2 and toks[1] in all_deleted:
+                    i += 1
+                    continue
+            elif op_tok == "OpDecorateId":
+                semi = stripped.find(";")
+                code = stripped[:semi] if semi >= 0 else stripped
+                toks = code.split()
+                if len(toks) >= 2 and (toks[1] in all_deleted or any(t in all_deleted for t in toks[3:] if t.startswith("%"))):
                     i += 1
                     continue
             elif op_tok == "OpGroupDecorate":
