@@ -667,12 +667,23 @@ public:
                 for (UINT32 i = 0; i < grp.NumBarriers; ++i) {
                     const auto& b = grp.pTextureBarriers[i];
                     const auto& r = b.Subresources;
-                    check(list_.barrier(leonida::TextureBarrier{
+                    const bool ok = list_.barrier(leonida::TextureBarrier{
                         u(b.SyncBefore), u(b.SyncAfter), u(b.AccessBefore), u(b.AccessAfter), u(b.LayoutBefore),
                         u(b.LayoutAfter), resource_id(b.pResource),
                         {r.IndexOrFirstMipLevel, r.NumMipLevels, r.FirstArraySlice, r.NumArraySlices, r.FirstPlane,
                          r.NumPlanes},
-                        u(b.Flags)}));
+                        u(b.Flags)});
+                    if (!ok) {  // which rule refused it (every UI list of the loading screen has two)
+                        static std::atomic<int> told{0};
+                        if (told.fetch_add(1, std::memory_order_relaxed) < 6)
+                            std::fprintf(stderr, "[rt] d3d12: texture barrier refused: resource %p sync %#x->%#x access "
+                                                 "%#x->%#x layout %u->%u mips %u+%u layers %u+%u planes %u+%u flags %#x\n",
+                                         static_cast<void*>(b.pResource), u(b.SyncBefore), u(b.SyncAfter),
+                                         u(b.AccessBefore), u(b.AccessAfter), u(b.LayoutBefore), u(b.LayoutAfter),
+                                         r.IndexOrFirstMipLevel, r.NumMipLevels, r.FirstArraySlice, r.NumArraySlices,
+                                         r.FirstPlane, r.NumPlanes, u(b.Flags));
+                    }
+                    check(ok);
                 }
                 break;
             default:
