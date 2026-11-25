@@ -25,6 +25,8 @@ template<class Derived, class Stubs, class... Interfaces>
 class Object : public Stubs {
 public:
     ULONG STDMETHODCALLTYPE AddRef() override { return ++refs_; }
+    // The current reference count, for diagnostics (a snapshot; 0 while the object is being destroyed).
+    ULONG reference_count() const { return refs_.load(); }
     // Adds a reference unless the count already reached zero (the object is being destroyed). For a caller that found
     // the object through a registry it does not own a reference to; the registry entry must still be locked then.
     bool try_add_ref() {

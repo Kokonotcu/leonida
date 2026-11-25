@@ -908,9 +908,22 @@ private:
             *got_device_local = allocation.memoryTypeIndex != 0xffffffffu &&
                                 (memory_.memoryTypes[allocation.memoryTypeIndex].propertyFlags &
                                  VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
-        bool ready = allocation.memoryTypeIndex != 0xffffffffu &&
-                     vk_.vkAllocateMemory(device_, &allocation, nullptr, &made.memory) == VK_SUCCESS &&
-                     vk_.vkBindBufferMemory(device_, made.buffer, made.memory, 0) == VK_SUCCESS;
+        bool allocated = allocation.memoryTypeIndex != 0xffffffffu &&
+                         vk_.vkAllocateMemory(device_, &allocation, nullptr, &made.memory) == VK_SUCCESS;
+        if (!allocated && device_local) {
+            // VRAM refused (a full device while a story load streams): the table in host-visible memory still works,
+            // only slower to read; without it the flush failed and every submission after it was dropped.
+            allocation.memoryTypeIndex = memory_type(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                                                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            allocated = allocation.memoryTypeIndex != 0xffffffffu &&
+                        vk_.vkAllocateMemory(device_, &allocation, nullptr, &made.memory) == VK_SUCCESS;
+            if (got_device_local) *got_device_local = false;
+            static bool told = false;
+            if (!std::exchange(told, true))
+                std::fprintf(stderr, "[rt] bindless: a %zu-byte table buffer did not fit in VRAM; host memory %s\n",
+                             bytes, allocated ? "took it" : "refused it too");
+        }
+        bool ready = allocated && vk_.vkBindBufferMemory(device_, made.buffer, made.memory, 0) == VK_SUCCESS;
         if (ready && !device_local)
             ready = vk_.vkMapMemory(device_, made.memory, 0, VK_WHOLE_SIZE, 0, &made.mapped) == VK_SUCCESS;
         if (!ready) {
@@ -963,6 +976,10 @@ private:
             bool device_local = false;
             if (!create(larger.table, bytes, true, &device_local) || !create(larger.staging, bytes, false)) {
                 destroy(larger);
+                static bool told = false;
+                if (!std::exchange(told, true))
+                    std::fprintf(stderr, "[rt] bindless: a new table generation failed: its %zu-byte buffers could not "
+                                         "be made\n", bytes);
                 return false;
             }
             // A spare set (a retired generation whose submissions are done) takes only what changed since it was
@@ -975,6 +992,11 @@ private:
                 spares_.pop_back();
             } else if (!make_set(pool, set)) {
                 destroy(larger);
+                static bool told = false;
+                if (!std::exchange(told, true))
+                    std::fprintf(stderr, "[rt] bindless: a new table generation failed: no descriptor pool and set "
+                                         "(%zu retired generations, %zu made)\n",
+                                 retired_.size(), static_cast<std::size_t>(generations_made_));
                 return false;
             }
             table_device_local_ = device_local;

@@ -240,7 +240,27 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     // Plane 1 is composed over plane 0 only when flagged an overlay (hypothesis). Otherwise it is not shown, as before: in
     // the public HDR sample it is the GameDVR copy of the frame, and blending a plane we cannot tell apart from it risks
     // drawing the frame twice with an alpha that was never meant to be blended.
-    const bool overlay = plane_count == 2 && (planes[1].Flags & xbox_plane_flag_overlay) != 0;
+    // LEONIDA_PLANE1_OVERLAY=1 composes plane 1 over plane 0 whatever its flags: the retail title as an Xbox Series S
+    // presents two 1920x1080 planes (its 3D frame and, by all appearances, its UI) and plane 0 alone stayed black.
+    static const bool force_overlay = [] {
+        const char* v = std::getenv("LEONIDA_PLANE1_OVERLAY");
+        return v && v[0] == '1';
+    }();
+    const bool overlay =
+        plane_count == 2 && (force_overlay || (planes[1].Flags & xbox_plane_flag_overlay) != 0);
+    if (plane_count == 2) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true, std::memory_order_relaxed)) {
+            const D3D12_RESOURCE_DESC d0 = planes[0].ppResources[0]->GetDesc();
+            const D3D12_RESOURCE_DESC d1 = planes[1].ppResources[0]->GetDesc();
+            std::fprintf(stderr, "[rt] present: plane 0 %llux%u format %u colour space %d flags 0x%x; plane 1 %llux%u "
+                                 "format %u colour space %d flags 0x%x filter %d placement %s\n",
+                         static_cast<unsigned long long>(d0.Width), d0.Height, unsigned(d0.Format),
+                         planes[0].ColorSpace, planes[0].Flags, static_cast<unsigned long long>(d1.Width), d1.Height,
+                         unsigned(d1.Format), planes[1].ColorSpace, planes[1].Flags, planes[1].ScaleFilter,
+                         planes[1].pDestPlacementBase ? "yes" : "no");
+        }
+    }
     // Review I13: an HDR10 plane 0 on an output that cannot show HDR10, with plane 1 an SDR plane of the same frame (no
     // overlay flag: the title's own SDR copy, the GameDVR plane): plane 1 is shown as it is, the title's SDR look, and
     // through the plain blit, instead of tone mapping plane 0 with a curve of ours in the compose pass.

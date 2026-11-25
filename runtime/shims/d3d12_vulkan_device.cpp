@@ -87,6 +87,10 @@
 #include <cwchar>
 #include <vector>
 
+// Set while a guarded read of the title's pages runs (guarded_probe_hash and friends): main.cpp's crash logger skips
+// those expected access violations.
+thread_local int leonida_quiet_av = 0;
+
 namespace rt::d3d12 {
 namespace {
 
@@ -758,6 +762,12 @@ std::filesystem::path shader_directory_from_file(const std::filesystem::path& co
 }
 
 // What a device's children need from it, kept apart from the COM class so children can hold a plain pointer.
+// Memory accounting for the stats line allocate_resource prints every 64th new block: resources alive, the bytes of
+// dedicated allocations made (never subtracted: freeing goes through the deletion queue), live title textures.
+std::atomic<long long> g_live_resources{0};
+std::atomic<unsigned long long> g_dedicated_bytes{0}, g_new_blocks{0};
+std::size_t live_title_texture_stats(unsigned long long& bytes);  // under title_texture_mutex
+
 struct DeviceState {
     VulkanDeviceInfo info;
     std::vector<std::uint32_t> families;
@@ -2526,8 +2536,44 @@ struct DeviceState {
         return VK_NULL_HANDLE;
     }
 
-    // One vkAllocateMemory of `type`; `next` chains a VkMemoryDedicatedAllocateInfo.
+    // The driver's budget and this process's use of `heap` (VK_EXT_memory_budget); false when it does not answer.
+    bool heap_budget(std::uint32_t heap, VkDeviceSize& usage, VkDeviceSize& budget) const {
+        static const auto properties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+            info.get_instance_proc ? info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties2")
+                                   : nullptr);
+        if (!properties2 || !info.physical || heap >= VK_MAX_MEMORY_HEAPS) return false;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT b{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b};
+        properties2(info.physical, &props);
+        if (!b.heapBudget[heap]) return false;
+        usage = b.heapUsage[heap];
+        budget = b.heapBudget[heap];
+        return true;
+    }
+
+    // One vkAllocateMemory of `type`; `next` chains a VkMemoryDedicatedAllocateInfo. A device-local allocation that
+    // would take the heap past the driver's budget is refused here, so the caller moves on to the next memory type:
+    // NVIDIA grants VRAM far past the budget (10.4 GB used of 7.2 in a story load), and Windows then pages the
+    // allocations in and out at every submission, until the GPU queue stalls and the title's watchdog ends the run.
+    // LEONIDA_VRAM_OVERCOMMIT=1 allows it again.
     VkDeviceMemory allocate_type(std::uint32_t type, VkDeviceSize size, bool device_address, const void* next) const {
+        static const bool overcommit = [] {
+            const char* v = std::getenv("LEONIDA_VRAM_OVERCOMMIT");
+            return v && v[0] == '1';
+        }();
+        if (!overcommit && (memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            VkDeviceSize usage = 0, budget = 0;
+            constexpr VkDeviceSize headroom = VkDeviceSize(192) << 20;  // the driver's own allocations, swapchain
+            if (heap_budget(memory.memoryTypes[type].heapIndex, usage, budget) && usage + size + headroom > budget) {
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 4)
+                    std::fprintf(stderr, "[rt] d3d12: VRAM budget: %llu MiB more for type %u would pass it (%llu of "
+                                         "%llu MiB used); the next memory type takes it\n",
+                                 (unsigned long long)(size >> 20), type, (unsigned long long)(usage >> 20),
+                                 (unsigned long long)(budget >> 20));
+                return VK_NULL_HANDLE;
+            }
+        }
         VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, next};
         flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
         VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -2625,18 +2671,27 @@ struct DeviceState {
                 if (!out.memory) continue;
                 map_own(out);
                 if (!out.memory) return out;
+                g_dedicated_bytes += requirements.size;
             } else {
                 const leonida::SuballocPool pool{type, image != VK_NULL_HANDLE, device_address,
                                                  map && (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)};
                 leonida::Suballocator::Allocation range;
                 if (!suballocator.allocate(pool, requirements.size, requirements.alignment, range)) {
                     // A new block, halved while the driver refuses it and half still holds the resource.
+                    const long long now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                 std::chrono::steady_clock::now().time_since_epoch()).count();
+                    if (now_ms < type_refused_until_ms[type].load(std::memory_order_relaxed)) continue;
                     VkDeviceSize block = suballocator.next_block_size(pool, sizes, requirements.size);
                     VkDeviceMemory memory_block = VK_NULL_HANDLE;
                     while (!(memory_block = allocate_type(type, block, device_address, nullptr)) &&
                            block / 2 >= requirements.size && block / 2 >= leonida::kSuballocMiB)
                         block /= 2;
-                    if (!memory_block) continue;
+                    if (!memory_block) {
+                        // Out of this type: the next 2 s of new blocks go to the next type in the order at once.
+                        if (memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                            type_refused_until_ms[type].store(now_ms + 2000, std::memory_order_relaxed);
+                        continue;
+                    }
                     void* base = nullptr;
                     if (pool.mapped &&
                         vk.vkMapMemory(info.device, memory_block, 0, VK_WHOLE_SIZE, 0, &base) != VK_SUCCESS) {
@@ -2644,7 +2699,9 @@ struct DeviceState {
                         return out;
                     }
                     range = suballocator.add_block(pool, memory_handle(memory_block), base, block, requirements.size);
+                    ++g_new_blocks;
                 }
+                maybe_print_memory_stats(type, requirements.size);
                 auto* node = new MemoryNode;
                 node->release = [](leonida::DeferredRelease* self) {
                     auto* own = static_cast<MemoryNode*>(self);
@@ -2663,6 +2720,42 @@ struct DeviceState {
         }
         return out;
     }
+
+    // Where image and buffer memory sits: per memory type with blocks, live resources and title textures.
+    void print_memory_stats(std::uint32_t new_type, VkDeviceSize new_block) {
+        char text[768];
+        int n = std::snprintf(text, sizeof(text), "[rt] d3d12: memory: %llu blocks made; a %llu KiB range in type %u;",
+                              (unsigned long long)g_new_blocks.load(), (unsigned long long)(new_block >> 10), new_type);
+        for (std::uint32_t t = 0; t < memory.memoryTypeCount && n > 0 && n < int(sizeof(text)) - 96; ++t) {
+            const auto s = suballocator.stats(t);
+            if (!s.blocks) continue;
+            n += std::snprintf(text + n, sizeof(text) - n, " type %u: %zu blocks %llu MiB (%llu used, %zu ranges);", t,
+                               s.blocks, (unsigned long long)(s.block_bytes >> 20),
+                               (unsigned long long)(s.used_bytes >> 20), s.allocations);
+        }
+        // The driver's own count of this process's use per heap (VK_EXT_memory_budget), when it answers.
+        for (std::uint32_t h = 0; h < memory.memoryHeapCount && n > 0 && n < int(sizeof(text)) - 64; ++h) {
+            VkDeviceSize usage = 0, budget = 0;
+            if (heap_budget(h, usage, budget))
+                n += std::snprintf(text + n, sizeof(text) - n, " heap %u use %llu of %llu MiB;", h,
+                                   (unsigned long long)(usage >> 20), (unsigned long long)(budget >> 20));
+        }
+        unsigned long long title_bytes = 0;
+        const std::size_t titles = live_title_texture_stats(title_bytes);
+        std::fprintf(stderr, "%s dedicated made %llu MiB; resources alive %lld; title textures %zu (%llu MiB)\n", text,
+                     g_dedicated_bytes.load() >> 20, g_live_resources.load(), titles, title_bytes >> 20);
+    }
+    std::atomic<long long> memory_stats_next_ms{0};
+    void maybe_print_memory_stats(std::uint32_t type, VkDeviceSize bytes) {
+        const long long now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch()).count();
+        long long due = memory_stats_next_ms.load(std::memory_order_relaxed);
+        if (now < due || !memory_stats_next_ms.compare_exchange_strong(due, now + 5000)) return;
+        print_memory_stats(type, bytes);
+    }
+    // A memory type whose new block the driver refused (out of VRAM): later new blocks skip it for a while instead of
+    // asking again, each ask a chain of halved vkAllocateMemory calls of up to 10 ms (9400 of them in a story load).
+    mutable std::atomic<long long> type_refused_until_ms[VK_MAX_MEMORY_TYPES]{};
 
     // Gives a resource's memory back once the GPU is done with it: after the submissions so far (the deletion
     // queue, where its image or buffer goes too), or at once when `now` (nothing submitted can still use it).
@@ -3156,6 +3249,8 @@ struct TitleTexture {
     std::chrono::steady_clock::time_point readable_until{};  // the next VirtualQuery of its pages, at the earliest
     bool readable = false;                                    // what the last VirtualQuery found
     std::uint64_t readable_generation = 0;                    // xmem's map generation then
+    std::uint64_t serial = 0;                                 // registration order
+    std::uint32_t width = 0, height = 0, format = 0, mips = 0, flags = 0;
 };
 
 // A cheap change detector for a texture's title bytes: 64 bytes of every 4 KiB page. Bink writes every video frame
@@ -3167,21 +3262,29 @@ std::uint64_t title_hash(const std::uint8_t* p, std::size_t bytes);
 
 // The hashes over the title's pages, which the title may unmap on another thread between the readability check and the
 // read (streaming): false instead of a crash (probe_hash faulted in a retail run). No C++ objects here: __try.
+// ::leonida_quiet_av is set around each guarded read: the crash logger (main.cpp) then leaves the expected access
+// violation to the __except without dumping registers and a stack for it (dozens per story load).
 bool guarded_probe_hash(const std::uint8_t* p, std::size_t bytes, std::uint64_t& out) {
     __try {
+        ::leonida_quiet_av = 1;
         out = probe_hash(p, bytes);
+        ::leonida_quiet_av = 0;
         return true;
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
                                                                  : EXCEPTION_CONTINUE_SEARCH) {
+        ::leonida_quiet_av = 0;
         return false;
     }
 }
 bool guarded_title_hash(const std::uint8_t* p, std::size_t bytes, std::uint64_t& out) {
     __try {
+        ::leonida_quiet_av = 1;
         out = title_hash(p, bytes);
+        ::leonida_quiet_av = 0;
         return true;
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
                                                                  : EXCEPTION_CONTINUE_SEARCH) {
+        ::leonida_quiet_av = 0;
         return false;
     }
 }
@@ -3280,15 +3383,20 @@ public:
 
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
              D3D12_HEAP_FLAGS heap_flags)
-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {}
+        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags) {
+        ++g_live_resources;
+    }
 
     // A placed resource lives inside a heap's arena range: the heap owns the range, so only the console VA is kept
     // here and nothing goes back to the arena when this object dies.
     Resource(DeviceState& device, const D3D12_RESOURCE_DESC& desc, const D3D12_HEAP_PROPERTIES& heap,
              D3D12_HEAP_FLAGS heap_flags, VkDeviceSize placed_va)
-        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {}
+        : device_(device), desc_(desc), heap_(heap), heap_flags_(heap_flags), placed_(true), va_(placed_va) {
+        ++g_live_resources;
+    }
 
     ~Resource() override {
+        --g_live_resources;
         unregister_title_texture(this);
         if (map_shadow_) VirtualFree(map_shadow_, 0, MEM_RELEASE);  // after the sync can no longer read it
         if (accel_) {
@@ -4425,6 +4533,13 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
                          unsigned(desc.DepthOrArraySize), unsigned(desc.MipLevels), int(desc.Format));
     }
     t->watch = !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+    t->width = static_cast<std::uint32_t>(desc.Width);
+    t->height = desc.Height;
+    t->format = static_cast<std::uint32_t>(desc.Format);
+    t->mips = desc.MipLevels;
+    t->flags = static_cast<std::uint32_t>(desc.Flags);
+    static std::atomic<std::uint64_t> serial{0};
+    t->serial = ++serial;
     rt::xg::g_write_listener.store(&title_texture_written, std::memory_order_release);
     std::lock_guard lock(title_texture_mutex());
     report_title_overlap(t->title, t->bytes, desc, "texture");
@@ -4432,6 +4547,51 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
     title_textures().push_back(std::move(t));
     g_title_texture_count.store(title_textures().size(), std::memory_order_release);
     return true;
+}
+
+std::size_t live_title_texture_stats(unsigned long long& bytes) {
+    // try_lock: the title-texture sync allocates staging memory with this mutex held (a lock here deadlocked it).
+    bytes = 0;
+    std::unique_lock lock(title_texture_mutex(), std::try_to_lock);
+    if (!lock.owns_lock()) return 0;
+    // Textures with the same start: a title that frees texture memory and places a new texture there without the
+    // old resource going away leaves both alive (memory that only grows). The pairs say which it is: same
+    // description (a second resource for one texture), another (reuse), and the old one's reference count.
+    std::vector<const TitleTexture*> sorted;
+    sorted.reserve(title_textures().size());
+    for (const auto& t : title_textures()) {
+        bytes += t->bytes;
+        sorted.push_back(t.get());
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const TitleTexture* a, const TitleTexture* b) {
+        return a->title != b->title ? a->title < b->title : a->serial < b->serial;
+    });
+    std::size_t same_start = 0, same_desc = 0;
+    int samples = 0;
+    static int samples_told = 0;
+    for (std::size_t i = 1; i < sorted.size(); ++i) {
+        const TitleTexture* old = sorted[i - 1];
+        const TitleTexture* now = sorted[i];
+        if (old->title != now->title) continue;
+        ++same_start;
+        const bool same = old->width == now->width && old->height == now->height && old->format == now->format &&
+                          old->mips == now->mips;
+        same_desc += same;
+        if (samples < 3 && samples_told < 24) {
+            ++samples;
+            ++samples_told;
+            const ULONG refs = old->resource->reference_count() + 1;  // printed as refs - 1
+            std::fprintf(stderr,
+                         "[rt] d3d12: same title start %p: #%llu %ux%u f%u m%u fl%#x (refs %lu) then #%llu %ux%u f%u m%u "
+                         "fl%#x\n",
+                         static_cast<const void*>(old->title), (unsigned long long)old->serial, old->width, old->height,
+                         old->format, old->mips, old->flags, refs - 1, (unsigned long long)now->serial, now->width,
+                         now->height, now->format, now->mips, now->flags);
+        }
+    }
+    std::fprintf(stderr, "[rt] d3d12: title textures with the same start as an older one: %zu of %zu (%zu same "
+                         "description)\n", same_start, sorted.size(), same_desc);
+    return title_textures().size();
 }
 
 // Every page of [p, p + bytes) committed and readable: the title's range may still be reserved (xmem commits pages as
@@ -6110,10 +6270,11 @@ public:
         }
         static const bool log_psos = std::getenv("LEONIDA_LOG_PSOS") != nullptr;
         std::string names;
-        if (log_psos) {
+        if (log_psos || dred_requested()) {
             for (const Stage& stage : stages)
                 if (stage.entry) names += std::string(" ") + stage.name + "=" + stage.entry->name;
-            graphics_.debug_name = names;
+            if (log_psos) graphics_.debug_name = names;
+            if (dred_requested()) leonida::note_breadcrumb_pso_name(id(), names);
         }
         device_.context->add_graphics_pipeline(id(), graphics_);
         if (log_psos) {
@@ -6162,6 +6323,7 @@ public:
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
         if (stub_pipelines_enabled()) {
             pipeline_.pending = true;
+            pipeline_.stub = true;
             device_.context->add_pipeline(id(), pipeline_);
             registered_ = true;
             return S_OK;
@@ -6202,11 +6364,32 @@ public:
                 // A PSO that never gets a pipeline: registered pending, so its dispatches are skipped, and the title
                 // keeps an object rather than a failure it would read through (retail boot 5 died on such a null).
                 pipeline_.pending = true;
+                pipeline_.stub = true;
                 device_.context->add_pipeline(id(), pipeline_);
                 registered_ = true;
                 return S_OK;
             }
             return E_INVALIDARG;
+        }
+        // LEONIDA_SKIP_PSO=<part>[,<part>...]: a compute shader whose entry name contains a part is a stub (its
+        // dispatches are left out), for a shader whose translation hangs the GPU (the retail title's
+        // CS_DefragHeap_ComputeRelocations, library/lib_cs_03141, loops without end on NVIDIA in the first loading
+        // screen).
+        if (const char* skip = std::getenv("LEONIDA_SKIP_PSO"); skip && *skip) {
+            const std::string all = skip;
+            const std::string& source = entry->name;
+            for (std::size_t at = 0; at <= all.size();) {
+                const std::size_t comma = std::min(all.find(',', at), all.size());
+                const std::string part = all.substr(at, comma - at);
+                at = comma + 1;
+                if (part.empty() || source.find(part) == std::string::npos) continue;
+                std::fprintf(stderr, "[rt] d3d12: %s left out (LEONIDA_SKIP_PSO %s)\n", source.c_str(), part.c_str());
+                pipeline_.pending = true;
+                pipeline_.stub = true;
+                device_.context->add_pipeline(id(), pipeline_);
+                registered_ = true;
+                return S_OK;
+            }
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
         // shader declares bindings has it in its layout and has it bound at every dispatch.
@@ -6223,6 +6406,7 @@ public:
             return E_NOTIMPL;
         }
         if (entry->binding_count) register_literal_samplers(device_, *entry);
+        if (dred_requested()) leonida::note_breadcrumb_pso_name(id(), "cs=" + entry->name);
         // SHADER-309: a module over the device's maxComputeSharedMemorySize is invalid usage that spirv-val accepts
         // and RADV dies on (#1721); some drivers report 32768. Refuse it here instead of creating the pipeline.
         if (entry->lds_bytes) {
@@ -11943,8 +12127,13 @@ HRESULT create_stub_pipeline_state(ID3D12Device* device, REFIID riid, void** out
 bool guarded_copy_from_title(Resource* resource, const std::uint8_t* title, const rt::xg::ResourceLayout& layout,
                              const leonida::xg_console::Layout* console) {
     __try {
-        return console ? resource->copy_from_console(title, *console) : resource->copy_from_title(title, layout);
+        ::leonida_quiet_av = 1;
+        const bool copied =
+            console ? resource->copy_from_console(title, *console) : resource->copy_from_title(title, layout);
+        ::leonida_quiet_av = 0;
+        return copied;
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
+        ::leonida_quiet_av = 0;
         return false;
     }
 }
@@ -13108,6 +13297,31 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
             *v13.next() = &min_lod;
         }
     }
+    // VK_EXT_pageable_device_local_memory (with VK_EXT_memory_priority, which it needs): the game's textures alone
+    // outgrow an 8 GB card in a story load (40,000 resources), and without it NVIDIA kept every allocation resident
+    // in VRAM, memory types in the system heap too, so Windows paged them at each submission until the queue stalled
+    // past the title's 30 s watchdog. Pageable memory lets the driver page out what is not used. LEONIDA_PAGEABLE=0
+    // leaves it off. VK_EXT_memory_budget makes the budget queries of allocate_type defined.
+    const auto has_extension = [&](const char* name) {
+        return std::any_of(extensions.begin(), extensions.end(),
+                           [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });
+    };
+    VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT pageable{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT};
+    bool use_pageable = false;
+    if (environment_text(L"LEONIDA_PAGEABLE") != L"0" &&
+        has_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME) &&
+        has_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &pageable};
+        vkGetPhysicalDeviceFeatures2(info.physical, &query);
+        use_pageable = pageable.pageableDeviceLocalMemory == VK_TRUE;
+        if (use_pageable) {
+            pageable.pNext = *v13.next();
+            *v13.next() = &pageable;
+        }
+        std::fprintf(stderr, "[rt] d3d12: pageable device-local memory %s\n", use_pageable ? "on" : "not offered");
+    }
+    const bool use_memory_budget = has_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     const char* divisor_extension = nullptr;
     for (const char* name :
          {VK_KHR_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME}) {
@@ -13379,6 +13593,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.depth_range_unrestricted) device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     if (info.conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    if (use_pageable) {
+        device_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+        device_extensions.push_back(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+    }
+    if (use_memory_budget) device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     if (info.vertex_attribute_divisor) device_extensions.push_back(divisor_extension);
     if (info.conditional_rendering) device_extensions.push_back(conditional_extension);
     if (info.host_image_copy) device_extensions.push_back(host_image_copy_name);

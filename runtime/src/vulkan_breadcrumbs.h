@@ -201,6 +201,26 @@ inline std::string breadcrumb_utf8(const std::wstring& name) {
     return out;
 }
 
+// The shader names of pipeline state objects, by the opaque id commands carry (the PSO object), filled by the device
+// while breadcrumbs are on: a list stuck on the GPU then names the shader of the operation it stopped in.
+inline std::mutex& breadcrumb_pso_names_mutex() {
+    static std::mutex m;
+    return m;
+}
+inline std::unordered_map<std::uintptr_t, std::string>& breadcrumb_pso_names() {
+    static std::unordered_map<std::uintptr_t, std::string> names;
+    return names;
+}
+inline void note_breadcrumb_pso_name(std::uintptr_t id, std::string name) {
+    std::lock_guard lock(breadcrumb_pso_names_mutex());
+    breadcrumb_pso_names()[id] = std::move(name);
+}
+inline std::string breadcrumb_pso_name(std::uintptr_t id) {
+    std::lock_guard lock(breadcrumb_pso_names_mutex());
+    const auto it = breadcrumb_pso_names().find(id);
+    return it == breadcrumb_pso_names().end() ? std::string() : it->second;
+}
+
 struct BreadcrumbFunctions {
     PFN_vkCreateBuffer create_buffer = nullptr;
     PFN_vkDestroyBuffer destroy_buffer = nullptr;
@@ -227,6 +247,7 @@ public:
         std::uint32_t first_op = 0;           // the op number of ops[0] (breadcrumb_ops_completed)
         bool progress_safe = true;            // level 2: its slot's earlier owners can write nothing more into it
         std::vector<std::uint32_t> positions;  // the command index of each op, for the per-op markers
+        std::vector<std::uintptr_t> pipelines;  // the PSO id of each draw or dispatch op (0 for the others)
     };
     // A submitted list as the breadcrumbs see it now.
     struct Entry {
@@ -236,6 +257,7 @@ public:
         BreadcrumbState state = BreadcrumbState::submitted;
         std::uint64_t queue_id = 0;
         std::wstring list_name, queue_name;
+        std::vector<std::uintptr_t> pipelines;  // as Mark::pipelines
         bool progress_known = false;      // GPU breadcrumbs: completed_ops is what the progress word says
         bool no_slot = false;             // level 2 with every slot busy: no GPU marker, progress unknown
         std::uint32_t completed_ops = 0;  // operations finished, in order (D3D12's *pLastBreadcrumbValue)
@@ -330,6 +352,12 @@ public:
             if (breadcrumb_op_of(commands[i], op)) {
                 m.ops.push_back(op);
                 m.positions.push_back(static_cast<std::uint32_t>(i));
+                std::uintptr_t pso = 0;
+                if (const auto* d = std::get_if<Dispatch>(&commands[i])) pso = d->pipeline;
+                else if (const auto* g = std::get_if<Draw>(&commands[i])) pso = g->pipeline;
+                else if (const auto* x = std::get_if<ExecuteIndirect>(&commands[i]))
+                    pso = x->pipeline ? x->pipeline : (x->state ? x->state->pipeline : 0);
+                m.pipelines.push_back(pso);
             }
         {
             std::lock_guard lock(mutex_);
@@ -452,7 +480,7 @@ public:
             const bool words = gpu_ && m->slot != kNoSlot;
             const BreadcrumbState state =
                 words ? breadcrumb_state(read(m->slot, 0), read(m->slot, 1), m->tag) : BreadcrumbState::unknown;
-            Entry e{m->tag, m->list_id, m->ops, state, m->queue_id, m->list_name, m->queue_name};
+            Entry e{m->tag, m->list_id, m->ops, state, m->queue_id, m->list_name, m->queue_name, m->pipelines};
             e.no_slot = gpu_ && m->slot == kNoSlot;
             if (state == BreadcrumbState::completed) {
                 e.progress_known = true;  // the end word: every operation finished
@@ -539,6 +567,19 @@ private:
             std::fprintf(out, "%s%s", k ? ", " : ": ", breadcrumb_op_name(e.ops[k]));
         std::fprintf(out, "%s%s\n", e.ops.size() > shown ? ", ..." : "",
                      e.no_slot ? " (every breadcrumb slot was busy: not tracked on the GPU)" : "");
+        // A list the GPU stopped inside: the operations around the first one that did not finish, numbered, with
+        // the shader of each draw or dispatch.
+        if (e.progress_known && e.state == BreadcrumbState::started && e.completed_ops < e.ops.size()) {
+            const std::size_t at = e.completed_ops;
+            const std::size_t from = at > 4 ? at - 4 : 0, to = std::min(e.ops.size(), at + 3);
+            for (std::size_t k = from; k < to; ++k) {
+                const std::uintptr_t pso = k < e.pipelines.size() ? e.pipelines[k] : 0;
+                const std::string name = pso ? breadcrumb_pso_name(pso) : std::string();
+                std::fprintf(out, "[rt] d3d12 DRED:     %s op %zu %s%s%s\n", k == at ? "->" : "  ", k,
+                             breadcrumb_op_name(e.ops[k]), pso ? " pso " : "",
+                             pso ? (name.empty() ? "(unnamed)" : name.c_str()) : "");
+            }
+        }
     }
     static std::size_t count_incomplete(const std::vector<Entry>& entries) {
         std::size_t n = 0;

@@ -2879,9 +2879,75 @@ private:
         return result;
     }
 
+    // Before the lists are prepared: every compute pipeline their dispatches use that is still being compiled
+    // (LEONIDA_ASYNC_PSO, LEONIDA_LAZY_COMPUTE) is started and waited for, up to 8 s each, instead of its dispatches
+    // being left out. A left-out dispatch is not a missing frame but missing work: the retail title's GPU heap
+    // (CS_DefragHeap_*) then walked metadata an earlier dispatch never wrote, looped on the GPU without end, and the
+    // title's 30 s watchdog ended the run. A pipeline that is still not ready after its wait is not waited for again
+    // (its dispatches are left out, as before). LEONIDA_COMPUTE_WAIT=0: no waiting.
+    void wait_for_pending_compute(std::span<const CommandList* const> lists) {
+        static const bool enabled = [] {
+            const char* v = std::getenv("LEONIDA_COMPUTE_WAIT");
+            return !(v && v[0] == '0');
+        }();
+        if (!enabled) return;
+        static std::mutex given_up_mutex;
+        static std::unordered_set<std::uintptr_t> given_up;
+        std::vector<std::uintptr_t> ids;
+        {
+            std::shared_lock lock(context_.resource_mutex_);
+            for (const CommandList* list : lists)
+                for (const auto& command : list->commands()) {
+                    std::uintptr_t id = 0;
+                    if (const auto* d = std::get_if<Dispatch>(&command)) id = d->pipeline;
+                    else if (const auto* x = std::get_if<ExecuteIndirect>(&command);
+                             x && x->kind == IndirectKind::dispatch)
+                        id = x->pipeline;
+                    if (!id) continue;
+                    const auto it = context_.pipelines_.find(id);
+                    if (it == context_.pipelines_.end() || !it->second.pending || it->second.stub) continue;
+                    if (std::find(ids.begin(), ids.end(), id) != ids.end()) continue;
+                    {
+                        std::lock_guard g(given_up_mutex);
+                        if (given_up.count(id)) continue;
+                    }
+                    request_compute(it->second);
+                    ids.push_back(id);
+                }
+        }
+        if (ids.empty()) return;
+        const auto start = std::chrono::steady_clock::now();
+        const auto deadline = start + std::chrono::seconds(8);  // for the whole submission: stub PSOs never finish
+        for (const std::uintptr_t id : ids) {
+            for (;;) {
+                bool pending = false;
+                {
+                    std::shared_lock lock(context_.resource_mutex_);
+                    const auto it = context_.pipelines_.find(id);
+                    pending = it != context_.pipelines_.end() && it->second.pending;
+                }
+                if (!pending) break;
+                if (std::chrono::steady_clock::now() > deadline) {
+                    std::lock_guard g(given_up_mutex);
+                    given_up.insert(id);
+                    std::fprintf(stderr, "[rt] compute wait: a pipeline is still compiling after 8 s; its dispatches "
+                                         "are left out\n");
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        static std::atomic<int> told{0};
+        const double ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (told.fetch_add(1, std::memory_order_relaxed) < 16 || ms > 1000)
+            std::fprintf(stderr, "[rt] compute wait: %zu compiling pipeline(s) waited for, %.0f ms\n", ids.size(), ms);
+    }
+
     ReplayResult execute_lists(std::span<const CommandList* const> lists, std::span<const CommandList* const> identity,
                                std::span<const BreadcrumbRing::Names> held_names) {
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
+        wait_for_pending_compute(lists);
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
                 for (const auto& command : list->commands())

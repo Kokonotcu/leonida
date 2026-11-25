@@ -207,10 +207,13 @@ public:
         return memory;
     }
 
-    Stats stats() const {
+    // Every pool's blocks, or with `memory_type` below 32 only that memory type's.
+    Stats stats(std::uint32_t memory_type = ~0u) const {
         std::lock_guard lock(mutex_);
         Stats s;
-        for (const Pool& p : pools_) {
+        for (std::size_t i = 0; i < std::size(pools_); ++i) {
+            if (memory_type < 32 && (i >> 3) != memory_type) continue;
+            const Pool& p = pools_[i];
             for (const auto& block : p.blocks) {
                 ++s.blocks;
                 s.empty_blocks += !block->allocations;

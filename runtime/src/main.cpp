@@ -54,6 +54,7 @@ namespace rt::d3d12 {
 int prebuild_recorded_pipelines(const std::filesystem::path& recipes, unsigned threads);  // shims/d3d12_com.h
 int prebuild_shader_binaries(unsigned threads);                                            // shims/d3d12_com.h
 }
+extern thread_local int leonida_quiet_av;  // shims/d3d12_vulkan_device.cpp: a guarded title read is running
 #endif
 
 namespace {
@@ -155,6 +156,10 @@ bool step_over_title_assert(EXCEPTION_POINTERS* info) {
 LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
     if (!info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
     const EXCEPTION_RECORD& r = *info->ExceptionRecord;
+#ifdef LEONIDA_VULKAN_DEVICE
+    // A guarded read of the title's pages (d3d12_vulkan_device.cpp) expects this fault and handles it itself.
+    if (leonida_quiet_av && r.ExceptionCode == 0xC0000005) return EXCEPTION_CONTINUE_SEARCH;
+#endif
     if (step_over_title_assert(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (r.ExceptionCode != 0xC0000005 && r.ExceptionCode != 0xC0000374 && r.ExceptionCode != 0x80000003 &&
         r.ExceptionCode != 0xC0000409 && r.ExceptionCode != 0xC00000FD)

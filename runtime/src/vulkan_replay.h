@@ -836,6 +836,8 @@ struct ComputePipeline {
     // pipeline replaces this entry, so the title never waits on the driver's compiler (its watchdog ends a run where
     // a thread makes no progress for ~30 s, and one wave64-emulated compute shader can take longer than that).
     bool pending = false;
+    // Pending for good (a missing shader's stub, LEONIDA_SKIP_PSO): its dispatches are left out and never waited for.
+    bool stub = false;
     // LEONIDA_LAZY_COMPUTE=1: a pending pipeline whose compile has not started; the first dispatch that meets it calls
     // request() (once, across every copy of this entry) to start it. The retail title creates ~2,700 compute PSOs at
     // start and compiling all of them took the process past 22 GB in a minute (boot 32) for programs most frames never
@@ -4297,7 +4299,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         const auto& p = prepared.commands[i];
         // A draw or dispatch prepare left out (a pending or stub pipeline) has no prepared draw: nothing to emit.
         // Before this a left-out draw read prepared.draws[0] and its null pipeline (retail boot 63).
-        if (p.skip && (detail::draw_of(command) || std::holds_alternative<Dispatch>(command))) continue;
+        // An indirect dispatch whose compute pipeline is still compiling is left out the same way: emitting it bound the
+        // empty prepared pipeline (vkCmdBindPipeline with a null handle crashed NVIDIA's driver in a story load).
+        if (p.skip && (detail::draw_of(command) || std::holds_alternative<Dispatch>(command) ||
+                       std::holds_alternative<ExecuteIndirect>(command)))
+            continue;
         if (!std::holds_alternative<CopyBuffer>(command) && !std::holds_alternative<CopyTexture>(command) &&
             !std::holds_alternative<CopyResource>(command))
             copy_run = false;
