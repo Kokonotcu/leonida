@@ -2056,6 +2056,27 @@ public:
         // with every submitting thread queued on this lock, and the holder's stack did not say which phase it was in.
         using slow_clock = std::chrono::steady_clock;
         const auto entered = slow_clock::now();
+        // What the title wrote at its slot-133 textures' addresses reaches their images first, before this queue's lock:
+        // the sync is device-wide and coalesced (one sync serves every call that arrived before it began), so the
+        // title's submitting threads no longer queue behind each other's syncs on a queue lock. Textures these lists
+        // copy into are the GPU's from now on, and are left out of it (note_title_textures_copied).
+        {
+            std::vector<std::uintptr_t> copied_into;
+            for (UINT i = 0; i < count && lists; ++i) {
+                const GraphicsCommandList* list = GraphicsCommandList::from(lists[i]);
+                if (!list) continue;
+                for (const auto& command : list->commands().commands()) {
+                    if (const auto* copy = std::get_if<leonida::CopyTexture>(&command)) {
+                        if (!copy->dst.footprint) copied_into.push_back(static_cast<std::uintptr_t>(copy->dst.resource));
+                    } else if (const auto* whole = std::get_if<leonida::CopyResource>(&command)) {
+                        copied_into.push_back(static_cast<std::uintptr_t>(whole->dst));
+                    }
+                }
+            }
+            note_title_textures_copied(copied_into);
+        }
+        sync_title_textures();
+        const auto textures_synced = slow_clock::now();
         std::lock_guard lock(mutex_);
         const auto locked = slow_clock::now();
         if (count > 0 && !lists) {
@@ -2131,9 +2152,7 @@ public:
         const auto pages_required = slow_clock::now();
         queue_.flush_title_pages();
         const auto pages_flushed = slow_clock::now();
-        // What the title wrote into the pages of its slot-133 textures reaches their images before the lists run.
-        sync_title_textures();
-        const auto textures_synced = slow_clock::now();
+        // (The title-texture sync ran before the queue lock, above.)
         std::uint64_t in_batch = 0;  // draws in this batch, counted before execute can consume the lists
         for (const auto* commands : recorded)
             for (const auto& command : commands->commands())
@@ -2161,9 +2180,9 @@ public:
                                          "texture sync %lld, record+submit %lld (room %u, compute wait %u, prepare %u, "
                                          "record %u, submit %u)\n",
                                  ms(entered, done), count, recorded.empty() ? std::size_t(0) : recorded[0]->commands().size(),
-                                 ms(entered, locked), ms(locked, heaps_synced), ms(heaps_synced, pages_required),
-                                 ms(pages_required, pages_flushed), ms(pages_flushed, textures_synced),
-                                 ms(textures_synced, done), t.room_ms, t.compute_wait_ms, t.prepare_ms, t.record_ms,
+                                 ms(textures_synced, locked), ms(locked, heaps_synced), ms(heaps_synced, pages_required),
+                                 ms(pages_required, pages_flushed), ms(entered, textures_synced),
+                                 ms(pages_flushed, done), t.room_ms, t.compute_wait_ms, t.prepare_ms, t.record_ms,
                                  t.submit_ms);
             }
         }

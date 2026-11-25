@@ -89,9 +89,7 @@
 #include <cwchar>
 #include <vector>
 
-// Set while a guarded read of the title's pages runs (guarded_probe_hash and friends): main.cpp's crash logger skips
-// those expected access violations.
-thread_local int leonida_quiet_av = 0;
+#include "../src/quiet_av.h"  // leonida_quiet_av: set around the guarded reads of the title's pages
 
 namespace rt::d3d12 {
 // Below sync_title_textures; the device hands it to xmem (rt::xmem::g_title_written).
@@ -1113,18 +1111,35 @@ struct DeviceState {
             if (items.empty()) continue;
             leonida::CommandList& list = batch.lists[family];
             bool ok = list.close();
-            for (const auto& item : items)
-                context->add_resource(reinterpret_cast<leonida::ResourceId>(item.staging.get()), *item.staging);
+            for (const auto& item : items)  // not add_resource: VulkanContext::add_transient_binding
+                context->add_transient_binding(reinterpret_cast<leonida::ResourceId>(item.staging.get()), *item.staging);
             if (ok) {
+                // Where a slow flush waits (the texture sync's "flush" was 140-380 ms, run 13): the staging lock, or
+                // the queue's phases.
+                const auto t0 = std::chrono::steady_clock::now();
                 std::lock_guard lock(staging_mutex);
+                const auto t1 = std::chrono::steady_clock::now();
                 leonida::VulkanQueue& queue = staging_queue_for(family == 1);
                 const leonida::CommandList* lists[] = {&list};
                 ok = queue.ok() && queue.execute(lists) == leonida::ReplayResult::success;
                 if (ok) context->note_upload(queue.progress_semaphore(), queue.submitted_value());
+                const auto t2 = std::chrono::steady_clock::now();
+                const auto ms = [](auto d) {
+                    return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
+                };
+                if (ms(t2 - t0) >= 100) {
+                    static std::atomic<int> told{0};
+                    const leonida::VulkanQueue::ExecuteTiming t = queue.last_timing();
+                    if (told.fetch_add(1, std::memory_order_relaxed) < 60)
+                        std::fprintf(stderr, "[rt] d3d12: slow staged-copy flush %lld ms (%zu copies): staging lock %lld, "
+                                             "execute %lld (room %u, compute wait %u, prepare %u, record %u, submit %u)\n",
+                                     ms(t2 - t0), items.size(), ms(t1 - t0), ms(t2 - t1), t.room_ms, t.compute_wait_ms,
+                                     t.prepare_ms, t.record_ms, t.submit_ms);
+                }
             }
             if (!ok) log_once("title texture sync: batched staging copies failed; copies", int(items.size()));
             for (auto& item : items) {
-                context->remove_resource(reinterpret_cast<leonida::ResourceId>(item.staging.get()));
+                context->remove_transient_binding(reinterpret_cast<leonida::ResourceId>(item.staging.get()));
                 context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, item.staging->buffer);
                 release_resource(item.memory, false);
             }
@@ -3903,6 +3918,13 @@ struct TitleTexture {
     std::uint64_t readable_generation = 0;                    // xmem's map generation then
     std::uint64_t serial = 0;                                 // registration order
     std::uint32_t width = 0, height = 0, format = 0, mips = 0, flags = 0;
+    // A submission copied into it (CopyTextureRegion / CopyResource): on the console that copy wrote the title's
+    // memory, here only the image, so a refresh from the memory would put the old bytes back over what the copy
+    // wrote. Never refreshed again (five-star-recomp docs/gpu-resources.md, "GPU copies into a texture", as
+    // victory-gta6 does).
+    bool gpu_written = false;
+    std::size_t index = 0;                                    // its slot in title_textures()
+    std::multimap<std::uintptr_t, TitleTexture*>::iterator by_start;  // its entry in title_textures_by_start()
 };
 
 // A cheap change detector for a texture's title bytes: 64 bytes of every 4 KiB page. Bink writes every video frame
@@ -3982,12 +4004,64 @@ std::vector<std::unique_ptr<TitleTexture>>& title_textures() {
 }
 std::atomic<std::size_t> g_title_texture_count{0};  // one load per submission when nothing is registered
 
+// Indexes of title_textures() (title_texture_mutex held): by title start, and by resource. Every view the title
+// made (add_ref_texture_at), every registration, release and texture-computer write used to walk all ~35,000
+// textures under the mutex each submission's sync takes as well (a pointer chase per texture, ~3 ms a walk): the
+// loading screen's submitting threads queued behind it for 0.5-1.2 s per ExecuteCommandLists (2026-11-25, run 10).
+std::multimap<std::uintptr_t, TitleTexture*>& title_textures_by_start() {
+    static std::multimap<std::uintptr_t, TitleTexture*> index;
+    return index;
+}
+std::unordered_multimap<const Resource*, TitleTexture*>& title_textures_by_resource() {
+    static std::unordered_multimap<const Resource*, TitleTexture*> index;
+    return index;
+}
+std::size_t g_title_texture_max_bytes = 0;  // the largest registered span: how far back an overlap's start can lie
+
+void add_title_texture(std::unique_ptr<TitleTexture> t) {
+    auto& textures = title_textures();
+    t->index = textures.size();
+    t->by_start = title_textures_by_start().emplace(reinterpret_cast<std::uintptr_t>(t->title), t.get());
+    title_textures_by_resource().emplace(t->resource, t.get());
+    g_title_texture_max_bytes = std::max(g_title_texture_max_bytes, t->bytes);
+    textures.push_back(std::move(t));
+    g_title_texture_count.store(textures.size(), std::memory_order_release);
+}
+
+// Removes `t` from the registry and its indexes (the last texture moves into its slot).
+void remove_title_texture(TitleTexture* t) {
+    auto& textures = title_textures();
+    title_textures_by_start().erase(t->by_start);
+    auto& by_resource = title_textures_by_resource();
+    for (auto [it, end] = by_resource.equal_range(t->resource); it != end; ++it)
+        if (it->second == t) {
+            by_resource.erase(it);
+            break;
+        }
+    const std::size_t i = t->index;
+    if (i + 1 != textures.size()) {
+        textures[i] = std::move(textures.back());
+        textures[i]->index = i;
+    }
+    textures.pop_back();
+    g_title_texture_count.store(textures.size(), std::memory_order_release);
+}
+
+// Calls f(TitleTexture*) for each registered texture overlapping [begin, end).
+template <class F>
+void for_title_textures_overlapping(std::uintptr_t begin, std::uintptr_t end, F&& f) {
+    auto& index = title_textures_by_start();
+    const std::uintptr_t from = begin > g_title_texture_max_bytes ? begin - g_title_texture_max_bytes : 0;
+    for (auto it = index.lower_bound(from); it != index.end() && it->first < end; ++it)
+        if (it->first + it->second->bytes > begin) f(it->second);
+}
+
 void unregister_title_texture(const Resource* resource) {
     if (!g_title_texture_count.load(std::memory_order_acquire)) return;
     std::lock_guard lock(title_texture_mutex());
-    auto& textures = title_textures();
-    std::erase_if(textures, [&](const auto& t) { return t->resource == resource; });
-    g_title_texture_count.store(textures.size(), std::memory_order_release);
+    auto& by_resource = title_textures_by_resource();
+    for (auto it = by_resource.find(resource); it != by_resource.end(); it = by_resource.find(resource))
+        remove_title_texture(it->second);
 }
 
 // The title ranges of mapped textures (under title_texture_mutex): every title texture over such a range is refreshed
@@ -4008,8 +4082,8 @@ void mark_title_texture_mapped(const Resource* resource) {
     if (!g_title_texture_count.load(std::memory_order_acquire)) return;
     std::lock_guard lock(title_texture_mutex());
     const TitleTexture* mapped = nullptr;
-    for (const auto& t : title_textures())
-        if (t->resource == resource) mapped = t.get();
+    for (auto [it, end] = title_textures_by_resource().equal_range(resource); it != end; ++it)
+        if (!mapped || it->second->serial > mapped->serial) mapped = it->second;  // the last registered, as before
     if (!mapped || overlaps_mapped_range(mapped->title, mapped->bytes)) return;
     const auto begin = reinterpret_cast<std::uintptr_t>(mapped->title);
     mapped_title_ranges().emplace_back(begin, begin + mapped->bytes);
@@ -4017,11 +4091,12 @@ void mark_title_texture_mapped(const Resource* resource) {
     if (told++ < 24)
         std::fprintf(stderr, "[rt] d3d12: title texture %p mapped (%zu bytes)\n", static_cast<const void*>(mapped->title),
                      mapped->bytes);
-    for (const auto& t : title_textures())
-        if (!t->mapped && overlaps_mapped_range(t->title, t->bytes)) {
-            t->mapped = true;
-            t->dirty = true;  // whatever the title writes through the mapping from now on
-        }
+    // Only the range just added can newly overlap a texture: the others were marked when theirs was added.
+    for_title_textures_overlapping(begin, begin + mapped->bytes, [](TitleTexture* t) {
+        if (t->mapped) return;
+        t->mapped = true;
+        t->dirty = true;  // whatever the title writes through the mapping from now on
+    });
 }
 
 // rt::xg's write listener: the texture computer wrote [address, address + bytes).
@@ -4029,10 +4104,7 @@ void title_texture_written(const void* address, std::size_t bytes) {
     if (!g_title_texture_count.load(std::memory_order_acquire)) return;
     const auto begin = reinterpret_cast<std::uintptr_t>(address), end = begin + bytes;
     std::lock_guard lock(title_texture_mutex());
-    for (const auto& t : title_textures()) {
-        const auto first = reinterpret_cast<std::uintptr_t>(t->title);
-        if (begin < first + t->bytes && first < end) t->dirty = true;
-    }
+    for_title_textures_overlapping(begin, end, [](TitleTexture* t) { t->dirty = true; });
 }
 
 class Resource final
@@ -4116,6 +4188,7 @@ public:
     }
     bool evicted() const { return evicted_; }
     bool paged() const { return paged_; }
+    bool tail_committed() const { return tail_committed_; }
 
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
@@ -4705,6 +4778,27 @@ public:
         std::uint32_t page_types = 0;
         if (on_pages) {
             if (!pages->layout(image_, info, page_tiles, page_types)) return committed_instead();
+            // A streamed texture (pages of its own, no aliasing) that is all mip tail: the pages give it nothing but a
+            // 64 KiB page for a few KiB and a queue bind. ~36,000 of the loading screen's 39,800 held one page each,
+            // and their opaque binds took 0.2-1.2 ms apiece on the bind queue (4.3 s for one batch of 3,656, NVIDIA
+            // holding every submission meanwhile; run 10, 2026-11-25). A committed image instead: no bind, a
+            // suballocated range, and released under newer textures like the others. LEONIDA_TAIL_ON_PAGES=1: paged.
+            static const bool tails_on_pages = [] {
+                const char* v = std::getenv("LEONIDA_TAIL_ON_PAGES");
+                return v && v[0] == '1';
+            }();
+            const bool streamed_texture =
+                !(desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+            if (!tails_on_pages && streamed_texture &&
+                std::all_of(page_tiles.begin(), page_tiles.end(), [](const auto& tile) { return tile.opaque; })) {
+                static std::atomic<std::uint64_t> told{0};
+                const std::uint64_t n = ++told;
+                if ((n & (n - 1)) == 0)
+                    std::fprintf(stderr, "[rt] d3d12: %llu all-tail streamed textures made committed, not paged\n",
+                                 static_cast<unsigned long long>(n));
+                tail_committed_ = true;  // never released under a newer texture, as a paged one is not
+                return committed_instead();
+            }
             memory_flags_ = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         } else {
             memory_ = device_.allocate_resource(image_, VK_NULL_HANDLE, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
@@ -5292,6 +5386,10 @@ private:
     std::uint64_t shared_import_ = 0;  // host_import_ on a window's shared import: its start (DeviceState::SharedImport)
     bool evicted_ = false;      // evict_title_image: no image any more
     bool paged_ = false;        // on the title's shared pages (vulkan_title_pages.h): no memory_ of its own
+    // A streamed all-tail texture made committed instead of paged (create_texture): the title's streaming pool packs
+    // partly resident textures 16 KiB apart inside a newer one's full span, so "starts inside a newer texture" does
+    // not mean reused memory for it (vulkan_title_pages.h, the header's note on XCL's rule).
+    bool tail_committed_ = false;
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
@@ -5314,8 +5412,10 @@ void report_title_overlap(const std::uint8_t* title, std::size_t bytes, const D3
                           const char* kind) {
     static int told = 0;
     if (told >= 40) return;
-    for (const auto& other : title_textures()) {
-        if (other->title >= title + bytes || title >= other->title + other->bytes) continue;
+    std::vector<const TitleTexture*> overlapping;
+    const auto begin = reinterpret_cast<std::uintptr_t>(title);
+    for_title_textures_overlapping(begin, begin + bytes, [&](TitleTexture* t) { overlapping.push_back(t); });
+    for (const TitleTexture* other : overlapping) {
         const D3D12_RESOURCE_DESC& o = other->resource->desc();
         // Only pairs where one is GPU-written or atlas-sized: small textures whose computed layout spans past the
         // title's spacing (17x17 tables 0x1B000 apart with 128 KiB layouts) overlap their neighbours by the hundred.
@@ -5451,22 +5551,27 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
     if (evict && t->watch) {
         static std::atomic<unsigned long long> evicted_count{0}, evicted_bytes{0};
         const auto begin = reinterpret_cast<std::uintptr_t>(t->title), end = begin + t->bytes;
-        std::erase_if(title_textures(), [&](const std::unique_ptr<TitleTexture>& o) {
-            const auto start = reinterpret_cast<std::uintptr_t>(o->title);
-            if (start < begin || start >= end || !o->watch || o->mapped || o->resource == texture) return false;
-            if (o->resource->paged()) return false;  // its pages supersede it (vulkan_title_pages.h)
+        std::vector<TitleTexture*> under;
+        auto& index = title_textures_by_start();
+        for (auto it = index.lower_bound(begin); it != index.end() && it->first < end; ++it) {
+            TitleTexture* o = it->second;
+            if (!o->watch || o->mapped || o->resource == texture) continue;
+            if (o->resource->paged()) continue;  // its pages supersede it (vulkan_title_pages.h)
+            if (o->resource->tail_committed()) continue;  // packed beside it, not under it (Resource::tail_committed_)
+            under.push_back(o);
+        }
+        for (TitleTexture* o : under) {
             o->resource->evict_title_image();
             const unsigned long long n = ++evicted_count, b = evicted_bytes += o->bytes;
             if ((n & (n - 1)) == 0)
                 std::fprintf(stderr, "[rt] d3d12: %llu title textures under newer ones released (%llu MiB)\n", n,
                              b >> 20);
-            return true;
-        });
+            remove_title_texture(o);
+        }
     }
     report_title_overlap(t->title, t->bytes, desc, "texture");
     t->mapped = overlaps_mapped_range(t->title, t->bytes);  // pages the title already writes through a mapping
-    title_textures().push_back(std::move(t));
-    g_title_texture_count.store(title_textures().size(), std::memory_order_release);
+    add_title_texture(std::move(t));
     return true;
 }
 
@@ -9517,15 +9622,20 @@ public:
     ID3D12Resource* add_ref_texture_at(std::uint64_t va, const D3D12_RESOURCE_DESC& desc) {
         {
             std::lock_guard lock(title_texture_mutex());
-            for (const auto& t : title_textures()) {
-                if (reinterpret_cast<std::uint64_t>(t->title) != va) continue;
+            // The textures starting at `va`, in registration order (title_textures_by_start).
+            const auto [at_va, past_va] = title_textures_by_start().equal_range(static_cast<std::uintptr_t>(va));
+            for (auto it = at_va; it != past_va; ++it) {
+                TitleTexture* const t = it->second;
                 const D3D12_RESOURCE_DESC& have = t->resource->desc();
                 if (have.Width != desc.Width || have.Height != desc.Height || have.Dimension != desc.Dimension)
                     continue;
                 // A view is where the title's new bytes are taken: it makes a texture's view once its data has
                 // arrived (five-star-recomp, docs/gpu-resources.md, "Refresh points"). Not for a texture the GPU
                 // writes (render target or UAV): its pages are not its contents.
-                if (t->watch) t->dirty = true;
+                if (t->watch) {
+                    t->dirty = true;
+                    t->readable_until = {};  // a read that faulted before the data came is tried again at once
+                }
                 t->resource->AddRef();
                 return t->resource;
             }
@@ -9533,8 +9643,8 @@ public:
             // the view's words name. A separate copy made from the pages would not hold what the GPU draws into it:
             // Scaleform draws its glyph cache on the GPU, and the cached letters came out as blocks or missing (the
             // ones without ascenders or descenders, on every screen).
-            for (const auto& t : title_textures()) {
-                if (reinterpret_cast<std::uint64_t>(t->title) != va) continue;
+            for (auto it = at_va; it != past_va; ++it) {
+                TitleTexture* const t = it->second;
                 static std::atomic<int> told_alias{0};
                 if (told_alias.fetch_add(1, std::memory_order_relaxed) < 8) {
                     const D3D12_RESOURCE_DESC& have = t->resource->desc();
@@ -11462,6 +11572,25 @@ public:
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,
                                    void** out) {
         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
+        // A slow creation (100 ms or more): the title rebuilds objects between a release and a create (its output
+        // object's settings reset, 0x14290B2A0), and another thread read the half-made one at 0x1428EF557 (runs 10,
+        // 14); a creation stuck behind the runtime's locks widens that window from microseconds to the wait.
+        const struct SlowCreate {
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            const D3D12_RESOURCE_DESC& desc;
+            ~SlowCreate() {
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                                                      start).count();
+                if (ms < 100) return;
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 100)
+                    std::fprintf(stderr, "[rt] d3d12: slow slot-133 creation %lld ms (dimension %d, %llux%u, format %d, "
+                                         "flags %#x)\n",
+                                 static_cast<long long>(ms), int(desc.Dimension),
+                                 static_cast<unsigned long long>(desc.Width), desc.Height, int(desc.Format),
+                                 unsigned(desc.Flags));
+            }
+        } slow_create{std::chrono::steady_clock::now(), desc};
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
             // A texture is not placed on the title's pages yet: it gets an ordinary committed DEFAULT texture of the
             // same description, as slot 76 gives one, so the title has its resource instead of asserting (found in
@@ -13500,6 +13629,7 @@ void start_transient_watch(leonida::VulkanContext* context) {
 // the first loading screen (2026-11-25), with every other submitting thread waiting behind it.
 struct SyncStats {
     long long ready_ns = 0, hash_ns = 0, copy_ns = 0, longest_ns = 0;
+    long long lock_ns = 0, marks_ns = 0, pages_ns = 0, flush_ns = 0;  // the mutex, the dirty marks, page state, flush
     std::size_t copies = 0, copy_bytes = 0;
     std::uint32_t longest_width = 0, longest_height = 0, longest_format = 0;
 };
@@ -13509,6 +13639,29 @@ struct SyncTimer {
     explicit SyncTimer(long long& target) : into(target) {}
     ~SyncTimer() { into += (std::chrono::steady_clock::now() - start).count(); }
 };
+
+void note_title_textures_copied(const std::vector<std::uintptr_t>& ids) {
+    if (ids.empty() || !g_title_texture_count.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(title_texture_mutex());
+    auto& by_resource = title_textures_by_resource();
+    for (const std::uintptr_t id : ids) {
+        // The id is the resource's ID3D12Resource pointer (resource_id), used as a key only, never dereferenced.
+        const Resource* r = static_cast<const Resource*>(reinterpret_cast<const ID3D12Resource*>(id));
+        for (auto [it, end] = by_resource.equal_range(r); it != end; ++it) {
+            TitleTexture* const t = it->second;
+            if (!t->gpu_written) {
+                static std::atomic<std::uint64_t> told{0};
+                const std::uint64_t n = ++told;
+                if ((n & (n - 1)) == 0)
+                    std::fprintf(stderr, "[rt] d3d12: %llu title textures copied into by the GPU, not refreshed from "
+                                         "their memory any more (last %ux%u format %u, %s)\n",
+                                 static_cast<unsigned long long>(n), t->width, t->height, t->format,
+                                 t->resource->paged() ? "paged" : "committed");
+            }
+            t->gpu_written = true;
+        }
+    }
+}
 
 void sync_title_textures() {
     if (!g_title_texture_count.load(std::memory_order_acquire)) return;  // one load when nothing is registered
@@ -13520,16 +13673,36 @@ void sync_title_textures() {
         ~SyncReport() {
             const auto ms = [](long long ns) { return ns / 1000000; };
             const long long total = (std::chrono::steady_clock::now() - start).count();
-            if (total < 400000000LL) return;  // 400 ms: with the binds off the submit path, 600-800 ms syncs remain
+            if (total < 150000000LL) return;  // 150 ms: each one holds every submitting thread behind its queue lock
             static std::atomic<int> told{0};
             if (told.fetch_add(1, std::memory_order_relaxed) >= 200) return;
-            std::fprintf(stderr, "[rt] d3d12: slow title texture sync %lld ms: readability %lld, hashes %lld, %zu copies "
-                                 "(%zu MiB) %lld, longest copy %lld ms (%ux%u format %u)\n",
-                         ms(total), ms(s.ready_ns), ms(s.hash_ns), s.copies, s.copy_bytes >> 20, ms(s.copy_ns),
-                         ms(s.longest_ns), s.longest_width, s.longest_height, s.longest_format);
+            std::fprintf(stderr, "[rt] d3d12: slow title texture sync %lld ms: lock %lld, marks %lld, page state %lld, "
+                                 "readability %lld, hashes %lld, %zu copies (%zu MiB) %lld, flush %lld, longest copy %lld "
+                                 "ms (%ux%u format %u)\n",
+                         ms(total), ms(s.lock_ns), ms(s.marks_ns), ms(s.pages_ns), ms(s.ready_ns), ms(s.hash_ns),
+                         s.copies, s.copy_bytes >> 20, ms(s.copy_ns), ms(s.flush_ns), ms(s.longest_ns),
+                         s.longest_width, s.longest_height, s.longest_format);
         }
     } sync_report{sync_stats, now};
-    std::lock_guard lock(title_texture_mutex());
+    // Coalesced: what the title wrote before this call is covered by any sync that began after the call did (each
+    // flushes its copies, and publishes them to every queue's next submission, before it lets go of the mutex). The
+    // title's submitting threads each ran a whole sync, one after another, holding their queue locks (0.5-1.2 s waits
+    // per ExecuteCommandLists, runs 10-14); now one sync serves every call that arrived before it began.
+    static std::atomic<std::uint64_t> syncs_begun{0};
+    static std::uint64_t last_finished_begin = 0;  // under title_texture_mutex: the begin number of the last one done
+    const std::uint64_t arrived_after = syncs_begun.load(std::memory_order_acquire);
+    std::unique_lock lock(title_texture_mutex(), std::defer_lock);
+    {
+        const SyncTimer lock_timer(sync_stats.lock_ns);
+        lock.lock();
+    }
+    if (last_finished_begin > arrived_after) return;  // a sync that began after this call arrived is done
+    const std::uint64_t my_begin = syncs_begun.fetch_add(1, std::memory_order_acq_rel) + 1;
+    // Set when this sync is done, after its batch is flushed (BatchScope, declared after this, is destroyed first).
+    const struct FinishMark {
+        std::uint64_t begin;
+        ~FinishMark() { last_finished_begin = begin; }
+    } finish_mark{my_begin};
     // The long watch is paid from a byte budget that refills at kTitleTextureRecheckRate: hashing every texture
     // the title placed on every submission ran the boot at 1 frame per second (retail 1.0.2.1).
     static auto refilled = now;
@@ -13546,7 +13719,8 @@ void sync_title_textures() {
     const struct BatchScope {
         DeviceState* device;
         DeviceState::StagedBatch& batch;
-        BatchScope(DeviceState* d, DeviceState::StagedBatch& b) : device(d), batch(b) {
+        long long& flush_ns;
+        BatchScope(DeviceState* d, DeviceState::StagedBatch& b, long long& f) : device(d), batch(b), flush_ns(f) {
             static const bool off = [] {
                 const char* v = std::getenv("LEONIDA_SYNC_BATCH");  // 0: one submission per copy, as before
                 return v && v[0] == '0';
@@ -13560,21 +13734,25 @@ void sync_title_textures() {
             if (!device) return;
             device->staged_batch.store(nullptr, std::memory_order_release);
             device->staged_batch_owner.store(std::thread::id{}, std::memory_order_release);
+            const SyncTimer flush_timer(flush_ns);
             device->flush_staged_batch(batch);
         }
-    } batch_scope{count ? const_cast<DeviceState*>(&textures.front()->resource->device_state()) : nullptr, staged};
+    } batch_scope{count ? const_cast<DeviceState*>(&textures.front()->resource->device_state()) : nullptr, staged,
+                  sync_stats.flush_ns};
     // Streamed textures on the title's pages (vulkan_title_pages.h) with more mips bound since the last submission (a
     // view asked for them): those pages are fresh, so their bytes are copied again.
     leonida::TitlePages* const pages = count ? textures.front()->resource->device_state().context->title_pages() : nullptr;
+    std::optional<SyncTimer> marks_timer(std::in_place, sync_stats.marks_ns);
     if (pages) {
         const std::vector<std::uintptr_t> grown = pages->take_remapped();
-        if (!grown.empty()) {
-            const std::unordered_set<std::uintptr_t> ids(grown.begin(), grown.end());
-            for (const auto& t : textures)
-                if (ids.count(t->resource->id())) {
-                    t->dirty = true;
-                    t->copied = false;
-                }
+        auto& by_resource = title_textures_by_resource();
+        for (const std::uintptr_t id : grown) {
+            // The id is the resource's ID3D12Resource pointer (resource_id); used as a key only, never dereferenced.
+            const Resource* r = static_cast<const Resource*>(reinterpret_cast<const ID3D12Resource*>(id));
+            for (auto [it, end] = by_resource.equal_range(r); it != end; ++it) {
+                it->second->dirty = true;
+                it->second->copied = false;
+            }
         }
     }
     // Textures under ranges written behind the title's back (note_title_texture_write): compared and copied again.
@@ -13594,29 +13772,29 @@ void sync_title_textures() {
                     written[++merged] = written[i];
             }
             written.resize(merged + 1);
-            for (const auto& t : textures) {
-                const auto begin = reinterpret_cast<std::uintptr_t>(t->title);
-                const auto end = begin + t->bytes;
-                // The first range ending after the texture's start: it overlaps if it starts before the texture's end.
-                const auto it = std::upper_bound(written.begin(), written.end(), begin,
-                                                 [](std::uintptr_t v, const auto& r) { return v < r.second; });
-                if (it != written.end() && it->first < end) t->dirty = true;
-            }
+            for (const auto& [begin, end] : written)
+                for_title_textures_overlapping(begin, end, [](TitleTexture* t) { t->dirty = true; });
         }
     }
+    marks_timer.reset();
     for (std::size_t n = 0; n < count; ++n) {
         const auto& t = textures[(cursor + n) % count];
         // Nothing due on this submission (dirty, mapped, or a watched one whose next check has come; see the checks
         // below): skipped before the title pages' locks and the span. Two locks and a span for each of ~35,000
         // textures on every submission were ~15 ms of every ExecuteCommandLists in the loading screen.
         if (!t->dirty && !(t->copied && (t->mapped || (t->watch && now >= t->next_check)))) continue;
+        if (t->gpu_written) continue;  // the GPU's since a copy into it (TitleTexture::gpu_written)
         // On the title's pages and not bound now (a streamed texture no view has asked a mip of, or its bind not made
         // yet): nothing to copy into. Left as it is (dirty stays), so it is copied once it is bound.
         const bool paged = pages && t->resource->paged();
-        if (paged && !pages->ready(t->resource->id())) continue;
-        // A streamed texture with only its smaller mips bound reads, hashes and copies just their bytes: the rest of
-        // its range is its neighbours' memory (resident_prefix).
-        const std::uint32_t first_mip = paged ? pages->first_mip(t->resource->id()) : 0;
+        std::uint32_t first_mip = 0;
+        if (paged) {
+            const SyncTimer pages_timer(sync_stats.pages_ns);
+            if (!pages->ready(t->resource->id())) continue;
+            // A streamed texture with only its smaller mips bound reads, hashes and copies just their bytes: the rest
+            // of its range is its neighbours' memory (resident_prefix).
+            first_mip = pages->first_mip(t->resource->id());
+        }
         const std::size_t span = resident_prefix(t->console.get(), t->bytes, first_mip);
         // LEONIDA_DUMP_TARGETS with LEONIDA_DUMP_TITLE_TEXTURE: the glyph atlas's image is dumped with the targets.
         static const bool note_atlas =
@@ -13698,7 +13876,10 @@ void sync_title_textures() {
         // Its bind is with the bind worker and not made yet (VulkanContext::enqueue_title_binds_locked): a copy now
         // would land in unbound pages, and its submission would wait on the host until the bind is made. Left as it is
         // (dirty stays), so a later submission copies it.
-        if (paged && t->resource->device_state().context->title_bind_pending(t->resource->id())) continue;
+        if (paged) {
+            const SyncTimer pages_timer(sync_stats.pages_ns);
+            if (t->resource->device_state().context->title_bind_pending(t->resource->id())) continue;
+        }
         // A render target or UAV texture (not watched) the title placed but never wrote by CPU: its pages are not in the
         // working set and read as zeros, which the image already holds. Hashing them made every page resident: the
         // retail title's 4K targets kept about 1.2 GB of zero pages in RAM. It counts as copied; a later CPU write
@@ -13719,27 +13900,23 @@ void sync_title_textures() {
         // texture on every submission, it was the game's frame (about 1 fps, ntdll in the sampled stack). A range found
         // readable is asked again only when xmem mapped or unmapped something since, at most every 250 ms; one found
         // unreadable is retried every 250 ms (the guarded hashes below cover what changes in between).
-        const std::uint64_t generation = rt::xmem::g_map_generation.load(std::memory_order_acquire);
-        const bool known_readable = t->readable && (t->readable_generation == generation || now < t->readable_until);
-        const SyncTimer ready_timer(sync_stats.ready_ns);
-        if (!known_readable) {
-            if (!t->readable && now < t->readable_until) continue;  // found unreadable lately
-            t->readable_until = now + std::chrono::milliseconds(250);
-            if (t->mapped && !title_range_readable(t->title, span))
-                if (const auto commit = rt::xmem::g_commit_range.load(std::memory_order_acquire))
-                    commit(t->title, span);
-            t->readable = title_range_readable(t->title, span);
-            t->readable_generation = generation;
-            if (!t->readable) continue;  // reserved pages: a later submission copies it
-        }
+        // No VirtualQuery first: the reads below are guarded, and a fault is the answer. The queries (one per region,
+        // re-asked whenever xmem mapped anything, which in a loading screen is always) took 200-470 ms of a sync
+        // while the driver's host-import scans held the address space (run 11, 2026-11-25), with every submitting
+        // thread queued behind the sync. A texture that faulted lately waits out its second.
+        if (!t->readable && now < t->readable_until) continue;
+        t->readable = true;
         std::uint64_t hash = t->hash;
         std::uint64_t probe = 0;
-        // A read that faulted (pages unmapped although the readability check passed): unreadable for a second, not
-        // retried at every submission. Each fault also costs the crash logger's full report (thousands of log lines a
-        // minute on the retail boot).
+        // A read that faulted (reserved or unmapped pages): unreadable for a second, not retried at every submission.
+        // A mapped texture's pages are committed then (xmem commits on first touch; the title writes them through
+        // another view, the mirrored window), so the next try sees what it wrote.
         const auto faulted = [&] {
             t->readable = false;
             t->readable_until = now + std::chrono::seconds(1);
+            const SyncTimer ready_timer(sync_stats.ready_ns);
+            if (t->mapped)
+                if (const auto commit = rt::xmem::g_commit_range.load(std::memory_order_acquire)) commit(t->title, span);
         };
         const auto hash_start = std::chrono::steady_clock::now();
         const bool probed = guarded_probe_hash(t->title, span, probe);

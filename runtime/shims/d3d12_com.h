@@ -340,6 +340,9 @@ HRESULT create_stub_pipeline_state(ID3D12Device* device, REFIID riid, void** out
 // (new ones, ones the texture computer wrote, and changed ones within a second of their last copy; the ASSUMPTION is
 // at "Title-placed textures" in d3d12_vulkan_device.cpp). Every ExecuteCommandLists calls it before the lists.
 void sync_title_textures();
+// The title textures (by resource id) a submission copies into: the GPU's from now on, never refreshed from the
+// title's memory again (on the console the copy wrote that memory; here only the image).
+void note_title_textures_copied(const std::vector<std::uintptr_t>& ids);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 

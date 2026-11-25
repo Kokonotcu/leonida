@@ -44,6 +44,7 @@
 #include <vector>
 
 #include "shims.h"
+#include "../src/quiet_av.h"
 
 namespace rt::startup_trace {
 
@@ -317,6 +318,9 @@ inline bool skip_int3(EXCEPTION_POINTERS* info) {
 
 inline LONG CALLBACK handler(EXCEPTION_POINTERS* info) {
     if (!enabled() || in_handler || !info || !info->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+    // A guarded read of the title's pages (quiet_av.h): expected, caught by its own __except.
+    if (::leonida_quiet_av && info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
     if (skip_int3(info)) return EXCEPTION_CONTINUE_EXECUTION;
     in_handler = true;
 #ifdef _MSC_VER

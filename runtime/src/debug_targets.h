@@ -59,6 +59,10 @@ inline std::uint64_t arena_size = 0;
 // Reads `bytes` of the title's own memory at `va` (its CPU address) when it is committed and readable; false otherwise
 // (set by the device: the check needs VirtualQuery).
 inline bool (*read_title)(std::uint64_t va, void* out, std::size_t bytes) = nullptr;
+// For an arena address in a title-backed shader-visible heap's real copy: the title's own bytes there now (`now`) and
+// what the last heap sync copied (`copied`), 32 bytes each; false when the address is in no such heap (set by the
+// d3d12_xs layer). Tells a table the title wrote after its submission's sync from one the sync missed.
+inline bool (*title_heap_of)(const void* real, void* now, void* copied) = nullptr;
 
 // Reads `bytes` at GPU VA `va` for a diagnostic: the arena below 4 GiB, the title's memory above. False when neither
 // holds it.
@@ -82,6 +86,17 @@ inline void log_table(std::FILE* out, int user_data, std::uint32_t table) {
         std::fprintf(out, "\n[rt] d3d12 DRED:          table %d +%02x: %08x %08x %08x %08x %08x %08x %08x %08x", user_data,
                      row * 32, w[8 * row], w[8 * row + 1], w[8 * row + 2], w[8 * row + 3], w[8 * row + 4],
                      w[8 * row + 5], w[8 * row + 6], w[8 * row + 7]);
+    if (arena_mapped && title_heap_of && table < arena_size) {
+        std::uint32_t now[8] = {}, copied[8] = {};
+        if (title_heap_of(arena_mapped + table, now, copied)) {
+            std::fprintf(out, "\n[rt] d3d12 DRED:          table %d in a title heap: title now %08x %08x %08x %08x %08x "
+                              "%08x %08x %08x; last synced %08x %08x %08x %08x %08x %08x %08x %08x",
+                         user_data, now[0], now[1], now[2], now[3], now[4], now[5], now[6], now[7], copied[0], copied[1],
+                         copied[2], copied[3], copied[4], copied[5], copied[6], copied[7]);
+        } else {
+            std::fprintf(out, "\n[rt] d3d12 DRED:          table %d in no title heap", user_data);
+        }
+    }
     for (int q = 0; q < 8; ++q) {
         const std::uint32_t* v = w + 4 * q;
         const std::uint64_t base = v[0] | (std::uint64_t(v[1] & 0xFFFF) << 32);

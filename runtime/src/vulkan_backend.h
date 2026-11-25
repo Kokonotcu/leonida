@@ -1307,6 +1307,21 @@ public:
         std::unique_lock lock(resource_mutex_);
         set_resource_locked(id, binding);
     }
+    // Staging buffers a batched texture-sync copy reads (d3d12_vulkan_device.cpp, flush_staged_batch): resolvable while
+    // their list is recorded, without resource_mutex_. Registering them as resources took it exclusively, which waited
+    // for every queue's recording and submission (they hold it shared): 140-650 ms per sync, with the queue lock held
+    // (run 14, 2026-11-25). Plain buffers with no VA, tracking or layout, so the registry's other duties do not apply.
+    // A binding stays at one address until removed (node-based map), as resolve's callers expect while recording.
+    void add_transient_binding(ResourceId id, const ResourceBinding& binding) {
+        std::lock_guard lock(transient_mutex_);
+        transient_bindings_.insert_or_assign(id, binding);
+        transient_count_.store(transient_bindings_.size(), std::memory_order_release);
+    }
+    void remove_transient_binding(ResourceId id) {
+        std::lock_guard lock(transient_mutex_);
+        transient_bindings_.erase(id);
+        transient_count_.store(transient_bindings_.size(), std::memory_order_release);
+    }
     void add_resource(ResourceId id, const ResourceBinding& binding, VkImageLayout current_layout) {
         std::unique_lock rlock(resource_mutex_);
         set_resource_locked(id, binding);
@@ -2204,7 +2219,11 @@ private:
 
     const ResourceBinding* resolve(ResourceId id) const {
         const auto it = resources_.find(id);
-        return it == resources_.end() ? nullptr : &it->second;
+        if (it != resources_.end()) return &it->second;
+        if (!transient_count_.load(std::memory_order_acquire)) return nullptr;
+        std::lock_guard lock(transient_mutex_);
+        const auto t = transient_bindings_.find(id);
+        return t == transient_bindings_.end() ? nullptr : &t->second;
     }
 
     // The render pass and framebuffer that resolve one layer of a depth-only multisampled image into one layer of
@@ -2318,6 +2337,9 @@ private:
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
     QueueHolds<VkSemaphore> holds_;
     std::unordered_map<ResourceId, ResourceBinding> resources_;
+    mutable std::mutex transient_mutex_;  // after resource_mutex_ when both are held (resolve)
+    std::unordered_map<ResourceId, ResourceBinding> transient_bindings_;  // add_transient_binding
+    std::atomic<std::size_t> transient_count_{0};
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
     TitleBufferLookup title_buffer_at_;      // buffer_at's fallback for title addresses (set_title_buffer_lookup)
     std::function<void(std::uint64_t, std::uint64_t)> title_range_mapper_;  // set_title_range_mapper
@@ -2433,8 +2455,10 @@ private:
 
     // Images per vkQueueBindSparse call. NVIDIA holds a device-wide lock through the call: every other thread's
     // vkQueueSubmit waited behind a 2 s bind of 2,000 textures (run 03:44: a 129x1 texture copy took 841 ms). Chunks of
-    // this many keep each call to a fraction of a frame, and the submissions get in between.
-    static constexpr std::size_t kBindChunkImages = 128;
+    // this many keep each call to a fraction of a frame, and the submissions get in between. 128 images were still
+    // ~100-150 ms a call (0.8-1.2 ms an image), and the texture sync's copy flush waited 140-380 ms behind them (run 13);
+    // 16 keep a call near 15 ms.
+    static constexpr std::size_t kBindChunkImages = 16;
 
     void bind_title_pages(BindJob& job) {
         std::size_t image_binds = 0, opaque_binds = 0, image_info_count = 0, opaque_info_count = 0;
@@ -2444,10 +2468,34 @@ private:
             image_info_count += !op.image_binds.empty();
             opaque_info_count += !op.opaque_binds.empty();
         }
-        const auto t0 = std::chrono::steady_clock::now();
+        const auto t_wait = std::chrono::steady_clock::now();
         VkResult result = is_device_lost() ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
-        // The chunks run in order through the binder's own chain timeline: the first waits for the job's waits, each
-        // later one for the one before, and the last signals the job's ticket.
+        // The job's waits (every queue's work submitted before it) are met here, on the host, before any bind call:
+        // passed to vkQueueBindSparse, NVIDIA met them inside the call, with the device-wide lock held, so every
+        // submission waited until the GPU had drained (0.3-4.3 s "slow binds", each holding the title's submitting
+        // threads; runs 10-13). The binds themselves then wait for nothing.
+        bool waited_on_host = false;
+        if (result == VK_SUCCESS && !job.waits.empty()) {
+            VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            wait.semaphoreCount = std::uint32_t(job.waits.size());
+            wait.pSemaphores = job.waits.data();
+            wait.pValues = job.values.data();
+            for (;;) {
+                const VkResult r = vk.vkWaitSemaphores(device_, &wait, kRetireWaitSliceNs);
+                if (r == VK_SUCCESS) {
+                    waited_on_host = true;
+                    break;
+                }
+                if (r != VK_TIMEOUT || is_device_lost()) {
+                    if (r == VK_ERROR_DEVICE_LOST) result = r;
+                    break;  // not met on the host: the first call keeps the waits, as before
+                }
+            }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const long long wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t0 - t_wait).count();
+        // The chunks run in order through the binder's own chain timeline: the first waits for the job's waits (unless
+        // met on the host above), each later one for the one before, and the last signals the job's ticket.
         const std::size_t chunks = std::max<std::size_t>(1, (job.ops.size() + kBindChunkImages - 1) / kBindChunkImages);
         for (std::size_t c = 0; c < chunks && result == VK_SUCCESS; ++c) {
             const std::size_t from = c * kBindChunkImages, to = std::min(job.ops.size(), from + kBindChunkImages);
@@ -2463,8 +2511,10 @@ private:
             std::vector<VkSemaphore> waits;
             std::vector<std::uint64_t> wait_values;
             if (c == 0) {
-                waits = job.waits;
-                wait_values = job.values;
+                if (!waited_on_host) {
+                    waits = job.waits;
+                    wait_values = job.values;
+                }
             } else {
                 waits.push_back(binder_.chain);
                 wait_values.push_back(binder_.chain_value);
@@ -2513,14 +2563,15 @@ private:
             return;
         }
         finish_bind_job(job);  // published only now: what is submitted from here on waits for a bind already made
-        if (ms >= 300) {
+        if (ms + wait_ms >= 300) {
             static std::atomic<int> told{0};
             if (told.fetch_add(1, std::memory_order_relaxed) < 200)
                 std::fprintf(stderr,
-                             "[rt] title pages: slow bind %lld ms on the bind queue: %zu images, %zu image binds in %zu "
-                             "infos, %zu opaque binds in %zu infos, %zu calls (ticket %llu)\n",
-                             ms, job.ops.size(), image_binds, image_infos_size, opaque_binds, opaque_infos_size, chunks,
-                             static_cast<unsigned long long>(job.ticket));
+                             "[rt] title pages: slow bind %lld ms on the bind queue (after %lld ms waiting on the host "
+                             "for the GPU): %zu images, %zu image binds in %zu infos, %zu opaque binds in %zu infos, %zu "
+                             "calls (ticket %llu)\n",
+                             ms, wait_ms, job.ops.size(), image_binds, image_infos_size, opaque_binds, opaque_infos_size,
+                             chunks, static_cast<unsigned long long>(job.ticket));
         }
     }
 

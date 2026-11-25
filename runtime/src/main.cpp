@@ -56,8 +56,8 @@ namespace rt::d3d12 {
 int prebuild_recorded_pipelines(const std::filesystem::path& recipes, unsigned threads);  // shims/d3d12_com.h
 int prebuild_shader_binaries(unsigned threads);                                            // shims/d3d12_com.h
 }
-extern thread_local int leonida_quiet_av;  // shims/d3d12_vulkan_device.cpp: a guarded title read is running
 #endif
+#include "quiet_av.h"  // leonida_quiet_av: a guarded title read is running (shims/d3d12_vulkan_device.cpp)
 
 namespace {
 

@@ -37,6 +37,7 @@
 #include "../src/frame_pacer.h"     // leonida::FrameTokenSource: the tokens slots 78/79/80 and PresentX share
 #include "d3d12_xs_desc_clean.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
+#include "../src/debug_targets.h"   // title_heap_of: hang reports look at the title's bytes behind a table
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -410,8 +411,23 @@ std::atomic<std::size_t> g_title_sync_count{0};
 std::atomic<TitleSamplerSlotsFn> g_title_sampler_slots{nullptr};
 TitleHeapSyncStats g_title_sync_stats;  // title_sync_mutex()
 
+// debug_targets::title_heap_of: a hang report's look at the title's bytes behind a table (no lock: the reporter may run
+// while a sync holds it; heaps are immortal enough for a report, and the reads are of plain memory).
+bool title_heap_bytes_of(const void* real, void* now, void* copied) {
+    const auto* p = static_cast<const std::uint8_t*>(real);
+    for (const auto& sync : title_syncs()) {
+        if (p < sync->real || p + 32 > sync->real + sync->bytes) continue;
+        const std::size_t at = static_cast<std::size_t>(p - sync->real);
+        std::memcpy(now, sync->title + at, 32);
+        std::memcpy(copied, sync->shadow.get() + at, 32);
+        return true;
+    }
+    return false;
+}
+
 bool register_title_sync(const HeapProxy* heap, ID3D12Device* real_device, SIZE_T title, SIZE_T bytes, SIZE_T real,
                          std::size_t increment, bool sampler) {
+    leonida::debug_targets::title_heap_of = &title_heap_bytes_of;
     auto sync = std::unique_ptr<TitleHeapSync>(new (std::nothrow) TitleHeapSync{
         heap, real_device, reinterpret_cast<std::uint8_t*>(title), reinterpret_cast<std::uint8_t*>(real), bytes,
         increment, sampler, std::unique_ptr<std::uint8_t[]>(new (std::nothrow) std::uint8_t[bytes]())});
