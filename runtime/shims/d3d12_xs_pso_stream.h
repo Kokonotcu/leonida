@@ -4,7 +4,9 @@
 // PSO it returns (ID3D12Object private data, so the copy is freed with the PSO). Slot 55 takes a base PSO and up to
 // three state records; it patches a copy of the base stream and creates the new PSO through the same path.
 //
-// Record layout (TomBox's create_derived_pso_x, GPL-3.0): 0x14c bytes, a u32 tag, then the state payload at +4.
+// Record layout: 0x14c bytes, a u32 tag, then the state payload at +4.
+// Layout facts only, no code: omonkeyz/xbox-emulator crates/compat/d3d12_xs/src/device_wrap.rs (create_derived_pso_x; the
+// continuation of drycheetah84/TomBox), GPL-3.0-or-later.
 //   tag 0: D3D12_DEPTH_STENCIL_DESC (0x34) -> the DEPTH_STENCIL or DEPTH_STENCIL1 subobject (first 0x34 bytes)
 //   tag 1: D3D12_RASTERIZER_DESC (0x2c)
 //   tag 2: D3D12_BLEND_DESC (0x148)
@@ -19,9 +21,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace rt::d3d12_xs {
+
+// The Vulkan parser selects the layout. Slot 55 keeps its canonical tags for subsequent derivation.
+inline thread_local bool used_console_stream = false;
+constexpr unsigned pc_stream_type(unsigned raw, bool console) {
+    return console && raw >= 23 && raw < 63 ? raw + 1 : raw;
+}
+
+void audit_pso_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, HRESULT hr, bool console);
 
 inline constexpr std::size_t kDerivedRecordSize = 0x14c;
 inline constexpr std::size_t kDerivedRecordPayload = 4;
@@ -35,8 +46,14 @@ inline constexpr unsigned kDerivedMaxRecords = 4;
 class PsoStreamRecord {
 public:
     // Null when the stream is malformed, holds a subobject type this module does not walk, or is too large.
-    static std::unique_ptr<PsoStreamRecord> capture(const D3D12_PIPELINE_STATE_STREAM_DESC& desc);
-    ~PsoStreamRecord();
+    static std::unique_ptr<PsoStreamRecord> capture(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, bool console = false);
+    // The same, with shader containers the caller already keeps alive: a stage whose bytecode is one of `shaders` is
+    // referenced through it and not copied.
+    using ShaderData = std::shared_ptr<const std::vector<std::uint8_t>>;
+    static std::unique_ptr<PsoStreamRecord> capture(const D3D12_PIPELINE_STATE_STREAM_DESC& desc,
+                                                     std::span<const ShaderData> shaders, bool console = false);
+    static std::unique_ptr<PsoStreamRecord> derived(const PsoStreamRecord& base, std::vector<unsigned char> stream);
+    ~PsoStreamRecord() = default;
     PsoStreamRecord(const PsoStreamRecord&) = delete;
     PsoStreamRecord& operator=(const PsoStreamRecord&) = delete;
 
@@ -55,25 +72,13 @@ private:
     bool copy_pointed_data(std::size_t type, std::size_t payload_offset);
 
     std::vector<unsigned char> bytes_;
-    std::vector<std::vector<unsigned char>> blobs_;  // owned copies; their buffers do not move when this grows
-    std::vector<ID3D12RootSignature*> roots_;        // AddRef'd
-    std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> shared_;  // SharedBytecodeScope buffers, referenced
-};
-
-// While one is alive on a thread, capture() on that thread keeps a reference to each of these buffers instead of
-// copying shader bytecode that is exactly one of them. The native pipeline path (slot 57) creates ~25,000 PSOs from a
-// few thousand shared DXBC containers; copying both containers into every kept stream took gigabytes (retail boot 34:
-// 1,329 private allocations averaging 3.5 MB within 40 s).
-class SharedBytecodeScope {
-public:
-    explicit SharedBytecodeScope(std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> buffers);
-    ~SharedBytecodeScope();
-    SharedBytecodeScope(const SharedBytecodeScope&) = delete;
-    SharedBytecodeScope& operator=(const SharedBytecodeScope&) = delete;
-
-private:
-    std::vector<std::shared_ptr<const std::vector<std::uint8_t>>> buffers_;
-    const std::vector<std::shared_ptr<const std::vector<std::uint8_t>>>* previous_;
+    struct Payloads {
+        std::vector<std::vector<unsigned char>> blobs;  // owned copies; their buffers do not move when this grows
+        std::vector<ShaderData> shaders;
+        std::vector<ID3D12RootSignature*> roots;        // AddRef'd
+        ~Payloads();
+    };
+    std::shared_ptr<Payloads> payloads_;
 };
 
 enum class DeriveStatus { ok, unknown_tag, missing_state, malformed };
@@ -86,6 +91,7 @@ DeriveStatus derive_stream(const PsoStreamRecord& base, const unsigned char* rec
 // Keeps `record` on `object` (lifetime follows the object) and finds it again. attach returns false on failure, and
 // then the record is dropped. find returns null when no record was attached to that object.
 bool attach_pso_record(ID3D12Object* object, std::unique_ptr<PsoStreamRecord> record);
+bool share_pso_record(ID3D12Object* source, ID3D12Object* target);
 const PsoStreamRecord* find_pso_record(ID3D12Object* object);
 
 }  // namespace rt::d3d12_xs

@@ -225,7 +225,7 @@ public:
           device_(device),
           context_(context),
           swapchain_(gipa, instance, physical, gdpa, context.device(), queue, queue_family, context.submit_mutex(),
-                     swapchain_maintenance1) {
+                     swapchain_maintenance1, context.device_fault()) {
         if (parent_) parent_->AddRef();
         if (device_) device_->AddRef();
     }
@@ -234,6 +234,7 @@ public:
         unregister_buffers();
         if (restrict_to_output_) restrict_to_output_->Release();
         if (waitable_) CloseHandle(waitable_);
+        swapchain_.close();
         if (device_) device_->Release();
         if (parent_) parent_->Release();
     }

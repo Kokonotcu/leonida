@@ -1,18 +1,18 @@
 # First boot: the runbook and the two traces
 
-**Status: `--dry-run` and `--init` have been run on the retail executable; `--run` has not.** The package in the
-repository's test corpus does not contain `game_scarlett_master.exe` (RT-5); the dry-run on an executable supplied
-separately maps it and leaves 30 imports unimplemented, and `--init` runs its TLS callbacks and the package DLLs'
-`DllMain`s without an exception
-([`runtime_imports.md`](runtime_imports.md#the-retail-executable-rt-5)), so this page is still the procedure and the
-trace tool for the first boot. The executable's `ws2_32.dll` imports are served by the offline Winsock2 shim, like
-`winhttp.dll` (`runtime/shims/ws2_32_offline.cpp`), so no socket or DNS query leaves the
-process. Nothing here quotes game data; a real trace stays on the player's machine.
+The Windows integration has a dedicated [offline first-run UI profile](first_run_ui.md); booting under Proton/Wine
+on Linux is in [linux_proton.md](linux_proton.md). The original dry-run and initialization measurements used a
+separately supplied executable (the package in the repository's test corpus does not contain
+`game_scarlett_master.exe`, RT-5): the dry-run maps it and leaves 30 imports unimplemented, and `--init` runs its TLS
+callbacks and the package DLLs' `DllMain`s without an exception
+([original import measurements](runtime_imports.md#the-retail-executable-rt-5)). This page is the procedure and the
+trace tool for a boot. Nothing here quotes game data; keep retail runs offline and traces on the player's machine.
 
-Outbound `ws2_32.dll` and `winhttp.dll` calls are restricted offline by the shims (`winhttp_offline.cpp` refuses all
-requests). A runtime configured with `-DLEONIDA_WS2_HOST_LOOPBACK=ON` uses upstream's `ws2_offline.cpp` instead of
-`ws2_32_offline.cpp`, which leaves the host's `ws2_32.dll` loaded and permits loopback only; running with the network
-off remains good defence in depth either way.
+The executable's `ws2_32.dll` imports are served by the offline Winsock2 shim, like `winhttp.dll`
+(`runtime/shims/ws2_32_offline.cpp`), so no socket or DNS query leaves the process; `winhttp_offline.cpp` refuses all
+requests. A runtime configured with `-DLEONIDA_WS2_HOST_LOOPBACK=ON` uses upstream's `ws2_offline.cpp` instead of
+`ws2_32_offline.cpp`, which leaves the host's `ws2_32.dll` loaded and restricts connections to loopback; running with
+the network off remains good defence in depth either way.
 
 Loader switches for the first boot: `LEONIDA_TLS_GA_PATCH=0` turns off the rewrite of the executable's index-0 TLS
 reads (`gs:[58h]`, pe_loader.cpp); `LEONIDA_HEAP_PROBE=1` validates the CRT heap at each `GetModuleHandleW` and logs it
@@ -117,13 +117,29 @@ Useful switches:
 * `LEONIDA_HANG_DUMP=<seconds>` (with `--trace`) writes a `thread_stack` event for every thread that many seconds
   after the trace opens: each thread is suspended only to read its registers, and its stack is walked after it
   resumes. For a title that hangs, or whose watchdog gives up after a fixed time, it shows where each thread waits.
+* `LEONIDA_STUB_PIPELINES=1` creates a pipeline whose translated shader is missing (no shader library, or no entry
+  for its program) as a no-op stub instead of failing `CreateGraphicsPipelineState` / `CreateComputePipelineState`.
+  The stub is never registered, so `SetPipelineState` binds no PSO and its draws and dispatches are no-ops (D3D-482).
+  Diagnostic only, like `LEONIDA_SKIP_INT3`: it follows a boot past every pipeline the title creates without
+  translating or running a game shader, so nothing the title draws reaches the screen. Each stub is logged with a
+  power-of-two count.
+* During `--run` on Vulkan, the runtime paints the package shell splash when the title shows its window. The first
+  direct queue presents it on the window's swapchain. Startup clears keep the splash visible until the first
+  non-black output replaces it. The runtime reads `ShellVisuals/SplashScreenImage` from
+  `MicrosoftGame.Config` or `SplashScreen/Image` from `appxmanifest.xml`, preserves the image's aspect ratio and
+  uses the same swapchain for PresentX. A surface without readback hands off at the first title present.
+  Set `LEONIDA_PACKAGE_SPLASH=0` to disable the splash.
 * `LEONIDA_VK_VALIDATION=1` enables the Khronos validation layer with the Vulkan backend (startup overhead; it is a
   diagnostic).
+* `LEONIDA_DEVICE_FAULT=1` enables Vulkan device-loss diagnostics and checkpoints where available. The first
+  observed loss prints a `[rt] device-fault:` report to stderr.
 * `DISABLE_RTSS_LAYER=1` and `DISABLE_VULKAN_OBS_CAPTURE=1` when MSI Afterburner or OBS is installed; their
   implicit layers add swapchain usage that shows up as validation errors ([testing.md](testing.md), "Known
   problems").
 * `--overlay DIR` sends the guest's writes to DIR instead of the default `<game-dir>\overlay` (useful when the
-  package drive is read-only); the package itself is never written.
+  package drive is read-only); the package itself is never written. Set `LEONIDA_WRITE_DIR` to override that folder
+  for one run (it wins over `--overlay`). For a fresh first-run profile, also set `LEONIDA_SAVE_DIR` to a separate
+  empty directory for the local game-save provider.
 
 ## 3. Triage order
 

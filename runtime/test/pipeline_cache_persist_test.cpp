@@ -5,7 +5,7 @@
 // creation counter on an injected clock, the log limiter, and the worker thread on a short interval (nothing without
 // a creation, one save at a time, creation not held up by a slow save, a failed save retried, stop() waits).
 #include "../src/pipeline_cache_persist.h"
-#include "pipeline_cache_file.h"
+#include "../src/pipeline_cache_file.h"
 #include "pipeline_cache_snapshot.h"
 
 #include <algorithm>

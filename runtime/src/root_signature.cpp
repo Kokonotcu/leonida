@@ -60,8 +60,10 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
     uint64_t cost = 0;  // 64-bit, as in pack()
     uint64_t next = out.base;
     std::vector<uint32_t> first;
+    std::vector<uint32_t> spill;
     first.reserve(sig.params.size());
-    // Once a parameter does not fit, it and every later one go to the spill array (byte offset `spill_at`), which is
+    spill.reserve(sig.params.size());
+    // Once a parameter does not fit, it and every later one go to the spill array (dword offset `spill_at`), which is
     // laid out for compute only (root_signature.h).
     const bool compute = stage == Stage::Compute;
     bool spilling = false;
@@ -86,18 +88,21 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
         if (!spilling && next + dwords > kMaxUserSgprs) spilling = true;
         if (!spilling) {
             first.push_back(static_cast<uint32_t>(next));
+            spill.push_back(kNoSpill);
             next += dwords;
             continue;
         }
         if (refused.empty() && !compute)
             refused = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
-                      std::to_string(out.base) + " (where a graphics stage's spill pointer goes is not measured)";
+                      std::to_string(out.base) + " (spill array not modelled: where a graphics stage's spill pointer " +
+                      "goes is not measured)";
         if (refused.empty() && p.type == ParamType::Table)
             refused = "root parameter " + std::to_string(i) +
                       " is a descriptor table in the compute spill array (its size there is not measured)";
-        // Packed in root order, no alignment: a constant 4 bytes per value, a root descriptor 8 (its 64-bit VA).
-        first.push_back(static_cast<uint32_t>(kMaxUserSgprs + spill_at / 4));
-        spill_at += 4 * (p.type == ParamType::Descriptor ? 2 : uint64_t(p.num_values));
+        // Packed in root order, no alignment: a constant 1 dword per value, a root descriptor 2 (its 64-bit VA).
+        first.push_back(static_cast<uint32_t>(kMaxUserSgprs + spill_at));
+        spill.push_back(static_cast<uint32_t>(spill_at));
+        spill_at += dwords;
     }
     if (spilling && refused.empty() &&
         (sig.flags & (kFlagResourceHeapDirectlyIndexed | kFlagSamplerHeapDirectlyIndexed)))
@@ -107,35 +112,31 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
         out.spills = true;
         return out;
     }
-    if (spilling) {
-        // s[0:1] holds the array's pointer; the arguments still in user SGPRs end at s31 at most.
-        out.first_sgpr = std::move(first);
-        out.end_sgpr = static_cast<uint32_t>(next);
-        out.spill_bytes = static_cast<uint32_t>(spill_at);
-        out.d3d12_cost = static_cast<uint32_t>(cost);
-        out.ok = true;
-        return out;
-    }
-    // The heap bases follow the last parameter, the CBV/SRV/UAV heap's first (docs/d3d12_vulkan.md section 3.4).
-    const struct {
-        uint32_t flag;
-        uint32_t* slot;
-        const char* name;
-    } heaps[] = {{kFlagResourceHeapDirectlyIndexed, &out.resource_heap_sgpr, "CBV/SRV/UAV"},
-                 {kFlagSamplerHeapDirectlyIndexed, &out.sampler_heap_sgpr, "sampler"}};
-    for (const auto& heap : heaps) {
-        if (!(sig.flags & heap.flag)) continue;
-        if (next + 1 > kMaxUserSgprs) {
-            out.resource_heap_sgpr = out.sampler_heap_sgpr = kNoSgpr;
-            out.error = std::string("the ") + heap.name + " heap base does not fit in the user SGPRs from s" +
-                        std::to_string(out.base) + " (spill array not modelled)";
-            out.spills = true;
-            return out;
+    out.arguments_end = static_cast<uint32_t>(next);
+    if (!spilling) {
+        // The heap bases follow the last parameter, the CBV/SRV/UAV heap's first (docs/d3d12_vulkan.md section 3.4).
+        const struct {
+            uint32_t flag;
+            uint32_t* slot;
+            const char* name;
+        } heaps[] = {{kFlagResourceHeapDirectlyIndexed, &out.resource_heap_sgpr, "CBV/SRV/UAV"},
+                     {kFlagSamplerHeapDirectlyIndexed, &out.sampler_heap_sgpr, "sampler"}};
+        // merge: a heap base past s31 is not supplied (kNoSgpr) and the arguments keep their places, as upstream
+        // does for both bind points (RT-DIRECT-HEAP-GRAPHICS: 23 constants from s8 leave s31 for the resource heap
+        // only; 27 from s4 the same for compute). Refusing the stage instead moved a graphics signature to pack()'s
+        // s0 layout, which no s8 shader reads, and left a compute one unbindable. The command list notes the heap
+        // it cannot supply (compute_direct_data, graphics_user_data).
+        for (const auto& heap : heaps) {
+            if (!(sig.flags & heap.flag) || next + 1 > kMaxUserSgprs) continue;
+            *heap.slot = static_cast<uint32_t>(next++);
         }
-        *heap.slot = static_cast<uint32_t>(next++);
     }
+    // With a spill, s[0:1] holds the array's pointer; the arguments still in user SGPRs end at s31 at most.
     out.first_sgpr = std::move(first);
+    out.spill_dword = std::move(spill);
     out.end_sgpr = static_cast<uint32_t>(next);
+    out.spill_dwords = static_cast<uint32_t>(spill_at);
+    out.spill_bytes = static_cast<uint32_t>(4 * spill_at);
     out.d3d12_cost = static_cast<uint32_t>(cost);
     out.ok = true;
     return out;

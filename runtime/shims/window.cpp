@@ -156,11 +156,11 @@ BOOL WINAPI show_window(HWND hwnd, int command) { return ShowWindow(hwnd, comman
 
 }  // namespace rt::shims::window
 
+// merge: CreateWindowExA/W are registered once, by lifecycle.cpp (the title-window fitting and SC_CLOSE hook), which
+// creates through create_window_ex_a/w here; two registrations made the winner depend on link order.
 #define WINDOW(dll)                                                                                                  \
     {dll, "RegisterClassExA", reinterpret_cast<void*>(&rt::shims::window::register_class_ex_a)},                     \
     {dll, "RegisterClassExW", reinterpret_cast<void*>(&rt::shims::window::register_class_ex_w)},                     \
-    {dll, "CreateWindowExA", reinterpret_cast<void*>(&rt::shims::window::create_window_ex_a)},                       \
-    {dll, "CreateWindowExW", reinterpret_cast<void*>(&rt::shims::window::create_window_ex_w)},                       \
     {dll, "DefWindowProcA", reinterpret_cast<void*>(&rt::shims::window::def_window_proc_a)},                         \
     {dll, "DefWindowProcW", reinterpret_cast<void*>(&rt::shims::window::def_window_proc_w)},                         \
     {dll, "ShowWindow", reinterpret_cast<void*>(&rt::shims::window::show_window)},                                   \

@@ -63,8 +63,15 @@ inline float depth_clear_value(float value) {
 struct Depth24Job {
     bool to_float = false;           // an upload (D24 words to floats); false: a readback (floats to words)
     bool rgb96 = false;              // 96-bit texels: `to_float` is only the direction (true: the upload)
+    // 16-bit B4G4R4A4 texels of an RGBA8-backed render target (rgba4_render_fallback): half a word in the footprint,
+    // one in the scratch. `to_float` is only the direction, as for rgb96.
+    bool rgba4 = false;
     std::uint32_t app_texel_words() const { return rgb96 ? 3 : 1; }
     std::uint32_t scratch_texel_words() const { return rgb96 ? 4 : 1; }
+    // The words a footprint row of `texels` covers.
+    std::uint64_t app_row_span_words(std::uint64_t texels) const {
+        return rgba4 ? (texels + 1) / 2 : texels * app_texel_words();
+    }
     VkBuffer app = VK_NULL_HANDLE;   // the application's buffer
     std::uint64_t app_offset = 0;    // bytes, a multiple of 4
     std::uint64_t app_size = 0;      // bytes in the buffer

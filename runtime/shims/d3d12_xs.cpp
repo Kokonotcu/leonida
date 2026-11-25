@@ -2,7 +2,9 @@
 // The SDK types describe the Windows side. The measured guest ABI differs in the root-signature flag word: Xbox
 // sets bits in the high byte (observed 0x03000000) and the PC serializer rejects them, so descriptors are copied
 // with that byte cleared before forwarding. On a host that serializes only up to 1.1 (Windows 10's built-in
-// d3d12.dll), version 1.2 descriptions are rewritten as 1.1 when no static sampler uses 1.2's flags.
+// d3d12.dll), version 1.2 descriptions are rewritten as 1.1 when no static sampler uses 1.2's flags, and the same
+// host refuses the two heap-directly-indexed flags at every version, so they are serialized without them and put
+// back into the blob (d3d12_xs_rootsig.h).
 // D3D12XboxCreateDevice returns an Xbox-ABI proxy (d3d12_xs_device.h) over the PC device; only the measured slots
 // are overridden, the rest follow the PC vtable.
 #include <windows.h>
@@ -84,58 +86,6 @@ HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DES
     return hr;
 }
 
-D3D12_ROOT_SIGNATURE_FLAGS* versioned_flags(D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc) {
-    switch (desc.Version) {
-        case D3D_ROOT_SIGNATURE_VERSION_1_0: return &desc.Desc_1_0.Flags;
-        case D3D_ROOT_SIGNATURE_VERSION_1_1: return &desc.Desc_1_1.Flags;
-        case D3D_ROOT_SIGNATURE_VERSION_1_2: return &desc.Desc_1_2.Flags;
-        default: return nullptr;
-    }
-}
-
-// Root-signature flags the host serializer refuses, asked once per bit with an otherwise empty 1.1 description.
-// Windows 10's built-in d3d12.dll predates shader model 6.6 and refuses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED (0x400)
-// and SAMPLER_HEAP_DIRECTLY_INDEXED (0x800) with "Unsupported bit-flag set" (measured, boot 9); the title's programs
-// use both, and a failed serialization leaves a null program in its pass table (the crash at +0xb5a5f8).
-std::uint32_t host_refused_flags(SerializeFn fn) {
-    static const std::uint32_t refused = [fn] {
-        std::uint32_t mask = 0;
-        for (const std::uint32_t bit : {0x100u, 0x200u, 0x400u, 0x800u}) {
-            D3D12_VERSIONED_ROOT_SIGNATURE_DESC probe{};
-            probe.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
-            probe.Desc_1_1.Flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(bit);
-            ID3DBlob* blob = nullptr;
-            ID3DBlob* error = nullptr;
-            if (FAILED(fn(&probe, &blob, &error))) mask |= bit;
-            if (blob) blob->Release();
-            if (error) error->Release();
-        }
-        if (mask)
-            std::fprintf(stderr,
-                         "[rt] d3d12_xs: the host d3d12.dll refuses root signature flags 0x%x; they are serialized "
-                         "without and written back into the blob\n",
-                         mask);
-        return mask;
-    }();
-    return refused;
-}
-
-// Serializes with the refused flags taken out, then puts them back into the RTS0 chunk of the result.
-HRESULT serialize_moving_flags(SerializeFn fn, D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc, ID3DBlob** blob,
-                               ID3DBlob** error) {
-    D3D12_ROOT_SIGNATURE_FLAGS* flags = versioned_flags(desc);
-    const std::uint32_t moved = flags ? (static_cast<std::uint32_t>(*flags) & host_refused_flags(fn)) : 0;
-    if (moved) *flags = static_cast<D3D12_ROOT_SIGNATURE_FLAGS>(static_cast<std::uint32_t>(*flags) & ~moved);
-    const HRESULT hr = fn(&desc, blob, error);
-    if (SUCCEEDED(hr) && moved && blob && *blob &&
-        !rt::d3d12_xs::set_rts0_flag_bits((*blob)->GetBufferPointer(), (*blob)->GetBufferSize(), moved)) {
-        (*blob)->Release();
-        *blob = nullptr;
-        return E_FAIL;
-    }
-    return hr;
-}
-
 HRESULT serialize_root_signature_unlogged(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc, ID3DBlob** blob,
                                           ID3DBlob** error) {
     static auto fn = reinterpret_cast<SerializeFn>(host("D3D12SerializeVersionedRootSignature"));
@@ -167,9 +117,11 @@ HRESULT serialize_root_signature_unlogged(const D3D12_VERSIONED_ROOT_SIGNATURE_D
             std::fprintf(stderr,
                          "[rt] d3d12_xs: the host d3d12.dll serializes root signatures only up to 1.1; version 1.2 "
                          "descriptions without static sampler flags are serialized as 1.1\n");
-        return serialize_moving_flags(fn, v11, blob, error);
+        // merge: kept upstream (same Windows 10 heap-flag fix as ours, but it also covers the legacy entry point and
+        // checks the container hash before patching a copy, not the host's blob)
+        return rt::d3d12_xs::serialize_versioned_keeping_heap_flags(fn, v11, blob, error);
     }
-    return serialize_moving_flags(fn, cleared, blob, error);
+    return rt::d3d12_xs::serialize_versioned_keeping_heap_flags(fn, cleared, blob, error);
 }
 
 // The package DLLs import the versioned serializer; the legacy entry point is kept because it is trivial to forward
@@ -183,7 +135,7 @@ HRESULT WINAPI serialize_root_signature_legacy(const D3D12_ROOT_SIGNATURE_DESC* 
 
     D3D12_ROOT_SIGNATURE_DESC cleared{};
     rt::d3d12_xs::copy_root_signature_desc_clear_xbox_flags(*desc, cleared);
-    return fn(&cleared, version, blob, error);
+    return rt::d3d12_xs::serialize_legacy_keeping_heap_flags(fn, cleared, version, blob, error);
 }
 
 HRESULT WINAPI create_root_signature_deserializer(const void* data, SIZE_T size, REFIID iid, void** out) {
@@ -298,8 +250,12 @@ rt::d3d12_xs::XboxPresentationSink* create_retail_presentation(ID3D12Device* rea
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX attached to window %p (Vulkan swapchain + frame pace)\n",
                  static_cast<void*>(window));
     // The pacer shares the device's token source: a token from WaitFrameEventX (device slot 80) is one PresentX takes.
+    // With LEONIDA_FRAME_PACING=1 the pacer also answers a zero-timeout origin wait with the newest passed origin
+    // (upstream's current_origin_poll, as the device's own presentation core does).
+    const char* pacing = std::getenv("LEONIDA_FRAME_PACING");
     return new RetailPresentation(std::make_unique<rt::d3d12::XboxPresentation>(
-        std::move(presenter), nullptr, rt::d3d12_xs::device_frame_tokens(device_proxy)));
+        std::move(presenter), nullptr, rt::d3d12_xs::device_frame_tokens(device_proxy),
+        pacing && *pacing && *pacing != '0'));
 }
 #endif  // LEONIDA_VULKAN_DEVICE
 
@@ -307,7 +263,8 @@ rt::d3d12_xs::XboxPresentationSink* create_retail_presentation(ID3D12Device* rea
 // logged and not used to create the device. The struct's total size is unknown, so the log reads 24 x 32-bit words
 // (96 bytes) and no more. The PC D3D12CreateDevice needs a minimum feature level instead: create_host_device asks for
 // 11_0, the least restrictive one (BL-2; 12_0 refused an adapter that tops out at 11_x), and the device still has its
-// highest level.
+// highest level. Wine's d3d12 (vkd3d) reports at most 11_1, so a 12_0 floor makes the host device fail there with
+// E_INVALIDARG even on a 12_x GPU.
 HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, const IID* riid, void** out) {
     rt::d3d12_xs::set_default_descriptor_heap_allocator(&xmem_descriptor_heap_alloc, &xmem_descriptor_heap_free);
     constexpr auto method = "D3D12XboxCreateDevice";
@@ -343,7 +300,21 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         std::fprintf(stderr,
                      "[rt] d3d12_xs: D3D12XboxCreateDevice: wrapping the PC ID3D12Device in the Xbox-ABI proxy "
                      "(slot 62 -> CreateComputePipelineState, slot 76 -> CreateCommittedResource).\n");
+        // A console method whose slot is another PC method (61) is served only to the title: a caller in an image
+        // this loader mapped.
+        rt::d3d12_xs::set_console_caller([](std::uint64_t address) {
+            std::uint64_t base = 0;
+            return rt::shims::mapped_image_base(address, base);
+        });
     }
+
+    // A console title gets the console-shaped list the Xbox ABI calls. A guest compiled against the PC
+    // headers (the tiny fixtures, which call the list through PC vtable indices) asks for PC-shaped lists
+    // with LEONIDA_D3D12_LISTS=pc — the device, queue and friends stay console-shaped either way.
+    char lists_mode[8] = {};
+    size_t lists_length = 0;
+    const bool pc_lists = getenv_s(&lists_length, lists_mode, "LEONIDA_D3D12_LISTS") == 0 &&
+                          std::strcmp(lists_mode, "pc") == 0;
 
 #ifdef LEONIDA_VULKAN_DEVICE
     // Opt-in until the Vulkan device covers the first frame: LEONIDA_D3D12=vulkan puts the Vulkan-backed device
@@ -359,7 +330,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
                          static_cast<unsigned long>(vhr));
             return result(method, vhr);
         }
-        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out);
+        vhr = rt::d3d12_xs::create_device_proxy(vulkan, *riid, out, /*console_lists=*/!pc_lists);
         if (FAILED(vhr)) {
             vulkan->Release();
             std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: proxy over the Vulkan device failed "
@@ -388,7 +359,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
         return result(method, hr);
     }
 
-    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out);
+    hr = rt::d3d12_xs::create_device_proxy(real, *riid, out, /*console_lists=*/!pc_lists);
     if (FAILED(hr)) {
         // create_device_proxy keeps the caller's reference on failure.
         real->Release();

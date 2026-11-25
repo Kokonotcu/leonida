@@ -527,9 +527,11 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // inert: the configured slot is unset, so the old beyond-the-vtable refusal is what the proxy returns.
-    EXPECT(as_hr(call_slot(d.queue.p, 1, reinterpret_cast<std::uint64_t>(&plane), 0)) == E_NOTIMPL);
+    // inert: the configured slot is unset, so nothing is captured. merge: the answer is upstream's for an unmodelled
+    // console-only queue slot past the public chain, S_OK (a refusal wedged the present loop; d3d12_xs_device.cpp,
+    // "unmodelled console queue methods"), where this tree used to refuse it with E_NOTIMPL.
+    EXPECT(as_hr(call_slot(d.queue.p, 1, reinterpret_cast<std::uint64_t>(&plane), 0)) == S_OK);
     EXPECT(files_in(directory) == 0);
-    std::printf("presentx_capture_probe: inert 1/1 E_NOTIMPL, no files\n");
+    std::printf("presentx_capture_probe: inert 1/1 S_OK, no files\n");
     return 0;
 }

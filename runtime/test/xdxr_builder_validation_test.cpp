@@ -172,7 +172,10 @@ int main() {
                               dst, scratch));
     CHECK(g_rec.binds > 0 && g_rec.dispatches > 0 && g_rec.pushes == g_rec.dispatches);
 
-    // 7. Large record_copy dispatches compute group counts without 32-bit overflow.
+    // 7. Large record_copy dispatches compute group counts without 32-bit overflow. merge: this tree's builder splits a
+    // step whose grid passes the device's maxComputeWorkGroupCount[0] (65535 until set_max_groups says more); this
+    // mock device takes any count, so it says so and the step stays one dispatch, which is what this check looks at.
+    builder.set_max_groups(0xffffffffu);
     g_rec.reset();
     CHECK(builder.record_copy(cb, dst, dst + 0x10000, 0xffffffffull));
     CHECK(g_rec.dispatches == 1 && g_rec.last_copy_count == 0x3fffffffu &&

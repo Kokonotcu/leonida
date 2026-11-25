@@ -12,6 +12,13 @@
 // 2 and 3). A footprint texel is then three words and a scratch texel four, and the words are copied as they are:
 // to_float == 3 (upload):   scratch[s .. s+2] = app[a .. a+2], scratch[s+3] = 0 (never read: views read alpha as one)
 // to_float == 2 (readback): app[a .. a+2]     = scratch[s .. s+2]
+//
+// And 16-bit B4G4R4A4 texels of a render target the layer holds in an RGBA8 image (no 4444 colour attachment on the
+// device; Format::rgba4_render_fallback, `to_float` 4 and 5). A footprint texel is half a word (B in bits 0-3, G 4-7,
+// R 8-11, A 12-15), a scratch texel one RGBA8 word (R in byte 0):
+// to_float == 5 (upload):   scratch[s] = each nibble n as the byte n * 17, which the RGBA8 image holds exactly
+// to_float == 4 (readback): the half of app[a] = each byte b as the nibble round(b * 15 / 255); the other half kept
+// Two texels share an app word, so the half is written with atomics, never a read-modify-write of the whole word.
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -21,7 +28,7 @@ layout(set = 0, binding = 1) buffer Scratch { uint scratch[]; };
 
 layout(push_constant) uniform Push {
     uint width, height, slices;
-    uint to_float;   // 0 and 1: D24 words and floats; 2 and 3: 96-bit texels of 3 and 4 words (see above)
+    uint to_float;   // 0 and 1: D24 words and floats; 2 and 3: 96-bit texels of 3 and 4 words; 4 and 5: B4G4R4A4
     uint app_base;   // first word of the region in `app`, within the bound window
     uint app_row;    // words between rows and between slices of the app buffer
     uint app_slice;
@@ -51,6 +58,25 @@ uint depth24_from_bits(uint bits) {
 void main() {
     uvec3 g = gl_GlobalInvocationID;
     if (g.x >= pc.width || g.y >= pc.height || g.z >= pc.slices) return;
+    if (pc.to_float >= 4u) {
+        // The texel's half word: rows and slices start on whole words (D3D12's 256-byte pitches).
+        uint h = (pc.app_base + g.z * pc.app_slice + g.y * pc.app_row) * 2u + g.x;
+        uint a = h >> 1u;
+        uint shift = (h & 1u) * 16u;
+        uint s = pc.scratch_base + (g.z * pc.height + g.y) * pc.width + g.x;
+        if (pc.to_float == 5u) {
+            uint v = (app[a] >> shift) & 0xffffu;
+            uvec4 b = uvec4((v >> 8u) & 15u, (v >> 4u) & 15u, v & 15u, v >> 12u) * 17u;  // R, G, B, A
+            scratch[s] = b.x | (b.y << 8u) | (b.z << 16u) | (b.w << 24u);
+        } else {
+            uint c = scratch[s];
+            uvec4 n = (uvec4(c & 255u, (c >> 8u) & 255u, (c >> 16u) & 255u, c >> 24u) * 15u + 127u) / 255u;
+            uint v = n.z | (n.y << 4u) | (n.x << 8u) | (n.w << 12u);
+            atomicAnd(app[a], ~(0xffffu << shift));
+            atomicOr(app[a], v << shift);
+        }
+        return;
+    }
     if (pc.to_float >= 2u) {
         uint a = pc.app_base + g.z * pc.app_slice + g.y * pc.app_row + g.x * 3u;
         uint s = pc.scratch_base + ((g.z * pc.height + g.y) * pc.width + g.x) * 4u;

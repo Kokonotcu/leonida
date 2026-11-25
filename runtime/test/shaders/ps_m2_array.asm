@@ -1,5 +1,6 @@
 ; M2 pixel shader for a 2D array view: ps_m2.asm with dim:SQ_RSRC_IMG_2D_ARRAY and slice coordinate 1.0. Run:
-; d3d12_m2_formats_test. User data as in ps_m2.asm ([0] a table holding one SRV, [1] a table holding one sampler).
+; d3d12_m2_formats_test. User data as in ps_m2.asm ([0] a table holding one SRV at s8, [1] a table holding one sampler
+; at s9), moved to s[0:1] and s[2:3] as there.
 ; The slice is relative to the view: a view of slices 0..2 reads slice 1, a view of slices 1..2 reads slice 2.
 ; attr0.xy = (u, v), 0..1 over the quad.   mrt0 = the texel under the pixel.
 ; fssm-at: 0x10

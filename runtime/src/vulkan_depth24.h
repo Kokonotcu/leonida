@@ -12,6 +12,8 @@
 #endif
 #include <vulkan/vulkan.h>
 
+#include "vulkan_device_fault.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -20,6 +22,7 @@
 
 #include "depth24.h"
 #include "depth24_convert_spv.h"
+#include "vulkan_aftermath.h"
 
 namespace leonida {
 
@@ -29,14 +32,15 @@ public:
     using Allocate = std::function<VkDeviceMemory(const VkMemoryRequirements&)>;
 
     // `max_range`: the device's maxStorageBufferRange; a copy is split into dispatches that stay inside it.
-    Depth24Converter(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate, std::uint64_t max_range = 1u << 27)
-        : device_(device), allocate_(std::move(allocate)), max_range_(max_range) {
+    Depth24Converter(PFN_vkGetDeviceProcAddr get, VkDevice device, Allocate allocate,
+                     std::uint64_t max_range = 1u << 27, DeviceFaultDiagnostics* diagnostics = nullptr)
+        : device_(device), diagnostics_(diagnostics), allocate_(std::move(allocate)), max_range_(max_range) {
         loaded_ = vk_.load(get, device);
     }
 
     ~Depth24Converter() {
         if (!loaded_) return;
-        vk_.vkDeviceWaitIdle(device_);
+        DeviceFaultDiagnostics::observe(diagnostics_, vk_.vkDeviceWaitIdle(device_), "vkDeviceWaitIdle");
         release(current_);
         for (auto& batch : retired_) release(batch);
         for (auto& chunk : spare_) destroy(chunk);
@@ -58,8 +62,8 @@ public:
     // the floats are.
     bool prepare(Depth24Job& whole, std::vector<Depth24Job>& parts) {
         // A row of the footprint is `aw` words wide and a row of the scratch `sw` (a texel is one word of each for
-        // D24, three and four for 96-bit texels).
-        const std::uint64_t aw = std::uint64_t(whole.width) * whole.app_texel_words();
+        // D24, three and four for 96-bit texels, half and one for B4G4R4A4).
+        const std::uint64_t aw = whole.app_row_span_words(whole.width);
         const std::uint64_t sw = std::uint64_t(whole.width) * whole.scratch_texel_words();
         if (!loaded_ || !make_pipeline() || !whole.app || !whole.width || !whole.height || !whole.slices ||
             whole.app_offset % 4 || whole.app_row_words < aw ||
@@ -110,7 +114,8 @@ public:
     void run(VkCommandBuffer command_buffer, const Depth24Job& job) const {
         struct Push {
             std::uint32_t width, height, slices, to_float, app_base, app_row, app_slice, scratch_base;
-        } push{job.width, job.height, job.slices, (job.to_float ? 1u : 0u) | (job.rgb96 ? 2u : 0u), job.app_base_words,
+        } push{job.width, job.height, job.slices,
+               (job.to_float ? 1u : 0u) | (job.rgb96 ? 2u : 0u) | (job.rgba4 ? 4u : 0u), job.app_base_words,
                job.app_row_words, job.app_slice_words, job.scratch_base_words};
         vk_.vkCmdBindPipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         vk_.vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout_, 0, 1, &job.set, 0,
@@ -146,7 +151,9 @@ public:
             if (retired_[i].ticket != 0) {
                 std::uint64_t done = 0;
                 if (!retired_[i].timeline ||
-                    vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done) != VK_SUCCESS ||
+                    DeviceFaultDiagnostics::observe(diagnostics_,
+                        vk_.vkGetSemaphoreCounterValue(device_, retired_[i].timeline, &done),
+                        "vkGetSemaphoreCounterValue (scratch)") != VK_SUCCESS ||
                     done < retired_[i].ticket) {
                     ++i;
                     continue;
@@ -225,7 +232,8 @@ private:
         bool ok = vk_.vkCreateDescriptorSetLayout(device_, &set_info, nullptr, &set_layout_) == VK_SUCCESS;
         layout_info.pSetLayouts = &set_layout_;
         ok = ok && vk_.vkCreatePipelineLayout(device_, &layout_info, nullptr, &pipeline_layout_) == VK_SUCCESS &&
-             vk_.vkCreateShaderModule(device_, &module_info, nullptr, &module) == VK_SUCCESS;
+             (aftermath::ShaderName("(runtime) depth24_convert.comp"),
+              vk_.vkCreateShaderModule(device_, &module_info, nullptr, &module) == VK_SUCCESS);
         if (ok) {
             VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
             info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -249,7 +257,7 @@ private:
         constexpr std::uint64_t alignment = 256;
         const std::uint64_t span = ((std::uint64_t(part.slices) - 1) * part.app_slice_words +
                                     (std::uint64_t(part.height) - 1) * part.app_row_words +
-                                    std::uint64_t(part.width) * part.app_texel_words()) * 4;
+                                    part.app_row_span_words(part.width)) * 4;
         const std::uint64_t window = part.app_offset / alignment * alignment;
         const std::uint64_t range = part.app_offset - window + span;
         const std::uint64_t tight = std::uint64_t(part.width) * part.scratch_texel_words() * part.height * part.slices * 4;
@@ -354,6 +362,7 @@ private:
     }
 
     VkDevice device_;
+    DeviceFaultDiagnostics* diagnostics_;
     Allocate allocate_;
     std::uint64_t max_range_;
     Functions vk_;

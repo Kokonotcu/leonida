@@ -596,9 +596,21 @@ int main() {
     our_programs.vs = d3d12test::shader_container(vs_program);
     our_programs.ps = d3d12test::shader_container(ps_program);
 
+    // A host runtime without independent front and back stencil masks (OPTIONS14; Windows 10's in-box d3d12.dll)
+    // refuses every DEPTH_STENCIL2 stream, so it is no reference for those cases: they are skipped, not compared.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS14 host_options14{};
+    const bool host_face_masks =
+        SUCCEEDED(host.p->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS14, &host_options14, sizeof(host_options14))) &&
+        host_options14.IndependentFrontAndBackStencilRefMaskSupported;
     const std::vector<Case> cases = build_cases();
     unsigned compared = 0, differ = 0, skipped = 0;
     for (const Case& c : cases) {
+        if (c.stream && !host_face_masks) {
+            std::printf("%s: SKIP, the host runtime has no independent front and back stencil masks\n",
+                        c.name.c_str());
+            ++skipped;
+            continue;
+        }
         const Result reference = run(host.p, c, host_programs);
         const Result mine = run(ours.p, c, our_programs);
         if (!reference.ok && SUCCEEDED(reference.pso) ) {

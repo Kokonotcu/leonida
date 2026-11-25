@@ -129,6 +129,13 @@ class Flbit64Tests(unittest.TestCase):
         with self.assertRaises(si.UnsupportedConstruct):
             run_lines(["s_flbit_i32_b64 s0, exec"])
 
+    # b64 of a lane mask reads the whole wave's mask: tests/semantic/test_lane_mask_bitreplicate_flbit.py.
+    # Upstream refuses i64 of a lane mask (test_signed_lane_mask_source_is_rejected); this tree translates it from the
+    # same 64-bit wave mask, so it reaches the interpreter as b64 does.
+    def test_signed_lane_mask_source_translates(self):
+        with self.assertRaises(si.UnsupportedConstruct):
+            run_lines(["s_flbit_i32_i64 s0, exec"])
+
 
 if __name__ == "__main__":
     unittest.main()

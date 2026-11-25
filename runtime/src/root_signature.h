@@ -130,20 +130,27 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 //     in this layout equals the program's RSRC2 USER_SGPR count in 29 of 29, and the programs read the tables and
 //     root CBVs at exactly these SGPRs (tools/rootsig_census.py --disasm). The game's compute census agrees (lowest
 //     pointer s4, one-dword tables).
-//   - vertex/pixel/geometry s8 and mesh s16: a hypothesis from the corpus census only (lowest pointer SGPR per stage);
-//     no signature confirms them, and visibility is not modelled (every parameter takes its place in every stage).
-// A parameter that does not fit goes to the console's spill array together with every parameter after it.
-//   - compute: measured (section 7, the console compiler's output): the array is packed in root order with no
-//     alignment, a constant taking 4 bytes per value and a root CBV/SRV/UAV 8 (its 64-bit VA), and the 40-bit pointer
-//     to it is in s[0:1]. Such a parameter's first_sgpr is kMaxUserSgprs + its byte offset / 4 (a "spill dword"; the
-//     command list writes those into the array). A descriptor table in the spill, or a heap base that does not fit,
-//     is refused: their size and place there are not measured (no translated shader reads a spill, D3D-315).
-//   - graphics: where the pointer goes is not measured, so a spill is refused, never truncated.
+//   - vertex/pixel/geometry s8 and mesh s16: from the corpus census (lowest pointer SGPR per stage) and one live
+//     retail frame (a VS and PS reading their tables at s8, s9, s10; issue #14, comment 7131556366); no serialized
+//     signature confirms them yet, and visibility is not modelled (every parameter takes its place in every stage).
+//     The graphics bind point uses Stage::Pixel (s8, as vertex and geometry); a mesh shader reads the same dwords
+//     through its translator-side window (docs/d3d12_vulkan.md section 3.5).
+// A parameter that does not fit goes to the console's spill array behind s[0:1] (compute, section 7) together with
+// every parameter after it.
+//   - compute: the array is packed in root order with no alignment, a constant taking 1 dword per value and a root
+//     CBV/SRV/UAV 2 (its 64-bit VA); the 40-bit pointer to it is in s[0:1]. spill_dword holds each spilled
+//     parameter's dword offset there, and its first_sgpr is kMaxUserSgprs + that offset (is_spill_dword; the command
+//     list writes those into the array).
+//   - graphics: where the spill pointer goes is not measured, so pack_stage refuses a graphics spill (the device keeps
+//     the inline part of such a signature and sends the rest to the argument block, D3D-448-GRAPHICS).
 //
 // Direct heap indexing (docs/d3d12_vulkan.md section 3.4, D3D-329): a signature with
-// D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED gets one more SGPR right after its last parameter, the
-// 32-bit VA of the bound CBV/SRV/UAV heap's first descriptor; SAMPLER_HEAP_DIRECTLY_INDEXED one more after that, the
-// sampler heap's. Neither is a root parameter: the list fills them from SetDescriptorHeaps at each dispatch.
+// D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED gets one more SGPR right after its last parameter
+// (arguments_end), the 32-bit VA of the bound CBV/SRV/UAV heap's first descriptor; SAMPLER_HEAP_DIRECTLY_INDEXED one
+// more after that, the sampler heap's. Neither is a root parameter: the list fills them from SetDescriptorHeaps at
+// each dispatch and draw.
+// merge: kept upstream's layout (the translator merge took it); the struct keeps both sides' fields so the device code
+// of either side compiles. arguments_end (not end_sgpr, which includes the heap bases) is upstream's *_arguments_end.
 enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, Mesh = 4 };
 
 [[nodiscard]] constexpr uint32_t stage_base(Stage stage) noexcept {
@@ -174,6 +181,7 @@ enum class Stage : uint32_t { Vertex = 0, Pixel = 1, Geometry = 2, Compute = 3, 
 }
 
 constexpr uint32_t kNoSgpr = 0xFFFFFFFFu;
+constexpr uint32_t kNoSpill = 0xFFFFFFFFu;
 
 // D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED and SAMPLER_HEAP_DIRECTLY_INDEXED (d3d12.h values).
 constexpr uint32_t kFlagResourceHeapDirectlyIndexed = 0x400;
@@ -187,12 +195,17 @@ struct StagePackResult {
     bool spills = false;
     Stage stage = Stage::Compute;
     uint32_t base = 0;            // stage_base(stage)
-    std::vector<uint32_t> first_sgpr;  // per parameter: its first user SGPR (kNoSgpr when the signature is refused)
+    // Per parameter: its first user SGPR, or, for a parameter in the compute spill array, kMaxUserSgprs + its dword
+    // offset there (is_spill_dword); kNoSgpr when the signature is refused.
+    std::vector<uint32_t> first_sgpr;
+    std::vector<uint32_t> spill_dword; // per parameter: dword offset in s[0:1] spill array (kNoSpill when inline)
     uint32_t resource_heap_sgpr = kNoSgpr;  // the bound CBV/SRV/UAV heap's base (kNoSgpr: the flag is clear)
     uint32_t sampler_heap_sgpr = kNoSgpr;   // the bound sampler heap's base (kNoSgpr: the flag is clear)
-    uint32_t end_sgpr = 0;        // one past the last SGPR used: the RSRC2 USER_SGPR count the layout implies
+    uint32_t arguments_end = 0;   // one past the last inline argument SGPR: where the heap bases (if any) start
+    uint32_t end_sgpr = 0;        // one past the last SGPR used, heap bases included: the RSRC2 USER_SGPR count
     uint32_t d3d12_cost = 0;      // cost against the 64-dword D3D12 limit
     uint32_t spill_bytes = 0;     // compute: the spill array's size (0: nothing spills, s[0:1] is not a pointer)
+    uint32_t spill_dwords = 0;    // the same in dwords
 };
 
 // A first_sgpr at kMaxUserSgprs or above is a dword of the compute spill array, not a user SGPR (pack_stage).
@@ -201,8 +214,8 @@ struct StagePackResult {
 }
 
 // Lays the parameters out for `stage` in the console layout, then the heap bases the signature's flags ask for.
-// Fails like pack() on more than 64 parameters, a constant parameter of 0 values or the 64-dword cost limit, and on
-// any parameter or heap base that would spill.
+// Fails like pack() on more than 64 parameters, an unknown parameter type, a constant parameter of 0 values or the
+// 64-dword cost limit, and on any parameter or heap base that would spill where the spill is not modelled.
 [[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
 
 // D3D12 cost of one parameter against the 64-dword limit.

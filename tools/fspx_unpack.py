@@ -144,13 +144,12 @@ def code_range(code: bytes):
     """(start, end) of the instructions in a kind-6 program: after the 36-byte prologue when it is there, through
     the first s_endpgm. end is None when the program has no s_endpgm."""
     words = struct.unpack_from(f"<{len(code) // 4}I", code)
-    # Most programs carry three hash words; some pipeline-library programs of 1.0.2.1 carry two (a 24-byte prologue,
-    # then s_inst_prefetch), measured on the 50 programs the runtime found untranslated. Two or three count.
-    hash_words = 0
-    while hash_words < len(PROLOGUE_WORDS) and len(words) > PROLOGUE_WORDS[hash_words] + 2 and \
-            words[PROLOGUE_WORDS[hash_words]] >> 16 == 0xD580:
-        hash_words += 1
-    start = hash_words * PROLOGUE_SIZE // len(PROLOGUE_WORDS) if hash_words >= 2 and len(words) > 8 else 0
+    start = PROLOGUE_SIZE if len(words) > 8 and all(words[k] >> 16 == 0xD580 for k in PROLOGUE_WORDS) else 0
+    # Some pipeline programs have only the two hash carriers. Both must be literal-bearing
+    # VOP3 NOPs of the form in fspx_prologue_probe; the first body instruction starts at byte 24.
+    if not start and len(words) >= 6 and all(
+            words[k] >> 16 == 0xD580 and words[k + 1] & 0xFFFE0100 == 0x03FE0100 for k in (0, 3)):
+        start = 24
     pos = code.find(ENDPGM, start)
     while pos >= 0 and pos % 4:
         pos = code.find(ENDPGM, pos + 1)
@@ -318,7 +317,8 @@ def main(argv=None) -> int:
                     # every branch inside the code is the program's end.
                     end = branch_closed_end(blob[6], start, a.mcpu, disasm) or end
                     meta["code"]["end"] = end
-                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, compute=True)
+                asm, invalid, err = disasm.disasm(blob[6][start:end], a.mcpu, wave32=meta.get("wave32", True),
+                                                  compute=True)
                 if not asm.strip():
                     reason = (err.strip().splitlines() or ["no output"])[0]
                     print(f"{name}: {reason}", file=sys.stderr)

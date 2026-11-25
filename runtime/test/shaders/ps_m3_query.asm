@@ -1,5 +1,5 @@
 ; M3 occlusion probe: one color export, with all framebuffer writes disabled by the PSO.
-; Same root constants as ps_m3.asm; no depth export, discard or memory side effects.
+; Same root constants as ps_m3.asm (c0, c1, c2 at s13, s14, s15); no depth export, discard or memory side effects.
 ; Vulkan permits occlusion counts multiplied by the number of written color outputs, even with PRECISE.
 ; Keep the probe single-output so its count can be compared exactly with the CPU's visible rectangle area.
 ; fssm-at: 0x10

@@ -51,10 +51,9 @@ inline constexpr std::uint32_t xbox_frame_interval_120hz_us = 8333;
 class XboxPresentation {
 public:
     // `clock` null: real time (a steady high-resolution timer). Tests pass a leonida::ManualFrameClock, which must
-    // outlive this object. `presenter` is what create_window_presenter returned. `tokens` null: the pacer owns its
-    // own source; the retail sink passes the device's source so WaitFrameEventX tokens are accepted by PresentX.
+    // outlive this object. `presenter` is what create_window_presenter returned.
     explicit XboxPresentation(std::unique_ptr<WindowPresenter> presenter, leonida::FrameClock* clock = nullptr,
-                              std::shared_ptr<leonida::FrameTokenSource> tokens = nullptr);
+                              std::shared_ptr<leonida::FrameTokenSource> tokens = nullptr, bool current_origin_poll = false);
     ~XboxPresentation();
     XboxPresentation(const XboxPresentation&) = delete;
     XboxPresentation& operator=(const XboxPresentation&) = delete;

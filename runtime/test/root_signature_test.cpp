@@ -421,7 +421,9 @@ int main() {
 
         // An empty signature is valid and uses nothing.
         const StagePackResult empty = pack_stage(RootSignature{}, Stage::Compute);
-        check(empty.ok && empty.first_sgpr.empty() && empty.end_sgpr == 4, "pack_stage: empty signature");
+        check(empty.ok && empty.first_sgpr.empty() && empty.spill_dword.empty() && empty.end_sgpr == 4 &&
+                  empty.spill_dwords == 0,
+              "pack_stage: empty signature");
         check(empty.resource_heap_sgpr == kNoSgpr && empty.sampler_heap_sgpr == kNoSgpr,
               "pack_stage: no heap-indexing flag, no heap SGPR");
     }
@@ -461,10 +463,18 @@ int main() {
         check(f1.ok && f1.resource_heap_sgpr == 31 && f1.end_sgpr == 32, "pack_stage: heap base in s31");
         full.flags |= kFlagSamplerHeapDirectlyIndexed;
         const StagePackResult f2 = pack_stage(full, Stage::Compute);
-        check(!f2.ok && f2.first_sgpr.empty() && f2.resource_heap_sgpr == kNoSgpr &&
-                  f2.error.find("sampler heap base") != std::string::npos &&
-                  f2.error.find("spill") != std::string::npos && f2.spills,
-              "pack_stage: a heap base that does not fit is refused and named");
+        // merge: a heap base that does not fit is left out (upstream's rule, d3d12_compute_test's 27 and 28
+        // constants): the arguments keep their SGPRs and the CBV/SRV/UAV base still takes s31.
+        check(f2.ok && f2.first_sgpr == std::vector<uint32_t>({4}) && f2.resource_heap_sgpr == 31 &&
+                  f2.sampler_heap_sgpr == kNoSgpr && f2.end_sgpr == 32 && !f2.spills,
+              "pack_stage: a heap base that does not fit is left out");
+        RootSignature fuller;
+        fuller.params = {consts(28)};
+        fuller.flags = kFlagResourceHeapDirectlyIndexed | kFlagSamplerHeapDirectlyIndexed;
+        const StagePackResult f3 = pack_stage(fuller, Stage::Compute);
+        check(f3.ok && f3.resource_heap_sgpr == kNoSgpr && f3.sampler_heap_sgpr == kNoSgpr && f3.end_sgpr == 32 &&
+                  f3.arguments_end == 32,
+              "pack_stage: arguments to s31 leave no heap base");
     }
 
     // Compute has 28 SGPRs above s4; what does not fit goes to the spill array behind s[0:1] (M10, section 7):
@@ -474,7 +484,9 @@ int main() {
         RootSignature exact;
         exact.params = {consts(28)};
         const StagePackResult e = pack_stage(exact, Stage::Compute);
-        check(e.ok && e.spill_bytes == 0 && e.end_sgpr == 32, "pack_stage: 28 constants fill compute exactly");
+        check(e.ok && e.spill_bytes == 0 && e.end_sgpr == 32 && e.spill_dwords == 0 &&
+                  e.spill_dword == std::vector<uint32_t>({kNoSpill}),
+              "pack_stage: 28 constants fill compute exactly, with no spill");
         RootSignature over;
         over.params = {consts(27), view(), consts(3)};  // the view would need s31..s32
         const StagePackResult r = pack_stage(over, Stage::Compute);
@@ -482,6 +494,8 @@ int main() {
                   r.first_sgpr[1] == kMaxUserSgprs && r.first_sgpr[2] == kMaxUserSgprs + 2 && r.spill_bytes == 20 &&
                   r.end_sgpr == 31 && is_spill_dword(r.first_sgpr[1]) && !is_spill_dword(r.first_sgpr[0]),
               "pack_stage: the parameter that does not fit and the ones after it go to the compute spill array");
+        check(r.spill_dword == std::vector<uint32_t>({kNoSpill, 0, 2}) && r.spill_dwords == 5,
+              "pack_stage: spill_dword holds each spilled parameter's dword offset (upstream's field)");
         // The same signature fits the graphics stages from s8 only up to 24 SGPRs: a spill there, refused.
         const StagePackResult g = pack_stage(over, Stage::Pixel);
         check(!g.ok && g.spills && g.first_sgpr.empty() && g.error.find("root parameter 0") != std::string::npos &&
@@ -503,6 +517,12 @@ int main() {
         const StagePackResult h = pack_stage(spilled_heap, Stage::Compute);
         check(!h.ok && h.spills && h.error.find("heap base") != std::string::npos,
               "pack_stage: a heap base after a compute spill is refused (its place is not measured)");
+        // 64-dword D3D12 cost still holds for spilling compute signatures.
+        RootSignature max64;
+        max64.params = {consts(64)};
+        const StagePackResult m64 = pack_stage(max64, Stage::Compute);
+        check(m64.ok && m64.end_sgpr == 4 && m64.spill_dwords == 64 && m64.d3d12_cost == 64,
+              "pack_stage: 64-dword spilled compute signature accepted");
         RootSignature tables;
         tables.params.assign(20, table());  // one dword each: compute s4..s23; pack() needs 40
         check(pack_stage(tables, Stage::Compute).ok && !pack(tables).ok,
@@ -510,11 +530,64 @@ int main() {
         tables.params.assign(16, table());  // fills mesh s16..s31 exactly
         check(pack_stage(tables, Stage::Mesh).ok, "pack_stage: 16 tables fill the mesh stage exactly");
         tables.params.push_back(table());
-        check(!pack_stage(tables, Stage::Mesh).ok, "pack_stage: a 17th table spills on mesh");
+        const StagePackResult mesh_spill = pack_stage(tables, Stage::Mesh);
+        check(!mesh_spill.ok && mesh_spill.first_sgpr.empty() &&
+                  mesh_spill.error.find("root parameter 16") != std::string::npos &&
+                  mesh_spill.error.find("spill") != std::string::npos,
+              "pack_stage: a 17th table still refuses to spill on mesh");
+        check(!pack_stage(over, Stage::Pixel).ok && !pack_stage(over, Stage::Vertex).ok,
+              "pack_stage: non-compute graphics stages still refuse spills");
+    }
+
+    // The graphics root window (D3D-448-GRAPHICS): the graphics bind point lays a signature out once with
+    // Stage::Pixel, root dword k at push dword 8 + k. A vertex, pixel or geometry shader reads SGPR i from push
+    // dword i, and a mesh shader its s16 + k from push dword 8 + k (tools/rdna2spirv.py, user_data_dword), so every
+    // stage of a pipeline finds each parameter in the same dword. The mesh window holds 16 dwords, the others 24.
+    {
+        const std::vector<RootSignature> shapes = [] {
+            std::vector<RootSignature> out(4);
+            out[0].params = {consts(2), view()};
+            out[1].params = {table(), table(), consts(1)};
+            out[2].params = {table(), consts(4), view(), table()};
+            out[3].params.assign(16, table());
+            return out;
+        }();
+        for (std::size_t s = 0; s < shapes.size(); ++s) {
+            const StagePackResult vs = pack_stage(shapes[s], Stage::Vertex);
+            const StagePackResult ps = pack_stage(shapes[s], Stage::Pixel);
+            const StagePackResult gs = pack_stage(shapes[s], Stage::Geometry);
+            const StagePackResult ms = pack_stage(shapes[s], Stage::Mesh);
+            check(vs.ok && ps.ok && gs.ok && ms.ok, "graphics window: the shape fits every graphics stage");
+            check(vs.first_sgpr == ps.first_sgpr && vs.first_sgpr == gs.first_sgpr,
+                  "graphics window: VS, PS and GS place every parameter in the same SGPR");
+            bool same_dword = vs.first_sgpr.size() == ms.first_sgpr.size();
+            for (std::size_t i = 0; same_dword && i < vs.first_sgpr.size(); ++i)
+                same_dword = vs.first_sgpr[i] - 8 == ms.first_sgpr[i] - 16;
+            check(same_dword, "graphics window: a mesh shader's s16 + k is the pixel shader's s8 + k");
+        }
+        RootSignature twenty;
+        twenty.params = {consts(20)};
+        check(pack_stage(twenty, Stage::Vertex).ok && !pack_stage(twenty, Stage::Mesh).ok,
+              "graphics window: 20 dwords fit a pixel shader (24 from s8) but not a mesh shader (16 from s16)");
+        RootSignature full;
+        full.params = {consts(24)};
+        check(pack_stage(full, Stage::Pixel).ok, "graphics window: 24 constants fill s8..s31 exactly");
+        full.params = {consts(23), view()};
+        check(!pack_stage(full, Stage::Pixel).ok, "graphics window: a root view past s31 spills");
+        RootSignature tables;
+        tables.params = {table(), table()};
+        const StagePackResult t = pack_stage(tables, Stage::Pixel);
+        check(t.ok && t.first_sgpr == std::vector<uint32_t>({8, 9}) && t.end_sgpr == 10,
+              "graphics window: two tables are s8 and s9, one dword each (pack() gave s[0:1] and s[2:3])");
     }
 
     // pack_stage keeps pack()'s validation.
     {
+        RootSignature invalid_sig;
+        RootParameter bad_param;
+        bad_param.type = static_cast<ParamType>(0xffffffffu);
+        invalid_sig.params = {bad_param};
+        check(!pack_stage(invalid_sig, Stage::Compute).ok, "pack_stage: invalid parameter enum rejected");
         RootSignature zero;
         zero.params = {consts(0)};
         check(!pack_stage(zero, Stage::Compute).ok && !pack_stage(zero, Stage::Compute).spills,
@@ -535,9 +608,9 @@ int main() {
         check(!pack_stage(many, Stage::Compute).ok && !pack_stage(many, Stage::Compute).spills,
               "pack_stage: more than 64 parameters rejected");
         RootSignature bogus;
-        RootParameter bad_param{};
-        bad_param.type = static_cast<ParamType>(99);
-        bogus.params = {bad_param};
+        RootParameter unknown_param{};
+        unknown_param.type = static_cast<ParamType>(99);
+        bogus.params = {unknown_param};
         check(!pack_stage(bogus, Stage::Compute).ok, "pack_stage: unknown parameter type rejected");
     }
 

@@ -1,5 +1,6 @@
-// A heap's GPU address arena range on the Vulkan-backed device, with a small arena (CTest sets LEONIDA_ARENA_MB=64):
-//   - texture-only heaps reserve nothing: four of 128 MiB each are created and take a placed texture, eight times
+// A heap's GPU address arena range on the Vulkan-backed device, with a small arena (CTest sets LEONIDA_ARENA_MB=96:
+// the title page table and the quad indices take the first 32.8 MiB, leaving about 63 MiB):
+//   - texture-only heaps reserve nothing: four of 128 MiB each are created and take a placed texture, over five times
 //     the arena (before, CreateHeap refused the first with E_OUTOFMEMORY);
 //   - a heap that allows buffers reserves its size when the first buffer is placed: in a 128 MiB one a texture is
 //     placed, and a buffer is refused with E_OUTOFMEMORY, the arena being too small;
@@ -87,7 +88,7 @@ bool small_buffer_heap(ID3D12Device* device) {
     return va_a && va_b == va_a + k64;
 }
 // A 48 MiB heap for buffers and textures whose texture tiles have their own sparse backing refuses a placed buffer;
-// the refusal must leave the arena free, so a 32 MiB buffer heap still fits the 64 MiB arena. 1: pass, 0: fail,
+// the refusal must leave the arena free, so a 32 MiB buffer heap still fits the arena (63 MiB free). 1: pass, 0: fail,
 // -1: no sparse texture tiles here (skipped).
 int refused_buffer_keeps_arena(ID3D12Device* device) {
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
@@ -139,7 +140,7 @@ int main() {
             created = created && SUCCEEDED(device->CreateHeap(&desc, IID_PPV_ARGS(&heaps[i].p)));
             placed = placed && created && SUCCEEDED(place(device.p, heaps[i].p, 0, texture_desc(), textures[i]));
         }
-        check(created, "four 128 MiB texture-only heaps with a 64 MiB arena");
+        check(created, "four 128 MiB texture-only heaps with a 96 MiB arena");
         check(placed, "a placed texture in each");
     }
 

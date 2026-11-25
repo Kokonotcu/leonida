@@ -41,7 +41,8 @@ inline std::uint64_t override_mb() {
     char* end = nullptr;
     const unsigned long long mb = std::strtoull(value, &end, 10);
     if (!end || *end || mb == 0 || mb > 1048576) return 0;
-    return mb;
+    // merge: upstream's range for the override (its XSystemGetAppMemoryUsageLimit clamped it to 2048..65536 MiB).
+    return mb < 2048 ? 2048 : mb > 65536 ? 65536 : mb;
 }
 
 // An Xbox Series S title gets less: 8 GiB (ASSUMPTION: the documented ~8 GB a Series S game may use of its 10 GB).

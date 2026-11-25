@@ -8,6 +8,7 @@
 
 #include "vulkan_backend.h"
 #include "present_compose_spv.h"
+#include "vulkan_aftermath.h"
 
 #include <algorithm>
 #include <array>
@@ -126,6 +127,8 @@ public:
         VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         module_info.codeSize = sizeof(present_compose_spirv);
         module_info.pCode = present_compose_spirv;
+        // merge: our cleanup on failure, with upstream's Aftermath shader name.
+        const aftermath::ShaderName aftermath_name("(runtime) present_compose");
         if (vk.vkCreateShaderModule(device, &module_info, nullptr, &module) != VK_SUCCESS || !module) {
             module = VK_NULL_HANDLE;
             cleanup();

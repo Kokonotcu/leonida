@@ -20,6 +20,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -188,7 +189,7 @@ Result run(vktest::Device& d, const std::filesystem::path& library, const leonid
     CASE_EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
     Ref<ID3D12Device> device;
     CASE_EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                            reinterpret_cast<void**>(&device.p))));
+                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
     rt::d3d12::set_device_outer(inner, device.p);
 
     // Root signature: [0] four constants (s4..s7 in the console compute layout, D3D-448), the V# the shaders store
@@ -385,7 +386,7 @@ DrawResult draw(vktest::Device& d, const std::filesystem::path& library, const l
     CASE_EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&inner))));
     Ref<ID3D12Device> device;
     CASE_EXPECT(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner, __uuidof(ID3D12Device),
-                                                            reinterpret_cast<void**>(&device.p))));
+                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
     rt::d3d12::set_device_outer(inner, device.p);
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC root_desc{};
@@ -535,6 +536,11 @@ const Pixel readlane_expected = {0x40000079u, 0x40000010u, 0x40000064u, 0x400000
 }  // namespace
 
 int main() {
+    // The PSO's subgroup requests are recorded when its Vulkan pipeline is made, and the layer builds compute
+    // pipelines lazily by default: at the first dispatch (or on the warm-up thread), not at
+    // CreateComputePipelineState. `run` reads them straight after creation, so build at creation on this thread.
+    // (A device released with warm-up builds queued no longer outlives its release: d3d12_compile_teardown_test.)
+    _putenv_s("LEONIDA_LAZY_COMPUTE", "0");
     vktest::Device d;
     const auto device_status = d.initialize();
     if (device_status == vktest::DeviceStatus::unavailable) return 77;   // no Vulkan GPU: ctest skips

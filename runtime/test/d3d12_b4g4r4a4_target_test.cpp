@@ -4,8 +4,8 @@
 //
 // Exercises:
 //   1. GetResourceAllocationInfo and CreateCommittedResource for a render-target texture (UINT64_MAX before)
-//   2. ClearRenderTargetView through the RTV, whole view and a rectangle, read back as the RGBA8 image's texels
-//      (a buffer footprint gets 4-byte texels; the test reads them as such)
+//   2. ClearRenderTargetView through the RTV, whole view and a rectangle, read back through a footprint
+//      (a buffer footprint gets D3D12's packed 16-bit texels, repacked from the image's 4-byte ones)
 //   3. The SRV T# names 4_4_4_4, not 8_8_8_8, so shaders see the texture's own format
 //   4. A B4G4R4A4 texture without ALLOW_RENDER_TARGET still gets a size (it samples natively)
 // On a GPU where A4R4G4B4 is a colour attachment nothing is substituted and the test exits 77.
@@ -192,15 +192,15 @@ int main() {
     unsigned wrong = 0;
     for (UINT y = 0; y < kH; ++y) {
         for (UINT x = 0; x < kW; ++x) {
-            std::uint8_t texel[4] = {};
-            std::memcpy(texel, static_cast<const std::uint8_t*>(mapped) + y * kPitch + x * 4, sizeof(texel));
+            // merge: the footprint holds D3D12's packed 16-bit texels (B in bits 0-3, G 4-7, R 8-11, A 12-15),
+            // repacked from the RGBA8 image by the depth24 pass (Depth24Job::rgba4), not the image's 4-byte texels.
+            std::uint16_t texel = 0;
+            std::memcpy(&texel, static_cast<const std::uint8_t*>(mapped) + y * kPitch + x * 2, sizeof(texel));
             const bool inside = x >= UINT(rect.left) && x < UINT(rect.right) && y >= UINT(rect.top) &&
                                 y < UINT(rect.bottom);
-            const std::uint8_t want[4] = {std::uint8_t(inside ? 0x00 : 0xFF), std::uint8_t(inside ? 0xAA : 0x00),
-                                          std::uint8_t(inside ? 0x00 : 0x55), std::uint8_t(inside ? 0x00 : 0xFF)};
-            if (std::memcmp(texel, want, 4) != 0 && wrong++ < 4)
-                std::fprintf(stderr, "texel (%u, %u) = %02x %02x %02x %02x, want %02x %02x %02x %02x\n", x, y,
-                             texel[0], texel[1], texel[2], texel[3], want[0], want[1], want[2], want[3]);
+            const std::uint16_t want = inside ? 0x00A0 : 0xFF05;  // (0, 10/15, 0, 0) and (1, 0, 5/15, 1)
+            if (texel != want && wrong++ < 4)
+                std::fprintf(stderr, "texel (%u, %u) = %04x, want %04x\n", x, y, unsigned(texel), unsigned(want));
         }
     }
     readback->Unmap(0, nullptr);

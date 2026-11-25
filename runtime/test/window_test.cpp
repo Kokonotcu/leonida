@@ -169,8 +169,12 @@ int main(int argc, char** argv) {
         if (hwnd_w) {
             check(reinterpret_cast<HMODULE>(GetWindowLongPtrW(hwnd_w, GWLP_HINSTANCE)) == host,
                   "CreateWindowExW passes the host instance to user32");
-            check(reinterpret_cast<void*>(GetWindowLongPtrW(hwnd_w, GWLP_WNDPROC)) == wndproc_w(),
-                  "the wide window keeps the mapped WNDPROC");
+            // merge: the title's first top-level window is subclassed by lifecycle.cpp (upstream's SC_CLOSE hook),
+            // which keeps the mapped WNDPROC in its "leonida.title.wndproc" property and forwards to it (the message
+            // check below proves it runs).
+            const void* proc = reinterpret_cast<void*>(GetWindowLongPtrW(hwnd_w, GWLP_WNDPROC));
+            check(proc == wndproc_w() || GetPropW(hwnd_w, L"leonida.title.wndproc") == wndproc_w(),
+                  "the wide window keeps the mapped WNDPROC (directly, or behind the title-window hook)");
             const long before = calls_w();
             SendMessageW(hwnd_w, WM_APP + 1, 0, 0);
             check(calls_w() == before + 1, "a message reaches the mapped wide WNDPROC");
