@@ -253,6 +253,10 @@ public:
         // A dispatch's group counts and its first four user-data words (0 for the other ops): a hang report then
         // says whether a dispatch was huge or what it was pointed at.
         std::vector<std::array<std::uint32_t, 11>> details;
+        // For a dispatch whose user-data words point into the GPU address arena: the 4 dwords at each such word at
+        // submission (op index, 8 x 4 dwords; 0 for a word that is not such an address). The report shows them
+        // beside what is there at report time, which later writes may have changed (a ring the title reuses).
+        std::vector<std::pair<std::uint32_t, std::array<std::uint32_t, 32>>> submitted_words;
     };
     // A submitted list as the breadcrumbs see it now.
     struct Entry {
@@ -264,6 +268,7 @@ public:
         std::wstring list_name, queue_name;
         std::vector<std::uintptr_t> pipelines;  // as Mark::pipelines
         std::vector<std::array<std::uint32_t, 11>> details;  // as Mark::details
+        std::vector<std::pair<std::uint32_t, std::array<std::uint32_t, 32>>> submitted_words;  // as Mark's
         bool progress_known = false;      // GPU breadcrumbs: completed_ops is what the progress word says
         bool no_slot = false;             // level 2 with every slot busy: no GPU marker, progress unknown
         std::uint32_t completed_ops = 0;  // operations finished, in order (D3D12's *pLastBreadcrumbValue)
@@ -364,6 +369,18 @@ public:
                     pso = d->pipeline;
                     detail = {d->x, d->y, d->z, d->user_data[0], d->user_data[1], d->user_data[2], d->user_data[3],
                               d->user_data[4], d->user_data[5], d->user_data[6], d->user_data[7]};
+                    if (debug_targets::arena_mapped) {
+                        std::array<std::uint32_t, 32> words{};
+                        bool any = false;
+                        for (int w = 0; w < 8; ++w)
+                            if (arena_word(d->user_data[w])) {
+                                const auto* v = reinterpret_cast<const std::uint32_t*>(debug_targets::arena_mapped +
+                                                                                       d->user_data[w]);
+                                for (int k = 0; k < 4; ++k) words[w * 4 + k] = v[k];
+                                any = true;
+                            }
+                        if (any) m.submitted_words.emplace_back(static_cast<std::uint32_t>(m.ops.size() - 1), words);
+                    }
                 }
                 m.details.push_back(detail);
                 if (const auto* g = std::get_if<Draw>(&commands[i])) pso = g->pipeline;
@@ -494,6 +511,7 @@ public:
                 words ? breadcrumb_state(read(m->slot, 0), read(m->slot, 1), m->tag) : BreadcrumbState::unknown;
             Entry e{m->tag, m->list_id, m->ops, state, m->queue_id, m->list_name, m->queue_name, m->pipelines};
             e.details = m->details;
+            e.submitted_words = m->submitted_words;
             e.no_slot = gpu_ && m->slot == kNoSlot;
             if (state == BreadcrumbState::completed) {
                 e.progress_known = true;  // the end word: every operation finished
@@ -597,17 +615,29 @@ private:
                                  d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]);
                     // The descriptors a word names when it is an address in the GPU address arena (the V# a shader
                     // loads through it): 4 dwords each, for the stuck operation.
-                    if (k == at && debug_targets::arena_mapped)
+                    if (k == at && debug_targets::arena_mapped) {
+                        const std::array<std::uint32_t, 32>* then = nullptr;
+                        for (const auto& s : e.submitted_words)
+                            if (s.first == k) then = &s.second;
                         for (int w = 3; w < 11; ++w)
-                            if (d[w] >= 0x10000 && d[w] % 4 == 0 && d[w] + 16 <= debug_targets::arena_size) {
+                            if (arena_word(d[w])) {
                                 const auto* v = reinterpret_cast<const std::uint32_t*>(debug_targets::arena_mapped + d[w]);
                                 std::fprintf(out, "\n[rt] d3d12 DRED:          at user data %d (%#x): %08x %08x %08x %08x",
                                              w - 3, d[w], v[0], v[1], v[2], v[3]);
+                                if (then) {
+                                    const std::uint32_t* s = then->data() + (w - 3) * 4;
+                                    std::fprintf(out, " (at submission %08x %08x %08x %08x)", s[0], s[1], s[2], s[3]);
+                                }
                             }
+                    }
                 }
                 std::fprintf(out, "\n");
             }
         }
+    }
+    // A user-data word that is a 4-aligned address of 16 bytes in the GPU address arena, past its zero page.
+    static bool arena_word(std::uint32_t w) {
+        return w >= 0x10000 && w % 4 == 0 && std::uint64_t(w) + 16 <= debug_targets::arena_size;
     }
     static std::size_t count_incomplete(const std::vector<Entry>& entries) {
         std::size_t n = 0;

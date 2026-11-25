@@ -821,9 +821,11 @@ class TestSpirvEmission(unittest.TestCase):
         has_image_write = any("OpImageWrite" in ln for ln in g.body)
         self.assertTrue(has_image_write)
 
-    def test_sub_dword_unorm8_emits_atomic_rmw(self) -> None:
+    def test_sub_dword_unorm8_emits_byte_store(self) -> None:
+        # One 8-bit store, not an atomic and + or on the dword: atomics on the title's (host) memory cross PCIe and
+        # serialise per address (library 3436 ran past the TDR limit).
         spv = support.translate_lines(
-            "cs_tbuf_atomic_rmw",
+            "cs_tbuf_byte_store",
             [
                 "v_mov_b32_e32 v20, 1.0",
                 "v_mov_b32_e32 v5, 0x200",
@@ -832,8 +834,11 @@ class TestSpirvEmission(unittest.TestCase):
             ],
             fssm=CS_FSSM,
         )
-        self.assertIn("OpAtomicAnd", spv)
-        self.assertIn("OpAtomicOr", spv)
+        self.assertIn("OpCapability StorageBuffer8BitAccess", spv)
+        self.assertIn("OpStore", spv)
+        self.assertIn("%_ptr_PSB_uchar", spv)
+        self.assertNotIn("OpAtomicAnd", spv)
+        self.assertNotIn("OpAtomicOr", spv)
 
 
 class TestSpirvNegativeControls(unittest.TestCase):

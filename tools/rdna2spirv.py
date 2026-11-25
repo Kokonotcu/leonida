@@ -323,6 +323,7 @@ class Gen:
         self.uses_fma_khr = False      # an OpFmaKHR was emitted: capability FMAKHR + extension SPV_KHR_fma
         self.uses_fma_khr32 = False    # ... on f32 (feature shaderFmaFloat32)
         self.uses_fma_khr64 = False    # ... on f64 (feature shaderFmaFloat64)
+        self.uses_byte_store = False   # an 8-bit store to memory: capability StorageBuffer8BitAccess (store_byte)
         # The --fma option this module is translated under, for the index: a caller that changes the option before
         # shader_meta (translation and indexing in separate steps) must not relabel it.
         self.fma_mode = "exact" if FMA_EXACT else "khr" if FMA_KHR else "glsl"
@@ -1624,7 +1625,16 @@ class Gen:
         paged = add(entry, low)
         null = add(add("%heap_base", self.cl(PAGE_TABLE_SCRATCH)), low)
         self.emit(f"{mapped} = OpSelect %ulong {ok} {paged} {null}")
-        self.emit(f"{r} = OpSelect %ulong {arena} {direct} {mapped}")
+        # Below 4 GiB the directory load read dir[0], which no title VA uses. The runtime gives it a chunk whose
+        # entries are the VAs below 4 GiB shaders may address (the arena and the buffers outside it, identity
+        # entries: d3d12_vulkan_device.cpp note_low_va), so such a VA takes the paged path too, and one with no entry
+        # (a stale or non-buffer descriptor: the floats 300.0, 1000.0 read as a V# by CS_Prop_BatchCull gave base
+        # 0x43960000) reads and writes the scratch page; as a raw device address it hung the NVIDIA queue for good.
+        # A runtime without that chunk (dir[0] 0) keeps the direct heap_base + VA.
+        use_direct, nohas = t(), t()
+        self.emit(f"{nohas} = OpLogicalNot %bool {has}")
+        self.emit(f"{use_direct} = OpLogicalAnd %bool {arena} {nohas}")
+        self.emit(f"{r} = OpSelect %ulong {use_direct} {direct} {mapped}")
         return r
 
     def tof(self, u):
@@ -2342,16 +2352,12 @@ class Gen:
                     self.emit(f"{f2} = OpISub %ulong {far} {self.cl(3)}")
                     self.emit(f"{sel} = OpSelect %ulong {cross} {f2} {va}")
                     va = sel
-            p, sh = self.global_byte_ptr(va)
             if store:
-                byte, mk, inv, vs, t1, t2 = (self.tmp() for _ in range(6))
+                byte = self.tmp()
                 self.emit(f"{byte} = OpBitFieldUExtract %uint {old} {self.cu(16 * (half or 0) + 8 * k)} {self.cu(8)}")
-                self.emit(f"{mk} = OpShiftLeftLogical %uint {self.cu(0xFF)} {sh}")
-                self.emit(f"{inv} = OpNot %uint {mk}")
-                self.emit(f"{vs} = OpShiftLeftLogical %uint {byte} {sh}")
-                self.emit(f"{t1} = OpAtomicAnd %uint {p} {self.cu(1)} {self.cu(0)} {inv}")
-                self.emit(f"{t2} = OpAtomicOr %uint {p} {self.cu(1)} {self.cu(0)} {vs}")
+                self.store_byte(va, byte)
             else:
+                p, sh = self.global_byte_ptr(va)
                 w, b = self.tmp(), self.tmp()
                 self.emit(f"{w} = OpLoad %uint {p} Aligned 4")
                 self.emit(f"{b} = OpBitFieldUExtract %uint {w} {sh} {self.cu(8)}")
@@ -3856,6 +3862,42 @@ class Gen:
         self.emit(f"{sh} = OpShiftLeftLogical %uint {b3} {self.cu(3)}")
         return p, sh
 
+    def store_byte(self, va, value, host=None):
+        """Store the low 8 bits of `value` (a uint) at Xbox VA `va` (a ulong) with one 8-bit store, as the hardware
+        stores a byte: neighbouring bytes, maybe another lane's, are not touched. `host` is va's host address when the
+        caller has it. This was an atomic and + or on the byte's dword; the title's memory is host memory imported into
+        Vulkan, and there every atomic is a round trip over PCIe that the GPU serialises per address: a weatherParticle
+        initialisation (library 3436) storing 16-bit values to index 0 from 131,072 lanes ran past the 2 s TDR limit.
+        Needs storageBuffer8BitAccess (the runtime enables it; every Vulkan 1.2 desktop driver and MoltenVK have it)."""
+        self.uses_byte_store = True
+        p, b = self.tmp(), self.tmp()
+        self.emit(f"{p} = OpConvertUToPtr %_ptr_PSB_uchar {host if host is not None else self.host_addr(va)}")
+        self.emit(f"{b} = OpUConvert %uchar {value}")
+        self.emit(f"OpStore {p} {b} Aligned 1")
+
+    def store_small(self, addr, value, nbytes):
+        """A 1- or 2-byte element store (typed buffer stores of 8/16-bit formats) at `addr`: `nbytes` is 1 or 2, or a
+        uint id that is one of them; byte k of `value` goes to addr + k (one translation: a 2-byte element is
+        2-byte aligned, so both bytes are in one 64 KiB page)."""
+        host = self.host_addr(addr)
+        self.store_byte(addr, value, host)
+        if nbytes == 1:
+            return
+        hi, host1 = self.tmp(), self.tmp()
+        self.emit(f"{hi} = OpShiftRightLogical %uint {value} {self.cu(8)}")
+        self.emit(f"{host1} = OpIAdd %ulong {host} {self.cl(1)}")
+        if nbytes == 2:
+            self.store_byte(None, hi, host1)
+            return
+        two, l2, e2 = self.tmp(), self.tmp() + "_b2", self.tmp() + "_b2e"
+        self.emit(f"{two} = OpIEqual %bool {nbytes} {self.cu(2)}")
+        self.emit(f"OpSelectionMerge {e2} None")
+        self.emit(f"OpBranchConditional {two} {l2} {e2}")
+        self.emit(f"{l2} = OpLabel")
+        self.store_byte(None, hi, host1)
+        self.emit(f"OpBranch {e2}")
+        self.emit(f"{e2} = OpLabel")
+
     def global_sub(self, op, a, mods):
         """8- and 16-bit global stores (global_store_byte/short[_d16_hi]) and the d16 loads
         (global_load_{u,s}byte_d16[_hi], global_load_short_d16[_hi]). The access is done one byte at a time, so a
@@ -3883,16 +3925,12 @@ class Gen:
             if k:
                 va = self.tmp()
                 self.emit(f"{va} = OpIAdd %ulong {full} {self.cl(k)}")
-            p, sh = self.global_byte_ptr(va)
             if store:
-                byte, mk, inv, vs, t1, t2 = (self.tmp() for _ in range(6))
+                byte = self.tmp()
                 self.emit(f"{byte} = OpBitFieldUExtract %uint {old} {self.cu(16 * (half or 0) + 8 * k)} {self.cu(8)}")
-                self.emit(f"{mk} = OpShiftLeftLogical %uint {self.cu(0xFF)} {sh}")
-                self.emit(f"{inv} = OpNot %uint {mk}")
-                self.emit(f"{vs} = OpShiftLeftLogical %uint {byte} {sh}")
-                self.emit(f"{t1} = OpAtomicAnd %uint {p} {self.cu(1)} {self.cu(0)} {inv}")
-                self.emit(f"{t2} = OpAtomicOr %uint {p} {self.cu(1)} {self.cu(0)} {vs}")
+                self.store_byte(va, byte)
             else:
+                p, sh = self.global_byte_ptr(va)
                 w, b = self.tmp(), self.tmp()
                 self.emit(f"{w} = OpLoad %uint {p} Aligned 4")
                 self.emit(f"{b} = OpBitFieldUExtract %uint {w} {sh} {self.cu(8)}")
@@ -4616,27 +4654,8 @@ class Gen:
                             pp = self.buf_dword_ptr(ptr, host, step, k)
                             self.emit(f"OpStore {pp} {w} Aligned 4")
                     else:
-                        # 1- or 2-byte element: merge into its dword with atomics so neighbours are kept.
-                        al, sh, sh8, ap, mk, mks, inv, val, vs, t1, t2 = (self.tmp() for _ in range(11))
-                        self.emit(f"{sh} = OpUConvert %uint {addr}")
-                        lo3, lo64 = self.tmp(), self.tmp()
-                        self.emit(f"{lo3} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
-                        self.emit(f"{lo64} = OpUConvert %ulong {lo3}")
-                        self.emit(f"{al} = OpISub %ulong {addr} {lo64}")
-                        self.emit(f"{sh8} = OpShiftLeftLogical %uint {sh} {self.cu(3)}")
-                        sh24 = self.tmp()
-                        self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
-                        # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
-                        dword_arr = self.tmp()
-                        self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
-                        self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
-                        self.emit(f"{mk} = OpCopyObject %uint {self.cu((1 << (8 * size)) - 1)}")
-                        self.emit(f"{mks} = OpShiftLeftLogical %uint {mk} {sh24}")
-                        self.emit(f"{inv} = OpNot %uint {mks}")
-                        self.emit(f"{val} = OpBitwiseAnd %uint {words[0]} {mk}")
-                        self.emit(f"{vs} = OpShiftLeftLogical %uint {val} {sh24}")
-                        self.emit(f"{t1} = OpAtomicAnd %uint {ap} {self.cu(1)} {self.cu(0)} {inv}")
-                        self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
+                        # 1- or 2-byte element: byte stores, so neighbours are kept (store_small)
+                        self.store_small(addr, words[0], size)
             else:
                 pad = lambda xs: (list(xs) + [self.cu(0)] * 4)[:4]      # noqa: E731
                 two = norm2 + fc2 + ic2 + signed_ic2 if fixed_fmt is None else [self.cu(0)] * 8
@@ -4652,7 +4671,7 @@ class Gen:
                     self.emit(f"OpStore {pp} {words[k]} Aligned 4")
                     self.emit(f"OpBranch {le}")
                     self.emit(f"{le} = OpLabel")
-                # 1- or 2-byte element: merge into its dword with atomics so neighbours are kept.
+                # 1- or 2-byte element: byte stores, so neighbours are kept (store_small)
                 small, ld, le = self.tmp(), self.tmp() + "_s", self.tmp() + "_se"
                 sm1 = self.tmp()
                 self.emit(f"{sm1} = OpISub %uint {size} {self.cu(1)}")
@@ -4660,27 +4679,7 @@ class Gen:
                 self.emit(f"OpSelectionMerge {le} None")
                 self.emit(f"OpBranchConditional {small} {ld} {le}")
                 self.emit(f"{ld} = OpLabel")
-                al, sh, sh8, ap, mk, mks, inv, val, vs, t1, t2, one = (self.tmp() for _ in range(12))
-                self.emit(f"{sh} = OpUConvert %uint {addr}")
-                lo3, lo64 = self.tmp(), self.tmp()
-                self.emit(f"{lo3} = OpBitwiseAnd %uint {sh} {self.cu(3)}")
-                self.emit(f"{lo64} = OpUConvert %ulong {lo3}")
-                self.emit(f"{al} = OpISub %ulong {addr} {lo64}")
-                self.emit(f"{sh8} = OpShiftLeftLogical %uint {sh} {self.cu(3)}")
-                sh24 = self.tmp()
-                self.emit(f"{sh24} = OpBitwiseAnd %uint {sh8} {self.cu(24)}")
-                # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations.
-                dword_arr = self.tmp()
-                self.emit(f"{dword_arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
-                self.emit(f"{ap} = OpAccessChain %_ptr_PSB_uint {dword_arr} {self.cu(0)}")
-                self.emit(f"{one} = OpIEqual %bool {size} {self.cu(1)}")
-                self.emit(f"{mk} = OpSelect %uint {one} {self.cu(0xFF)} {self.cu(0xFFFF)}")
-                self.emit(f"{mks} = OpShiftLeftLogical %uint {mk} {sh24}")
-                self.emit(f"{inv} = OpNot %uint {mks}")
-                self.emit(f"{val} = OpBitwiseAnd %uint {words[0]} {mk}")
-                self.emit(f"{vs} = OpShiftLeftLogical %uint {val} {sh24}")
-                self.emit(f"{t1} = OpAtomicAnd %uint {ap} {self.cu(1)} {self.cu(0)} {inv}")
-                self.emit(f"{t2} = OpAtomicOr %uint {ap} {self.cu(1)} {self.cu(0)} {vs}")
+                self.store_small(addr, words[0], size)
                 self.emit(f"OpBranch {le}")
                 self.emit(f"{le} = OpLabel")
         self.emit(f"OpBranch {lbl_end}")
@@ -15708,6 +15707,9 @@ def assemble(gen):
     exts = (["SPV_KHR_physical_storage_buffer"] if psb else []) + (["SPV_EXT_descriptor_indexing"] if tex else [])
     if gen.uses_fma_khr:
         exts.append("SPV_KHR_fma")
+    if gen.uses_byte_store:
+        caps.append("StorageBuffer8BitAccess")   # storageBuffer8BitAccess (store_byte)
+        exts.append("SPV_KHR_8bit_storage")
     if gen.uses_clock:
         exts.append("SPV_KHR_shader_clock")
     if bary_builtin:
@@ -15829,6 +15831,8 @@ def assemble(gen):
                   "%rt_uint = OpTypeRuntimeArray %uint", "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
                   "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint"]
         dec.append("OpDecorate %rt_uint ArrayStride 4")
+        if gen.uses_byte_store:
+            types += ["%uchar = OpTypeInt 8 0", "%_ptr_PSB_uchar = OpTypePointer PhysicalStorageBuffer %uchar"]
         types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(gen.lconsts.items())]
     if tex:
         # Bindless set 0: images (binding 0), samplers (binding 1), descriptor hash table (binding 2).
@@ -18801,6 +18805,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
              "MultiViewport": "multiViewport",
              "DrawParameters": "shaderDrawParameters",
+             "StorageBuffer8BitAccess": "storageBuffer8BitAccess",
              }     # FMAKHR: shaderFmaFloat32 / shaderFmaFloat64 (VK_KHR_shader_fma) by the width used, below
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          # How fused multiply-adds were emitted. --fma khr is already implied by the FMAKHR capability,

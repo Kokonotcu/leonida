@@ -3939,15 +3939,21 @@ private:
             waits_ = std::move(saved_waits);
             wait_values_ = std::move(saved_values);
         };
+        // A slow flush (over 300 ms, on the submitting thread) says where it went: the first-bind layout
+        // initialisation or the bind call, and how many images and binds it carried.
+        const auto t0 = std::chrono::steady_clock::now();
+        std::size_t first_count = 0;
         {
             std::vector<ResourceId> first;
             for (const auto& op : ops)
                 if (op.first) first.push_back(op.id);
+            first_count = first.size();
             if (!first.empty() && !initialize_title_images(first)) {
                 restore();
                 return false;
             }
         }
+        const auto t1 = std::chrono::steady_clock::now();
         std::vector<VkSparseImageMemoryBindInfo> image_infos;
         std::vector<VkSparseImageOpaqueMemoryBindInfo> opaque_infos;
         for (const auto& op : ops) {
@@ -3984,10 +3990,29 @@ private:
             info.pImageOpaqueBinds = opaque_infos.data();
             info.signalSemaphoreCount = 1;
             info.pSignalSemaphores = &progress_;
+            const auto t2 = std::chrono::steady_clock::now();
             const VkResult result = vk.vkQueueBindSparse(queue_, 1, &info, VK_NULL_HANDLE);
             if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
             ok = result == VK_SUCCESS;
             if (ok) context_.record_submit_locked(progress_, ticket);
+            const auto t3 = std::chrono::steady_clock::now();
+            const auto ms = [](auto a, auto b) {
+                return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count());
+            };
+            if (ms(t0, t3) >= 300) {
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 200) {
+                    std::size_t image_binds = 0, opaque_binds = 0;
+                    for (const auto& i : image_infos) image_binds += i.bindCount;
+                    for (const auto& o : opaque_infos) opaque_binds += o.bindCount;
+                    std::fprintf(stderr,
+                                 "[rt] title pages: slow flush %lld ms: %zu images (%zu first), %zu image binds in %zu "
+                                 "infos, %zu opaque binds in %zu infos; first-bind init %lld ms, submit lock %lld ms, "
+                                 "vkQueueBindSparse %lld ms\n",
+                                 ms(t0, t3), ops.size(), first_count, image_binds, image_infos.size(), opaque_binds,
+                                 opaque_infos.size(), ms(t0, t1), ms(t1, t2), ms(t2, t3));
+                }
+            }
         }
         restore();
         if (!ok) {

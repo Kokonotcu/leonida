@@ -798,6 +798,9 @@ std::filesystem::path shader_directory_from_file(const std::filesystem::path& co
 // dedicated allocations made (never subtracted: freeing goes through the deletion queue), live title textures.
 std::atomic<long long> g_live_resources{0};
 std::atomic<unsigned long long> g_dedicated_bytes{0}, g_new_blocks{0};
+// Live device memory by kind, for the allocation-count limit (4096 on NVIDIA's Windows driver): resources with an
+// allocation of their own, and suballocator blocks (made less given back).
+std::atomic<long long> g_dedicated_live{0}, g_blocks_freed{0};
 // Title-placed textures made, by console layout & 0x1ff (0x100 + swizzle mode).
 std::array<std::atomic<unsigned>, 0x200> g_console_layout_count{};
 std::size_t live_title_texture_stats(unsigned long long& bytes);  // under title_texture_mutex
@@ -1144,7 +1147,13 @@ struct DeviceState {
                     region.State != MEM_COMMIT || region.Type == MEM_MAPPED ||
                     (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_NOACCESS)))
                     break;
-                q += page;
+                // The region VirtualQuery describes has these attributes throughout: its pages need no query of their
+                // own. One query per 64 KiB page over an acceleration-structure build's inputs (hundreds of MiB) held
+                // a title render thread in VirtualQuery during a 10 s stall (run 03:21, stacks_1).
+                const std::uint64_t region_end =
+                    reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
+                do q += page;
+                while (q < end && q < region_end && q - p < max_run && !title_pages.mapped.count(q));
             }
             if (q == p) {  // not committed: left unmapped (asked again after kSettledFor)
                 ++title_pages.refused;
@@ -1250,9 +1259,11 @@ struct DeviceState {
 
     // With title_pages.mutex held: the page-table entry of the 64 KiB page at title VA `v` becomes `value` (a device
     // address, 0: the scratch page). False when the table is full (`v` stays unmapped).
-    bool set_page_entry(std::uint64_t v, std::uint64_t value) {
+    // `low`: v is below 4 GiB, an address of the arena or of a buffer outside it (note_low_va); title VAs never are.
+    bool set_page_entry(std::uint64_t v, std::uint64_t value, bool low = false) {
         auto* dir = reinterpret_cast<volatile std::uint32_t*>(arena.mapped + kPageTableDir);
         const std::uint32_t d = static_cast<std::uint32_t>((v >> 32) & 0xFFFF);
+        if (d == 0 && !low) return false;  // dir[0]'s chunk lists the valid VAs below 4 GiB (note_low_va)
         std::uint32_t slot = dir[d];
         bool fresh = false;
         if (!slot) {
@@ -1311,12 +1322,16 @@ struct DeviceState {
             if ((n & (n - 1)) == 0)
                 std::fprintf(stderr, "[rt] d3d12: physical pages %#llx + %#llx could not be imported for the page "
                                      "table (memory types 0x%x, VkResult %d, error %lu; %llu failures, %llu MiB "
-                                     "imported; %ld device memory objects live, %zu imports by address)\n",
+                                     "imported; %ld device memory objects live: %zu imports by address, %zu chunks, "
+                                     "%lld resources of their own, %lld suballocator blocks, %zu title page blocks)\n",
                              static_cast<unsigned long long>(start), static_cast<unsigned long long>(end - start),
                              types, static_cast<int>(last_import_result), GetLastError(),
                              static_cast<unsigned long long>(n),
                              static_cast<unsigned long long>(title_pages.chunk_bytes >> 20),
-                             g_live_allocations.load(std::memory_order_relaxed), title_pages.imports.size());
+                             g_live_allocations.load(std::memory_order_relaxed), title_pages.imports.size(),
+                             title_pages.imported.size(), g_dedicated_live.load(),
+                             static_cast<long long>(g_new_blocks.load()) - g_blocks_freed.load(),
+                             context->title_pages() ? context->title_pages()->stats().blocks : std::size_t(0));
             return title_pages.imported.end();
         }
         title_pages.chunk_bytes += end - start;
@@ -1524,8 +1539,23 @@ struct DeviceState {
         return false;
     }
 
+    // The 64 KiB pages of a VA range below 4 GiB that shaders may address: the arena's, and those of buffers outside
+    // it (upload, readback and reserved buffers: their device address minus heap_base). They get entries in dir[0]'s
+    // chunk, the identity heap_base + VA. A translated shader sends a VA below 4 GiB with no entry to the scratch page
+    // (rdna2spirv.py host_addr): a wild one (constants read as a V# by CS_Prop_BatchCull) hung the queue for good.
+    // Entries are never removed: a freed buffer's pages stay addressable, as all low VAs were before.
+    void note_low_va(std::uint64_t va, std::uint64_t bytes) {
+        constexpr std::uint64_t k4G = 1ull << 32;
+        if (!arena.mapped || !bytes || va >= k4G) return;
+        const std::uint64_t end = std::min(va + bytes, k4G);
+        std::lock_guard lock(title_pages.mutex);
+        for (std::uint64_t p = va >> 16; p <= (end - 1) >> 16; ++p)
+            set_page_entry(p << 16, arena.address + (p << 16), true);
+    }
+
     // A console VA outside the arena (an upload or readback buffer: its device address minus heap_base).
     void log_va(const char* what, std::uint64_t va, VkDeviceSize bytes) {
+        note_low_va(va, bytes);
         if (arena.log)
             std::fprintf(stderr, "[rt] d3d12: %s VA 0x%llx + 0x%llx (outside the arena)\n", what,
                          (unsigned long long)va, (unsigned long long)bytes);
@@ -3031,6 +3061,7 @@ struct DeviceState {
                 map_own(out);
                 if (!out.memory) return out;
                 g_dedicated_bytes += requirements.size;
+                ++g_dedicated_live;
             } else {
                 const leonida::SuballocPool pool{type, image != VK_NULL_HANDLE, device_address,
                                                  map && (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)};
@@ -3154,6 +3185,7 @@ struct DeviceState {
     void release_resource(const MemoryRange& range, bool now = false) {
         if (!range) return;
         if (!range.node) {
+            --g_dedicated_live;
             if (now) context->vk.vkFreeMemory(info.device, range.memory, nullptr);
             else context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, range.memory);
         } else if (now) {
@@ -3165,8 +3197,10 @@ struct DeviceState {
     }
 
     void free_node(MemoryNode* node) {
-        if (const std::uint64_t block = suballocator.free(node->allocation))
+        if (const std::uint64_t block = suballocator.free(node->allocation)) {
             context->vk.vkFreeMemory(info.device, memory_handle(block), nullptr);  // unmaps it
+            ++g_blocks_freed;
+        }
         delete node;
     }
 
@@ -4229,6 +4263,7 @@ public:
         VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         address.buffer = sparse->buffer;
         va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
+        device_.note_low_va(va_, sparse->tile_count * tile_bytes);
         leonida::ResourceBinding binding{};
         binding.buffer = sparse->buffer;
         binding.size = desc_.Width;
@@ -9085,6 +9120,7 @@ public:
         arena.size = info.size;
         // The page table (kPageTable*) follows the zero page: zero, so every title VA starts unmapped.
         std::memset(arena.mapped + kArenaReserved, 0, kArenaPrefix - kArenaReserved);
+        state_.note_low_va(0, arena.size);  // dir[0]'s chunk: every page of the arena is addressable
         arena.free[kArenaPrefix] = arena.size - kArenaPrefix;
         arena.peak_end = kArenaPrefix;
         char log[4] = {};

@@ -599,8 +599,8 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             continue
         if op == "OpTypeInt":
             bits = int(a[0])
-            if bits not in (32, 64):
-                raise UnsupportedConstruct("integer type that is not 32 or 64 bits")
+            if bits not in (8, 32, 64):   # 8: the byte stores of StorageBuffer8BitAccess (OpUConvert + OpStore)
+                raise UnsupportedConstruct("integer type that is not 8, 32 or 64 bits")
             types.t[res] = ("int", bits, int(a[1]))
         elif op == "OpTypeFloat":
             bits = int(a[0])
@@ -865,6 +865,12 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 raise UnsupportedConstruct("store to PushConstant")
             if p[0] == "psb":
                 v, t = val(a[1]), types.t.get(id_type.get(a[1]))
+                if t is not None and t[:2] == ("int", 8) and isinstance(v, int) and not isinstance(v, bool):
+                    # an 8-bit store (StorageBuffer8BitAccess): one byte of its word, the others kept
+                    sh = 8 * (p[1] % 4)
+                    w = p[1] - p[1] % 4
+                    memory[w] = (memory.get(w, 0) & ~(0xFF << sh) & MASK) | ((v & 0xFF) << sh)
+                    continue
                 if isinstance(v, bool) or not isinstance(v, int) or v > MASK \
                         or (t is not None and t[:2] != ("int", 32)):
                     raise UnsupportedConstruct("PhysicalStorageBuffer store of a value that is not a 32-bit integer")
