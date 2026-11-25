@@ -37,6 +37,7 @@ namespace rt::write_watch {
 void start_from_environment();
 }
 #include "base_reservation.h"
+#include "big_alloc_log.h"
 #include "code_hooks.h"
 #include "cpu_emulation.h"
 #include "host_cpu.h"
@@ -397,6 +398,7 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+    leonida::big_alloc_log::install();  // LEONIDA_LOG_BIG_ALLOCS=1 (src/big_alloc_log.h)
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;

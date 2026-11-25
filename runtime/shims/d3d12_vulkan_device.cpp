@@ -93,6 +93,8 @@
 thread_local int leonida_quiet_av = 0;
 
 namespace rt::d3d12 {
+// Below sync_title_textures; the device hands it to xmem (rt::xmem::g_title_written).
+void note_title_texture_write(const void* address, std::size_t size);
 namespace {
 
 // Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
@@ -551,6 +553,12 @@ Format vulkan_format(DXGI_FORMAT format, bool depth) {
     }
 }
 
+// An A8_UNORM render target's image. As an R8 image (what other A8 textures are), a draw stored the pixel shader's red
+// output in it and blended with the colour factors, where the console stores alpha with the alpha factors: the UI's
+// 3840x2160 A8 gradient mask, drawn with alpha only, stayed zero, and the text and the loading screen's card that
+// multiply by it were invisible. As RGBA8, alpha lands in alpha; its views read alpha (bind_image, a8_in_rgba).
+constexpr VkFormat kA8TargetFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
 Format texture_storage_format(DXGI_FORMAT format, bool depth) {
     return vulkan_format(format == DXGI_FORMAT_A8_UNORM ? DXGI_FORMAT_R8_UNORM : format, depth);
 }
@@ -767,6 +775,8 @@ std::filesystem::path shader_directory_from_file(const std::filesystem::path& co
 // dedicated allocations made (never subtracted: freeing goes through the deletion queue), live title textures.
 std::atomic<long long> g_live_resources{0};
 std::atomic<unsigned long long> g_dedicated_bytes{0}, g_new_blocks{0};
+// Title-placed textures made, by console layout & 0x1ff (0x100 + swizzle mode).
+std::array<std::atomic<unsigned>, 0x200> g_console_layout_count{};
 std::size_t live_title_texture_stats(unsigned long long& bytes);  // under title_texture_mutex
 
 struct DeviceState {
@@ -1589,6 +1599,8 @@ struct DeviceState {
             }
         }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+        if (desc.Format == DXGI_FORMAT_A8_UNORM && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+            format.format = kA8TargetFormat;  // an A8 render target (kA8TargetFormat)
         if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D && (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
             return {};
         format.d24 = format.format == VK_FORMAT_D24_UNORM_S8_UINT;  // native or not: clears are quantised
@@ -2088,9 +2100,11 @@ struct DeviceState {
     // Gives the T# `words` a view in set 0 and an entry in the hash table, unless it has them. `storage`: shaders
     // write through it too (an unordered-access view), so it also goes into the storage arrays, which are
     // shorter. False when set 0 cannot show the image; the descriptor then finds the fallback at index 0.
+    // `a8_in_rgba`: an A8 render target's RGBA8 image (kA8TargetFormat): the T#'s one channel (X) is the image's alpha.
     bool bind_image(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image, VkImage vk_image,
                     VkFormat image_format, VkImageAspectFlags aspects, bool storage,
-                    bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED) {
+                    bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED,
+                    bool a8_in_rgba = false, float min_lod_floor = 0.0f) {
         namespace g = leonida::gfx10;
         // LEONIDA_LOG_TSHARP=<GPU address, hex>: every T# registered for a texture at that address, so a T# a shader
         // reads (LEONIDA_LOG_DESC) can be compared with the ones the hash table knows.
@@ -2151,6 +2165,7 @@ struct DeviceState {
             view_format = VK_FORMAT_R8G8B8A8_UNORM;
             channels_format = VK_FORMAT_A4R4G4B4_UNORM_PACK16;
         }
+        if (a8_in_rgba) view_format = channels_format = image_format;  // components below
         if (view_format == VK_FORMAT_UNDEFINED) {  // a 96-bit texture's T# names RGB32; its image is RGBA32
             view_format = rgb96_view_format(image_format, image.format);
             channels_format = rgb96_named_format(view_format);
@@ -2181,8 +2196,9 @@ struct DeviceState {
                                         image.type == g::ImageType::image_2d_array || image.type == g::ImageType::cube ||
                                         image.type == g::ImageType::image_3d;
         if (!storage && supports_lod_clamp && (aspects & VK_IMAGE_ASPECT_COLOR_BIT)) {
-            // Use the clamp in the T# itself: views with identical keys must sample identically.
-            clamp.minLod = g::image_min_lod(words);
+            // Use the clamp in the T# itself: views with identical keys must sample identically. A texture on the
+            // title's pages without its most detailed mips bound starts at the first one bound (min_lod_floor).
+            clamp.minLod = std::max(g::image_min_lod(words), min_lod_floor);
             if (clamp.minLod > float(image.first_mip + image.mip_count - 1)) {
                 // The accessible mip set is empty. Keep the dimensions and constant/missing channels.
                 for (auto& channel : swizzle)
@@ -2197,6 +2213,15 @@ struct DeviceState {
             }
         }
         view_info.components = g::vulkan_swizzle(swizzle, channels_format);
+        if (a8_in_rgba) {  // the T#'s X (its one channel) is the RGBA8 image's alpha
+            const auto component = [](std::uint8_t select) {
+                return select == g::select_one ? VK_COMPONENT_SWIZZLE_ONE
+                       : select == g::select_x ? VK_COMPONENT_SWIZZLE_A
+                                               : VK_COMPONENT_SWIZZLE_ZERO;
+            };
+            view_info.components = {component(swizzle[0]), component(swizzle[1]), component(swizzle[2]),
+                                    component(swizzle[3])};
+        }
         // The cast: MSVC's enums are ints, and it rejects int to VkImageAspectFlags in braces as narrowing.
         view_info.subresourceRange = {
             VkImageAspectFlags(stencil                                   ? VK_IMAGE_ASPECT_STENCIL_BIT
@@ -2760,9 +2785,10 @@ struct DeviceState {
         if (const leonida::TitlePages* pages = context->title_pages()) {
             const auto s = pages->stats();
             n += std::snprintf(text + n, sizeof(text) - n,
-                               " title pages: %zu textures (%zu streamed, %zu of them with no mip asked yet), %llu MiB "
-                               "in pages, %llu MiB allocated (%llu MiB in VRAM), %llu placed;",
-                               s.textures, s.streamed, s.streamed_unbound,
+                               " title pages: %zu textures (%zu streamed, %zu of them with no mip asked yet, %zu with a "
+                               "console mip order, %zu trimmed to their own mips), %llu MiB in pages, %llu MiB allocated "
+                               "(%llu MiB in VRAM), %llu placed;",
+                               s.textures, s.streamed, s.streamed_unbound, s.streamed_with_ends, s.streamed_trimmed,
                                (unsigned long long)(s.pages * leonida::TitlePages::kPage >> 20),
                                (unsigned long long)(s.blocks * leonida::TitlePages::kPage *
                                                     leonida::TitlePages::kBlockPages >> 20),
@@ -2770,8 +2796,21 @@ struct DeviceState {
                                                     leonida::TitlePages::kBlockPages >> 20),
                                (unsigned long long)s.placed);
         }
-        std::fprintf(stderr, "%s dedicated made %llu MiB; resources alive %lld; title textures %zu (%llu MiB)\n", text,
-                     g_dedicated_bytes.load() >> 20, g_live_resources.load(), titles, title_bytes >> 20);
+        // The console layouts of the title-placed textures made so far (layout & 0x1ff: 0x100 + swizzle mode), the most
+        // common first.
+        char layouts[160] = {};
+        {
+            std::vector<std::pair<unsigned, unsigned>> seen;
+            for (unsigned i = 0; i < g_console_layout_count.size(); ++i)
+                if (const unsigned c = g_console_layout_count[i].load(std::memory_order_relaxed)) seen.emplace_back(c, i);
+            std::sort(seen.rbegin(), seen.rend());
+            int at = 0;
+            for (std::size_t i = 0; i < seen.size() && i < 8 && at < int(sizeof(layouts)) - 24; ++i)
+                at += std::snprintf(layouts + at, sizeof(layouts) - at, " %#x:%u", seen[i].second, seen[i].first);
+        }
+        std::fprintf(stderr, "%s dedicated made %llu MiB; resources alive %lld; title textures %zu (%llu MiB); console "
+                             "layouts%s\n",
+                     text, g_dedicated_bytes.load() >> 20, g_live_resources.load(), titles, title_bytes >> 20, layouts);
     }
     std::atomic<long long> memory_stats_next_ms{0};
     void maybe_print_memory_stats(std::uint32_t type, VkDeviceSize bytes) {
@@ -3344,6 +3383,7 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
 struct TitlePageRequest {
     std::uint64_t va = 0;
     std::uint64_t bytes = 0;
+    std::vector<std::uint64_t> ends;  // title_resident_ends
 };
 thread_local const TitlePageRequest* g_title_page_request = nullptr;
 
@@ -4057,7 +4097,7 @@ public:
             const bool streamed = !(desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
                                                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
             if (pages->place(id(), image_, std::move(page_tiles), page_types, page_request->va, page_request->bytes,
-                             streamed)) {
+                             streamed, streamed ? page_request->ends : std::vector<std::uint64_t>{})) {
                 paged_ = true;
                 return S_OK;
             }
@@ -4627,6 +4667,39 @@ std::uint64_t title_span_bytes(const D3D12_RESOURCE_DESC& desc, std::uint32_t co
     }
     rt::xg::ResourceLayout linear;
     return rt::xg::linear_layout(desc, linear) ? linear.size_bytes : 0;
+}
+
+// Per mip m, the bytes from a texture's start that hold mip m and the smaller ones in its console layout, at most
+// `whole`: the console's tiled layouts put the mip tail block first and the larger mips after it in rising offsets, so
+// the mips a partly resident texture has are a prefix of its range (vulkan_title_pages.h, place). Empty where that is
+// not so (linear layouts, arrays, volumes, more planes, one mip).
+std::vector<std::uint64_t> title_resident_ends(const D3D12_RESOURCE_DESC& desc, std::uint32_t console_layout,
+                                               std::uint64_t whole) {
+    namespace xc = leonida::xg_console;
+    if (!xc::is_console_tiled(console_layout) || xc::swizzle_mode(console_layout) == xc::mode_linear) return {};
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.DepthOrArraySize != 1 || desc.MipLevels < 2)
+        return {};
+    xc::Desc x;
+    x.dimension = static_cast<std::uint32_t>(desc.Dimension);
+    x.width = desc.Width;
+    x.height = desc.Height;
+    x.depth_or_array_size = desc.DepthOrArraySize;
+    x.mip_levels = desc.MipLevels;
+    x.format = static_cast<std::uint32_t>(desc.Format);
+    x.sample_count = std::max<std::uint32_t>(desc.SampleDesc.Count, 1);
+    x.layout = console_layout;
+    const auto l = xc::compute_layout(x);
+    if (!l || l->plane_count != 1) return {};
+    const xc::Plane& plane = l->planes[0];
+    if (!plane.block_bytes || plane.thick || plane.slices != 1 || plane.mip_count != desc.MipLevels) return {};
+    std::vector<std::uint64_t> ends(plane.mip_count);
+    std::uint64_t end = 0;
+    for (std::uint32_t m = plane.mip_count; m-- > 0;) {
+        const xc::Mip& mip = plane.mips[m];
+        end = std::max<std::uint64_t>(end, mip.in_tail ? plane.block_bytes : mip.offset + mip.size);
+        ends[m] = std::min<std::uint64_t>(whole, plane.offset + end);
+    }
+    return ends;
 }
 
 bool register_title_texture(Resource* texture, const void* address, const D3D12_RESOURCE_DESC& desc) {
@@ -5658,6 +5731,7 @@ public:
         if (gpl_input_) vk.vkDestroyPipeline(dev, gpl_input_, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) device_.shader_modules().release(module);
+        for (VkShaderModule module : built_modules_) device_.shader_modules().release(module);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
     }
 
@@ -6024,6 +6098,7 @@ public:
                                    stage.edited ? leonida::pso::spirv_hash(stage.words) : stage.library_hash});
             stage_infos.push_back(info);
         }
+        module_sources_ = deferred_modules_;  // build() gives the modules back and makes them again from these
         if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
             const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias);
             const VkShaderModule module = words.empty() ? VK_NULL_HANDLE : device_.shader_modules().acquire(words);
@@ -6246,6 +6321,9 @@ public:
             if (graphics_.color_formats[i] == VK_FORMAT_A4R4G4B4_UNORM_PACK16 &&
                 !device_.color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16))
                 graphics_.color_formats[i] = VK_FORMAT_R8G8B8A8_UNORM;
+            // A8 render targets are RGBA8 images (kA8TargetFormat): the pixel shader's alpha lands in alpha, and the
+            // alpha blend factors and write mask apply to it as on the console.
+            if (desc.RTVFormats[i] == DXGI_FORMAT_A8_UNORM) graphics_.color_formats[i] = kA8TargetFormat;
             if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
                 return E_INVALIDARG;
@@ -6631,10 +6709,14 @@ public:
         // docs/aot_pipelines.md step 2: with shader objects the dispatch binds the shared shader object (made from the
         // build's stored binary where it fits) and no compute pipeline is compiled.
         const bool shader_object = device_.shader_objects_ready();
-        if (!shader_object) {
+        // The module only while a pipeline is being made (the driver holds ~3.5 MB per module): a background compile
+        // (LEONIDA_ASYNC_PSO) makes its own in the job from compute_entry_; the compile here gives it back after.
+        const bool async_compile = !shader_object && async_pso_enabled();
+        if (!shader_object && !async_compile) {
             module_ = device_.shader_modules().acquire(words);
             if (!module_) return E_FAIL;
         }
+        compute_entry_ = entry;
         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
@@ -6672,7 +6754,7 @@ public:
                 const VkShaderStageFlagBits stage = VK_SHADER_STAGE_COMPUTE_BIT;
                 fn->vkCmdBindShadersEXT(cb, 1, &stage, &shader);
             };
-        } else if (async_pso_enabled()) {
+        } else if (async_compile) {
             // LEONIDA_ASYNC_PSO: registered as pending below, compiled on DeviceState's compile workers, and swapped
             // in when done; replay skips its dispatches until then.
             async_compute_ = std::make_unique<AsyncCompute>();
@@ -6696,9 +6778,14 @@ public:
                     [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
                         return vk.vkCreateComputePipelines(dev, cache, 1, &create, nullptr, &pipeline_.pipeline);
                     },
-                    pipeline_info) != VK_SUCCESS)
+                    pipeline_info) != VK_SUCCESS) {
+                device_.shader_modules().release(module_);
+                module_ = VK_NULL_HANDLE;
                 return E_FAIL;
+            }
             device_.pipeline_created();
+            device_.shader_modules().release(module_);  // the pipeline no longer needs it
+            module_ = VK_NULL_HANDLE;
         }
 
         // The code base: shaders read constant tables embedded in their own program through s_getpc_b64. The
@@ -6726,12 +6813,19 @@ public:
                 auto& vkf = device_.context->vk;
                 VkComputePipelineCreateInfo info = async_compute_->info;
                 if (async_compute_->has_required) info.stage.pNext = &async_compute_->required;
+                // The module for this compile only (see create_compute), from the library's file.
+                const leonida::ShaderLibrary* library = device_.library();
+                const std::vector<std::uint32_t> words =
+                    library && compute_entry_ ? library->spirv(*compute_entry_) : std::vector<std::uint32_t>{};
+                const VkShaderModule module = words.empty() ? VK_NULL_HANDLE : device_.shader_modules().acquire(words);
+                info.stage.module = module;
                 VkPipeline made = VK_NULL_HANDLE;
-                const VkResult r = device_.create_pipeline(
+                const VkResult r = module ? device_.create_pipeline(
                     [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
                         return vkf.vkCreateComputePipelines(device_.info.device, cache, 1, &create, nullptr, &made);
                     },
-                    info);
+                    info) : VK_ERROR_INITIALIZATION_FAILED;
+                if (module) device_.shader_modules().release(module);
                 if (r == VK_SUCCESS) {
                     leonida::ComputePipeline ready = pipeline_;
                     ready.pipeline = made;
@@ -6828,9 +6922,29 @@ private:
     // The graphics pipeline with the formats of the `unbound` slots (leonida::GraphicsPipeline::variant) undefined,
     // made through pso_recipe.h's GraphicsCreateInfo (so --prebuild-pipelines makes the very same create info) and
     // recorded in pso_recipes.jsonl once it exists.
+    // Deferred modules (LEONIDA_DEFER_GRAPHICS) are made for the build and given back after it, and made again if a
+    // variant is built later: a pipeline (and the shared pipeline libraries) no longer needs its modules once made,
+    // and the NVIDIA driver holds ~3.5 MB per module. Kept for the PSO's life, the modules of the PSOs the title keeps
+    // filled the driver's heaps: seven 1 GiB and two 2 GiB blocks of nvoglv64.dll, about 8 GB of the process's
+    // private bytes in the first loading screen (measured with LEONIDA_LOG_BIG_ALLOCS).
     VkPipeline build(std::uint32_t unbound) {
-        // Deferred modules (LEONIDA_DEFER_GRAPHICS): made at the first build, from the library's file or the words
-        // this PSO edited. variant() holds variants_mutex_ around every deferred build.
+        const VkPipeline pipeline = build_with_modules(unbound);
+        drop_built_modules();
+        return pipeline;
+    }
+
+    void drop_built_modules() {
+        for (const VkShaderModule module : built_modules_) device_.shader_modules().release(module);
+        built_modules_.clear();
+        if (module_sources_.empty()) return;
+        for (const DeferredModule& d : module_sources_)
+            if (d.stage_index < recipe_.stages.size()) recipe_.stages[d.stage_index].module = VK_NULL_HANDLE;
+        deferred_modules_ = module_sources_;
+    }
+
+    VkPipeline build_with_modules(std::uint32_t unbound) {
+        // Deferred modules (LEONIDA_DEFER_GRAPHICS): made at the build, from the library's file or the words this PSO
+        // edited, and given back after it (build). variant() holds variants_mutex_ around every deferred build.
         if (!deferred_modules_.empty()) {
             const leonida::ShaderLibrary* library = device_.library();
             for (const DeferredModule& d : deferred_modules_) {
@@ -6842,7 +6956,7 @@ private:
                     return VK_NULL_HANDLE;
                 }
                 recipe_.stages[d.stage_index].module = module;
-                modules_.push_back(module);
+                built_modules_.push_back(module);
             }
             deferred_modules_.clear();
         }
@@ -6859,6 +6973,7 @@ private:
             const std::vector<std::uint32_t> words = leonida::rect_list_geometry_shader(vs_outputs_);
             const VkShaderModule gs = device_.shader_modules().acquire(words);
             if (!gs) return VK_NULL_HANDLE;
+            built_modules_.push_back(gs);  // given back after the build, as the deferred ones (it was never given back)
             recipe.stages.push_back({std::uint32_t(VK_SHADER_STAGE_GEOMETRY_BIT),
                                      "<rect_list_gs_" + std::to_string(vs_outputs_) + ">", 0u, 0u,
                                      leonida::pso::spirv_hash(words)});
@@ -7026,7 +7141,8 @@ private:
     std::vector<VkPipeline> gpl_outputs_;
     std::shared_ptr<GplUpgrade> gpl_upgrade_;  // null unless the base pipeline is a fast link with an upgrade pending
     VkShaderModule module_ = VK_NULL_HANDLE;
-    // LEONIDA_ASYNC_PSO: what the background compile of a compute PSO needs (module_ stays alive with the PSO).
+    const leonida::ShaderEntry* compute_entry_ = nullptr;  // a compute PSO's program in the library (its module's words)
+    // LEONIDA_ASYNC_PSO: what the background compile of a compute PSO needs (its module is made in the job).
     struct AsyncCompute {
         VkComputePipelineCreateInfo info{};
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required{};
@@ -7042,6 +7158,8 @@ private:
         std::vector<std::uint32_t> words;
     };
     std::vector<DeferredModule> deferred_modules_;
+    std::vector<DeferredModule> module_sources_;  // deferred_modules_ as made at creation: build() restores it
+    std::vector<VkShaderModule> built_modules_;   // made for the build in progress (build_with_modules)
     VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;
     bool registered_ = false;
@@ -7554,6 +7672,9 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     // 4_4_4_4 as on the console, and bind_image views the RGBA8 image with the 4444 view's channels.
     const bool rgba8_4444 = desc.Format == DXGI_FORMAT_B4G4R4A4_UNORM && resource.format() == VK_FORMAT_R8G8B8A8_UNORM;
     if (rgba8_4444) named = VK_FORMAT_A4R4G4B4_UNORM_PACK16;
+    // An A8 render target's RGBA8 image (kA8TargetFormat): its T# names the 8-bit format, as for any A8 texture, and
+    // bind_image reads that one channel from the image's alpha.
+    if (desc.Format == DXGI_FORMAT_A8_UNORM && resource.format() == kA8TargetFormat) named = VK_FORMAT_R8_UNORM;
     if (volume) {
         const bool compatible = vulkan_format(desc.Format, false).typeless
             ? desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS &&
@@ -8187,6 +8308,8 @@ public:
                                     state_.context->vk.vkGetImageSparseMemoryRequirements;
         // The memory types themselves are asked on first use (DeviceState::sparse_buffer_memory_types).
         state_.sparse_buffers_possible = sparse_aliasing && state_.arena.memory && info.features.sparseResidencyBuffer;
+        // What DirectStorage writes into title memory reaches the title's textures over it (sync_title_textures).
+        rt::xmem::g_title_written.store(&note_title_texture_write, std::memory_order_release);
         // The title's placed textures on shared 64 KiB pages (vulkan_title_pages.h): sparse residency images that alias,
         // whose unbound tiles read zero. LEONIDA_TITLE_PAGES=0: committed images, as before.
         if (sparse_aliasing && info.features.sparseResidencyImage2D && environment_text(L"LEONIDA_TITLE_PAGES") != L"0") {
@@ -8202,6 +8325,17 @@ public:
                                                                                       VkDeviceSize(512) << 20);
                                                });
             state_.title_pages_3d = info.features.sparseResidencyImage3D == VK_TRUE;
+            // The page budget (TitlePages::set_budget): LEONIDA_TITLE_PAGES_MB, else 3.5 GB, which with the render
+            // targets and buffers keeps an 8 GB card's VRAM and a 32 GB PC's commit; past it new streamed textures
+            // leave their most detailed mip out (their views start at the first mip bound).
+            if (leonida::TitlePages* pages = state_.context->title_pages()) {
+                std::uint64_t mb = 3584;
+                if (const std::wstring v = environment_text(L"LEONIDA_TITLE_PAGES_MB"); !v.empty())
+                    mb = std::wcstoull(v.c_str(), nullptr, 10);
+                pages->set_budget(mb << 20);
+                std::fprintf(stderr, "[rt] d3d12: title texture page budget %llu MiB%s\n",
+                             static_cast<unsigned long long>(mb), mb ? "" : " (none)");
+            }
             std::fprintf(stderr, "[rt] d3d12: title textures on shared 64 KiB pages: %s\n",
                          state_.context->title_pages() ? "on" : "not available");
         }
@@ -9465,10 +9599,26 @@ public:
         return kDescriptorSize;
     }
 
+    // Diagnostics: views that can write a 3840x2160 8-bit texture (the UI's gradient mask, which text and the loading
+    // screen's card multiply by, stays zero): the first 12, with the resource's flags and title address if placed.
+    static void note_mask_view(ID3D12Resource* resource, const char* kind) {
+        if (!resource) return;
+        const D3D12_RESOURCE_DESC d = resource->GetDesc();
+        if (d.Width != 3840 || d.Height != 2160 ||
+            (d.Format != DXGI_FORMAT_R8_UNORM && d.Format != DXGI_FORMAT_A8_UNORM && d.Format != DXGI_FORMAT_R8_TYPELESS))
+            return;
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) >= 12) return;
+        std::fprintf(stderr, "[rt] d3d12: %s view of a 3840x2160 8-bit texture %p (format %d, flags 0x%x, address %#llx)\n",
+                     kind, static_cast<void*>(resource), int(d.Format), unsigned(d.Flags),
+                     static_cast<unsigned long long>(resource->GetGPUVirtualAddress()));
+    }
+
     void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateRenderTargetView");
         if (!destination.ptr) return;
+        note_mask_view(resource, "render target");
         // LEONIDA_DUMP_TITLE_TEXTURE (glyph atlas hunt): a render target view of a 2048x2048 8-bit texture, the
         // atlas's size: the GPU then draws into it, and a copy from the title's bytes would overwrite what it drew.
         if (static const bool hunt = std::getenv("LEONIDA_DUMP_TITLE_TEXTURE") != nullptr; hunt && resource) {
@@ -9539,7 +9689,15 @@ public:
             const bool typed_bgra8_listed = r && !typed_rgba8 && rgba8_any_order(rd.Format) &&
                                             r->has_castable_formats();
             if (rd.Format == DXGI_FORMAT_A8_UNORM || (desc && desc->Format == DXGI_FORMAT_A8_UNORM)) {
-                view = {};
+                // An A8 render target is an RGBA8 image (kA8TargetFormat) and renders as one, in its own format only.
+                // Others (an A8 view of another texture, or an A8 texture made without the flag) stay null views:
+                // the null view here dropped every draw into the UI's gradient mask, which then stayed zero.
+                const bool own = rd.Format == DXGI_FORMAT_A8_UNORM && r && r->format() == kA8TargetFormat &&
+                                 (!desc || desc->Format == DXGI_FORMAT_UNKNOWN || desc->Format == DXGI_FORMAT_A8_UNORM);
+                if (own)
+                    view.format = static_cast<leonida::ColorViewFormat>(kA8TargetFormat);
+                else
+                    view = {};
             } else if (rd.Format == DXGI_FORMAT_B4G4R4A4_UNORM && (!r || r->format() != VK_FORMAT_R8G8B8A8_UNORM) &&
                        !state_.color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16)) {
                 // Usually the texture is an RGBA8 image (DeviceState's texture format choice) and its RTVs follow
@@ -10008,6 +10166,7 @@ public:
                                                      D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateUnorderedAccessView");
         if (!destination.ptr) return;
+        note_mask_view(resource, "unordered-access");
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         const Resource* r = Resource::from<Resource>(resource);
         if (!r) {
@@ -10530,7 +10689,10 @@ public:
             std::uint64_t page_bytes = title_span_bytes(desc, rt::d3d12_xs::g_placed_console_layout);
             if (rt::xg::ResourceLayout linear; rt::xg::linear_layout(desc, linear) && linear.size_bytes)
                 page_bytes = std::min<std::uint64_t>(page_bytes, linear.size_bytes);
-            const TitlePageRequest request{reinterpret_cast<std::uint64_t>(address), page_bytes};
+            g_console_layout_count[rt::d3d12_xs::g_placed_console_layout & 0x1ff].fetch_add(1, std::memory_order_relaxed);
+            const TitlePageRequest request{
+                reinterpret_cast<std::uint64_t>(address), page_bytes,
+                title_resident_ends(desc, rt::d3d12_xs::g_placed_console_layout, page_bytes)};
             g_title_page_request = request.bytes ? &request : nullptr;
             HRESULT hr = create_committed_validated(nullptr, &fallback, D3D12_HEAP_FLAG_NONE, &desc, initial, nullptr,
                                                     0, nullptr, riid, out);
@@ -11778,11 +11940,15 @@ private:
             log_once("GetResourceAllocationInfo layout as UNKNOWN:", desc.Layout);
         }
 
-        const Format format = state_.texture_format(desc);
+        Format format = state_.texture_format(desc);
         if (!format.format) {
             log_once("GetResourceAllocationInfo format not supported yet:", desc.Format);
             return kInvalidAllocation;
         }
+        // An A8 render target's image is RGBA8 (kA8TargetFormat), four times the bytes; the title sizes its pools by
+        // this answer for one byte per texel, and with four it ran a pool dry (assert, then a null read, 40 s into the
+        // boot). Its size is the R8 image's, as for any A8 texture; the larger image takes memory of its own.
+        if (format.format == kA8TargetFormat && desc.Format == DXGI_FORMAT_A8_UNORM) format.format = VK_FORMAT_R8_UNORM;
         VkMemoryRequirements need{};
         const TextureCreateInfo create(resolved, format, state_.color_attachment_usable(format.format));
         if (!state_.memory_requirements(create.info, need)) return kInvalidAllocation;
@@ -11835,8 +12001,9 @@ private:
                                            UINT64 fallback) {
         const VkImageAspectFlags aspect =
             (format.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : format.aspects;
-        const leonida::BlockFormat block = footprint_block(format, aspect);
+        leonida::BlockFormat block = footprint_block(format, aspect);
         if (!block.bytes || !alignment) return fallback;
+        if (desc.Format == DXGI_FORMAT_A8_UNORM) block.bytes = 1;  // an A8 target's RGBA8 image (kA8TargetFormat)
         const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const bool one_d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D;
         const UINT depth = volume ? desc.DepthOrArraySize : 1;
@@ -11874,12 +12041,15 @@ private:
         // A streamed texture on the title's pages has the mips its views read bound (vulkan_title_pages.h): from the
         // view's first mip, or from its LOD clamp's when that is further on (the title's streaming pool starts a
         // partly resident texture's view at its first resident mip). Its bytes are uploaded again after the bind.
+        // Its views then read from the first mip bound (the page budget may leave the most detailed ones out).
+        float min_lod_floor = 0.0f;
         if (resource.paged()) {
             if (leonida::TitlePages* pages = state_.context->title_pages()) {
                 const std::uint32_t last = image.first_mip + std::max<std::uint32_t>(image.mip_count, 1) - 1;
                 const float clamp = storage ? 0.0f : leonida::gfx10::image_min_lod(words);
                 const std::uint32_t clamped = clamp > 0.0f ? static_cast<std::uint32_t>(clamp) : 0u;
                 pages->require_mip(resource.id(), std::min(last, std::max<std::uint32_t>(image.first_mip, clamped)));
+                min_lod_floor = static_cast<float>(std::min(last, pages->first_mip(resource.id())));
             }
         }
         if (const char* v = std::getenv("LEONIDA_LOG_TSHARP"); v && std::strtoull(v, nullptr, 16) == image.address) {
@@ -11889,9 +12059,11 @@ private:
                          static_cast<unsigned long long>(d.Width), d.Height, int(d.Format), unsigned(d.Flags),
                          int(d.Layout), unsigned(resource.memory_flags()), int(storage));
         }
+        const bool a8_in_rgba =
+            resource.desc().Format == DXGI_FORMAT_A8_UNORM && resource.format() == kA8TargetFormat;
         const bool registered = state_.bind_image(words, image, resource.image(), resource.format(),
                                                   resource.aspects(), storage, resource.has_view_format_list(),
-                                                  resource.uint_backed());
+                                                  resource.uint_backed(), a8_in_rgba, min_lod_floor);
         if (registered && resource.sparse_image()) state_.context->note_shader_image(resource.id());
         if (leonida::gfx10::multisampled(image.type) && !registered) return;
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
@@ -12425,6 +12597,30 @@ bool guarded_copy_from_title(Resource* resource, const std::uint8_t* title, cons
                    : resource->copy_from_title(copy.data(), layout, first_mip);
 }
 
+// Ranges of title memory written behind the title's back since the last submission (DirectStorage requests, through
+// rt::xmem::g_title_written): the textures over them are copied again at the next one. The watch after a copy lasts a
+// second by default, and a streamed texture's bytes may arrive later than that (the loading screen's card art stayed
+// empty). The list only grows between submissions; sync_title_textures takes it.
+std::mutex& title_writes_mutex() {
+    static auto* m = new std::mutex;
+    return *m;
+}
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& title_writes() {
+    static auto* v = new std::vector<std::pair<std::uintptr_t, std::uintptr_t>>;
+    return *v;
+}
+void note_title_texture_write(const void* address, std::size_t size) {
+    const auto begin = reinterpret_cast<std::uintptr_t>(address);
+    std::lock_guard lock(title_writes_mutex());
+    auto& writes = title_writes();
+    // A run of requests filling one buffer comes in order: extend the last range rather than add one per request.
+    if (!writes.empty() && writes.back().second == begin) {
+        writes.back().second = begin + size;
+        return;
+    }
+    writes.emplace_back(begin, begin + size);
+}
+
 void sync_title_textures() {
     if (!g_title_texture_count.load(std::memory_order_acquire)) return;  // one load when nothing is registered
     const auto now = std::chrono::steady_clock::now();
@@ -12452,6 +12648,33 @@ void sync_title_textures() {
                     t->dirty = true;
                     t->copied = false;
                 }
+        }
+    }
+    // Textures under ranges written behind the title's back (note_title_texture_write): compared and copied again.
+    {
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> written;
+        {
+            std::lock_guard lock(title_writes_mutex());
+            written.swap(title_writes());
+        }
+        if (!written.empty()) {
+            std::sort(written.begin(), written.end());
+            std::size_t merged = 0;  // ranges merged in place: sorted, not overlapping
+            for (std::size_t i = 1; i < written.size(); ++i) {
+                if (written[i].first <= written[merged].second)
+                    written[merged].second = std::max(written[merged].second, written[i].second);
+                else
+                    written[++merged] = written[i];
+            }
+            written.resize(merged + 1);
+            for (const auto& t : textures) {
+                const auto begin = reinterpret_cast<std::uintptr_t>(t->title);
+                const auto end = begin + t->bytes;
+                // The first range ending after the texture's start: it overlaps if it starts before the texture's end.
+                const auto it = std::upper_bound(written.begin(), written.end(), begin,
+                                                 [](std::uintptr_t v, const auto& r) { return v < r.second; });
+                if (it != written.end() && it->first < end) t->dirty = true;
+            }
         }
     }
     for (std::size_t n = 0; n < count; ++n) {
@@ -13609,8 +13832,10 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // VK_EXT_pageable_device_local_memory (with VK_EXT_memory_priority, which it needs): the game's textures alone
     // outgrow an 8 GB card in a story load (40,000 resources), and without it NVIDIA kept every allocation resident
     // in VRAM, memory types in the system heap too, so Windows paged them at each submission until the queue stalled
-    // past the title's 30 s watchdog. Pageable memory lets the driver page out what is not used. LEONIDA_PAGEABLE=0
-    // leaves it off. VK_EXT_memory_budget makes the budget queries of allocate_type defined.
+    // past the title's 30 s watchdog. Pageable memory lets the driver page out what is not used.
+    // LEONIDA_PAGEABLE=0 leaves it off: then this driver counts memory types of the system heap against VRAM (10.6 GB
+    // used of a 7.2 GB budget at 2.5 minutes of the first loading screen, measured), which the budget check cannot
+    // see coming. VK_EXT_memory_budget makes the budget queries of allocate_type defined.
     const auto has_extension = [&](const char* name) {
         return std::any_of(extensions.begin(), extensions.end(),
                            [&](const auto& e) { return std::strcmp(e.extensionName, name) == 0; });

@@ -128,6 +128,63 @@ int main() {
         for (std::uintptr_t id : {1, 2, 3, 4, 5, 6}) pages.release(id);
         s = pages.stats();
         EXPECT(s.textures == 0 && s.pages == 0);
+
+        // Resident mips: a texture placed inside a streamed one's range owns that memory, so the older one keeps only
+        // the mips whose console bytes come before it (ends: mip 0 needs 6 pages, mip 1 2, the tail 1).
+        const std::vector<std::uint64_t> ends{6 * 64 * 1024, 2 * 64 * 1024, 64 * 1024, 64 * 1024, 64 * 1024};
+        EXPECT(pages.place(7, reinterpret_cast<VkImage>(17), tiles, types, 0x4000000, bytes, true, ends));
+        EXPECT(pages.require_mip(7, 0));  // its view reads from mip 0
+        pages.take();
+        pages.take_remapped();
+        EXPECT(pages.stats().pages == 6 && pages.first_mip(7) == 0);
+        EXPECT(pages.place(8, reinterpret_cast<VkImage>(18), tiles, types, 0x4000000 + 0x10000, bytes, true, ends));
+        EXPECT(pages.first_mip(7) == 2);  // only the tail is its own now
+        EXPECT(pages.stats().pages == 1);
+        ops = pages.take();
+        EXPECT(ops.size() == 1 && ops[0].image_binds.size() == 5 && ops[0].image_binds[0].memory == VK_NULL_HANDLE);
+        // A view of the newer one; then the newer one goes: the older one's mips come back and are uploaded again.
+        EXPECT(pages.require_mip(8, 0));
+        pages.take();
+        pages.take_remapped();
+        pages.release(8);
+        EXPECT(pages.first_mip(7) == 0 && pages.stats().pages == 6);
+        EXPECT(pages.take_remapped().size() == 1);
+        ops = pages.take();
+        EXPECT(ops.size() == 1 && ops[0].image_binds.size() == 5 && ops[0].image_binds[0].memory != VK_NULL_HANDLE);
+        // Unbind then bind of one tile before a flush: one bind per tile, the last.
+        EXPECT(pages.place(9, reinterpret_cast<VkImage>(19), tiles, types, 0x4000000 + 0x10000, bytes, true, ends));
+        pages.release(9);
+        ops = pages.take();
+        EXPECT(ops.size() == 1 && ops[0].image_binds.size() == 5 && ops[0].image_binds[0].memory != VK_NULL_HANDLE);
+        pages.release(7);
+        EXPECT(pages.stats().pages == 0);
+
+        // A texture the GPU copies into: every mip bound at once, and a texture placed inside it later trims nothing.
+        EXPECT(pages.place(10, reinterpret_cast<VkImage>(20), tiles, types, 0x5000000, bytes, true, ends));
+        EXPECT(pages.require_all(10));
+        EXPECT(pages.first_mip(10) == 0 && pages.stats().pages == 6);
+        EXPECT(!pages.require_all(10));  // once
+        EXPECT(pages.place(11, reinterpret_cast<VkImage>(21), tiles, types, 0x5000000 + 0x10000, bytes, true, ends));
+        EXPECT(pages.first_mip(10) == 0 && pages.stats().pages == 6);
+        pages.take();
+        pages.release(11);
+        pages.release(10);
+        EXPECT(pages.stats().pages == 0);
+
+        // The page budget: within it every mip; past it a new streamed texture leaves its mip 0 (4 tiles) out, and one
+        // bound already keeps what it has.
+        pages.set_budget(2 * 64 * 1024);
+        EXPECT(pages.place(12, reinterpret_cast<VkImage>(22), tiles, types, 0x6000000, bytes, true));
+        EXPECT(pages.require_mip(12, 0));
+        EXPECT(pages.first_mip(12) == 0 && pages.stats().pages == 6);  // within budget when it was bound
+        EXPECT(pages.place(13, reinterpret_cast<VkImage>(23), tiles, types, 0x7000000, bytes, true));
+        EXPECT(pages.require_mip(13, 0));
+        EXPECT(pages.first_mip(13) == 1 && pages.stats().pages == 8);  // mip 1 (1 tile) and the tail page
+        pages.take();
+        pages.release(12);
+        pages.release(13);
+        pages.set_budget(0);
+        EXPECT(pages.stats().pages == 0);
     }
     {
         // Past the VRAM budget a block comes from system memory; once video memory gives blocks again, they come first

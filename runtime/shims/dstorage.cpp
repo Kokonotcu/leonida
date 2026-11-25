@@ -11,8 +11,9 @@
 //   - A zlib request (ZlibDecompress alone) reads its source into a staging buffer, inflates it on the worker with
 //     the runtime's RFC 1950 inflater (leonida::zlib_inflate, src/shader_library.h) and copies the result to the
 //     destination only when it is exactly DestinationSize bytes; a stream that fails leaves the destination as it was.
-//   - BCPack, swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: they become stages between
-//     the read and the destination write, BCPack after the inflate).
+//   - A BCPack request is unpacked on the worker after its inflate (VIctory's decoder, src/bcpack_victory.h, with the
+//     format's table file supplied beside the runtime), and a request into physical pages is written through xmem.
+//     Swizzle and physical-page sources fail with E_NOTIMPL (Grand Theft Auto VI uses neither).
 // Nothing here goes online or touches the GPU.
 #include <windows.h>
 #include <d3d12.h>
@@ -32,9 +33,11 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../src/bcpack_victory.h"
 #include "../src/shader_library.h"  // leonida::zlib_inflate
 #include "dstorage_xs_abi.h"
 #include "shims.h"
+#include "xmem.h"
 
 using namespace dsx;
 
@@ -796,42 +799,51 @@ private:
         if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
         if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
-        if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
-            log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
+        // Swizzle and physical-page sources: Grand Theft Auto VI's packages use neither (VIctory, which runs the game,
+        // refuses them too).
+        if (options::swizzle(o) != 0) {
+            log_once("swizzle", "swizzle requests are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
-        if (o & (options::kDestinationPages | options::kSourcePages)) {
-            log_once("pages", "physical-page requests are not implemented yet (E_NOTIMPL)");
+        if (o & options::kSourcePages) {
+            log_once("source-pages", "requests from physical pages are not implemented yet (E_NOTIMPL)");
             return E_NOTIMPL;
         }
         const bool zlib = options::zlib(o);
-        // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST), so
-        // it is 0 for every request that gets here (BCPack is refused above).
-        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
+        const unsigned bc = static_cast<unsigned>(options::bcpack(o));
+        const bool pages = (o & options::kDestinationPages) != 0;
+        if (bc == DSTORAGE_BCPACK_MODE_BC2) {
+            log_once("bc2", "BCPack of BC2 has no decoder (E_NOTIMPL)");
+            return E_NOTIMPL;
+        }
+        // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST).
+        if (r.IntermediateSize != 0 && !(zlib && bc)) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
         // E_DSTORAGE_INVALID_DESTINATION_SIZE: without decompression DestinationSize must equal the source's length,
-        // with it it must be larger (dstorageerr.h's description; DSTORAGE_REQUEST says the same of DestinationSize).
-        if (zlib ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize)
+        // with zlib alone it must be larger (dstorageerr.h's description; DSTORAGE_REQUEST says the same of
+        // DestinationSize). A BCPack stream has no such rule.
+        if (!bc && (zlib ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize))
             return E_DSTORAGE_INVALID_DESTINATION_SIZE;
         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
         const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
         if (total > kMaxRequestBytes) return E_DSTORAGE_REQUEST_TOO_LARGE;
-        // DSTORAGE_REQUEST: a buffer over 32 MiB is allowed only with 64 KiB or 2 MiB pages, which are not implemented
-        // yet (refused above). The source is never larger than the destination here (the same size without zlib,
-        // smaller with it), so this covers both buffers, and bounds the staging buffers of a zlib request too.
-        if (r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
+        // DSTORAGE_REQUEST: a buffer over 32 MiB is allowed only with 64 KiB or 2 MiB pages.
+        if (!pages && r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
         // DSTORAGE_REQUEST: with ZlibDecompress the file offset must be 16-byte aligned.
         if (zlib && !memory && r.FileOffset % 16 != 0) return E_DSTORAGE_INVALID_FILE_OFFSET;
-        if (!r.Destination) return E_INVALIDARG;
+        if (pages ? !r.DestinationPageArray : !r.Destination) return E_INVALIDARG;
         if (memory) {
             if (!r.Source) return E_INVALIDARG;
         } else {
             if (!r.File) return E_INVALIDARG;
             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
         }
+        if (bc || pages) return staged_request(e, memory, zlib, bc, pages);
         if (zlib) return inflate_request(e, memory);
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
-        if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
-        return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+        const HRESULT hr = memory ? (guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION)
+                                  : read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+        if (SUCCEEDED(hr)) rt::xmem::note_title_written(r.Destination, r.SourceSize);
+        return hr;
     }
 
     // A zlib request whose checks have passed: the source (SourceSize bytes of the file or of memory) goes into a
@@ -873,15 +885,152 @@ private:
                 case leonida::ZlibError::limit: hr = E_DSTORAGE_DECOMPRESSION_ERROR; break;  // longer than the destination
                 default: hr = E_DSTORAGE_ZLIB_BAD_DATA; break;
             }
-        } else if (result.size() != r.DestinationSize) {
-            hr = E_DSTORAGE_DECOMPRESSION_ERROR;  // shorter than the destination
         }
+        // A stream that ends short of DestinationSize passes, its bytes written and the rest left as it was: the
+        // title's chunks fill their destinations exactly, and nothing says a shorter one fails (VIctory accepts it).
         if (FAILED(hr)) {
             std::lock_guard lock(stats().mutex);
             ++stats().s.DecompressionErrors;
             return hr;
         }
-        return guarded_move(r.Destination, result.data(), result.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+        if (!guarded_move(r.Destination, result.data(), result.size())) return E_DSTORAGE_ACCESS_VIOLATION;
+        rt::xmem::note_title_written(r.Destination, result.size());
+        return S_OK;
+    }
+
+    // A BCPack request, or one into physical pages: the source is read into a staging buffer, inflated (zlib, into
+    // IntermediateSize bytes before a BCPack decode, else DestinationSize), unpacked from BCPack into DestinationSize
+    // bytes of BC blocks (bcpack_victory.h), then written to the destination: the title's memory, or the physical pages
+    // DestinationPageArray names (one per 64 KiB, from DestinationPageOffset in the first) through xmem, which every
+    // view of a page then shows. The console's order: zlib first, then BCPack.
+    HRESULT staged_request(const Entry& e, bool memory, bool zlib, unsigned bc, bool pages) {
+        const DSTORAGE_REQUEST& r = e.request;
+        std::vector<uint8_t> source, inflated, result;
+        try {
+            source.resize(r.SourceSize);
+        } catch (const std::bad_alloc&) {
+            return E_OUTOFMEMORY;
+        }
+        if (r.SourceSize != 0) {
+            if (memory) {
+                if (!guarded_move(source.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
+            } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, source.data(), r.SourceSize);
+                       FAILED(hr)) {
+                return hr;
+            }
+        }
+        const auto failed = [](HRESULT hr) {
+            std::lock_guard lock(stats().mutex);
+            ++stats().s.DecompressionErrors;
+            return hr;
+        };
+        std::vector<uint8_t>* packed = &source;
+        if (zlib) {
+            set_decompression_pending(+1);
+            leonida::ZlibError why = leonida::ZlibError::none;
+            const uint32_t limit = bc ? (r.IntermediateSize ? r.IntermediateSize : r.DestinationSize) : r.DestinationSize;
+            const bool ok = leonida::zlib_inflate(source, inflated, limit, &why);
+            set_decompression_pending(-1);
+            if (!ok)
+                return failed(why == leonida::ZlibError::header     ? E_DSTORAGE_ZLIB_BAD_HEADER
+                              : why == leonida::ZlibError::checksum ? E_DSTORAGE_ZLIB_PARITY_FAIL
+                              : why == leonida::ZlibError::limit    ? E_DSTORAGE_DECOMPRESSION_ERROR
+                                                                    : E_DSTORAGE_ZLIB_BAD_DATA);
+            packed = &inflated;
+        }
+        if (bc) {
+            const leonida::bcpack_victory::Tables* tables = bcpack_tables();
+            if (!tables) return E_NOTIMPL;  // no table file: logged once
+            try {
+                result.resize(r.DestinationSize);
+            } catch (const std::bad_alloc&) {
+                return E_OUTOFMEMORY;
+            }
+            set_decompression_pending(+1);
+            const char* why = nullptr;
+            const bool ok = leonida::bcpack_victory::decode(bc, *packed, result, *tables, &why);
+            set_decompression_pending(-1);
+            if (!ok) {
+                log_once(std::string("bcpack-") + (why ? why : "?"),
+                         std::string("a BCPack stream did not decode: ") + (why ? why : "unknown") + " (first of its kind)");
+                return failed(E_DSTORAGE_DECOMPRESSION_ERROR);
+            }
+            log_once("bcpack", "BCPack requests are unpacked on the CPU (VIctory's decoder, bcpack_victory.h)");
+            packed = &result;
+        }
+        std::vector<uint8_t>& out = *packed;
+        if (!pages) {
+            if (!guarded_move(r.Destination, out.data(), out.size())) return E_DSTORAGE_ACCESS_VIOLATION;
+            rt::xmem::note_title_written(r.Destination, out.size());
+            return S_OK;
+        }
+        return write_pages(r, out);
+    }
+
+    // Writes `data` to the physical pages of a request. The title may write a request's page list after enqueueing it
+    // (a queue half full is submitted on its own, so a read can start first): a list naming page 0 (no page; numbers
+    // start at 16) is read again for a few milliseconds before the request fails (VIctory's rule: the title never
+    // looks at a request's result, so a failed one is a model or texture left unwritten).
+    HRESULT write_pages(const DSTORAGE_REQUEST& r, std::vector<uint8_t>& data) {
+        constexpr size_t kPage = 64 * 1024;
+        const auto transfer = rt::xmem::g_transfer_physical.load(std::memory_order_acquire);
+        if (!transfer) {
+            log_once("pages-no-xmem", "a request into physical pages before any were allocated (E_INVALIDARG)");
+            return E_INVALIDARG;
+        }
+        if (data.empty()) return S_OK;
+        const uint16_t offset = static_cast<uint16_t>(r.DestinationPageOffset % kPage);
+        const size_t count = (offset + data.size() + kPage - 1) / kPage;
+        std::vector<uint64_t> list(count);
+        for (int attempt = 0; attempt < 9; ++attempt) {
+            if (attempt) Sleep(1);
+            if (!guarded_move(list.data(), r.DestinationPageArray, count * sizeof(uint64_t)))
+                return E_DSTORAGE_ACCESS_VIOLATION;
+            if (std::find(list.begin(), list.end(), uint64_t{0}) != list.end()) continue;
+            if (transfer(list.data(), count, offset, data.data(), data.size(), true)) {
+                if (attempt) log_once("pages-late", "a request's page list was filled after it started: written late");
+                return S_OK;
+            }
+            break;
+        }
+        log_once("pages-failed", "a request's physical pages could not be written; it fails (logged once)");
+        return E_INVALIDARG;
+    }
+
+    // The BCPack format's constant tables (VIctory's bcpack-tables.bin, 77,982 bytes: not part of the repository, its
+    // licence does not cover it), from LEONIDA_BCPACK_TABLES or bcpack-tables.bin beside the runtime, read once.
+    static const leonida::bcpack_victory::Tables* bcpack_tables() {
+        static const leonida::bcpack_victory::TablesPtr tables = [] {
+            wchar_t path[MAX_PATH * 2] = {};
+            DWORD n = GetEnvironmentVariableW(L"LEONIDA_BCPACK_TABLES", path, MAX_PATH * 2);
+            if (n == 0 || n >= MAX_PATH * 2) {
+                n = GetModuleFileNameW(nullptr, path, MAX_PATH * 2);
+                std::wstring dir(path, n);
+                dir = dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"bcpack-tables.bin";
+                wcsncpy_s(path, dir.c_str(), _TRUNCATE);
+            }
+            std::vector<uint8_t> bytes;
+            const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (file != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER size{};
+                if (GetFileSizeEx(file, &size) && size.QuadPart > 0 && size.QuadPart < (1 << 20)) {
+                    bytes.resize(static_cast<size_t>(size.QuadPart));
+                    DWORD got = 0;
+                    if (!ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &got, nullptr) ||
+                        got != bytes.size())
+                        bytes.clear();
+                }
+                CloseHandle(file);
+            }
+            const char* why = "the table file could not be read";
+            leonida::bcpack_victory::TablesPtr parsed;
+            if (!bytes.empty()) parsed = leonida::bcpack_victory::parse_tables(bytes, &why);
+            if (!parsed)
+                log_once("bcpack-tables", std::string("BCPack requests fail (E_NOTIMPL): ") + (why ? why : "") +
+                                              " (bcpack-tables.bin beside gta6rt.exe, or LEONIDA_BCPACK_TABLES)");
+            return parsed;
+        }();
+        return tables.get();
     }
 
     void set_pending(int delta) {

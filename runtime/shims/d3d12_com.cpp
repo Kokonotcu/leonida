@@ -2092,6 +2092,17 @@ public:
         }
         // LEONIDA_TITLE_HEAP_SYNC: what changed in title-backed shader-visible heaps reaches their real heaps first.
         rt::d3d12_xs::sync_title_heaps();
+        // A streamed title texture these lists copy into is the GPU's from now on: all its mips are bound (a copy into
+        // an unbound tile is lost; the glyph atlas, filled by copies, lost its letters), before the binds are made.
+        if (leonida::TitlePages* pages = context_.title_pages())
+            for (const auto* commands : recorded)
+                for (const auto& command : commands->commands()) {
+                    if (const auto* copy = std::get_if<leonida::CopyTexture>(&command)) {
+                        if (!copy->dst.footprint) pages->require_all(copy->dst.resource);
+                    } else if (const auto* whole = std::get_if<leonida::CopyResource>(&command)) {
+                        pages->require_all(whole->dst);
+                    }
+                }
         // Title textures on shared pages bound (and superseded ones unbound) before anything copies into them or the
         // lists sample them (vulkan_title_pages.h).
         queue_.flush_title_pages();

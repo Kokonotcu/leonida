@@ -82,9 +82,22 @@ constexpr size_t kLargeBlock = 64 * 1024;
 std::mutex g_large_mutex;
 std::set<void*>* g_large_blocks = new std::set<void*>;  // immortal: a block may be freed during shutdown
 
+// Diagnostics: the title's allocations of 256 MiB and more, with their caller (the first 40): the process commits about
+// 16 GB in its first seconds, and which of it is the title's own is what this tells.
+void note_big_allocation(const char* api, size_t size, DWORD type, const void* caller, const void* result) {
+    if (size < (size_t{256} << 20)) return;
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1, std::memory_order_relaxed) >= 40) return;
+    std::fprintf(stderr, "[rt] xmem: big title allocation: %s %llu MiB, type 0x%lx, from %p -> %p\n", api,
+                 static_cast<unsigned long long>(size >> 20), static_cast<unsigned long>(type), caller, result);
+}
+
+PVOID title_virtual_alloc2(SIZE_T size, ULONG type, ULONG protect, SIZE_T alignment);  // below 1 TiB (see there)
+
 void* allocate_block(size_t size) {
     if (size < kLargeBlock) return _aligned_malloc(size ? size : 1, kAlign);
-    void* p = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void* p = title_virtual_alloc2(size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE, 0);
+    if (!p) p = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (p) {
         std::lock_guard lock(g_large_mutex);
         g_large_blocks->insert(p);
@@ -110,7 +123,9 @@ void free_block(void* p) {
 // released by either free.
 void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
     note_attributes(kApiAllocDefault, attributes, size, _ReturnAddress());
-    return allocate_block(size);
+    void* const p = allocate_block(size);
+    note_big_allocation("XMemAllocDefault", size, MEM_COMMIT, _ReturnAddress(), p);
+    return p;
 }
 
 void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
@@ -130,7 +145,9 @@ void* __stdcall XMemAlloc(size_t size, uint64_t attributes) {
     note_attributes(kApiAlloc, attributes, size, _ReturnAddress());
     const AllocRoutine hook = g_alloc_hook.load(std::memory_order_acquire);
     // Allocate directly: calling XMemAllocDefault would log a second, misleading XMemAllocDefault event.
-    return hook ? hook(size, attributes) : allocate_block(size);
+    void* const p = hook ? hook(size, attributes) : allocate_block(size);
+    note_big_allocation("XMemAlloc", size, MEM_COMMIT, _ReturnAddress(), p);
+    return p;
 }
 
 void __stdcall XMemFree(void* p, uint64_t attributes) {
@@ -349,6 +366,17 @@ struct MappedPage {
 };
 
 std::unordered_map<uintptr_t, MappedPage> g_mapped;
+// page number -> the addresses it is mapped at (both windows of a mirrored pair), with g_phys_mutex held: a
+// DirectStorage request writes pages by number, and the title's textures over them are told by address.
+std::unordered_multimap<uint64_t, uintptr_t> g_page_addresses;
+void forget_page_address(uint64_t page, uintptr_t address) {
+    auto [first, last] = g_page_addresses.equal_range(page);
+    for (; first != last; ++first)
+        if (first->second == address) {
+            g_page_addresses.erase(first);
+            return;
+        }
+}
 SRWLOCK g_fault_lock = SRWLOCK_INIT;
 
 // Mirrored windows (with g_phys_mutex held). The retail title reserves two windows of one size and type for its GPU
@@ -376,6 +404,11 @@ uintptr_t mirror_of(uintptr_t address) {
     for (const Mirror& m : g_mirrors)
         if (address - m.base < m.size) return m.partner + (address - m.base);
     return 0;
+}
+// mirror_of for callers outside xmem (rt::xmem::g_mirror_address), which take no lock of ours.
+uintptr_t locked_mirror_of(uintptr_t address) {
+    const std::lock_guard lock(g_phys_mutex);
+    return mirror_of(address);
 }
 
 // Forget the mirrors of any range a new window takes over (the title released it first).
@@ -440,18 +473,43 @@ bool isolate_placeholder(void* address, SIZE_T size) {
     return VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != FALSE;
 }
 
-PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
+// The title's memory lies in the console's 40-bit GPU address space: XboxBvhBuilder.dll refuses an acceleration
+// structure above it ("DestAccelerationStructureData can not have more than 40b of address set", E_INVALIDARG thrown
+// as a C++ exception, which ended runs at 2:40-2:50 in the first loading screen), and the console never hands out more.
+// Windows' ASLR put the title's 16 GiB windows at 1.7-2.4 TiB. So a title allocation the host places gets an address in
+// [8 GiB, 1 TiB) (above the image at 0x140000000 and the runtime's arena, which keeps below 4 GiB), and falls back to
+// anywhere only when that range is full.
+constexpr uintptr_t kTitleLowest = uintptr_t{8} << 30;
+constexpr uintptr_t kTitleHighest = (uintptr_t{1} << 40) - 1;
+
+// VirtualAlloc2 with no address: in [kTitleLowest, kTitleHighest] with `alignment` (0: the default), else anywhere.
+PVOID title_virtual_alloc2(SIZE_T size, ULONG type, ULONG protect, SIZE_T alignment) {
+    if (!placeholder_api().available())  // no VirtualAlloc2 on this host: a plain reservation (never a placeholder)
+        return (type & MEM_RESERVE_PLACEHOLDER) ? nullptr : VirtualAlloc(nullptr, size, type, protect);
     MEM_ADDRESS_REQUIREMENTS requirements{};
+    requirements.LowestStartingAddress = reinterpret_cast<PVOID>(kTitleLowest);
+    requirements.HighestEndingAddress = reinterpret_cast<PVOID>(kTitleHighest);
+    requirements.Alignment = alignment > kXmemPageSize64k ? alignment : 0;
     MEM_EXTENDED_PARAMETER parameter{};
-    ULONG parameter_count = 0;
-    if (!address && alignment > kXmemPageSize64k) {
-        requirements.Alignment = alignment;
-        parameter.Type = MemExtendedParameterAddressRequirements;
-        parameter.Pointer = &requirements;
-        parameter_count = 1;
-    }
+    parameter.Type = MemExtendedParameterAddressRequirements;
+    parameter.Pointer = &requirements;
+    if (PVOID p = placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, type, protect, &parameter, 1))
+        return p;
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true))
+        std::fprintf(stderr, "[rt] xmem: no room below 1 TiB for a %llu-byte title allocation (error %lu); placed anywhere\n",
+                     static_cast<unsigned long long>(size), GetLastError());
+    requirements.LowestStartingAddress = nullptr;
+    requirements.HighestEndingAddress = nullptr;
+    const ULONG count = requirements.Alignment ? 1 : 0;
+    return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, type, protect,
+                                            count ? &parameter : nullptr, count);
+}
+
+PVOID reserve_placeholder(void* address, SIZE_T size, SIZE_T alignment) {
+    if (!address) return title_virtual_alloc2(size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, alignment);
     return placeholder_api().virtual_alloc2(GetCurrentProcess(), address, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                            PAGE_NOACCESS, parameter_count ? &parameter : nullptr, parameter_count);
+                                            PAGE_NOACCESS, nullptr, 0);
 }
 
 // With g_phys_mutex held: [start, end) is no longer part of any window (it was committed); the rest of each window
@@ -509,6 +567,9 @@ void* commit_over_placeholders(void* address, SIZE_T size, DWORD protect) {
 
 // VirtualAlloc, and for a commit the host refused with ERROR_INVALID_ADDRESS, the same commit over placeholders.
 void* host_virtual_alloc(void* address, SIZE_T size, DWORD type, DWORD protect) {
+    // A new reservation the host places: below 1 TiB (title_virtual_alloc2).
+    if (!address && (type & MEM_RESERVE) && placeholder_api().available())
+        if (void* const result = title_virtual_alloc2(size, type, protect, 0)) return result;
     if (void* const result = VirtualAlloc(address, size, type, protect)) return result;
     const DWORD error = GetLastError();
     if (!address || (type & (MEM_COMMIT | MEM_RESERVE)) != MEM_COMMIT || error != ERROR_INVALID_ADDRESS ||
@@ -550,7 +611,9 @@ void* virtual_alloc_paged(void* address, SIZE_T size, DWORD allocation_type, DWO
 void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
     note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
     note_virtual_alloc(allocation_type, attributes, protect, size, _ReturnAddress());
-    return virtual_alloc_paged(address, size, allocation_type, protect);
+    void* const result = virtual_alloc_paged(address, size, allocation_type, protect);
+    note_big_allocation("XMemVirtualAlloc", size, allocation_type, _ReturnAddress(), result);
+    return result;
 }
 
 // XMemVirtualAlloc without the attribute word; TitleVirtualAlloc's path for the console page-size bits too.
@@ -660,15 +723,8 @@ void* virtual_alloc_paged(void* address, SIZE_T size, DWORD allocation_type, DWO
         }
         return result;
     }
-    if (page_mode == kXmemLargePages && address == nullptr) {
-        MEM_ADDRESS_REQUIREMENTS requirements{};
-        requirements.Alignment = kXmemPageSize2m;
-        MEM_EXTENDED_PARAMETER parameter{};
-        parameter.Type = MemExtendedParameterAddressRequirements;
-        parameter.Pointer = &requirements;
-        return placeholder_api().virtual_alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, host_prot,
-                                                &parameter, 1);
-    }
+    if (page_mode == kXmemLargePages && address == nullptr)
+        return title_virtual_alloc2(size, host_type | MEM_RESERVE, host_prot, kXmemPageSize2m);
     return host_virtual_alloc(address, size, host_type, host_prot);
 }
 
@@ -681,6 +737,7 @@ bool unmap_page(uintptr_t address) {
                                        MEM_PRESERVE_PLACEHOLDER)) {
         return false;
     }
+    forget_page_address(it->second.page, address);
     g_mapped.erase(it);
     rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
     return true;
@@ -704,6 +761,7 @@ bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
                                                    protect, nullptr, 0);
     if (!view) return false;
     g_mapped[address] = MappedPage{page, it->second.section, it->second.offset};
+    g_page_addresses.emplace(page, address);
     rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
     return true;
 }
@@ -856,6 +914,8 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         return FALSE;
     }
     rt::xmem::g_commit_range.store(&rt::xmem::commit_physical_range, std::memory_order_release);
+    rt::xmem::g_transfer_physical.store(&rt::xmem::transfer_physical, std::memory_order_release);
+    rt::xmem::g_mirror_address.store(&locked_mirror_of, std::memory_order_release);
     const uint64_t bytes = count * kPhysicalPageSize;  // below 2^37: count is below 2^21
     const HANDLE handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                              static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
@@ -1066,9 +1126,15 @@ constexpr DWORD kMemTitle = 0x40000000;
 // the host, which the title never set up) is dropped. A commit into a placeholder window is handled as there (B7).
 LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
     DWORD type = allocation_type & ~(kMemGraphics | kMemTitle);
-    if (type & kXmemLargePages) return virtual_alloc_paged(address, size, type, protect);
-    type &= ~DWORD{MEM_PHYSICAL};
-    return host_virtual_alloc(address, size, type, host_protect(protect));
+    void* result = nullptr;
+    if (type & kXmemLargePages) {
+        result = virtual_alloc_paged(address, size, type, protect);
+    } else {
+        type &= ~DWORD{MEM_PHYSICAL};
+        result = host_virtual_alloc(address, size, type, host_protect(protect));
+    }
+    note_big_allocation("VirtualAlloc", size, allocation_type, _ReturnAddress(), result);
+    return result;
 }
 
 // Review M8: once pages are mapped into a physical-page window it is many host allocations (a view or a placeholder
@@ -1169,13 +1235,9 @@ bool commit_physical_range(const void* address, size_t size) {
     return true;
 }
 
-bool commit_physical_pages(const uint64_t* page_array, size_t count) {
-    if (count == 0) return true;
-    if (!page_array) {
-        SetLastError(ERROR_INVALID_PARAMETER);
-        return false;
-    }
-    const std::lock_guard lock(g_phys_mutex);
+namespace {
+// commit_physical_pages with g_phys_mutex held.
+bool commit_pages_locked(const uint64_t* page_array, size_t count) {
     size_t first = 0;
     while (first < count) {
         const auto it = g_pages.find(page_array[first]);
@@ -1195,6 +1257,48 @@ bool commit_physical_pages(const uint64_t* page_array, size_t count) {
         void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset;
         if (!VirtualAlloc(backing, (last - first) * kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return false;
         first = last;
+    }
+    return true;
+}
+}  // namespace
+
+bool commit_physical_pages(const uint64_t* page_array, size_t count) {
+    if (count == 0) return true;
+    if (!page_array) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    const std::lock_guard lock(g_phys_mutex);
+    return commit_pages_locked(page_array, count);
+}
+
+// After upstream Leonida's xmem transfer_physical (ubiquitarianism/leonida, GPL-3.0): each page's bytes go through its
+// section's scratch view, so every view the page is mapped at shows them, mapped or not yet.
+bool transfer_physical(const uint64_t* pages, size_t count, uint16_t offset, uint8_t* staging, size_t size, bool write) {
+    if (size == 0) return true;
+    if (!pages || offset >= kPhysicalPageSize || count != 1 + (size - 1 + offset) / kPhysicalPageSize) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    const std::lock_guard lock(g_phys_mutex);
+    if (!commit_pages_locked(pages, count)) return false;
+    for (size_t i = 0; i < count; ++i) {
+        const PhysicalPage& backing = g_pages.at(pages[i]);
+        uint8_t* const at = static_cast<uint8_t*>(backing.section->scratch) + backing.offset + offset;
+        const size_t bytes = (std::min)(size, size_t(kPhysicalPageSize - offset));
+        if (write) {
+            std::memcpy(at, staging, bytes);
+            // The title's textures over the page see new bytes (the D3D12 layer's watch, g_title_written).
+            if (const auto told = g_title_written.load(std::memory_order_acquire)) {
+                auto [first, last] = g_page_addresses.equal_range(pages[i]);
+                for (; first != last; ++first) told(reinterpret_cast<const void*>(first->second + offset), bytes);
+            }
+        } else {
+            std::memcpy(staging, at, bytes);
+        }
+        staging += bytes;
+        size -= bytes;
+        offset = 0;
     }
     return true;
 }

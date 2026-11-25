@@ -144,14 +144,17 @@ public:
     // i-th 64 KiB page boundary inside its range. GPU targets the title places over one address are transients of a
     // frame that take turns on the same memory, so they share its pages, as on the console.
     // A texture the CPU fills (`streamed`) gets pages of its own (shared only with textures at the same address and
-    // size), bound per mip as the title's views ask for them (require_mip). Its PC tiles are in another order than its
-    // console layout, so sharing pages by address with its neighbours mixed their texels. And the title's streaming
-    // pool packs partly resident textures: on the console a texture's smallest mips come first in its memory, and a
-    // 1024x1024 BC1 texture (684 KiB) with only its mip tail resident is placed 16 KiB before the next one, its view
-    // starting at the first resident mip. Binding only the mips the views name keeps such a texture to its tail page
-    // instead of 684 KiB, as the console keeps it to 16 KiB.
+    // size): its PC tiles are in another order than its console layout, so sharing pages by address with its
+    // neighbours mixed their texels. Its mips are bound when a view of it asks for them (require_mip), and only those
+    // whose bytes are its own: on the console a texture's smallest mips come first in its memory, and the title's
+    // streaming pool places a partly resident texture so that its resident mips fill the start of its range and the
+    // next texture starts right after them (a 1024x1024 BC1 texture of 684 KiB with only its mip tail resident sits
+    // 16 KiB before the next one). Its views still start at mip 0 (the shader clamps the level), so binding what the
+    // views ask alone put every mip of every such texture in memory: 11 GB of pages in the first loading screen.
+    // `ends` (streamed): per mip m, the bytes from `va` that hold mip m and the smaller ones in the console layout
+    // (ends[0] the whole texture); empty: every mip needs the whole range.
     bool place(std::uintptr_t id, VkImage image, std::vector<Tile> tiles, std::uint32_t types, std::uint64_t va,
-               std::uint64_t bytes, bool streamed) {
+               std::uint64_t bytes, bool streamed, std::vector<std::uint64_t> ends = {}) {
         std::lock_guard lock(mutex_);
         Target t;
         t.image = image;
@@ -160,75 +163,75 @@ public:
         t.va = va;
         t.bytes = bytes;
         t.streamed = streamed;
+        t.ends = std::move(ends);
         if (!streamed) {
             if (!acquire(t)) return false;
             queue_bind(id, t, true);
         }
         t.mapped = true;
-        targets_.emplace(id, std::move(t));
+        Target& placed = targets_.emplace(id, std::move(t)).first->second;
+        by_va_.emplace(va, id);
+        max_bytes_ = std::max(max_bytes_, bytes);
+        if (streamed) placed.floor = resident_floor(placed);
+        // Streamed textures this one starts inside: their memory from here on is this one's.
+        reconsider(va);
         ++placed_;
         return true;
     }
 
-    // A view of streamed texture `id` reads from mip `mip` on: binds that mip's tiles and those of every mip between it
-    // and the ones bound already (on pages of its own). True when it bound something: the texture's bytes are then
-    // uploaded again (`take_remapped`). False otherwise, also when the pool could not grow (the mips stay unbound and
-    // read zero).
+    // A view of streamed texture `id` reads from mip `mip` on: binds the tiles of the mips from there that are the
+    // texture's own (resident_floor), on pages of its own. True when it bound something: the texture's bytes are then
+    // uploaded again (`take_remapped`).
     bool require_mip(std::uintptr_t id, std::uint32_t mip) {
         std::lock_guard lock(mutex_);
         const auto it = targets_.find(id);
         if (it == targets_.end() || !it->second.streamed) return false;
         Target& t = it->second;
-        if (t.bound_mip != kNoMip && mip >= t.bound_mip) return false;
-        if (t.slots.size() != t.tiles.size()) t.slots.assign(t.tiles.size(), {});
-        Op op;
-        op.id = id;
-        op.image = t.image;
-        op.first = !t.ever_bound;
-        op.full = false;
-        const std::size_t held = t.extra.size();
-        for (std::size_t i = 0; i < t.tiles.size(); ++i) {
-            const Tile& tile = t.tiles[i];
-            // Already bound: its mip is at or past the bound one; metadata goes with the first bind.
-            const bool metadata = (tile.flags & VK_SPARSE_MEMORY_BIND_METADATA_BIT) != 0;
-            const bool bound = t.bound_mip != kNoMip && (metadata || tile.mip >= t.bound_mip);
-            if (bound || (!metadata && tile.mip < mip)) continue;
-            Slot slot;
-            if (!take_own(t, std::uint32_t(i), slot)) {
-                // Nothing of this call stays held: what it took goes back.
-                while (t.extra.size() > held) {
-                    put_own(t.extra.back());
-                    t.extra.pop_back();
-                }
-                return false;
-            }
-            t.slots[i] = slot;
-            const Block& block = blocks_[slot.block];
-            const VkDeviceSize offset = VkDeviceSize(slot.index) * kPage;
-            if (tile.opaque)
-                op.opaque_binds.push_back({tile.resource_offset, kPage, block.memory, offset, tile.flags});
-            else
-                op.image_binds.push_back({tile.subresource, tile.offset, tile.extent, block.memory, offset, 0});
-        }
-        t.bound_mip = mip;
-        t.ever_bound = true;
-        if (op.image_binds.empty() && op.opaque_binds.empty()) return false;
-        pending_.push_back(std::move(op));
-        remapped_.push_back(id);
-        return true;
+        if (t.want != kNoMip && mip >= t.want) return false;
+        t.want = mip;
+        return fit(id, t);
     }
 
-    // The title released the texture: its pages are no longer its.
+    // The pages streamed textures may take before their most detailed mips are left out (budget_floor), in bytes; 0:
+    // no budget. Every page also costs the process RAM on NVIDIA (each 16 MiB block is mapped into it), so pages past
+    // the card's VRAM and the PC's RAM ran the process out of commit in the first loading screen.
+    void set_budget(std::uint64_t bytes) {
+        std::lock_guard lock(mutex_);
+        budget_pages_ = static_cast<std::size_t>(bytes / kPage);
+    }
+
+    // Streamed texture `id` is written by the GPU (a copy into it): every mip is bound and stays bound, whatever its
+    // views ask and whatever starts inside its range (its texels are the GPU's, not the title memory's). True when it
+    // bound something.
+    bool require_all(std::uintptr_t id) {
+        std::lock_guard lock(mutex_);
+        const auto it = targets_.find(id);
+        if (it == targets_.end() || !it->second.streamed || it->second.gpu_written) return false;
+        Target& t = it->second;
+        t.gpu_written = true;
+        t.want = 0;
+        t.floor = 0;
+        return fit(id, t);
+    }
+
+    // The title released the texture: its pages are no longer its, and a streamed texture it started inside owns its
+    // memory again from there.
     void release(std::uintptr_t id) {
         std::lock_guard lock(mutex_);
         const auto it = targets_.find(id);
         if (it == targets_.end()) return;
         Target t = std::move(it->second);
         targets_.erase(it);
+        for (auto range = by_va_.equal_range(t.va); range.first != range.second; ++range.first)
+            if (range.first->second == id) {
+                by_va_.erase(range.first);
+                break;
+            }
         // A bind still waiting to be made names an image about to be destroyed.
         pending_.erase(std::remove_if(pending_.begin(), pending_.end(), [&](const Op& op) { return op.id == id; }),
                        pending_.end());
         give_back(t);
+        reconsider(t.va);
     }
 
     // Whether the texture is on pages (bound, or streamed and bound as its views ask).
@@ -258,10 +261,10 @@ public:
         return targets_.count(id) != 0;
     }
 
-    // The binds to make (the caller submits them in one batch), one op per image: a render target's op binds all its
-    // tiles, so of two only the last counts; a streamed texture's ops bind tiles not bound before, so they add up. The
-    // merged op keeps `first` from those before it. One op per image keeps the batch free of two binds of one tile,
-    // whose order within a batch would be up to the driver.
+    // The binds to make (the caller submits them in one batch), one op per image, one bind per tile: the last bind
+    // (or unbind) of a tile counts, as the order of two binds of one tile within a batch would be up to the driver. A
+    // render target's op binds all its tiles; a streamed texture's ops bind or unbind some. The merged op keeps
+    // `first` from those before it.
     std::vector<Op> take() {
         std::lock_guard lock(mutex_);
         std::vector<Op> out;
@@ -283,6 +286,7 @@ public:
             }
             merged.first = first;
         }
+        for (Op& op : out) last_per_tile(op);
         pending_.clear();
         return out;
     }
@@ -308,6 +312,7 @@ public:
     struct Stats {
         std::size_t textures = 0, mapped = 0, pages = 0, blocks = 0, local_blocks = 0;
         std::size_t streamed = 0, streamed_unbound = 0;  // streamed textures, those no view has asked a mip of yet
+        std::size_t streamed_with_ends = 0, streamed_trimmed = 0;  // with a console mip order; with mips not their own
         std::uint64_t placed = 0;
     };
     Stats stats() const {
@@ -318,6 +323,8 @@ public:
             s.mapped += t.mapped;
             s.streamed += t.streamed;
             s.streamed_unbound += t.streamed && t.bound_mip == kNoMip;
+            s.streamed_with_ends += t.streamed && !t.ends.empty();
+            s.streamed_trimmed += t.streamed && t.floor > 0;
         }
         s.pages = pages_.size() + extra_.size();
         s.blocks = blocks_.size();
@@ -350,10 +357,135 @@ private:
         bool ever_bound = false;
         bool streamed = false;
         std::uint32_t bound_mip = kNoMip;  // streamed: the most detailed mip bound (its tiles and all smaller ones)
+        std::uint32_t want = kNoMip;       // streamed: the most detailed mip a view of it reads
+        std::uint32_t floor = 0;           // streamed: the most detailed mip whose bytes are its own (resident_floor)
+        bool gpu_written = false;          // streamed: a copy wrote it; every mip stays bound (require_all)
+        std::vector<std::uint64_t> ends;   // streamed: see place
+        std::vector<bool> bound;           // streamed: per tile
         std::vector<std::uint64_t> own;    // page addresses it holds
         std::vector<ExtraKey> extra;       // (va, bytes, tile) pages it holds
         std::vector<Slot> slots;           // per tile, while mapped (render targets) or bound (streamed)
     };
+
+    // The most detailed mip of streamed texture `t` whose console bytes lie before the next texture's start inside
+    // its range (the rest of the range is that texture's memory): 0 without one, the smallest mip when not even it fits.
+    std::uint32_t resident_floor(const Target& t) const {
+        if (t.ends.empty() || t.gpu_written) return 0;
+        const auto next = by_va_.upper_bound(t.va);
+        const std::uint64_t own = next != by_va_.end() && next->first < t.va + t.bytes ? next->first - t.va : t.bytes;
+        for (std::uint32_t m = 0; m < t.ends.size(); ++m)
+            if (t.ends[m] <= own) return m;
+        return static_cast<std::uint32_t>(t.ends.size() - 1);
+    }
+
+    // A texture was placed at, or released from, `point`: the streamed textures whose range holds it own a different
+    // part of their memory now, and their binds follow.
+    void reconsider(std::uint64_t point) {
+        const std::uint64_t from = point > max_bytes_ ? point - max_bytes_ : 0;
+        for (auto it = by_va_.lower_bound(from); it != by_va_.end() && it->first < point; ++it) {
+            Target& o = targets_.at(it->second);
+            if (!o.streamed || o.va + o.bytes <= point) continue;
+            const std::uint32_t floor = resident_floor(o);
+            if (floor == o.floor) continue;
+            o.floor = floor;
+            fit(it->second, o);
+        }
+    }
+
+    // Binds the tiles of streamed texture `t` from mip max(want, floor) on (its mip tail and metadata with any), and
+    // unbinds those before it. True when it bound a tile (its bytes are uploaded again: take_remapped). A tile the pool
+    // has no page for stays unbound (reads zero).
+    // Mips of streamed texture `t` left out for the page budget (set_budget): none within it; past it the most detailed
+    // mip of a texture whose mip 0 takes 4 pages or more, and past 5/4 of it the next one too. A texture without a mip
+    // chain (UI art), or one the GPU writes, keeps every mip.
+    std::uint32_t budget_floor(const Target& t) const {
+        if (!budget_pages_ || t.gpu_written) return 0;
+        const std::size_t used = pages_.size() + extra_.size();
+        if (used <= budget_pages_) return 0;
+        std::size_t mip_tiles[2] = {};
+        for (const Tile& tile : t.tiles)
+            if (!tile.opaque && tile.mip < 2) ++mip_tiles[tile.mip];
+        std::uint32_t drop = 0;
+        if (mip_tiles[0] >= 4) drop = 1;
+        if (drop && used > budget_pages_ + budget_pages_ / 4 && mip_tiles[1] >= 4) drop = 2;
+        return drop;
+    }
+
+    bool fit(std::uintptr_t id, Target& t) {
+        if (t.want == kNoMip) return false;
+        // Bound already from a mip: the budget does not take it away (its views may read it); it only keeps new
+        // detail out.
+        const std::uint32_t budget = budget_floor(t);
+        const std::uint32_t from = std::max({t.want, t.floor, t.bound_mip == kNoMip ? budget : std::min(budget, t.bound_mip)});
+        const std::size_t n = t.tiles.size();
+        if (t.bound.size() != n) {
+            t.bound.assign(n, false);
+            t.slots.assign(n, {});
+        }
+        Op op;
+        op.id = id;
+        op.image = t.image;
+        op.first = !t.ever_bound;
+        op.full = false;
+        bool added = false;
+        for (std::size_t i = 0; i < n; ++i) {
+            const Tile& tile = t.tiles[i];
+            const bool metadata = (tile.flags & VK_SPARSE_MEMORY_BIND_METADATA_BIT) != 0;
+            const bool tail = tile.opaque && !metadata;
+            const bool needed = metadata || tail || tile.mip >= from;
+            const ExtraKey key{t.va, t.bytes, std::uint32_t(i)};
+            if (needed && !t.bound[i]) {
+                Slot slot;
+                if (!take_own(t, std::uint32_t(i), slot)) continue;
+                t.slots[i] = slot;
+                t.bound[i] = true;
+                added = true;
+                const Block& block = blocks_[slot.block];
+                const VkDeviceSize offset = VkDeviceSize(slot.index) * kPage;
+                if (tile.opaque)
+                    op.opaque_binds.push_back({tile.resource_offset, kPage, block.memory, offset, tile.flags});
+                else
+                    op.image_binds.push_back({tile.subresource, tile.offset, tile.extent, block.memory, offset, 0});
+            } else if (!needed && t.bound[i]) {
+                t.bound[i] = false;
+                put_own(key);
+                const auto held = std::find(t.extra.begin(), t.extra.end(), key);
+                if (held != t.extra.end()) t.extra.erase(held);
+                if (tile.opaque)
+                    op.opaque_binds.push_back({tile.resource_offset, kPage, VK_NULL_HANDLE, 0, tile.flags});
+                else
+                    op.image_binds.push_back({tile.subresource, tile.offset, tile.extent, VK_NULL_HANDLE, 0, 0});
+            }
+        }
+        t.bound_mip = from;
+        if (op.image_binds.empty() && op.opaque_binds.empty()) return false;
+        t.ever_bound = true;
+        pending_.push_back(std::move(op));
+        if (added) remapped_.push_back(id);
+        return added;
+    }
+
+    // Keeps the last bind of each tile of a merged op (an image bind by subresource and offset, an opaque one by its
+    // resource offset), in the order of their last appearance.
+    static void last_per_tile(Op& op) {
+        if (op.full) return;
+        const auto dedupe = [](auto& binds, auto key_of) {
+            std::map<decltype(key_of(binds.front())), std::size_t> last;
+            for (std::size_t i = 0; i < binds.size(); ++i) last[key_of(binds[i])] = i;
+            if (last.size() == binds.size()) return;
+            std::remove_reference_t<decltype(binds)> kept;
+            for (std::size_t i = 0; i < binds.size(); ++i)
+                if (last[key_of(binds[i])] == i) kept.push_back(binds[i]);
+            binds.swap(kept);
+        };
+        if (!op.image_binds.empty())
+            dedupe(op.image_binds, [](const VkSparseImageMemoryBind& b) {
+                return std::make_tuple(b.subresource.aspectMask, b.subresource.mipLevel, b.subresource.arrayLayer,
+                                       b.offset.x, b.offset.y, b.offset.z);
+            });
+        if (!op.opaque_binds.empty())
+            dedupe(op.opaque_binds, [](const VkSparseMemoryBind& b) { return std::make_tuple(b.resourceOffset, b.flags); });
+    }
 
     static void add_pages(std::vector<Tile>& out, VkDeviceSize offset, VkDeviceSize size, VkSparseMemoryBindFlags flags,
                           std::uint32_t mip) {
@@ -509,6 +641,9 @@ private:
     std::unordered_map<std::uint64_t, Page> pages_;  // title page address -> its video memory
     std::map<ExtraKey, Page> extra_;
     std::unordered_map<std::uintptr_t, Target> targets_;
+    std::multimap<std::uint64_t, std::uintptr_t> by_va_;  // every texture by its start
+    std::uint64_t max_bytes_ = 0;
+    std::size_t budget_pages_ = 0;  // set_budget; 0: none
     std::uint64_t placed_ = 0;
     std::vector<Op> pending_;
     std::vector<std::uintptr_t> remapped_;
