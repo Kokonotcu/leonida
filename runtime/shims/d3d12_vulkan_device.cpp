@@ -1430,13 +1430,54 @@ struct DeviceState {
         share(create);
         VkMemoryHostPointerPropertiesEXT properties{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         VkMemoryRequirements requirements{};
+        struct {
+            std::chrono::steady_clock::duration properties{};
+        } import_timing;
         bool ok = vk.vkCreateBuffer(device, &create, nullptr, &buffer) == VK_SUCCESS;
         if (ok) {
             vk.vkGetBufferMemoryRequirements(device, buffer, &requirements);
+            const auto tp = std::chrono::steady_clock::now();
             ok = get_host_pointer_properties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host,
                                              &properties) == VK_SUCCESS;
+            import_timing.properties = std::chrono::steady_clock::now() - tp;
         }
         types = ok ? properties.memoryTypeBits & requirements.memoryTypeBits : 0;
+        const auto ta = std::chrono::steady_clock::now();
+        // A slow import (30 ms or more) by driver call, with the process's count of address-space regions at the first:
+        // each import held NVIDIA's device lock for 9-130 ms whatever its size (runs 17, 18), and one for over 10 s
+        // stalled every queue into the title's watchdog (run 20, stacks_1: import_host inside the driver, the binder
+        // and a staging submit waiting on its lock). The suspicion: the driver walks the address space, which xmem's
+        // 64 KiB views of physical memory cut into tens of thousands of regions.
+        const struct ImportReport {
+            std::chrono::steady_clock::time_point start;
+            const std::chrono::steady_clock::duration& properties;
+            VkDeviceSize bytes;
+            ~ImportReport() {
+                const auto ms = [](std::chrono::steady_clock::duration d) {
+                    return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
+                };
+                const auto allocate = std::chrono::steady_clock::now() - start;
+                if (ms(allocate + properties) < 30) return;
+                static std::atomic<int> told{0};
+                const int n = told.fetch_add(1, std::memory_order_relaxed);
+                if (n >= 80) return;
+                std::size_t regions = 0;
+                if (n == 0 || n == 40) {  // a walk of the whole address space, twice a run
+                    MEMORY_BASIC_INFORMATION info{};
+                    for (auto* p = static_cast<std::uint8_t*>(nullptr);
+                         VirtualQuery(p, &info, sizeof(info)) == sizeof(info);
+                         p = static_cast<std::uint8_t*>(info.BaseAddress) + info.RegionSize) {
+                        ++regions;
+                        if (static_cast<std::uint8_t*>(info.BaseAddress) + info.RegionSize <= p) break;
+                    }
+                }
+                std::fprintf(stderr, "[rt] d3d12: slow host import %lld ms (%llu KiB): pointer properties %lld, "
+                                     "allocate %lld%s",
+                             ms(allocate + properties), static_cast<unsigned long long>(bytes >> 10), ms(properties),
+                             ms(allocate), regions ? "" : "\n");
+                if (regions) std::fprintf(stderr, "; the process has %zu address-space regions\n", regions);
+            }
+        } import_report{ta, import_timing.properties, bytes};
         if (types) {
             VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
             import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
