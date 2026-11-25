@@ -326,6 +326,9 @@ public:
         if (!(planes.hdr_peak_nits > 0.0f) || !std::isfinite(planes.hdr_peak_nits)) return VK_ERROR_UNKNOWN;
         for (std::uint32_t i = 0; i < planes.count; ++i) {
             const PresentPlane& plane = planes.plane[i];
+            // The planes go into a dump too (LEONIDA_DUMP_TARGETS): plane 0 can be written by compute (the console FSR
+            // upscaler's output), which no draw notes.
+            debug_targets::note(plane.source);
             ResourceBinding binding;
             {
                 std::shared_lock lock(context_.resource_mutex_);
