@@ -1251,6 +1251,8 @@ struct DeviceState {
     static constexpr std::uint64_t kPhysicalChunk = 2ull << 20;
     static constexpr std::chrono::milliseconds kSettledFor{500}, kFailedChunkFor{5000};
     VkResult last_import_result = VK_SUCCESS;  // import_host's vkAllocateMemory, for the failure log
+    // The last import_host failure came from the driver (not host_range_importable).
+    bool chunk_bytes_refused_by_driver() const { return last_import_result != VK_ERROR_INVALID_EXTERNAL_HANDLE; }
 
     // A title VA (at or above 4 GiB) as a buffer and offset, for what binds a VkBuffer rather than reading through
     // the page table: vertex and index views, copies (VulkanContext::buffer_at falls back to this). Memory not
@@ -1479,8 +1481,10 @@ struct DeviceState {
         if (ok) {
             vk.vkGetBufferMemoryRequirements(device, buffer, &requirements);
             const auto tp = std::chrono::steady_clock::now();
-            ok = get_host_pointer_properties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host,
-                                             &properties) == VK_SUCCESS;
+            const VkResult pr = get_host_pointer_properties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                                            host, &properties);
+            ok = pr == VK_SUCCESS;
+            if (!ok) last_import_result = pr;
             import_timing.properties = std::chrono::steady_clock::now() - tp;
         }
         types = ok ? properties.memoryTypeBits & requirements.memoryTypeBits : 0;
@@ -1636,6 +1640,39 @@ struct DeviceState {
         if (!chunk.address) {
             title_pages.failed_chunks[start] = now;
             const std::uint64_t n = ++title_pages.chunk_failures;
+            // The first two refusals: which 64 KiB of the chunk the driver will not take (halves imported in turn) and
+            // what VirtualQuery says of it. Committed read-write store-view chunks were refused again and again while
+            // others imported (run 28), so the cause is something of those pages.
+            if (n <= 2 && chunk_bytes_refused_by_driver()) {
+                if (lock) lock->unlock();
+                std::uintptr_t lo = start, hi = end;
+                while (hi - lo > 0x10000) {
+                    const std::uintptr_t mid = lo + (hi - lo) / 2;
+                    VkBuffer b = VK_NULL_HANDLE;
+                    VkDeviceMemory m = VK_NULL_HANDLE;
+                    std::uint32_t t = 0;
+                    const bool left_ok = import_host(reinterpret_cast<void*>(lo), mid - lo, b, m, t) != 0;
+                    if (b) context->vk.vkDestroyBuffer(info.device, b, nullptr);
+                    if (m) context->vk.vkFreeMemory(info.device, m, nullptr);
+                    if (left_ok) lo = mid;
+                    else hi = mid;
+                }
+                VkBuffer b = VK_NULL_HANDLE;
+                VkDeviceMemory m = VK_NULL_HANDLE;
+                std::uint32_t t = 0;
+                const bool page_ok = import_host(reinterpret_cast<void*>(lo), hi - lo, b, m, t) != 0;
+                if (b) context->vk.vkDestroyBuffer(info.device, b, nullptr);
+                if (m) context->vk.vkFreeMemory(info.device, m, nullptr);
+                MEMORY_BASIC_INFORMATION r{};
+                VirtualQuery(reinterpret_cast<const void*>(lo), &r, sizeof(r));
+                std::fprintf(stderr, "[rt] d3d12: refused chunk %#llx: 64 KiB at %#llx alone %s (VkResult %d): "
+                                     "region %p + %#llx state %#lx type %#lx protect %#lx alloc %p\n",
+                             static_cast<unsigned long long>(start), static_cast<unsigned long long>(lo),
+                             page_ok ? "imports (no single page refused: the whole chunk is)" : "is refused",
+                             static_cast<int>(last_import_result), r.BaseAddress,
+                             static_cast<unsigned long long>(r.RegionSize), r.State, r.Type, r.Protect, r.AllocationBase);
+                if (lock) lock->lock();
+            }
             if ((n & (n - 1)) == 0)
                 std::fprintf(stderr, "[rt] d3d12: physical pages %#llx + %#llx could not be imported for the page "
                                      "table (memory types 0x%x, VkResult %d, error %lu; %llu failures, %llu MiB "
