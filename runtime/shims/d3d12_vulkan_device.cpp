@@ -8771,6 +8771,13 @@ bool image_descriptor(const Resource& resource, const TextureView& view, leonida
     }
     if (view_format == VK_FORMAT_UNDEFINED) {
         log_once("view format not supported for this texture:", int(view.format));
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 16)  // which textures: BC7/BC1 views (card art?) and A8
+            std::fprintf(stderr, "[rt] d3d12:   view format %d (gfx10 %u) of a %llux%u texture of DXGI format %d, image "
+                                 "VkFormat %d (uint-backed %d), view list %d, mips %u\n",
+                         int(view.format), code, static_cast<unsigned long long>(desc.Width), desc.Height,
+                         int(desc.Format), int(resource.format()), int(resource.uint_backed()),
+                         int(resource.has_view_format_list()), unsigned(desc.MipLevels));
         return false;
     }
     const UINT layers = volume ? 1 : desc.DepthOrArraySize;
