@@ -1778,6 +1778,8 @@ public:
         fn.free = vk.vkFreeMemory;
         fn.requirements = vk.vkGetImageMemoryRequirements;
         fn.sparse_requirements = vk.vkGetImageSparseMemoryRequirements;
+        fn.submitted_ticket = [this] { return submitted_ticket_.load(std::memory_order_acquire); };
+        fn.completed_ticket = [this] { return completed_ticket_seen_.load(std::memory_order_acquire); };
         if (!fn.allocate || !fn.free || !fn.requirements || !fn.sparse_requirements || !vk.vkQueueBindSparse || !families)
             return;
         title_pages_ = std::make_unique<TitlePages>(device(), fn, memory);
@@ -1990,6 +1992,11 @@ public:
         // A DEVICE_LOST seen here is the first Vulkan operation to discover it; it must not be mistaken for
         // "this ticket has not completed".
         if (lost) mark_device_lost();
+        if (!lost) {  // the last completed ticket seen, for readers that may not take submit_mutex_ (TitlePages)
+            std::uint64_t seen = completed_ticket_seen_.load(std::memory_order_relaxed);
+            while (ticket > seen && !completed_ticket_seen_.compare_exchange_weak(seen, ticket, std::memory_order_acq_rel)) {
+            }
+        }
         return lost ? 0 : ticket;
     }
 
@@ -2346,6 +2353,7 @@ private:
     }
     std::unordered_map<VkSemaphore, ProgressWaitState> progress_waits_;
     std::atomic<std::uint64_t> submitted_ticket_{0};
+    std::atomic<std::uint64_t> completed_ticket_seen_{0};  // completed_retire_ticket's last answer
     DeferredDeletionQueue deletion_queue_;
     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
     QueueHolds<VkSemaphore> holds_;
@@ -4309,16 +4317,14 @@ private:
             std::vector<TitlePages::Op> urgent, streamed;
             for (auto& op : ops) (op.full ? urgent : streamed).push_back(std::move(op));
             std::lock_guard lock(context_.submit_mutex());
+            // No waits for the queues' work: what a bind changes is either memory the title says is free now (a
+            // texture placed over another's range; the title released or no longer uses it, as on the console) or a
+            // page of our pool, which is taken again only once the GPU is past the work submitted before it was
+            // given back (TitlePages quarantine). Waiting for "every queue's work submitted so far" deadlocked: that
+            // work can wait (wait-before-signal across queues) on submissions made later, which wait on these binds
+            // (run 28: binder -> compute queue -> direct queue -> binder).
             std::vector<VkSemaphore> semaphores;
             std::vector<std::uint64_t> values;
-            for (const auto& [semaphore, value] : context_.latest_pending_queue_values()) {
-                semaphores.push_back(semaphore);
-                values.push_back(value);
-            }
-            if (submitted_ && std::find(semaphores.begin(), semaphores.end(), progress_) == semaphores.end()) {
-                semaphores.push_back(progress_);
-                values.push_back(submitted_);
-            }
             if (!urgent.empty()) context_.enqueue_title_binds_locked(std::move(urgent), semaphores, values, true);
             if (!streamed.empty())
                 context_.enqueue_title_binds_locked(std::move(streamed), std::move(semaphores), std::move(values), false);

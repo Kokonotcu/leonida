@@ -2093,7 +2093,19 @@ public:
             std::fprintf(stderr, "[rt] d3d12: %llu batches held on console memory waits\n",
                          static_cast<unsigned long long>(n));
     }
-    // Every held batch released now (a present, a queue going away).
+    // Every held batch is to be released (a present, the title blocking on a fence). Done by the watcher thread: the
+    // release records and submits the held batches, which can take seconds (a host import in the driver took over 10 s
+    // in run 27), and done on the title's present thread it held the present and the title's GPU watchdog fired.
+    void request_release(const char* why) {
+        {
+            std::lock_guard lock(mutex_);
+            if (pending_ == 0) return;
+            release_why_ = why;
+            release_requested_ = true;
+        }
+        cv_.notify_one();
+    }
+    // Every held batch released now, on this thread (a queue going away: `only`).
     void release_all(const char* why, MemoryWaitQueue* only = nullptr) {
         std::vector<std::pair<std::shared_ptr<MemoryWaitQueue>, std::uint64_t>> release;
         {
@@ -2128,10 +2140,20 @@ private:
     void run() {
         for (;;) {
             std::vector<std::shared_ptr<MemoryWaitQueue>> queues;
+            const char* forced = nullptr;  // request_release: every batch goes now, met or not
             {
                 std::unique_lock lock(mutex_);
                 cv_.wait(lock, [this] { return pending_ > 0; });
                 queues = queues_;
+                if (release_requested_) {
+                    forced = release_why_;
+                    release_requested_ = false;
+                }
+            }
+            if (forced) {
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 8)
+                    std::fprintf(stderr, "[rt] d3d12: console memory waits released (%s)\n", forced);
             }
             const auto now = std::chrono::steady_clock::now();
             std::vector<std::pair<std::shared_ptr<MemoryWaitQueue>, std::uint64_t>> release;
@@ -2144,10 +2166,10 @@ private:
                     MemoryWaitBatch& batch = queue->pending.front();
                     bool all = true;
                     for (const ListMemoryWait& w : batch.waits) all = all && memory_wait_holds(w);
-                    if (!all && now - batch.since < kMemoryWaitLimit) break;
+                    if (!all && !forced && now - batch.since < kMemoryWaitLimit) break;
                     const auto waited =
                         std::chrono::duration_cast<std::chrono::milliseconds>(now - batch.since).count();
-                    if (!all) {
+                    if (!all && !forced) {
                         for (const ListMemoryWait& w : batch.waits) {
                             if (memory_wait_holds(w)) continue;
                             timed.push_back(w.va);
@@ -2192,6 +2214,8 @@ private:
     std::vector<std::shared_ptr<MemoryWaitQueue>> queues_;
     std::size_t pending_ = 0;
     bool started_ = false;
+    bool release_requested_ = false;
+    const char* release_why_ = "";
     std::set<std::uint64_t> timed_out_;
     std::atomic<std::uint64_t> held_total_{0};
 };
@@ -2837,7 +2861,7 @@ bool note_list_memory_wait_words(void* pc_list, std::uint64_t va, std::uint32_t 
     return note_list_memory_wait(pc_list, wait);
 }
 
-void release_memory_waits(const char* why) { MemoryWaitWatcher::get().release_all(why); }
+void release_memory_waits(const char* why) { MemoryWaitWatcher::get().request_release(why); }
 
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device,

@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -47,6 +48,13 @@ public:
         PFN_vkFreeMemory free = nullptr;
         PFN_vkGetImageMemoryRequirements requirements = nullptr;
         PFN_vkGetImageSparseMemoryRequirements sparse_requirements = nullptr;
+        // The device's retire tickets (VulkanContext): the last handed to a submission, and the last whose work and
+        // every earlier one's is done. A page given back is taken again only once the GPU is past the work submitted
+        // before it was given back (quarantine_), so the binds need not wait for the queues (they did, and a bind
+        // waiting on work that itself waited on later submissions, which wait on the binds, deadlocked run 28).
+        // Both are read without a lock (TitlePages runs with submit_mutex held). Unset: pages are reused at once.
+        std::function<std::uint64_t()> submitted_ticket;
+        std::function<std::uint64_t()> completed_ticket;
     };
 
     // One 64 KiB piece of an image: a block of texels of a mip level (image bind) or a page of a mip tail or metadata
@@ -536,6 +544,7 @@ private:
         // A free page in video memory first, then a new block there (refused past the VRAM budget), then a free page
         // in system memory, then a new block there. Type 0 is system memory on NVIDIA: walking the types in index
         // order put pages in system memory while video memory had free ones.
+        ripen();
         const auto take_free = [&](bool local) {
             for (std::uint32_t type = 0; type < memory_.memoryTypeCount; ++type) {
                 if (!(types & (1u << type)) || local_type(type) != local) continue;
@@ -610,7 +619,7 @@ private:
         for (const std::uint64_t address : t.own) {
             const auto it = pages_.find(address);
             if (it != pages_.end() && --it->second.users == 0) {
-                free_[blocks_[it->second.slot.block].type].push_back(it->second.slot);
+                free_slot(it->second.slot);
                 pages_.erase(it);
             }
         }
@@ -638,8 +647,27 @@ private:
     void put_own(const ExtraKey& key) {
         const auto it = extra_.find(key);
         if (it != extra_.end() && --it->second.users == 0) {
-            free_[blocks_[it->second.slot.block].type].push_back(it->second.slot);
+            free_slot(it->second.slot);
             extra_.erase(it);
+        }
+    }
+
+    // A page no one holds any more: free once the GPU has finished the work submitted until now (Functions).
+    void free_slot(const Slot& slot) {
+        const std::uint32_t type = blocks_[slot.block].type;
+        if (!fn_.submitted_ticket || !fn_.completed_ticket) {
+            free_[type].push_back(slot);
+            return;
+        }
+        quarantine_.push_back({slot, type, fn_.submitted_ticket()});
+    }
+    // Quarantined pages the GPU is past go to the free lists. Tickets only rise, so the front is the oldest.
+    void ripen() {
+        if (quarantine_.empty()) return;
+        const std::uint64_t done = fn_.completed_ticket();
+        while (!quarantine_.empty() && quarantine_.front().ticket <= done) {
+            free_[quarantine_.front().type].push_back(quarantine_.front().slot);
+            quarantine_.pop_front();
         }
     }
 
@@ -668,6 +696,12 @@ private:
     mutable std::mutex mutex_;
     std::vector<Block> blocks_;
     std::vector<Slot> free_[VK_MAX_MEMORY_TYPES];
+    struct Quarantined {
+        Slot slot;
+        std::uint32_t type = 0;
+        std::uint64_t ticket = 0;  // free once the completed retire ticket reaches it
+    };
+    std::deque<Quarantined> quarantine_;
     std::unordered_map<std::uint64_t, Page> pages_;  // title page address -> its video memory
     std::map<ExtraKey, Page> extra_;
     std::unordered_map<std::uintptr_t, Target> targets_;

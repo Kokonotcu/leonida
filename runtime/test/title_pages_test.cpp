@@ -220,6 +220,35 @@ int main() {
         s = pages.stats();
         EXPECT(s.blocks == 2);
     }
+    {
+        // Quarantine: a page given back is taken again only once the completed retire ticket reaches the ticket
+        // submitted when it was given back.
+        static std::uint64_t submitted = 0, completed = 0;
+        TitlePages::Functions qfns = fns;
+        qfns.submitted_ticket = [] { return submitted; };
+        qfns.completed_ticket = [] { return completed; };
+        TitlePages pages(reinterpret_cast<VkDevice>(1), qfns, memory);
+        std::vector<TitlePages::Tile> one(1);
+        one[0].opaque = true;
+        const auto offset_of = [&] {
+            const auto ops = pages.take();
+            return ops.size() == 1 && ops[0].opaque_binds.size() == 1 ? ops[0].opaque_binds[0].memoryOffset
+                                                                       : ~VkDeviceSize(0);
+        };
+        EXPECT(pages.place(1, reinterpret_cast<VkImage>(31), one, 0x3, 0x100000, 0x10000, false));
+        const VkDeviceSize a = offset_of();
+        submitted = 5;
+        pages.release(1);  // quarantined until ticket 5 completes
+        EXPECT(pages.place(2, reinterpret_cast<VkImage>(32), one, 0x3, 0x200000, 0x10000, false));
+        const VkDeviceSize b = offset_of();
+        EXPECT(b != a);  // not the quarantined page
+        completed = 5;
+        submitted = 6;
+        pages.release(2);  // quarantined until 6
+        EXPECT(pages.place(3, reinterpret_cast<VkImage>(33), one, 0x3, 0x300000, 0x10000, false));
+        EXPECT(offset_of() == a);  // the first page is free again, the second not yet
+        pages.release(3);
+    }
     EXPECT(freed > 0);
     std::printf("%s (%d failures)\n", failures ? "FAILED" : "OK", failures);
     return failures ? 1 : 0;
