@@ -230,6 +230,7 @@ public:
         // A bind still waiting to be made names an image about to be destroyed.
         pending_.erase(std::remove_if(pending_.begin(), pending_.end(), [&](const Op& op) { return op.id == id; }),
                        pending_.end());
+        pending_ids_.erase(id);
         give_back(t);
         reconsider(t.va);
     }
@@ -247,7 +248,7 @@ public:
         const auto it = targets_.find(id);
         if (it == targets_.end() || !it->second.mapped) return false;
         if (it->second.streamed && it->second.bound_mip == kNoMip) return false;
-        return std::none_of(pending_.begin(), pending_.end(), [&](const Op& op) { return op.id == id; });
+        return pending_ids_.count(id) == 0;  // a scan of pending_ per texture per sync took ~400 ms (run 03:51)
     }
     // The most detailed mip with texels in memory: copies of the mips before it would land nowhere.
     std::uint32_t first_mip(std::uintptr_t id) const {
@@ -288,6 +289,7 @@ public:
         }
         for (Op& op : out) last_per_tile(op);
         pending_.clear();
+        pending_ids_.clear();
         return out;
     }
     bool pending() const {
@@ -486,6 +488,7 @@ private:
         t.bound_mip = from;
         if (op.image_binds.empty() && op.opaque_binds.empty()) return false;
         t.ever_bound = true;
+        ++pending_ids_[op.id];
         pending_.push_back(std::move(op));
         if (added) remapped_.push_back(id);
         return added;
@@ -655,6 +658,7 @@ private:
             else
                 op.image_binds.push_back({tile.subresource, tile.offset, tile.extent, block.memory, offset, 0});
         }
+        ++pending_ids_[op.id];
         pending_.push_back(std::move(op));
     }
 
@@ -672,6 +676,7 @@ private:
     std::size_t budget_pages_ = 0;  // set_budget; 0: none
     std::uint64_t placed_ = 0;
     std::vector<Op> pending_;
+    std::unordered_map<std::uintptr_t, std::uint32_t> pending_ids_;  // the ops of pending_ per image (ready)
     std::vector<std::uintptr_t> remapped_;
 };
 

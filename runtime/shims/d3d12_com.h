@@ -111,6 +111,9 @@ struct VulkanDeviceInfo {
     // Distinct handles from queue_family, when the creator requested more than one queue.
     // Empty for caller-owned devices that only supplied queue above.
     std::vector<VkQueue> command_queues;
+    // A queue of queue_family kept out of command_queues for the title pages' sparse binds (made on a worker thread,
+    // VulkanContext::set_title_pages_queue). Null: the binds stay on the submitting queue.
+    VkQueue title_pages_queue = VK_NULL_HANDLE;
     std::uint32_t compute_family = UINT32_MAX;
     std::uint32_t copy_family = UINT32_MAX;
     std::vector<VkQueue> compute_queues;

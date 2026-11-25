@@ -257,6 +257,9 @@ public:
         // submission (op index, 8 x 4 dwords; 0 for a word that is not such an address). The report shows them
         // beside what is there at report time, which later writes may have changed (a ring the title reuses).
         std::vector<std::pair<std::uint32_t, std::array<std::uint32_t, 32>>> submitted_words;
+        // An acceleration-structure build's inputs (op index, text): which build a hang stopped in (run 03:27 stopped
+        // in op 419 of a list of builds).
+        std::vector<std::pair<std::uint32_t, std::string>> notes;
     };
     // A submitted list as the breadcrumbs see it now.
     struct Entry {
@@ -269,6 +272,7 @@ public:
         std::vector<std::uintptr_t> pipelines;  // as Mark::pipelines
         std::vector<std::array<std::uint32_t, 11>> details;  // as Mark::details
         std::vector<std::pair<std::uint32_t, std::array<std::uint32_t, 32>>> submitted_words;  // as Mark's
+        std::vector<std::pair<std::uint32_t, std::string>> notes;                              // as Mark's
         bool progress_known = false;      // GPU breadcrumbs: completed_ops is what the progress word says
         bool no_slot = false;             // level 2 with every slot busy: no GPU marker, progress unknown
         std::uint32_t completed_ops = 0;  // operations finished, in order (D3D12's *pLastBreadcrumbValue)
@@ -383,6 +387,34 @@ public:
                     }
                 }
                 m.details.push_back(detail);
+                if (const auto* b = std::get_if<BuildAccelerationStructure>(&commands[i])) {
+                    std::uint64_t primitives = 0;
+                    for (const auto& t : b->triangles)
+                        primitives += (t.index_type ? t.index_count : t.vertex_count) / 3;
+                    char text[384];
+                    if (b->is_tlas)
+                        std::snprintf(text, sizeof(text), "TLAS%s, %u instances%s at %#llx, flags %#x, dst %#llx, scratch %#llx",
+                                      b->update ? " update" : "", b->instance_count,
+                                      b->instance_pointers ? " (pointers)" : "",
+                                      static_cast<unsigned long long>(b->instances_va), b->build_flags,
+                                      static_cast<unsigned long long>(b->dst_va),
+                                      static_cast<unsigned long long>(b->scratch_va));
+                    else {
+                        const RtTriangleGeometry* g = b->triangles.empty() ? nullptr : &b->triangles.front();
+                        std::snprintf(text, sizeof(text),
+                                      "BLAS%s, %zu geometries, %llu triangles, flags %#x, dst %#llx, scratch %#llx; "
+                                      "first: vertices %#llx (%u, stride %u, format %u), indices %#llx (%u, type %u)",
+                                      b->update ? " update" : "", b->triangles.size(),
+                                      static_cast<unsigned long long>(primitives), b->build_flags,
+                                      static_cast<unsigned long long>(b->dst_va),
+                                      static_cast<unsigned long long>(b->scratch_va),
+                                      static_cast<unsigned long long>(g ? g->vertex_va : 0), g ? g->vertex_count : 0,
+                                      g ? g->vertex_stride : 0, g ? g->vertex_format : 0,
+                                      static_cast<unsigned long long>(g ? g->index_va : 0), g ? g->index_count : 0,
+                                      g ? g->index_type : 0);
+                    }
+                    m.notes.emplace_back(static_cast<std::uint32_t>(m.ops.size() - 1), text);
+                }
                 if (const auto* g = std::get_if<Draw>(&commands[i])) pso = g->pipeline;
                 else if (const auto* x = std::get_if<ExecuteIndirect>(&commands[i]))
                     pso = x->pipeline ? x->pipeline : (x->state ? x->state->pipeline : 0);
@@ -512,6 +544,7 @@ public:
             Entry e{m->tag, m->list_id, m->ops, state, m->queue_id, m->list_name, m->queue_name, m->pipelines};
             e.details = m->details;
             e.submitted_words = m->submitted_words;
+            e.notes = m->notes;
             e.no_slot = gpu_ && m->slot == kNoSlot;
             if (state == BreadcrumbState::completed) {
                 e.progress_known = true;  // the end word: every operation finished
@@ -628,9 +661,12 @@ private:
                                     const std::uint32_t* s = then->data() + (w - 3) * 4;
                                     std::fprintf(out, " (at submission %08x %08x %08x %08x)", s[0], s[1], s[2], s[3]);
                                 }
+                                debug_targets::log_table(out, w - 3, d[w]);
                             }
                     }
                 }
+                for (const auto& [op, text] : e.notes)
+                    if (op == k) std::fprintf(out, ": %s", text.c_str());
                 std::fprintf(out, "\n");
             }
         }

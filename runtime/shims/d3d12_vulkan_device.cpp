@@ -1012,6 +1012,58 @@ struct DeviceState {
     std::unique_ptr<leonida::VulkanQueue> staging_queue;
     std::unique_ptr<leonida::VulkanQueue> staging_copy_queue;
 
+    // With staging_mutex held: the staging queue of the copy family (colour copies) or of the graphics family.
+    leonida::VulkanQueue& staging_queue_for(bool copy_family) {
+        auto& q = copy_family ? staging_copy_queue : staging_queue;
+        if (!q) {
+            if (copy_family) {
+                q = std::make_unique<leonida::VulkanQueue>(*context, info.copy_queues.back(), info.copy_family,
+                                                           leonida::VulkanQueue::QueueKind::copy);
+            } else {
+                const auto& queues = info.command_queues;
+                const VkQueue own = queues.size() > 1 ? queues.back() : info.queue;
+                q = std::make_unique<leonida::VulkanQueue>(*context, own, info.queue_family);
+            }
+        }
+        return *q;
+    }
+
+    // The title-texture sync's staged writes, made as one submission per queue family when the sync ends
+    // (flush_staged_batch) instead of one per subresource: each was a staging buffer, an allocation and a whole
+    // submission, and 205 of them took 382 ms of a 507 ms sync that every queue's ExecuteCommandLists waited behind
+    // (run 03:44). Used only by the thread that opened it (staged_batch_owner); the title's own WriteToSubresource
+    // calls on other threads keep their own submissions.
+    struct StagedBatch;  // after MemoryRange
+    std::atomic<StagedBatch*> staged_batch{nullptr};
+    std::atomic<std::thread::id> staged_batch_owner{};
+
+    // Opens `batch` for this thread's staged writes, or (null) closes it and makes what it holds: one execute per
+    // family, then the staging buffers go after the submissions so far, as a single staged write's do.
+    void flush_staged_batch(StagedBatch& batch) {
+        for (int family = 0; family < 2; ++family) {
+            auto& items = batch.items[family];
+            if (items.empty()) continue;
+            leonida::CommandList& list = batch.lists[family];
+            bool ok = list.close();
+            for (const auto& item : items)
+                context->add_resource(reinterpret_cast<leonida::ResourceId>(item.staging.get()), *item.staging);
+            if (ok) {
+                std::lock_guard lock(staging_mutex);
+                leonida::VulkanQueue& queue = staging_queue_for(family == 1);
+                const leonida::CommandList* lists[] = {&list};
+                ok = queue.ok() && queue.execute(lists) == leonida::ReplayResult::success;
+                if (ok) context->note_upload(queue.progress_semaphore(), queue.submitted_value());
+            }
+            if (!ok) log_once("title texture sync: batched staging copies failed; copies", int(items.size()));
+            for (auto& item : items) {
+                context->remove_resource(reinterpret_cast<leonida::ResourceId>(item.staging.get()));
+                context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, item.staging->buffer);
+                release_resource(item.memory, false);
+            }
+            items.clear();
+        }
+    }
+
     // The GPU address arena (docs/d3d12_vulkan.md section 3.3): one host-visible, device-addressable VkBuffer that
     // stands in for the console's GPU address space. A console VA is an offset in it, and heap_base (push-constant
     // dwords 32-33) is its device address. It is at most 4 GiB, so every VA fits the 32-bit descriptor-table
@@ -3012,6 +3064,15 @@ struct DeviceState {
         MemoryNode* node = nullptr;  // null: the memory is the resource's own
         explicit operator bool() const { return memory != VK_NULL_HANDLE; }
     };
+    // The title-texture sync's staged writes (staged_batch, flush_staged_batch).
+    struct StagedItem {
+        std::unique_ptr<leonida::ResourceBinding> staging;  // its address is the staging buffer's resource id
+        MemoryRange memory;
+    };
+    struct StagedBatch {
+        std::vector<StagedItem> items[2];  // [0] graphics family, [1] copy family
+        leonida::CommandList lists[2];
+    };
 
     MemoryRange allocate_resource(VkImage image, VkBuffer buffer, VkMemoryPropertyFlags required,
                                   VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen, bool device_address,
@@ -4917,6 +4978,27 @@ private:
             }
         } copy_report{copy_started, allocated, packed, staging.size};
 
+        // Review D9: a VkQueue the game's direct queue is not on. CreateCommandQueue hands each family's VkQueues
+        // out from the first, so the last one. A colour copy goes to the copy family, whose engine runs beside
+        // queued graphics work (a second graphics VkQueue may be time-sliced behind it, as on NVIDIA); a depth
+        // or stencil copy may convert D24, and an rgb96 one is repacked, by a compute shader, so they stay on
+        // the graphics family.
+        const bool copy_family = !device_.info.copy_queues.empty() && aspects_ == VK_IMAGE_ASPECT_COLOR_BIT && !rgb96_;
+        // The title-texture sync's batch (DeviceState::StagedBatch): the copy joins its family's list, made when the
+        // sync ends; the staging buffer lives until then.
+        DeviceState::StagedBatch* const batch = write ? device_.staged_batch.load(std::memory_order_acquire) : nullptr;
+        if (batch && device_.staged_batch_owner.load(std::memory_order_acquire) == std::this_thread::get_id()) {
+            auto held = std::make_unique<leonida::ResourceBinding>(staging);
+            const auto held_id = reinterpret_cast<leonida::ResourceId>(held.get());
+            const std::uint32_t k = r.block.block;
+            const leonida::CopyLocation texture{id(), false, subresource, 0, 0, 0, 0, 0};
+            const leonida::CopyLocation placed{held_id, true, 0, 0, std::uint32_t(r.row_bytes / r.block.bytes) * k,
+                                               r.rows * k, r.slices, std::uint32_t(pitch)};
+            const leonida::CopyTexture copy{texture, r.box.left, r.box.top, r.box.front, placed, false, {}};
+            if (!batch->lists[copy_family].copy_texture(copy)) return release(E_INVALIDARG);
+            batch->items[copy_family].push_back({std::move(held), memory});
+            return S_OK;
+        }
         // The staging buffer is a resource only for the length of this call; its ID is its binding's address,
         // which no COM resource can share.
         const auto staging_id = reinterpret_cast<leonida::ResourceId>(&staging);
@@ -4937,26 +5019,7 @@ private:
         leonida::ReplayResult result = leonida::ReplayResult::unsupported;
         {
             std::lock_guard lock(device_.staging_mutex);
-            // Review D9: a VkQueue the game's direct queue is not on. CreateCommandQueue hands each family's VkQueues
-            // out from the first, so the last one. A colour copy goes to the copy family, whose engine runs beside
-            // queued graphics work (a second graphics VkQueue may be time-sliced behind it, as on NVIDIA); a depth
-            // or stencil copy may convert D24, and an rgb96 one is repacked, by a compute shader, so they stay on
-            // the graphics family.
-            const bool copy_family =
-                !device_.info.copy_queues.empty() && aspects_ == VK_IMAGE_ASPECT_COLOR_BIT && !rgb96_;
-            auto& staging_queue = copy_family ? device_.staging_copy_queue : device_.staging_queue;
-            if (!staging_queue) {
-                if (copy_family) {
-                    staging_queue = std::make_unique<leonida::VulkanQueue>(
-                        *device_.context, device_.info.copy_queues.back(), device_.info.copy_family,
-                        leonida::VulkanQueue::QueueKind::copy);
-                } else {
-                    const auto& queues = device_.info.command_queues;
-                    const VkQueue own = queues.size() > 1 ? queues.back() : device_.info.queue;
-                    staging_queue = std::make_unique<leonida::VulkanQueue>(*device_.context, own,
-                                                                           device_.info.queue_family);
-                }
-            }
+            leonida::VulkanQueue* const staging_queue = &device_.staging_queue_for(copy_family);
             if (staging_queue->ok()) {
                 const leonida::CommandList* lists[] = {&list};
                 result = staging_queue->execute(lists);
@@ -8833,6 +8896,7 @@ public:
                                                    return device_state->allocate_type(type, size, false, nullptr,
                                                                                       VkDeviceSize(1536) << 20);
                                                });
+            state_.context->set_title_pages_queue(state_.info.title_pages_queue);
             state_.title_pages_3d = info.features.sparseResidencyImage3D == VK_TRUE;
             // The page budget (TitlePages::set_budget): LEONIDA_TITLE_PAGES_MB, else 3 GB, which with the render
             // targets and buffers keeps an 8 GB card's VRAM and a 32 GB PC's commit; past it new streamed textures
@@ -9161,6 +9225,20 @@ public:
         arena_pages_ = std::make_shared<DeviceArenaPages>(state_);
         leonida::debug_targets::arena_mapped = arena.mapped;  // diagnostics read descriptors through it
         leonida::debug_targets::arena_size = arena.size;
+        // Hang reports follow V#s into the title's memory: committed, readable pages only (no fault in the report).
+        leonida::debug_targets::read_title = [](std::uint64_t va, void* out, std::size_t bytes) {
+            for (std::uint64_t at = va; at < va + bytes;) {
+                MEMORY_BASIC_INFORMATION region{};
+                if (!VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region)) ||
+                    region.State != MEM_COMMIT ||
+                    (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || !(region.Protect & (PAGE_READONLY |
+                    PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOMBINE)))
+                    return false;
+                at = reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
+            }
+            std::memcpy(out, reinterpret_cast<const void*>(va), bytes);
+            return true;
+        };
         return true;
     }
 
@@ -13140,7 +13218,7 @@ void note_title_texture_write(const void* address, std::size_t size) {
     writes.emplace_back(begin, begin + size);
 }
 
-// Where a slow sync_title_textures spent its time (over 1 s: logged at its end). It held the submission for 47 s in
+// Where a slow sync_title_textures spent its time (over 400 ms: logged at its end). It held the submission for 47 s in
 // the first loading screen (2026-11-25), with every other submitting thread waiting behind it.
 struct SyncStats {
     long long ready_ns = 0, hash_ns = 0, copy_ns = 0, longest_ns = 0;
@@ -13164,7 +13242,7 @@ void sync_title_textures() {
         ~SyncReport() {
             const auto ms = [](long long ns) { return ns / 1000000; };
             const long long total = (std::chrono::steady_clock::now() - start).count();
-            if (total < 1000000000LL) return;
+            if (total < 400000000LL) return;  // 400 ms: with the binds off the submit path, 600-800 ms syncs remain
             static std::atomic<int> told{0};
             if (told.fetch_add(1, std::memory_order_relaxed) >= 200) return;
             std::fprintf(stderr, "[rt] d3d12: slow title texture sync %lld ms: readability %lld, hashes %lld, %zu copies "
@@ -13185,6 +13263,23 @@ void sync_title_textures() {
     refilled = now;
     auto& textures = title_textures();
     const std::size_t count = textures.size();
+    // The copies this sync makes go out as one submission per queue family when it ends (DeviceState::StagedBatch).
+    DeviceState::StagedBatch staged;
+    const struct BatchScope {
+        DeviceState* device;
+        DeviceState::StagedBatch& batch;
+        BatchScope(DeviceState* d, DeviceState::StagedBatch& b) : device(d), batch(b) {
+            if (!device) return;
+            device->staged_batch_owner.store(std::this_thread::get_id(), std::memory_order_release);
+            device->staged_batch.store(&batch, std::memory_order_release);
+        }
+        ~BatchScope() {
+            if (!device) return;
+            device->staged_batch.store(nullptr, std::memory_order_release);
+            device->staged_batch_owner.store(std::thread::id{}, std::memory_order_release);
+            device->flush_staged_batch(batch);
+        }
+    } batch_scope{count ? const_cast<DeviceState*>(&textures.front()->resource->device_state()) : nullptr, staged};
     // Streamed textures on the title's pages (vulkan_title_pages.h) with more mips bound since the last submission (a
     // view asked for them): those pages are fresh, so their bytes are copied again.
     leonida::TitlePages* const pages = count ? textures.front()->resource->device_state().context->title_pages() : nullptr;
@@ -13313,6 +13408,10 @@ void sync_title_textures() {
             }
         }
         if (check == Check::none) continue;
+        // Its bind is with the bind worker and not made yet (VulkanContext::enqueue_title_binds_locked): a copy now
+        // would land in unbound pages, and its submission would wait on the host until the bind is made. Left as it is
+        // (dirty stays), so a later submission copies it.
+        if (paged && t->resource->device_state().context->title_bind_pending(t->resource->id())) continue;
         // A render target or UAV texture (not watched) the title placed but never wrote by CPU: its pages are not in the
         // working set and read as zeros, which the image already holds. Hashing them made every page resident: the
         // retail title's 4K targets kept about 1.2 GB of zero pages in RAM. It counts as copied; a later CPU write
@@ -14753,6 +14852,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     const auto get_queue = reinterpret_cast<PFN_vkGetDeviceQueue>(vkGetDeviceProcAddr(owned.device, "vkGetDeviceQueue"));
     for (std::uint32_t i = 0; i < command_queue_count; ++i)
         get_queue(owned.device, info.queue_family, i, &info.command_queues[i]);
+    // The last one binds the title pages on a worker thread (VkQueues need external synchronisation, so it is no D3D12
+    // queue's), when two or more stay for the D3D12 queues and the family can bind sparse memory.
+    // LEONIDA_TITLE_BIND_THREAD=0 keeps the binds on the submitting queue.
+    if (command_queue_count >= 3 && (families[info.queue_family].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) &&
+        environment_text(L"LEONIDA_TITLE_BIND_THREAD") != L"0") {
+        info.title_pages_queue = info.command_queues.back();
+        info.command_queues.pop_back();
+    }
     if (compute_count) {
         // Copies on the async-compute family split its queues with the compute queues: one VkQueue per live queue.
         const bool split = info.copy_family == info.compute_family && compute_count > 1;

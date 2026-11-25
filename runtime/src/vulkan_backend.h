@@ -1241,8 +1241,14 @@ public:
     }
 
     ~VulkanContext() {
+        stop_binder();  // every batch handed over is made (or its ticket signalled) before the queues go
         fence_dispatcher_.reset();
         deletion_queue_.drain(UINT64_MAX, device_, vk);
+        if (binder_.semaphore) {
+            if (vk.vkDeviceWaitIdle) vk.vkDeviceWaitIdle(device_);
+            vk.vkDestroySemaphore(device_, binder_.semaphore, nullptr);
+            if (binder_.chain) vk.vkDestroySemaphore(device_, binder_.chain, nullptr);
+        }
         if (vk.vkDestroySemaphore) {
             for (const auto& [sem, state] : progress_waits_)
                 if (state.destroy_when_done) vk.vkDestroySemaphore(device_, sem, nullptr);
@@ -1750,6 +1756,86 @@ public:
         title_pages_families_ = families;
     }
     TitlePages* title_pages() const { return title_pages_.get(); }
+
+    // The title pages' binds on a VkQueue of their own, made by a worker thread (flush_title_pages): NVIDIA's
+    // vkQueueBindSparse costs about 0.8 ms of CPU per image, and the loading screen first-binds a thousand or more
+    // textures at a time (run 03:27: 2,943 in 3.2 s), on the title's submitting thread with every queue lock waiting
+    // behind it. Submissions wait for a batch on the GPU (title_pages_semaphore_: wait-before-signal, core with timeline
+    // semaphores), so the binds overlap the work already queued. `queue`: in a family with VK_QUEUE_SPARSE_BINDING_BIT
+    // and used by nothing else. Without one the binds stay on the submitting queue.
+    void set_title_pages_queue(VkQueue queue) {
+        if (!queue || !title_pages_ || binder_.thread.joinable()) return;
+        VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+        type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+        if (vk.vkCreateSemaphore(device_, &info, nullptr, &binder_.semaphore) != VK_SUCCESS) {
+            binder_.semaphore = VK_NULL_HANDLE;
+            return;
+        }
+        if (vk.vkCreateSemaphore(device_, &info, nullptr, &binder_.chain) != VK_SUCCESS) {
+            vk.vkDestroySemaphore(device_, binder_.semaphore, nullptr);
+            binder_.semaphore = binder_.chain = VK_NULL_HANDLE;
+            return;
+        }
+        binder_.queue = queue;
+        binder_.thread = std::thread([this] { run_binder(); });
+    }
+    bool title_pages_async() const { return binder_.queue != VK_NULL_HANDLE; }
+
+    // With submit_mutex() held: hands a batch of binds to the worker. It waits for `waits` at `values` (every queue's
+    // work submitted so far: a page is reused only once what used it before has run) and signals the binder's timeline
+    // at the value returned, which every queue's next submission then waits for. Tickets are handed out under
+    // submit_mutex() and the worker takes batches in order, so the timeline only rises.
+    //
+    // `publish_now`: the batch binds render targets or other images the title writes right away, so every submission
+    // from here on waits for it (on NVIDIA such a wait holds the next vkQueueSubmit until the bind is made). Otherwise
+    // (streamed textures) the ticket is published once the worker has made the bind: submissions made meanwhile do not
+    // wait, a view of a texture whose bind is not made yet reads zeros for those frames (strict residency), the title
+    // texture sync copies into it only once it is made (title_bind_pending), and a list that copies into it waits for
+    // it first (wait_title_binds).
+    std::uint64_t enqueue_title_binds_locked(std::vector<TitlePages::Op> ops, std::vector<VkSemaphore> waits,
+                                             std::vector<std::uint64_t> values, bool publish_now) {
+        const std::uint64_t ticket = ++binder_.ticket;
+        record_submit_locked(binder_.semaphore, ticket);  // deletions of what the binds name wait for it
+        {
+            std::lock_guard lock(binder_.mutex);
+            if (!publish_now) {
+                for (const auto& op : ops) binder_.pending[op.id] = ticket;
+                binder_.pending_count.store(binder_.pending.size(), std::memory_order_release);
+            }
+            binder_.jobs.push_back({std::move(ops), std::move(waits), std::move(values), ticket, publish_now});
+        }
+        binder_.cv.notify_one();
+        if (publish_now) publish_title_binds(ticket);
+        return ticket;
+    }
+
+    // A streamed texture whose bind the worker has not made yet (enqueue_title_binds_locked).
+    bool title_bind_pending(std::uintptr_t id) {
+        if (!binder_.pending_count.load(std::memory_order_acquire)) return false;
+        std::lock_guard lock(binder_.mutex);
+        return binder_.pending.count(id) != 0;
+    }
+
+    // Before a submission that copies or resolves into title textures: until the binds of those it names are made
+    // (and published, so the submission waits for them on the GPU). A copy into an image whose pages are not bound yet
+    // writes nothing.
+    void wait_title_binds(std::span<const CommandList* const> lists) {
+        if (!binder_.pending_count.load(std::memory_order_acquire)) return;
+        std::vector<std::uintptr_t> ids;
+        for (const CommandList* list : lists)
+            for (const auto& command : list->commands()) {
+                if (const auto* c = std::get_if<CopyTexture>(&command)) ids.push_back(c->dst.resource);
+                else if (const auto* r = std::get_if<CopyResource>(&command)) ids.push_back(r->dst);
+                else if (const auto* s = std::get_if<ResolveSubresource>(&command)) ids.push_back(s->dst);
+            }
+        if (ids.empty()) return;
+        std::unique_lock lock(binder_.mutex);
+        binder_.done.wait(lock, [&] {
+            return binder_.pending.empty() ||
+                   std::none_of(ids.begin(), ids.end(), [&](std::uintptr_t id) { return binder_.pending.count(id) != 0; });
+        });
+    }
 
     std::vector<std::pair<VkSemaphore, std::uint64_t>> latest_pending_queue_values() const {
         std::vector<std::pair<VkSemaphore, std::uint64_t>> out;
@@ -2283,6 +2369,170 @@ private:
     // storage_mutex_.
     std::vector<std::pair<VkSemaphore, std::uint64_t>> upload_values_;
     std::uint64_t upload_version_ = 0;
+
+    // The title pages' bind worker (set_title_pages_queue).
+    struct BindJob {
+        std::vector<TitlePages::Op> ops;
+        std::vector<VkSemaphore> waits;
+        std::vector<std::uint64_t> values;
+        std::uint64_t ticket = 0;
+        bool published = false;  // published at enqueue (publish_now)
+    };
+    struct Binder {
+        VkQueue queue = VK_NULL_HANDLE;
+        VkSemaphore semaphore = VK_NULL_HANDLE;
+        VkSemaphore chain = VK_NULL_HANDLE;  // orders the calls of one job (bind_title_pages); worker thread only
+        std::uint64_t chain_value = 0;
+        std::uint64_t ticket = 0;  // the last handed out (submit_mutex_)
+        std::mutex mutex;
+        std::condition_variable cv;    // jobs to make
+        std::condition_variable done;  // a job made: `pending` shrank
+        std::deque<BindJob> jobs;
+        // Streamed textures in jobs not made yet, and the job's ticket (title_bind_pending).
+        std::unordered_map<std::uintptr_t, std::uint64_t> pending;
+        std::atomic<std::size_t> pending_count{0};
+        bool stop = false;
+        std::thread thread;
+    } binder_;
+
+    // Every queue's next submission waits for the binder's timeline at `ticket` (or a later value published already).
+    void publish_title_binds(std::uint64_t ticket) {
+        std::lock_guard lock(storage_mutex_);
+        if (title_pages_semaphore_ == binder_.semaphore && title_pages_value_ >= ticket) return;
+        title_pages_semaphore_ = binder_.semaphore;
+        title_pages_value_ = ticket;
+        ++title_pages_version_;
+    }
+
+    // After the worker made (or gave up on) a job: published if it was not, its textures no longer pending.
+    void finish_bind_job(const BindJob& job) {
+        if (!job.published) publish_title_binds(job.ticket);
+        {
+            std::lock_guard lock(binder_.mutex);
+            for (const auto& op : job.ops) {
+                const auto it = binder_.pending.find(op.id);
+                if (it != binder_.pending.end() && it->second == job.ticket) binder_.pending.erase(it);
+            }
+            binder_.pending_count.store(binder_.pending.size(), std::memory_order_release);
+        }
+        binder_.done.notify_all();
+    }
+
+    void run_binder() {
+        std::unique_lock lock(binder_.mutex);
+        for (;;) {
+            binder_.cv.wait(lock, [this] { return binder_.stop || !binder_.jobs.empty(); });
+            if (binder_.jobs.empty()) return;  // stopping, every batch made
+            BindJob job = std::move(binder_.jobs.front());
+            binder_.jobs.pop_front();
+            lock.unlock();
+            bind_title_pages(job);
+            lock.lock();
+        }
+    }
+
+    // Images per vkQueueBindSparse call. NVIDIA holds a device-wide lock through the call: every other thread's
+    // vkQueueSubmit waited behind a 2 s bind of 2,000 textures (run 03:44: a 129x1 texture copy took 841 ms). Chunks of
+    // this many keep each call to a fraction of a frame, and the submissions get in between.
+    static constexpr std::size_t kBindChunkImages = 128;
+
+    void bind_title_pages(BindJob& job) {
+        std::size_t image_binds = 0, opaque_binds = 0, image_info_count = 0, opaque_info_count = 0;
+        for (const auto& op : job.ops) {
+            image_binds += op.image_binds.size();
+            opaque_binds += op.opaque_binds.size();
+            image_info_count += !op.image_binds.empty();
+            opaque_info_count += !op.opaque_binds.empty();
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        VkResult result = is_device_lost() ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+        // The chunks run in order through the binder's own chain timeline: the first waits for the job's waits, each
+        // later one for the one before, and the last signals the job's ticket.
+        const std::size_t chunks = std::max<std::size_t>(1, (job.ops.size() + kBindChunkImages - 1) / kBindChunkImages);
+        for (std::size_t c = 0; c < chunks && result == VK_SUCCESS; ++c) {
+            const std::size_t from = c * kBindChunkImages, to = std::min(job.ops.size(), from + kBindChunkImages);
+            std::vector<VkSparseImageMemoryBindInfo> image_infos;
+            std::vector<VkSparseImageOpaqueMemoryBindInfo> opaque_infos;
+            for (std::size_t i = from; i < to; ++i) {
+                const auto& op = job.ops[i];
+                if (!op.image_binds.empty())
+                    image_infos.push_back({op.image, std::uint32_t(op.image_binds.size()), op.image_binds.data()});
+                if (!op.opaque_binds.empty())
+                    opaque_infos.push_back({op.image, std::uint32_t(op.opaque_binds.size()), op.opaque_binds.data()});
+            }
+            std::vector<VkSemaphore> waits;
+            std::vector<std::uint64_t> wait_values;
+            if (c == 0) {
+                waits = job.waits;
+                wait_values = job.values;
+            } else {
+                waits.push_back(binder_.chain);
+                wait_values.push_back(binder_.chain_value);
+            }
+            const bool last = c + 1 == chunks;
+            const VkSemaphore signal = last ? binder_.semaphore : binder_.chain;
+            const std::uint64_t signal_value = last ? job.ticket : ++binder_.chain_value;
+            VkTimelineSemaphoreSubmitInfo tickets{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+            tickets.waitSemaphoreValueCount = std::uint32_t(wait_values.size());
+            tickets.pWaitSemaphoreValues = wait_values.data();
+            tickets.signalSemaphoreValueCount = 1;
+            tickets.pSignalSemaphoreValues = &signal_value;
+            VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &tickets};
+            info.waitSemaphoreCount = std::uint32_t(waits.size());
+            info.pWaitSemaphores = waits.data();
+            info.imageBindCount = std::uint32_t(image_infos.size());
+            info.pImageBinds = image_infos.data();
+            info.imageOpaqueBindCount = std::uint32_t(opaque_infos.size());
+            info.pImageOpaqueBinds = opaque_infos.data();
+            info.signalSemaphoreCount = 1;
+            info.pSignalSemaphores = &signal;
+            result = vk.vkQueueBindSparse(binder_.queue, 1, &info, VK_NULL_HANDLE);
+        }
+        const std::size_t image_infos_size = image_info_count, opaque_infos_size = opaque_info_count;
+        const long long ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (result == VK_ERROR_DEVICE_LOST) mark_device_lost();
+        if (result != VK_SUCCESS) {
+            static std::atomic<bool> told{false};
+            if (!told.exchange(true))
+                std::fprintf(stderr, "[rt] title pages: vkQueueBindSparse failed (%d); %zu images keep their old binds\n",
+                             int(result), job.ops.size());
+            // Nothing will signal the ticket on the GPU: signal it from the host once the batch before it is
+            // signalled (a timeline only rises), or every queue's next submission waits for it forever.
+            VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            const std::uint64_t before = job.ticket - 1;
+            wait.semaphoreCount = 1;
+            wait.pSemaphores = &binder_.semaphore;
+            wait.pValues = &before;
+            if (before) vk.vkWaitSemaphores(device_, &wait, UINT64_MAX);
+            VkSemaphoreSignalInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+            signal.semaphore = binder_.semaphore;
+            signal.value = job.ticket;
+            vk.vkSignalSemaphore(device_, &signal);
+            finish_bind_job(job);
+            return;
+        }
+        finish_bind_job(job);  // published only now: what is submitted from here on waits for a bind already made
+        if (ms >= 300) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 200)
+                std::fprintf(stderr,
+                             "[rt] title pages: slow bind %lld ms on the bind queue: %zu images, %zu image binds in %zu "
+                             "infos, %zu opaque binds in %zu infos, %zu calls (ticket %llu)\n",
+                             ms, job.ops.size(), image_binds, image_infos_size, opaque_binds, opaque_infos_size, chunks,
+                             static_cast<unsigned long long>(job.ticket));
+        }
+    }
+
+    void stop_binder() {
+        if (!binder_.thread.joinable()) return;
+        {
+            std::lock_guard lock(binder_.mutex);
+            binder_.stop = true;
+        }
+        binder_.cv.notify_one();
+        binder_.thread.join();
+    }
 
 public:
     void note_upload(VkSemaphore semaphore, std::uint64_t value) {
@@ -3063,6 +3313,7 @@ private:
         last_timing_.room_ms = phase_ms(phase_start, room);
         last_timing_.compute_wait_ms = phase_ms(room, phase_clock::now());
         const auto prepare_start = phase_clock::now();
+        context_.wait_title_binds(lists);  // copies into streamed textures whose bind is not made yet (in "prepare")
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
                 for (const auto& command : list->commands())
@@ -3954,6 +4205,31 @@ private:
             }
         }
         const auto t1 = std::chrono::steady_clock::now();
+        if (context_.title_pages_async()) {
+            // The bind worker makes them (VulkanContext::set_title_pages_queue): after every queue's work submitted so
+            // far, this queue's included; this queue's next submission waits for them like every other queue's
+            // (title_pages_seen_ stays behind: the binds are on another VkQueue now). Render targets (whole-image
+            // ops) go in a batch of their own that submissions wait for at once; streamed textures in one published
+            // when made (enqueue_title_binds_locked).
+            std::vector<TitlePages::Op> urgent, streamed;
+            for (auto& op : ops) (op.full ? urgent : streamed).push_back(std::move(op));
+            std::lock_guard lock(context_.submit_mutex());
+            std::vector<VkSemaphore> semaphores;
+            std::vector<std::uint64_t> values;
+            for (const auto& [semaphore, value] : context_.latest_pending_queue_values()) {
+                semaphores.push_back(semaphore);
+                values.push_back(value);
+            }
+            if (submitted_ && std::find(semaphores.begin(), semaphores.end(), progress_) == semaphores.end()) {
+                semaphores.push_back(progress_);
+                values.push_back(submitted_);
+            }
+            if (!urgent.empty()) context_.enqueue_title_binds_locked(std::move(urgent), semaphores, values, true);
+            if (!streamed.empty())
+                context_.enqueue_title_binds_locked(std::move(streamed), std::move(semaphores), std::move(values), false);
+            restore();
+            return true;
+        }
         std::vector<VkSparseImageMemoryBindInfo> image_infos;
         std::vector<VkSparseImageOpaqueMemoryBindInfo> opaque_infos;
         for (const auto& op : ops) {

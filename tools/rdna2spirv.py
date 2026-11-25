@@ -4174,17 +4174,32 @@ class Gen:
             off = self.cu(inst)
         # step: bytes between consecutive dwords of a raw access, None for linear +4 (including all idxen=1 and fmt).
         step = None
+        total64 = None      # linear addressing: the 64-bit byte offset from the base
+        small_index = None  # linear addressing with an index: index * stride < 4 GiB
         if swz_active is False:
-            if soff_zero:
-                total = off
-            else:
-                total = self.tmp()
-                self.emit(f"{total} = OpIAdd %uint {soff_v} {off}")
+            # The hardware adds index * stride, soffset and the offset to the base in 64 bits, without wrapping: an
+            # index of -1 (a counter at 0) lands about stride * 4 GiB away. Wrapped at 32 bits it landed one record
+            # below the base, and a 20-byte record of index -1 overwrote the title's transient-pool nodes (title fault
+            # at 0x144e9b54a, run 03:44). An access whose index * stride reaches 4 GiB is out of range in every mode
+            # (it is dropped: far past anything the buffer can map). After five-star-recomp's docs/shader-translation.md
+            # ("Range checking", github.com/ThatRecompDev/five-star-recomp); the code is ours.
+            total64 = self.tmp()
+            self.emit(f"{total64} = OpUConvert %ulong {off}")
+            if not soff_zero:
+                s64, t = self.tmp(), self.tmp()
+                self.emit(f"{s64} = OpUConvert %ulong {soff_v}")
+                self.emit(f"{t} = OpIAdd %ulong {total64} {s64}")
+                total64 = t
             if idx is not None:
-                m, t = self.tmp(), self.tmp()
-                self.emit(f"{m} = OpIMul %uint {idx} {stride}")
-                self.emit(f"{t} = OpIAdd %uint {total} {m}")
-                total = t
+                i64, st64, m, t = self.tmp(), self.tmp(), self.tmp(), self.tmp()
+                self.emit(f"{i64} = OpUConvert %ulong {idx}")
+                self.emit(f"{st64} = OpUConvert %ulong {stride}")
+                self.emit(f"{m} = OpIMul %ulong {i64} {st64}")
+                self.emit(f"{t} = OpIAdd %ulong {total64} {m}")
+                total64 = t
+                small_index = self.tmp()
+                self.emit(f"{small_index} = OpULessThan %bool {m} {self.cl(1 << 32)}")
+            total = None
             sw3 = False
         else:
             # buffer_offset = (index / IS * stride + (off & ~3)) * IS + (index % IS) * 4 + (off & 3), IS = 2^L;
@@ -4248,7 +4263,10 @@ class Gen:
         self.emit(f"{h64} = OpUConvert %ulong {hi}")
         self.emit(f"{sh} = OpShiftLeftLogical %ulong {h64} %c64_32")
         self.emit(f"{base} = OpBitwiseOr %ulong {sh} {l64}")
-        self.emit(f"{o64} = OpUConvert %ulong {total}")
+        if total64 is not None:
+            o64 = total64
+        else:
+            self.emit(f"{o64} = OpUConvert %ulong {total}")
         self.emit(f"{addr} = OpIAdd %ulong {base} {o64}")
         mode = None if lit3 is None else lit3 >> 28 & 3
         mode0_rule = mode in (None, 0) or (mode == 3 and sw3 is not False)
@@ -4333,7 +4351,16 @@ class Gen:
             return r
 
         def check_end(end_bytes):
-            """in-range bool of an access that ends end_bytes after its first byte."""
+            """in-range bool of an access that ends end_bytes after its first byte (and, linear with an index, whose
+            index * stride is below 4 GiB: small_index)."""
+            r = check_end_mode(end_bytes)
+            if small_index is None:
+                return r
+            both = self.tmp()
+            self.emit(f"{both} = OpLogicalAnd %bool {r} {small_index}")
+            return both
+
+        def check_end_mode(end_bytes):
             if mode == 1:
                 return p1
             if mode == 2:
