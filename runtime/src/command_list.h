@@ -142,6 +142,10 @@ inline constexpr std::uint32_t compute_queue_shader_resource = 27;
 inline constexpr std::uint32_t compute_queue_copy_source = 28;
 inline constexpr std::uint32_t compute_queue_copy_dest = 29;
 inline constexpr std::uint32_t video_queue_common = 30;
+// D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ_COMPUTE_QUEUE_ACCESSIBLE (Agility SDK 1.613): a generic-read layout
+// both queue types may use. The retail title moves its UI render targets into it and back (RENDER_TARGET <-> 31,
+// sync NONE, NO_ACCESS) around every loading-screen UI list; refused as unknown, those barriers were left out.
+inline constexpr std::uint32_t direct_queue_generic_read_compute_queue_accessible = 31;
 } // namespace d3d12_layout
 
 // D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAGS, D3D12_CLEAR_FLAGS and
@@ -1148,7 +1152,8 @@ private:
     }
 
     static bool valid_layout(std::uint32_t layout) {
-        return layout == d3d12_layout::undefined || layout <= d3d12_layout::video_queue_common;
+        return layout == d3d12_layout::undefined ||
+               layout <= d3d12_layout::direct_queue_generic_read_compute_queue_accessible;
     }
 
     bool append(const Command& command) {
