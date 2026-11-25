@@ -2092,6 +2092,9 @@ public:
         }
         // LEONIDA_TITLE_HEAP_SYNC: what changed in title-backed shader-visible heaps reaches their real heaps first.
         rt::d3d12_xs::sync_title_heaps();
+        // Title textures on shared pages bound (and superseded ones unbound) before anything copies into them or the
+        // lists sample them (vulkan_title_pages.h).
+        queue_.flush_title_pages();
         // What the title wrote into the pages of its slot-133 textures reaches their images before the lists run.
         sync_title_textures();
         std::uint64_t in_batch = 0;  // draws in this batch, counted before execute can consume the lists

@@ -21,6 +21,7 @@
 #include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
+#include "vulkan_title_pages.h"
 #include "queue_families.h"
 #include "resource_tiling.h"
 #include "xdxr_build.h"
@@ -1712,6 +1713,22 @@ public:
     // With submit_mutex() held: each queue's timeline at the latest of its submissions not yet seen complete, one entry
     // per queue. A submit outside the D3D12 queues (the presenter's blit) waits for these to run after all the work
     // submitted so far, whichever VkQueue the title rendered the frame on (review B5).
+    // Shared pages for the title's placed textures (vulkan_title_pages.h): made once by the device where sparse
+    // residency images can alias (`families`: the queue families that can bind them, as a bit mask).
+    void enable_title_pages(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t families,
+                            std::function<VkDeviceMemory(std::uint32_t, VkDeviceSize)> allocate) {
+        TitlePages::Functions fn;
+        fn.allocate = std::move(allocate);
+        fn.free = vk.vkFreeMemory;
+        fn.requirements = vk.vkGetImageMemoryRequirements;
+        fn.sparse_requirements = vk.vkGetImageSparseMemoryRequirements;
+        if (!fn.allocate || !fn.free || !fn.requirements || !fn.sparse_requirements || !vk.vkQueueBindSparse || !families)
+            return;
+        title_pages_ = std::make_unique<TitlePages>(device(), fn, memory);
+        title_pages_families_ = families;
+    }
+    TitlePages* title_pages() const { return title_pages_.get(); }
+
     std::vector<std::pair<VkSemaphore, std::uint64_t>> latest_pending_queue_values() const {
         std::vector<std::pair<VkSemaphore, std::uint64_t>> out;
         for (const auto& [semaphore, value] :
@@ -2230,6 +2247,14 @@ private:
     VkSemaphore bindless_upload_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t bindless_upload_value_ = 0;
     std::uint64_t bindless_upload_version_ = 0;
+    // The title's textures on shared pages (vulkan_title_pages.h), and the last batch of their binds (the queue whose
+    // timeline signalled it and the value), which every other queue's next submission waits for, as for the bindless
+    // upload above (storage_mutex_).
+    std::unique_ptr<TitlePages> title_pages_;
+    std::uint32_t title_pages_families_ = 0;  // queue families with VK_QUEUE_SPARSE_BINDING_BIT, as a mask
+    VkSemaphore title_pages_semaphore_ = VK_NULL_HANDLE;
+    std::uint64_t title_pages_value_ = 0;
+    std::uint64_t title_pages_version_ = 0;
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
     std::unique_ptr<IndirectExpander> indirect_;  // multi-argument command signatures
@@ -2413,6 +2438,7 @@ public:
             std::lock_guard storage_lock(context_.storage_mutex_);
             if (context_.storage_init_semaphore_ == progress_) context_.storage_init_semaphore_ = VK_NULL_HANDLE;
             if (context_.bindless_upload_semaphore_ == progress_) context_.bindless_upload_semaphore_ = VK_NULL_HANDLE;
+            if (context_.title_pages_semaphore_ == progress_) context_.title_pages_semaphore_ = VK_NULL_HANDLE;
         }
         if (pool_) vk.vkDestroyCommandPool(context_.device(), pool_, nullptr);
         if (progress_) context_.destroy_or_defer_progress_semaphore(progress_);
@@ -3374,6 +3400,13 @@ private:
                 wait_values_.push_back(context_.bindless_upload_value_);
             }
             bindless_upload_seen_ = context_.bindless_upload_version_;
+            // The title's textures on shared pages: the last batch of binds another queue made (flush_title_pages).
+            if (context_.title_pages_semaphore_ && context_.title_pages_semaphore_ != progress_ &&
+                context_.title_pages_version_ != title_pages_seen_) {
+                waits_.push_back(context_.title_pages_semaphore_);
+                wait_values_.push_back(context_.title_pages_value_);
+            }
+            title_pages_seen_ = context_.title_pages_version_;
             if (kind_ != QueueKind::copy && runs_shaders)
                 storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
             if (!storage_images.empty()) context_.storage_pending_.clear();
@@ -3794,6 +3827,135 @@ private:
         return true;
     }
 
+  public:
+    // Makes the binds the title's shared pages queued (vulkan_title_pages.h) in one vkQueueBindSparse on this queue,
+    // before the title's next lists and copies: after every queue's work submitted so far (a page is reused only once
+    // what used it before has run) and before the next submission of every queue (title_pages_semaphore_, waited for
+    // in execute_lists). Images bound for the first time are moved to GENERAL over their whole range first, while
+    // still unbound, so no later first use can discard what the pages they share hold. Called by a D3D12 queue's
+    // ExecuteCommandLists before it copies the title's textures; a queue of a family without sparse binding leaves the
+    // binds to the next one that has it.
+    bool flush_title_pages() {
+        TitlePages* pages = context_.title_pages_.get();
+        if (!pages || !pages->pending() || !(context_.title_pages_families_ & (1u << family_))) return true;
+        std::lock_guard state(state_mutex_);
+        if (context_.is_device_lost()) return false;
+        std::vector<TitlePages::Op> ops = pages->take();
+        if (ops.empty()) return true;
+        auto& vk = context_.vk;
+        // The application's waits belong to its next batch, not to these internal submissions.
+        auto saved_waits = std::exchange(waits_, {});
+        auto saved_values = std::exchange(wait_values_, {});
+        const auto restore = [&] {
+            waits_ = std::move(saved_waits);
+            wait_values_ = std::move(saved_values);
+        };
+        {
+            std::vector<ResourceId> first;
+            for (const auto& op : ops)
+                if (op.first) first.push_back(op.id);
+            if (!first.empty() && !initialize_title_images(first)) {
+                restore();
+                return false;
+            }
+        }
+        std::vector<VkSparseImageMemoryBindInfo> image_infos;
+        std::vector<VkSparseImageOpaqueMemoryBindInfo> opaque_infos;
+        for (const auto& op : ops) {
+            if (!op.image_binds.empty())
+                image_infos.push_back({op.image, std::uint32_t(op.image_binds.size()), op.image_binds.data()});
+            if (!op.opaque_binds.empty())
+                opaque_infos.push_back({op.image, std::uint32_t(op.opaque_binds.size()), op.opaque_binds.data()});
+        }
+        const std::uint64_t ticket = submitted_ + 1;
+        bool ok = false;
+        {
+            std::lock_guard lock(context_.submit_mutex());
+            std::vector<VkSemaphore> semaphores;
+            std::vector<std::uint64_t> values;
+            for (const auto& [semaphore, value] : context_.latest_pending_queue_values()) {
+                semaphores.push_back(semaphore);
+                values.push_back(value);
+            }
+            if (submitted_ && std::find(semaphores.begin(), semaphores.end(), progress_) == semaphores.end()) {
+                semaphores.push_back(progress_);
+                values.push_back(submitted_);
+            }
+            VkTimelineSemaphoreSubmitInfo tickets{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+            tickets.waitSemaphoreValueCount = std::uint32_t(values.size());
+            tickets.pWaitSemaphoreValues = values.data();
+            tickets.signalSemaphoreValueCount = 1;
+            tickets.pSignalSemaphoreValues = &ticket;
+            VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO, &tickets};
+            info.waitSemaphoreCount = std::uint32_t(semaphores.size());
+            info.pWaitSemaphores = semaphores.data();
+            info.imageBindCount = std::uint32_t(image_infos.size());
+            info.pImageBinds = image_infos.data();
+            info.imageOpaqueBindCount = std::uint32_t(opaque_infos.size());
+            info.pImageOpaqueBinds = opaque_infos.data();
+            info.signalSemaphoreCount = 1;
+            info.pSignalSemaphores = &progress_;
+            const VkResult result = vk.vkQueueBindSparse(queue_, 1, &info, VK_NULL_HANDLE);
+            if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+            ok = result == VK_SUCCESS;
+            if (ok) context_.record_submit_locked(progress_, ticket);
+        }
+        restore();
+        if (!ok) {
+            static bool told = false;
+            if (!std::exchange(told, true))
+                std::fprintf(stderr, "[rt] title pages: vkQueueBindSparse failed; %zu images keep their old binds\n",
+                             ops.size());
+            return false;
+        }
+        submitted_ = last_sparse_ = ticket;
+        std::lock_guard lock(context_.storage_mutex_);
+        context_.title_pages_semaphore_ = progress_;
+        context_.title_pages_value_ = ticket;
+        ++context_.title_pages_version_;
+        title_pages_seen_ = context_.title_pages_version_;
+        return true;
+    }
+
+  private:
+    // Every subresource of these never-bound images from UNDEFINED to GENERAL, in one submission (see
+    // flush_title_pages).
+    bool initialize_title_images(const std::vector<ResourceId>& ids) {
+        // Lock order: resource_mutex_ (the bindings are read) -> tracker_mutex_.
+        std::shared_lock resources(context_.resource_mutex_);
+        std::lock_guard lock(context_.tracker_mutex_);
+        auto* slot = acquire();
+        if (!slot) return false;
+        const VkCommandBuffer command_buffer = slot->buffer;
+        auto& vk = context_.vk;
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        if (vk.vkBeginCommandBuffer(command_buffer, &begin) != VK_SUCCESS) {
+            slot->ticket = 0;
+            return false;
+        }
+        std::vector<std::pair<ResourceId, VkImageSubresourceRange>> done;
+        for (const ResourceId id : ids) {
+            const auto it = context_.resources_.find(id);
+            if (it == context_.resources_.end() || !it->second.image) continue;
+            const ResourceBinding& b = it->second;
+            const VkImageSubresourceRange range{b.aspects, 0, std::max(1u, b.mip_levels), 0,
+                                                b.volume ? 1u : std::max(1u, b.array_layers)};
+            detail::image_barrier(context_.replay_, command_buffer, b, range, VK_IMAGE_LAYOUT_UNDEFINED,
+                                  VK_IMAGE_LAYOUT_GENERAL, 0, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                  VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+            done.emplace_back(id, range);
+        }
+        if (vk.vkEndCommandBuffer(command_buffer) != VK_SUCCESS || !submit(command_buffer, VK_NULL_HANDLE, 0)) {
+            slot->ticket = 0;
+            return false;
+        }
+        for (const auto& [id, range] : done) context_.tracker_.set(id, range, VK_IMAGE_LAYOUT_GENERAL);
+        return true;
+    }
+
+  public:
     bool bind_tiles(ResourceId id, const std::shared_ptr<SparseResource>& resource,
                     std::map<std::uint64_t, TileMapping>& changes) {
         auto& vk = context_.vk;
@@ -4088,6 +4250,7 @@ private:
     std::unique_ptr<OcclusionResolve> occlusion_resolve_;
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
     std::uint64_t bindless_upload_seen_ = 0;  // the bindless_upload_version_ this queue has waited for
+    std::uint64_t title_pages_seen_ = 0;      // the title_pages_version_ this queue has waited for
     std::uint64_t last_sparse_ = 0;
     std::deque<PendingBindings> pending_bindings_;
     std::vector<VkSemaphore> waits_;

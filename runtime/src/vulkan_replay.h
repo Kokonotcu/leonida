@@ -3323,7 +3323,12 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
         };
 
         if (const auto* transition = std::get_if<TransitionBarrier>(&command)) {
-            if (!bind(transition->resource)) return ReplayResult::unresolved_resource;
+            // A barrier on a resource that is gone has nothing to order: left out, not the list failed (a title texture
+            // whose memory the title reused for a newer one has its image released while its object lives on).
+            if (!bind(transition->resource)) {
+                p.skip = true;
+                continue;
+            }
             if (p.binding.image == VK_NULL_HANDLE) {
                 if (transition->subresource != 0 && transition->subresource != all_subresources)
                     return ReplayResult::invalid_subresource;
@@ -3336,7 +3341,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!bind(buffer_barrier->resource)) return ReplayResult::unresolved_resource;
         } else if (const auto* texture = std::get_if<TextureBarrier>(&command)) {
             if (!vk.pipeline_barrier2) return ReplayResult::unsupported;
-            if (!bind(texture->resource)) return ReplayResult::unresolved_resource;
+            if (!bind(texture->resource)) {  // gone: left out, as a transition is
+                p.skip = true;
+                continue;
+            }
             if (!p.binding.image || !barrier_range(p.binding, texture->range, p.range))
                 return ReplayResult::invalid_subresource;
         } else if (const auto* color_clear = std::get_if<ClearRenderTarget>(&command)) {
@@ -3622,7 +3630,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             }
         } else if (const auto* discard = std::get_if<DiscardResource>(&command)) {
             // Buffers and partial (rectangle) discards keep their contents, which "undefined" allows.
-            if (!bind(discard->resource)) return ReplayResult::unresolved_resource;
+            if (!bind(discard->resource)) {  // gone: nothing to discard
+                p.skip = true;
+                continue;
+            }
             const std::uint64_t end = std::uint64_t(discard->first_subresource) + discard->count;
             if (!p.binding.image) {
                 if (!discard->whole && end > 1) return ReplayResult::invalid_subresource;
@@ -4323,7 +4334,10 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
         // An indirect dispatch whose compute pipeline is still compiling is left out the same way: emitting it bound the
         // empty prepared pipeline (vkCmdBindPipeline with a null handle crashed NVIDIA's driver in a story load).
         if (p.skip && (detail::draw_of(command) || std::holds_alternative<Dispatch>(command) ||
-                       std::holds_alternative<ExecuteIndirect>(command)))
+                       std::holds_alternative<ExecuteIndirect>(command) ||
+                       std::holds_alternative<TransitionBarrier>(command) ||
+                       std::holds_alternative<TextureBarrier>(command) ||
+                       std::holds_alternative<DiscardResource>(command)))
             continue;
         if (!std::holds_alternative<CopyBuffer>(command) && !std::holds_alternative<CopyTexture>(command) &&
             !std::holds_alternative<CopyResource>(command))

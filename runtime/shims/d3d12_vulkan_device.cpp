@@ -84,6 +84,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <cwchar>
 #include <vector>
 
@@ -1177,6 +1178,7 @@ struct DeviceState {
         return sparse_buffer_types;
     }
     bool sparse_image_tiles = false;
+    bool title_pages_3d = false;  // volume title textures can go on shared pages (sparseResidencyImage3D)
 
     bool tiles_share_arena() const { return (sparse_buffer_memory_types() & (1u << arena.memory_type)) != 0; }
 
@@ -2509,6 +2511,18 @@ struct DeviceState {
         return &sampler_entries.emplace(key, entry).first->second;
     }
 
+    // A single-sample optimal-tiling image of this format, type and usage can be a sparse residency image (the title's
+    // shared pages need it): the driver lists a sparse format for it.
+    bool sparse_image_supported(VkFormat format, VkImageType type, VkImageUsageFlags usage) const {
+        static const auto query = reinterpret_cast<PFN_vkGetPhysicalDeviceSparseImageFormatProperties>(
+            info.get_instance_proc ? info.get_instance_proc(info.instance, "vkGetPhysicalDeviceSparseImageFormatProperties")
+                                   : nullptr);
+        if (!query || !info.physical) return false;
+        std::uint32_t count = 0;
+        query(info.physical, format, type, VK_SAMPLE_COUNT_1_BIT, usage, VK_IMAGE_TILING_OPTIMAL, &count, nullptr);
+        return count != 0;
+    }
+
     // An optimal-tiling image of this format can take VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT.
     bool host_transfer_format(VkFormat format) const {
         if (!copy_memory_to_image || !format_properties2) return false;
@@ -2556,14 +2570,15 @@ struct DeviceState {
     // NVIDIA grants VRAM far past the budget (10.4 GB used of 7.2 in a story load), and Windows then pages the
     // allocations in and out at every submission, until the GPU queue stalls and the title's watchdog ends the run.
     // LEONIDA_VRAM_OVERCOMMIT=1 allows it again.
-    VkDeviceMemory allocate_type(std::uint32_t type, VkDeviceSize size, bool device_address, const void* next) const {
+    // `headroom`: what must stay free of the budget after it (default: the driver's own allocations, the swapchain).
+    VkDeviceMemory allocate_type(std::uint32_t type, VkDeviceSize size, bool device_address, const void* next,
+                                 VkDeviceSize headroom = VkDeviceSize(192) << 20) const {
         static const bool overcommit = [] {
             const char* v = std::getenv("LEONIDA_VRAM_OVERCOMMIT");
             return v && v[0] == '1';
         }();
         if (!overcommit && (memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
             VkDeviceSize usage = 0, budget = 0;
-            constexpr VkDeviceSize headroom = VkDeviceSize(192) << 20;  // the driver's own allocations, swapchain
             if (heap_budget(memory.memoryTypes[type].heapIndex, usage, budget) && usage + size + headroom > budget) {
                 static std::atomic<int> told{0};
                 if (told.fetch_add(1, std::memory_order_relaxed) < 4)
@@ -2742,6 +2757,19 @@ struct DeviceState {
         }
         unsigned long long title_bytes = 0;
         const std::size_t titles = live_title_texture_stats(title_bytes);
+        if (const leonida::TitlePages* pages = context->title_pages()) {
+            const auto s = pages->stats();
+            n += std::snprintf(text + n, sizeof(text) - n,
+                               " title pages: %zu textures (%zu streamed, %zu of them with no mip asked yet), %llu MiB "
+                               "in pages, %llu MiB allocated (%llu MiB in VRAM), %llu placed;",
+                               s.textures, s.streamed, s.streamed_unbound,
+                               (unsigned long long)(s.pages * leonida::TitlePages::kPage >> 20),
+                               (unsigned long long)(s.blocks * leonida::TitlePages::kPage *
+                                                    leonida::TitlePages::kBlockPages >> 20),
+                               (unsigned long long)(s.local_blocks * leonida::TitlePages::kPage *
+                                                    leonida::TitlePages::kBlockPages >> 20),
+                               (unsigned long long)s.placed);
+        }
         std::fprintf(stderr, "%s dedicated made %llu MiB; resources alive %lld; title textures %zu (%llu MiB)\n", text,
                      g_dedicated_bytes.load() >> 20, g_live_resources.load(), titles, title_bytes >> 20);
     }
@@ -3310,6 +3338,15 @@ std::uint64_t probe_hash(const std::uint8_t* p, std::size_t bytes) {
 void mark_title_texture_mapped(const Resource* resource);
 bool register_title_texture(Resource* texture, const void* address, const D3D12_RESOURCE_DESC& desc);
 
+// Set around the creation of a title-placed texture (create_at_host_address): where in the title's memory it lies, so
+// create_texture puts it on the shared pages (vulkan_title_pages.h). A plain pointer: a thread_local with a destructor
+// gives the exe a TLS callback the runtime's loader does not survive.
+struct TitlePageRequest {
+    std::uint64_t va = 0;
+    std::uint64_t bytes = 0;
+};
+thread_local const TitlePageRequest* g_title_page_request = nullptr;
+
 std::mutex& title_texture_mutex() {
     static std::mutex mutex;
     return mutex;
@@ -3398,6 +3435,8 @@ public:
     ~Resource() override {
         --g_live_resources;
         unregister_title_texture(this);
+        // Its pages go back (older textures it covered come back); the image itself goes as any other, below.
+        if (paged_) device_.context->title_pages()->release(id());
         if (map_shadow_) VirtualFree(map_shadow_, 0, MEM_RELEASE);  // after the sync can no longer read it
         if (accel_) {
             device_.context->unregister_acceleration_structure(gpu_va_);
@@ -3424,6 +3463,24 @@ public:
         if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
         device_.release_resource(memory_);  // after the image or buffer, once the GPU is done with both
     }
+
+    // The title placed a newer texture over this one's memory (its streaming pool reused): on the console this
+    // resource's texels are now the newer one's, and nothing samples it as itself again. Its image and memory go as
+    // when the title releases a texture (the GPU side of ~Resource), while the object lives on until the title
+    // releases it; commands that still name it are left out. 12,000 such textures held 1.5 GB in a loading screen.
+    void evict_title_image() {
+        if (!image_ || sparse_image_ || evicted_ || paged_) return;  // a paged texture is unbound by its pages instead
+        evicted_ = true;
+        if (image_address_) device_.forget_image(image_address_);
+        image_address_ = 0;
+        device_.context->remove_resource(id());
+        device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::image, image_);
+        image_ = VK_NULL_HANDLE;
+        device_.release_resource(memory_);
+        memory_ = {};
+    }
+    bool evicted() const { return evicted_; }
+    bool paged() const { return paged_; }
 
     leonida::ResourceId id() const { return resource_id(this); }
     VkImage image() const { return image_; }
@@ -3900,6 +3957,37 @@ public:
                          device_.host_transfer_format(format.format);
         rgb96_ = format.rgb96;
         if (host_transfer_) info.usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+        // A title-placed texture goes on the title's shared pages where it can (vulkan_title_pages.h): a sparse
+        // residency image the pages of its addresses are bound to. Anything that cannot be made so is committed.
+        leonida::TitlePages* const pages = device_.context->title_pages();
+        const TitlePageRequest* const page_request = g_title_page_request;
+        constexpr VkImageCreateFlags sparse_flags =
+            VK_IMAGE_CREATE_SPARSE_BINDING_BIT | VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT;
+        bool on_pages = page_request && pages && samples == 1 && !format.d24_as_float && !format.rgb96 &&
+                        format.aspects == VK_IMAGE_ASPECT_COLOR_BIT && !one_d && (!volume || device_.title_pages_3d);
+        if (on_pages) {
+            const VkImageUsageFlags usage = info.usage & ~VkImageUsageFlags(VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT);
+            if (device_.sparse_image_supported(info.format, info.imageType, usage)) {
+                host_transfer_ = false;
+                info.usage = usage;
+                info.flags |= sparse_flags;
+                if (FAILED(device_.check_image_support(info))) {
+                    info.flags &= ~sparse_flags;
+                    on_pages = false;
+                }
+            } else {
+                on_pages = false;
+            }
+        }
+        // The pages could not take it after all: made again as a committed image.
+        const auto committed_instead = [&]() -> HRESULT {
+            if (image_) vk.vkDestroyImage(device_.info.device, image_, nullptr);
+            image_ = VK_NULL_HANDLE;
+            g_title_page_request = nullptr;
+            const HRESULT hr = create_texture(format, castable);
+            g_title_page_request = page_request;
+            return hr;
+        };
         HRESULT support = device_.check_image_support(info);
         if (support == E_INVALIDARG && host_transfer_) {
             host_transfer_ = false;  // staging copies do not require host-transfer usage
@@ -3918,11 +4006,18 @@ public:
             }
             return E_OUTOFMEMORY;
         }
-        memory_ = device_.allocate_resource(image_, VK_NULL_HANDLE, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                                            &memory_flags_, false, false);
-        if (!memory_ ||
-            vk.vkBindImageMemory(device_.info.device, image_, memory_.memory, memory_.offset) != VK_SUCCESS)
-            return E_OUTOFMEMORY;
+        std::vector<leonida::TitlePages::Tile> page_tiles;
+        std::uint32_t page_types = 0;
+        if (on_pages) {
+            if (!pages->layout(image_, info, page_tiles, page_types)) return committed_instead();
+            memory_flags_ = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        } else {
+            memory_ = device_.allocate_resource(image_, VK_NULL_HANDLE, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                                                &memory_flags_, false, false);
+            if (!memory_ ||
+                vk.vkBindImageMemory(device_.info.device, image_, memory_.memory, memory_.offset) != VK_SUCCESS)
+                return E_OUTOFMEMORY;
+        }
 
         leonida::ResourceBinding binding{};
         binding.image = image_;
@@ -3952,6 +4047,23 @@ public:
         uint_backed_ = format.uint_backed;
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
+        if (on_pages) {
+            // Its pages may hold another texture's texels (one over the same addresses): never zero-filled, and in
+            // GENERAL for its whole life (moved there before its first bind), so no layout change discards them.
+            binding.not_zeroed = true;
+            binding.simultaneous_access = true;
+            binding_ = binding;
+            device_.context->add_resource(id(), binding, VK_IMAGE_LAYOUT_UNDEFINED);
+            const bool streamed = !(desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
+            if (pages->place(id(), image_, std::move(page_tiles), page_types, page_request->va, page_request->bytes,
+                             streamed)) {
+                paged_ = true;
+                return S_OK;
+            }
+            device_.context->remove_resource(id());
+            return committed_instead();
+        }
         binding_ = binding;
         if (host_transfer_) {
             // Moved to GENERAL and zero-filled on the host now, so the CPU can copy into it before any command
@@ -4135,7 +4247,9 @@ public:
     // subresource, each a D3D12 placed footprint at its offset from `title`.
     // The same from the console's tiled layout (src/xg_console_layout.h, five-star-recomp's XG): each subresource is
     // detiled into tight rows of elements (block rows for BC formats) and written as WriteToSubresource would.
-    bool copy_from_console(const std::uint8_t* title, const leonida::xg_console::Layout& layout) {
+    // `first_mip`: the mips before it are left out (a streamed texture on the title's pages without them bound).
+    bool copy_from_console(const std::uint8_t* title, const leonida::xg_console::Layout& layout,
+                           std::uint32_t first_mip = 0) {
         namespace xc = leonida::xg_console;
         const xc::Plane& plane = layout.planes[0];
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
@@ -4145,7 +4259,7 @@ public:
                                                 static_cast<std::size_t>(layout.size)};
         std::vector<std::byte> rows;
         for (std::uint32_t slice = 0; slice < slices; ++slice) {
-            for (std::uint32_t mip = 0; mip < mips; ++mip) {
+            for (std::uint32_t mip = first_mip; mip < mips; ++mip) {
                 const xc::Mip& m = plane.mips[mip];
                 const std::uint64_t row_pitch = std::uint64_t{m.width_elements} * plane.bytes_per_element;
                 const std::uint64_t depth_pitch = row_pitch * m.height_elements;
@@ -4161,10 +4275,11 @@ public:
         return true;
     }
 
-    bool copy_from_title(const std::uint8_t* title, const rt::xg::ResourceLayout& layout) {
+    bool copy_from_title(const std::uint8_t* title, const rt::xg::ResourceLayout& layout, std::uint32_t first_mip = 0) {
         const bool volume = desc_.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         const UINT count = layout.mip_levels * (volume ? 1u : desc_.DepthOrArraySize);
         for (UINT s = 0; s < count; ++s) {
+            if (s % layout.mip_levels < first_mip) continue;
             D3D12_PLACED_SUBRESOURCE_FOOTPRINT f{};
             if (!rt::xg::footprint(desc_, layout, s, f)) return false;
             const rt::xg::MipRecord& mip = layout.plane[0].mip[s % layout.mip_levels];
@@ -4446,6 +4561,8 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
+    bool evicted_ = false;      // evict_title_image: no image any more
+    bool paged_ = false;        // on the title's shared pages (vulkan_title_pages.h): no memory_ of its own
     bool reserved_ = false;
     bool sparse_image_ = false;
     bool placed_ = false;
@@ -4490,6 +4607,26 @@ void report_title_buffer_overlap(const void* address, const D3D12_RESOURCE_DESC&
     if (!g_title_texture_count.load(std::memory_order_acquire)) return;
     std::lock_guard lock(title_texture_mutex());
     report_title_overlap(static_cast<const std::uint8_t*>(address), static_cast<std::size_t>(desc.Width), desc, "buffer");
+}
+
+// The bytes of the title's memory a placed texture covers: its console layout's span when the layout word is a tiled
+// one (as register_title_texture reads it), else the texture computer's linear layout. 0 when neither can be had.
+std::uint64_t title_span_bytes(const D3D12_RESOURCE_DESC& desc, std::uint32_t console_layout) {
+    namespace xc = leonida::xg_console;
+    if (xc::is_console_tiled(console_layout) && xc::swizzle_mode(console_layout) != xc::mode_linear) {
+        xc::Desc x;
+        x.dimension = static_cast<std::uint32_t>(desc.Dimension);
+        x.width = desc.Width;
+        x.height = desc.Height;
+        x.depth_or_array_size = desc.DepthOrArraySize;
+        x.mip_levels = desc.MipLevels;
+        x.format = static_cast<std::uint32_t>(desc.Format);
+        x.sample_count = std::max<std::uint32_t>(desc.SampleDesc.Count, 1);
+        x.layout = console_layout;
+        if (auto l = xc::compute_layout(x)) return l->size;
+    }
+    rt::xg::ResourceLayout linear;
+    return rt::xg::linear_layout(desc, linear) ? linear.size_bytes : 0;
 }
 
 bool register_title_texture(Resource* texture, const void* address, const D3D12_RESOURCE_DESC& desc) {
@@ -4542,6 +4679,28 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
     t->serial = ++serial;
     rt::xg::g_write_listener.store(&title_texture_written, std::memory_order_release);
     std::lock_guard lock(title_texture_mutex());
+    // Older title textures that start inside this one's memory: the title reused it (Resource::evict_title_image).
+    // Only those starting inside, not those this one starts inside: packed tables of small textures, made in address
+    // order, overlap their next neighbour through layout padding and are all alive. LEONIDA_EVICT_SUPERSEDED=0: keep.
+    static const bool evict = [] {
+        const char* v = std::getenv("LEONIDA_EVICT_SUPERSEDED");
+        return !(v && v[0] == '0');
+    }();
+    if (evict && t->watch) {
+        static std::atomic<unsigned long long> evicted_count{0}, evicted_bytes{0};
+        const auto begin = reinterpret_cast<std::uintptr_t>(t->title), end = begin + t->bytes;
+        std::erase_if(title_textures(), [&](const std::unique_ptr<TitleTexture>& o) {
+            const auto start = reinterpret_cast<std::uintptr_t>(o->title);
+            if (start < begin || start >= end || !o->watch || o->mapped || o->resource == texture) return false;
+            if (o->resource->paged()) return false;  // its pages supersede it (vulkan_title_pages.h)
+            o->resource->evict_title_image();
+            const unsigned long long n = ++evicted_count, b = evicted_bytes += o->bytes;
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: %llu title textures under newer ones released (%llu MiB)\n", n,
+                             b >> 20);
+            return true;
+        });
+    }
     report_title_overlap(t->title, t->bytes, desc, "texture");
     t->mapped = overlaps_mapped_range(t->title, t->bytes);  // pages the title already writes through a mapping
     title_textures().push_back(std::move(t));
@@ -4589,8 +4748,41 @@ std::size_t live_title_texture_stats(unsigned long long& bytes) {
                          now->height, now->format, now->mips, now->flags);
         }
     }
-    std::fprintf(stderr, "[rt] d3d12: title textures with the same start as an older one: %zu of %zu (%zu same "
-                         "description)\n", same_start, sorted.size(), same_desc);
+    // Title memory the live textures cover (their ranges merged) against the sum of their sizes: where the title
+    // placed new textures over the memory of older ones (its streaming pool reused), each older one keeps an image
+    // of its own here, and the sum outgrows the union. Also: textures whose start lies inside a newer one's range.
+    std::uintptr_t covered = 0, reach = 0, run_start = 0;
+    for (const TitleTexture* t : sorted) {
+        const auto b = reinterpret_cast<std::uintptr_t>(t->title), e = b + t->bytes;
+        if (b >= reach) {
+            covered += reach - run_start;
+            run_start = b;
+            reach = e;
+        } else if (e > reach) {
+            reach = e;
+        }
+    }
+    covered += reach - run_start;
+    std::size_t superseded = 0;
+    unsigned long long superseded_bytes = 0;
+    for (std::size_t i = 0; i < sorted.size(); ++i) {
+        const TitleTexture* t = sorted[i];
+        const auto b = reinterpret_cast<std::uintptr_t>(t->title);
+        // A newer texture starting at or before b (up to 64 MiB back) whose range reaches past b.
+        for (std::size_t j = i; j-- > 0;) {
+            const auto ob = reinterpret_cast<std::uintptr_t>(sorted[j]->title);
+            if (b - ob > (64u << 20)) break;
+            if (sorted[j]->serial > t->serial && ob + sorted[j]->bytes > b) {
+                ++superseded;
+                superseded_bytes += t->bytes;
+                break;
+            }
+        }
+    }
+    std::fprintf(stderr, "[rt] d3d12: title textures: %zu, %llu MiB summed over %llu MiB of title memory; %zu (%llu MiB) "
+                         "start inside a newer one; %zu same start as an older one (%zu same description)\n",
+                 sorted.size(), bytes >> 20, (unsigned long long)(covered >> 20), superseded, superseded_bytes >> 20,
+                 same_start, same_desc);
     return title_textures().size();
 }
 
@@ -7995,6 +8187,24 @@ public:
                                     state_.context->vk.vkGetImageSparseMemoryRequirements;
         // The memory types themselves are asked on first use (DeviceState::sparse_buffer_memory_types).
         state_.sparse_buffers_possible = sparse_aliasing && state_.arena.memory && info.features.sparseResidencyBuffer;
+        // The title's placed textures on shared 64 KiB pages (vulkan_title_pages.h): sparse residency images that alias,
+        // whose unbound tiles read zero. LEONIDA_TITLE_PAGES=0: committed images, as before.
+        if (sparse_aliasing && info.features.sparseResidencyImage2D && environment_text(L"LEONIDA_TITLE_PAGES") != L"0") {
+            std::uint32_t sparse_families = 0;
+            for (std::uint32_t f = 0; f < family_count && f < 32; ++f)
+                if (families[f].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) sparse_families |= 1u << f;
+            // Blocks through allocate_type's VRAM budget check, keeping 512 MiB of the budget for what is made after
+            // them (render targets, buffers, the driver's own): past it they come from system memory.
+            DeviceState* const device_state = &state_;
+            state_.context->enable_title_pages(state_.memory, sparse_families,
+                                               [device_state](std::uint32_t type, VkDeviceSize size) {
+                                                   return device_state->allocate_type(type, size, false, nullptr,
+                                                                                      VkDeviceSize(512) << 20);
+                                               });
+            state_.title_pages_3d = info.features.sparseResidencyImage3D == VK_TRUE;
+            std::fprintf(stderr, "[rt] d3d12: title textures on shared 64 KiB pages: %s\n",
+                         state_.context->title_pages() ? "on" : "not available");
+        }
         startup_mark("breadcrumbs, labels, sparse checks");
     }
 
@@ -10312,11 +10522,22 @@ public:
             // uses it moves it to that command's layout (vulkan_replay.h, initialize), as for every texture here.
             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
             const D3D12_RESOURCE_STATES initial = state_for_barrier_layout(layout);
+            // On the title's shared pages when it can be (create_texture, vulkan_title_pages.h): the memory it covers is
+            // its console layout's span, as register_title_texture reads it.
+            // The extent counts no more than its texels' linear size: a small texture's console layout can be a whole
+            // 64 KiB swizzle block while the title packs such textures 1 KiB apart (16x4 tables), and taken at the
+            // block's size they would share pages and replace each other.
+            std::uint64_t page_bytes = title_span_bytes(desc, rt::d3d12_xs::g_placed_console_layout);
+            if (rt::xg::ResourceLayout linear; rt::xg::linear_layout(desc, linear) && linear.size_bytes)
+                page_bytes = std::min<std::uint64_t>(page_bytes, linear.size_bytes);
+            const TitlePageRequest request{reinterpret_cast<std::uint64_t>(address), page_bytes};
+            g_title_page_request = request.bytes ? &request : nullptr;
             HRESULT hr = create_committed_validated(nullptr, &fallback, D3D12_HEAP_FLAG_NONE, &desc, initial, nullptr,
                                                     0, nullptr, riid, out);
             if (FAILED(hr) && initial != D3D12_RESOURCE_STATE_COMMON)
                 hr = create_committed_validated(nullptr, &fallback, D3D12_HEAP_FLAG_NONE, &desc,
                                                 D3D12_RESOURCE_STATE_COMMON, nullptr, 0, nullptr, riid, out);
+            g_title_page_request = nullptr;
             if (SUCCEEDED(hr) && out && *out) {
                 // The console answers the texture's GetGPUVirtualAddress with the title's address; without it a
                 // title that clears the texture through that pointer writes at address 0 (XCL measured this on a
@@ -11650,6 +11871,17 @@ private:
         leonida::gfx10::Image image{};
         if (!image_descriptor(resource, view, image)) return;
         const leonida::gfx10::ImageWords words = leonida::gfx10::encode(image);
+        // A streamed texture on the title's pages has the mips its views read bound (vulkan_title_pages.h): from the
+        // view's first mip, or from its LOD clamp's when that is further on (the title's streaming pool starts a
+        // partly resident texture's view at its first resident mip). Its bytes are uploaded again after the bind.
+        if (resource.paged()) {
+            if (leonida::TitlePages* pages = state_.context->title_pages()) {
+                const std::uint32_t last = image.first_mip + std::max<std::uint32_t>(image.mip_count, 1) - 1;
+                const float clamp = storage ? 0.0f : leonida::gfx10::image_min_lod(words);
+                const std::uint32_t clamped = clamp > 0.0f ? static_cast<std::uint32_t>(clamp) : 0u;
+                pages->require_mip(resource.id(), std::min(last, std::max<std::uint32_t>(image.first_mip, clamped)));
+            }
+        }
         if (const char* v = std::getenv("LEONIDA_LOG_TSHARP"); v && std::strtoull(v, nullptr, 16) == image.address) {
             const D3D12_RESOURCE_DESC& d = resource.desc();
             std::fprintf(stderr, "[rt] d3d12: view of %#llx: %llux%u fmt %d flags %#x layout %d, memory flags %#x, "
@@ -12161,16 +12393,36 @@ bool guarded_title_read(std::uint8_t* out, const std::uint8_t* title, std::size_
 // themselves inside the guard, in the middle of cpu_copy and the locks it holds: a page the title unmapped there
 // faulted, the __except left those locks held for good, and the next submission blocked on them holding its queue's
 // lock, with the title's five loading-screen render workers behind it (its watchdog then ended the run).
+// The bytes from a texture's start that hold its mips from `first_mip` on, of `whole`. In the console's tiled layouts
+// the smallest mips come first (the mip tail block at offset 0, then the larger mips in rising offsets), so a partly
+// resident texture's resident mips are a prefix of its range: the rest is its neighbours' memory (the streaming pool
+// packs such textures 16 KiB apart over 684 KiB ranges). The whole size for anything else (linear layouts, arrays,
+// volumes, more planes).
+std::size_t resident_prefix(const leonida::xg_console::Layout* console, std::size_t whole, std::uint32_t first_mip) {
+    if (!console || !first_mip || console->plane_count != 1) return whole;
+    const leonida::xg_console::Plane& plane = console->planes[0];
+    if (!plane.block_bytes || plane.thick || plane.slices != 1 || first_mip >= plane.mip_count) return whole;
+    std::uint64_t end = 0;
+    for (std::uint32_t m = first_mip; m < plane.mip_count; ++m) {
+        const leonida::xg_console::Mip& mip = plane.mips[m];
+        end = std::max<std::uint64_t>(end, mip.in_tail ? plane.block_bytes : mip.offset + mip.size);
+    }
+    return static_cast<std::size_t>(std::min<std::uint64_t>(whole, plane.offset + end));
+}
+
+// `first_mip`: the most detailed mip with memory behind it (a streamed texture on the title's pages); only its bytes
+// and those of the smaller mips are read from the title.
 bool guarded_copy_from_title(Resource* resource, const std::uint8_t* title, const rt::xg::ResourceLayout& layout,
-                             const leonida::xg_console::Layout* console) {
+                             const leonida::xg_console::Layout* console, std::uint32_t first_mip) {
     const std::size_t bytes = console ? static_cast<std::size_t>(console->size)
                                       : static_cast<std::size_t>(layout.size_bytes);
     // A plain local buffer, not a thread_local one: a thread_local with a destructor gives gta6rt.exe a TLS callback,
     // and the title's threads then hung at their start under the runtime's own loader (0.8 s into the boot).
     if (!bytes) return false;
     std::vector<std::uint8_t> copy(bytes);
-    if (!guarded_title_read(copy.data(), title, bytes)) return false;
-    return console ? resource->copy_from_console(copy.data(), *console) : resource->copy_from_title(copy.data(), layout);
+    if (!guarded_title_read(copy.data(), title, resident_prefix(console, bytes, first_mip))) return false;
+    return console ? resource->copy_from_console(copy.data(), *console, first_mip)
+                   : resource->copy_from_title(copy.data(), layout, first_mip);
 }
 
 void sync_title_textures() {
@@ -12188,8 +12440,30 @@ void sync_title_textures() {
     refilled = now;
     auto& textures = title_textures();
     const std::size_t count = textures.size();
+    // Streamed textures on the title's pages (vulkan_title_pages.h) with more mips bound since the last submission (a
+    // view asked for them): those pages are fresh, so their bytes are copied again.
+    leonida::TitlePages* const pages = count ? textures.front()->resource->device_state().context->title_pages() : nullptr;
+    if (pages) {
+        const std::vector<std::uintptr_t> grown = pages->take_remapped();
+        if (!grown.empty()) {
+            const std::unordered_set<std::uintptr_t> ids(grown.begin(), grown.end());
+            for (const auto& t : textures)
+                if (ids.count(t->resource->id())) {
+                    t->dirty = true;
+                    t->copied = false;
+                }
+        }
+    }
     for (std::size_t n = 0; n < count; ++n) {
         const auto& t = textures[(cursor + n) % count];
+        // On the title's pages and not bound now (a streamed texture no view has asked a mip of, or its bind not made
+        // yet): nothing to copy into. Left as it is (dirty stays), so it is copied once it is bound.
+        const bool paged = pages && t->resource->paged();
+        if (paged && !pages->ready(t->resource->id())) continue;
+        // A streamed texture with only its smaller mips bound reads, hashes and copies just their bytes: the rest of
+        // its range is its neighbours' memory (resident_prefix).
+        const std::uint32_t first_mip = paged ? pages->first_mip(t->resource->id()) : 0;
+        const std::size_t span = resident_prefix(t->console.get(), t->bytes, first_mip);
         // LEONIDA_DUMP_TARGETS with LEONIDA_DUMP_TITLE_TEXTURE: the glyph atlas's image is dumped with the targets.
         static const bool note_atlas =
             leonida::debug_targets::dump_at() && std::getenv("LEONIDA_DUMP_TITLE_TEXTURE") != nullptr;
@@ -12249,18 +12523,18 @@ void sync_title_textures() {
                     t->next_check = now + kMappedRecheck;
                     check = Check::probe;
                 }
-            } else if (t->bytes <= kTitleTextureFullCheckBytes) {
+            } else if (span <= kTitleTextureFullCheckBytes) {
                 // A small texture (glyph pages, atlases, UI images) takes writes of a few bytes per row that a sample
                 // misses: the glyph cache was copied before its letters were drawn and never again, so the letters
                 // without ascenders or descenders were missing on every screen. A full hash at most every 500 ms.
-                if (now >= t->next_check && budget >= t->bytes) {
-                    budget -= t->bytes;
+                if (now >= t->next_check && budget >= span) {
+                    budget -= span;
                     t->next_check = now + std::chrono::milliseconds(500);
                     cursor = (cursor + n + 1) % count;
                     check = Check::full;
                 }
-            } else if (now >= t->next_check && budget >= t->bytes / 64) {
-                budget -= t->bytes / 64;  // for life, from the byte budget, round robin
+            } else if (now >= t->next_check && budget >= span / 64) {
+                budget -= span / 64;  // for life, from the byte budget, round robin
                 t->next_check = now + kTitleTextureRecheck;
                 cursor = (cursor + n + 1) % count;  // the next call starts after the last one checked
                 check = Check::probe;
@@ -12275,7 +12549,7 @@ void sync_title_textures() {
         // whose pages are not in this view's working set until read.
         if (!t->watch && !t->mapped && !t->copied &&
             (t->resource->desc().Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
-            !title_range_touched(t->title, t->bytes)) {
+            !title_range_touched(t->title, span)) {
             t->dirty = false;
             t->copied = true;
             t->hash = 0;
@@ -12292,10 +12566,10 @@ void sync_title_textures() {
         if (!known_readable) {
             if (!t->readable && now < t->readable_until) continue;  // found unreadable lately
             t->readable_until = now + std::chrono::milliseconds(250);
-            if (t->mapped && !title_range_readable(t->title, t->bytes))
+            if (t->mapped && !title_range_readable(t->title, span))
                 if (const auto commit = rt::xmem::g_commit_range.load(std::memory_order_acquire))
-                    commit(t->title, t->bytes);
-            t->readable = title_range_readable(t->title, t->bytes);
+                    commit(t->title, span);
+            t->readable = title_range_readable(t->title, span);
             t->readable_generation = generation;
             if (!t->readable) continue;  // reserved pages: a later submission copies it
         }
@@ -12308,7 +12582,7 @@ void sync_title_textures() {
             t->readable = false;
             t->readable_until = now + std::chrono::seconds(1);
         };
-        if (!guarded_probe_hash(t->title, t->bytes, probe)) {
+        if (!guarded_probe_hash(t->title, span, probe)) {
             faulted();
             continue;
         }
@@ -12316,7 +12590,7 @@ void sync_title_textures() {
             if (probe == t->probe) continue;
             hash = 0;  // changed: copied below without a full hash
         } else if (check == Check::full) {
-            if (!guarded_title_hash(t->title, t->bytes, hash)) {
+            if (!guarded_title_hash(t->title, span, hash)) {
                 faulted();
                 continue;
             }
@@ -12327,7 +12601,7 @@ void sync_title_textures() {
             }
         }
         t->dirty = false;
-        if (!guarded_copy_from_title(t->resource, t->title, *t->layout, t->console.get())) {
+        if (!guarded_copy_from_title(t->resource, t->title, *t->layout, t->console.get(), first_mip)) {
             faulted();
             log_once("a title-placed texture could not be copied from the title's pages; it keeps its texels; "
                      "dimension",

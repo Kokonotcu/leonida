@@ -29,6 +29,7 @@
 #include <system_error>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 
@@ -161,9 +162,15 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
     if (leonida_quiet_av && r.ExceptionCode == 0xC0000005) return EXCEPTION_CONTINUE_SEARCH;
 #endif
     if (step_over_title_assert(info)) return EXCEPTION_CONTINUE_EXECUTION;
-    if (r.ExceptionCode != 0xC0000005 && r.ExceptionCode != 0xC0000374 && r.ExceptionCode != 0x80000003 &&
-        r.ExceptionCode != 0xC0000409 && r.ExceptionCode != 0xC00000FD)
+    // A C++ exception (0xE06D7363) is logged too, the first 8: an unhandled one ended runs with nothing in the log (the
+    // throw site's stack below names it; most are caught and harmless, hence the cap).
+    if (r.ExceptionCode == 0xE06D7363) {
+        static std::atomic<int> cpp_told{0};
+        if (cpp_told.fetch_add(1) >= 8) return EXCEPTION_CONTINUE_SEARCH;
+    } else if (r.ExceptionCode != 0xC0000005 && r.ExceptionCode != 0xC0000374 && r.ExceptionCode != 0x80000003 &&
+               r.ExceptionCode != 0xC0000409 && r.ExceptionCode != 0xC00000FD) {
         return EXCEPTION_CONTINUE_SEARCH;
+    }
     const void* access = r.NumberParameters >= 2 ? reinterpret_cast<void*>(r.ExceptionInformation[1]) : nullptr;
     char module[MAX_PATH] = {};
     HMODULE host = nullptr;
