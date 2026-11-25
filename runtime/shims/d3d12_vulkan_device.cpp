@@ -96,6 +96,8 @@ thread_local int leonida_quiet_av = 0;
 namespace rt::d3d12 {
 // Below sync_title_textures; the device hands it to xmem (rt::xmem::g_title_written).
 void note_title_texture_write(const void* address, std::size_t size);
+// Below too: LEONIDA_WATCH_TRANSIENT's watch of the title's transient-memory pool.
+void start_transient_watch(leonida::VulkanContext* context);
 namespace {
 
 // Live VkDeviceMemory objects the layer holds (the device's vkAllocateMemory/vkFreeMemory go through these).
@@ -135,6 +137,7 @@ constexpr VkDeviceSize kPageTableDir = 0x30000;         // 65536 x u32
 constexpr VkDeviceSize kPageTableDirBytes = 0x40000;
 constexpr VkDeviceSize kPageTableChunkBytes = 0x80000;  // 65536 x u64
 constexpr std::uint32_t kPageTableChunks = 64;          // 256 GiB of distinct title memory windows
+constexpr std::uint32_t kPageTableLowTag = 0x4C4F0000;  // dir[0] = tag | chunk (note_low_va; rdna2spirv.py)
 constexpr VkDeviceSize kArenaPrefix = kPageTableDir + kPageTableDirBytes + kPageTableChunks * kPageTableChunkBytes;
 static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
 
@@ -1316,7 +1319,9 @@ struct DeviceState {
         auto* dir = reinterpret_cast<volatile std::uint32_t*>(arena.mapped + kPageTableDir);
         const std::uint32_t d = static_cast<std::uint32_t>((v >> 32) & 0xFFFF);
         if (d == 0 && !low) return false;  // dir[0]'s chunk lists the valid VAs below 4 GiB (note_low_va)
-        std::uint32_t slot = dir[d];
+        // dir[0] carries kPageTableLowTag in its high half (rdna2spirv.py PAGE_TABLE_LOW_TAG): a shader takes the low
+        // VAs through the table only when it is there.
+        std::uint32_t slot = d == 0 ? (dir[0] & 0xFFFF) : dir[d];
         bool fresh = false;
         if (!slot) {
             if (!value) return true;  // no chunk: every page of it reads the scratch already
@@ -1333,7 +1338,8 @@ struct DeviceState {
         auto* entries = reinterpret_cast<volatile std::uint64_t*>(arena.mapped + kPageTableDir + kPageTableDirBytes +
                                                                    (slot - 1) * kPageTableChunkBytes);
         entries[(v >> 16) & 0xFFFF] = value;
-        if (fresh) dir[d] = slot;  // after the entry: a shader that sees the chunk sees its page
+        if (fresh) dir[d] = d == 0 ? (kPageTableLowTag | slot) : slot;  // after the entry: a shader that sees the
+                                                                         // chunk sees its page
         return true;
     }
 
@@ -9225,6 +9231,7 @@ public:
         arena_pages_ = std::make_shared<DeviceArenaPages>(state_);
         leonida::debug_targets::arena_mapped = arena.mapped;  // diagnostics read descriptors through it
         leonida::debug_targets::arena_size = arena.size;
+        start_transient_watch(state_.context.get());
         // Hang reports follow V#s into the title's memory: committed, readable pages only (no fault in the report).
         leonida::debug_targets::read_title = [](std::uint64_t va, void* out, std::size_t bytes) {
             for (std::uint64_t at = va; at < va + bytes;) {
@@ -13218,6 +13225,79 @@ void note_title_texture_write(const void* address, std::size_t size) {
     writes.emplace_back(begin, begin + size);
 }
 
+// LEONIDA_WATCH_TRANSIENT=1: watches the title's transient-memory pool (GTA VI 1.0.2.1), whose node lists the title
+// walks at 0x144e9b480; a GPU write over them faulted the title there (0x144e9b54a / 0x144e9b578). Layout and design
+// from five-star-recomp's docs/debugging.md ("Transient pool watch", github.com/ThatRecompDev/five-star-recomp); the
+// code is ours. Globals: pool base 0x1475DF1B8, block records 0x1475DF1C0 (0x58 bytes each: block +0x10, retire
+// token +0x18, node list +0x48), block count 0x1475DF1C8, block size 0x1475DF1CC. Nodes are {next, object, token},
+// 0x18 bytes, inside the blocks. Every 5 ms each list is walked; a next pointer outside the pool or an object outside
+// user space, seen on three polls in a row, is logged once with the bytes around it and the kept dispatches (LEONIDA_DRED)
+// whose descriptor tables reach its block. Memory is read with ReadProcessMemory: an unmapped page is a failed read.
+void start_transient_watch(leonida::VulkanContext* context) {
+    static std::atomic<bool> started{false};
+    const char* on = std::getenv("LEONIDA_WATCH_TRANSIENT");
+    if (!on || on[0] != '1' || started.exchange(true)) return;
+    std::thread([context] {
+        const HANDLE self = GetCurrentProcess();
+        const auto read = [self](std::uint64_t at, void* out, std::size_t n) {
+            SIZE_T got = 0;
+            return ReadProcessMemory(self, reinterpret_cast<const void*>(at), out, n, &got) && got == n;
+        };
+        std::map<std::uint64_t, int> suspect;  // node address -> polls in a row it looked bad
+        std::set<std::uint64_t> told;
+        std::fprintf(stderr, "[rt] transient watch: on\n");
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            std::uint64_t pool = 0, records = 0;
+            std::uint32_t count = 0, block_bytes = 0;
+            if (!read(0x1475DF1B8, &pool, 8) || !read(0x1475DF1C0, &records, 8) || !read(0x1475DF1C8, &count, 4) ||
+                !read(0x1475DF1CC, &block_bytes, 4) || !pool || !records || !count || count > 65536 || !block_bytes)
+                continue;
+            const std::uint64_t pool_end = pool + std::uint64_t(count) * block_bytes;
+            std::map<std::uint64_t, int> seen;
+            for (std::uint32_t b = 0; b < count; ++b) {
+                std::uint64_t rec[11] = {};
+                if (!read(records + std::uint64_t(b) * 0x58, rec, sizeof(rec))) break;
+                std::uint64_t node = rec[0x48 / 8];
+                for (int steps = 0; node && steps < 4096; ++steps) {
+                    std::uint64_t n[3] = {};
+                    if (!read(node, n, sizeof(n))) break;
+                    const bool next_ok = !n[0] || (n[0] >= pool && n[0] < pool_end);
+                    const bool object_ok = !n[1] || (n[1] >= 0x10000 && n[1] < 0x800000000000ull);
+                    if (!next_ok || !object_ok) {
+                        const int polls = seen[node] = (suspect.count(node) ? suspect[node] : 0) + 1;
+                        if (polls >= 3 && told.insert(node).second) {
+                            const std::uint64_t block = rec[0x10 / 8];
+                            std::fprintf(stderr,
+                                         "[rt] transient watch: block %u (%#llx, token %#llx) node %#llx: next %#llx "
+                                         "object %#llx token %#llx (pool %#llx..%#llx)\n",
+                                         b, static_cast<unsigned long long>(block),
+                                         static_cast<unsigned long long>(rec[0x18 / 8]),
+                                         static_cast<unsigned long long>(node), static_cast<unsigned long long>(n[0]),
+                                         static_cast<unsigned long long>(n[1]), static_cast<unsigned long long>(n[2]),
+                                         static_cast<unsigned long long>(pool), static_cast<unsigned long long>(pool_end));
+                            std::uint32_t around[24] = {};
+                            if (read(node - 0x30, around, sizeof(around)))
+                                for (int row = 0; row < 3; ++row)
+                                    std::fprintf(stderr, "[rt] transient watch:   %#llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                                                 static_cast<unsigned long long>(node - 0x30 + row * 32),
+                                                 around[8 * row], around[8 * row + 1], around[8 * row + 2],
+                                                 around[8 * row + 3], around[8 * row + 4], around[8 * row + 5],
+                                                 around[8 * row + 6], around[8 * row + 7]);
+                            if (leonida::BreadcrumbRing* ring = context->breadcrumbs())
+                                ring->report_reaching(stderr, block, block + block_bytes);
+                            std::fflush(stderr);
+                        }
+                        break;  // the rest of this list is not to be trusted
+                    }
+                    node = n[0];
+                }
+            }
+            suspect.swap(seen);
+        }
+    }).detach();
+}
+
 // Where a slow sync_title_textures spent its time (over 400 ms: logged at its end). It held the submission for 47 s in
 // the first loading screen (2026-11-25), with every other submitting thread waiting behind it.
 struct SyncStats {
@@ -13269,6 +13349,11 @@ void sync_title_textures() {
         DeviceState* device;
         DeviceState::StagedBatch& batch;
         BatchScope(DeviceState* d, DeviceState::StagedBatch& b) : device(d), batch(b) {
+            static const bool off = [] {
+                const char* v = std::getenv("LEONIDA_SYNC_BATCH");  // 0: one submission per copy, as before
+                return v && v[0] == '0';
+            }();
+            if (off) device = nullptr;
             if (!device) return;
             device->staged_batch_owner.store(std::this_thread::get_id(), std::memory_order_release);
             device->staged_batch.store(&batch, std::memory_order_release);

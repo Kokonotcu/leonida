@@ -124,6 +124,7 @@ PAGE_TABLE_DIR = 0x30000
 PAGE_TABLE_DIR_BYTES = 0x40000
 PAGE_TABLE_CHUNK_BYTES = 0x80000
 PAGE_TABLE_CHUNKS = 64
+PAGE_TABLE_LOW_TAG = 0x4C4F0000        # dir[0] = tag | chunk: the VAs below 4 GiB go through the table (note_low_va)
 
 
 def pc_tail_chain(name, member, c):
@@ -1602,7 +1603,16 @@ class Gen:
         self.emit(f"{idx} = OpBitwiseAnd %uint {hi32} {self.cu(0xFFFF)}")
         self.emit(f"{idx64} = OpUConvert %ulong {idx}")
         self.emit(f"{doff} = OpShiftLeftLogical %ulong {idx64} {self.cl(2)}")
-        slot = load_u32(add(add("%heap_base", self.cl(PAGE_TABLE_DIR)), doff))
+        raw = load_u32(add(add("%heap_base", self.cl(PAGE_TABLE_DIR)), doff))
+        # dir[0] (VAs below 4 GiB) names a chunk only with PAGE_TABLE_LOW_TAG in its high half (note_low_va): any
+        # other word there (an older runtime's 0, a test's fill pattern) keeps the direct heap_base + VA.
+        tag, tagged, low_slot, slot = t(), t(), t(), t()
+        self.emit(f"{tag} = OpBitwiseAnd %uint {raw} {self.cu(0xFFFF0000)}")
+        self.emit(f"{tagged} = OpIEqual %bool {tag} {self.cu(PAGE_TABLE_LOW_TAG)}")
+        low_masked = t()
+        self.emit(f"{low_masked} = OpBitwiseAnd %uint {raw} {self.cu(0xFFFF)}")
+        self.emit(f"{low_slot} = OpSelect %uint {tagged} {low_masked} {self.cu(0)}")
+        self.emit(f"{slot} = OpSelect %uint {arena} {low_slot} {raw}")
         has, slot1, chunk, chunk64, coff, page, page_idx, poff = (t() for _ in range(8))
         self.emit(f"{has} = OpINotEqual %bool {slot} {self.cu(0)}")
         self.emit(f"{slot1} = OpISub %uint {slot} {self.cu(1)}")

@@ -495,6 +495,46 @@ public:
         for (const auto& m : history_) words += m.ops.size() + m.positions.capacity();
         return words;
     }
+    // The kept lists' dispatches whose descriptor tables (the user-data words that are arena addresses, 0x80 bytes
+    // each, read now) hold a V# whose range reaches [lo, hi): which GPU work may have written title memory there (the
+    // transient-pool watch, d3d12_vulkan_device.cpp, after five-star-recomp's --watch-transient). Newest first, at most
+    // `limit` lines. A table rewritten since its dispatch shows what it holds now.
+    void report_reaching(std::FILE* out, std::uint64_t lo, std::uint64_t hi, int limit = 40) const {
+        std::lock_guard lock(mutex_);
+        int shown = 0;
+        for (auto m = history_.rbegin(); m != history_.rend() && shown < limit; ++m) {
+            const bool words = gpu_ && m->slot != kNoSlot && owner_[m->slot] == m->tag;
+            const BreadcrumbState state =
+                words ? breadcrumb_state(read(m->slot, 0), read(m->slot, 1), m->tag) : BreadcrumbState::unknown;
+            for (std::size_t k = 0; k < m->details.size() && shown < limit; ++k) {
+                const auto& d = m->details[k];
+                if (!(d[0] | d[1] | d[2])) continue;  // not a dispatch
+                for (int w = 3; w < 11 && shown < limit; ++w) {
+                    if (!arena_word(d[w])) continue;
+                    std::uint32_t t[32];
+                    if (!debug_targets::read_gpu_va(d[w], t, sizeof(t))) continue;
+                    for (int q = 0; q < 8; ++q) {
+                        const std::uint32_t* v = t + 4 * q;
+                        const std::uint64_t base = v[0] | (std::uint64_t(v[1] & 0xFFFF) << 32);
+                        const std::uint32_t stride = (v[1] >> 16) & 0x3FFF;
+                        const std::uint64_t extent = std::uint64_t(v[2]) * (stride ? stride : 1);
+                        if (!base || !v[2] || base >= hi || base + extent <= lo) continue;
+                        const std::uintptr_t pso = k < m->pipelines.size() ? m->pipelines[k] : 0;
+                        const std::string name = pso ? breadcrumb_pso_name(pso) : std::string();
+                        std::fprintf(out,
+                                     "[rt] transient watch:   tag %u op %zu (%s) %s groups %u x %u x %u: user data %d "
+                                     "table +%02x V# base %#llx stride %u records %u\n",
+                                     m->tag, k, breadcrumb_state_name(state), name.empty() ? "(unnamed)" : name.c_str(),
+                                     d[0], d[1], d[2], w - 3, q * 16, static_cast<unsigned long long>(base), stride,
+                                     v[2]);
+                        ++shown;
+                    }
+                }
+            }
+        }
+        if (!shown) std::fprintf(out, "[rt] transient watch:   no kept dispatch's tables reach it\n");
+    }
+
     VkBuffer marker_buffer() const { return buffer_; }
     VkDeviceSize progress_offset(const Mark& m) const { return offset(m.slot, 2); }
 
