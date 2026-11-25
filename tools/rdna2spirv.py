@@ -17386,6 +17386,32 @@ def restore_mix_inline_literal(ins, raw, literal):
     ins["enc"] = raw.hex()
 
 
+def widen_wave64_masks(insns):
+    """In place: the lane-mask SGPR operands of VALU instructions become the pairs they are in wave64.
+
+    From upstream PR #1021 (SHADER-W64-SDST-PAIR, by DadaCap). Listings made by llvm-mc without +wavefrontsize64 print
+    the wave32 form: v_cmp_*_e64 s8 where the wave64 hardware writes s[8:9], and s10 for the s[10:11] that
+    v_cndmask_b32_e64 reads; carry-in/out and v_mad_*64 / v_div_scale SDSTs likewise. Taken literally the high SGPR
+    keeps its old value and lanes 32..63 take wrong bits (loops that peel lanes off EXEC never end: the retail title's
+    CS_DefragHeap_ComputeRelocations and CS_Prop_BatchCull hung the GPU, emulated wave64 on NVIDIA)."""
+    for ins in insns:
+        op, a = base_op(ins["op"]), ins["args"]
+        if op.startswith("v_cmp") and len(a) == 3:
+            at = (0,)
+        elif op.startswith("v_") and "_co_ci_" in op:
+            at = (1, 4)
+        elif op.startswith("v_") and "_co_" in op or op in ("v_mad_u64_u32", "v_mad_i64_i32",
+                                                            "v_div_scale_f32", "v_div_scale_f64"):
+            at = (1,)
+        elif op in ("v_cndmask_b32", "v_cndmask_b16"):
+            at = (3,)
+        else:
+            continue
+        for i in at:
+            if i < len(a) and a[i]["k"] == "sgpr" and a[i].get("n", 1) == 1:
+                a[i] = dict(a[i], n=2)
+
+
 def output_signature(path, name):
     """OSG1 elements as (register, system value), one per register (first element wins)."""
     d = shader_container(path, name)
@@ -17716,6 +17742,8 @@ def translate(path):
         g.wave64 = False
     else:
         g.wave64 = code_w64 or stage == "ms"   # NGG mesh shaders here are wave64 (thread = wave id * 64 + lane)
+    if g.wave64:
+        widen_wave64_masks(insns)
     if stage == "gs":
         ins_by_reg = {}
         for reg, mask, sv, ctype in input_signature(path, info["name"]):
