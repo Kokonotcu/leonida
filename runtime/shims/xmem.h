@@ -39,6 +39,13 @@ inline void note_title_written(const void* address, std::size_t size) {
             told(reinterpret_cast<const void*>(other), size);
 }
 
+// Host memory whose protection we flip ourselves: the title-heap dirty watch keeps a heap's pages read-only between
+// syncs (d3d12_xs). True when [begin, end) overlaps such a range. Host imports stay away from it: on NVIDIA one import
+// of memory that is not plain read-write is refused (-2) and every host import after it fails too, for the rest of the
+// device's life (heapimport `alias` test, 2026-11-25; boykopovar/AnyPS5#1022 saw the same on Linux).
+using ProtectWatchedFn = bool (*)(std::uintptr_t begin, std::uintptr_t end);
+inline std::atomic<ProtectWatchedFn> g_protect_watched{nullptr};
+
 // Changes whenever a physical page is mapped or unmapped anywhere: a reader that found a range readable need not ask
 // VirtualQuery again (one call per 64 KiB view) until it changes.
 inline std::atomic<std::uint64_t> g_map_generation{0};

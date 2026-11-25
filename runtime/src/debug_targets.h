@@ -15,12 +15,29 @@
 
 namespace leonida::debug_targets {
 
-inline std::uint64_t dump_at() {
-    static const std::uint64_t at = [] {
+// LEONIDA_DUMP_TARGETS=<n>[,<n>...]: the presents to dump at, in any order.
+inline const std::vector<std::uint64_t>& dump_list() {
+    static const std::vector<std::uint64_t> list = [] {
+        std::vector<std::uint64_t> out;
         const char* v = std::getenv("LEONIDA_DUMP_TARGETS");
-        return v ? std::strtoull(v, nullptr, 10) : 0ull;
+        while (v && *v) {
+            char* end = nullptr;
+            const unsigned long long n = std::strtoull(v, &end, 10);
+            if (end == v) break;
+            if (n) out.push_back(n);
+            v = *end == ',' ? end + 1 : end;
+            if (*end != ',') break;
+        }
+        return out;
     }();
-    return at;
+    return list;
+}
+// Non-zero when any dump is asked for (the first present asked).
+inline std::uint64_t dump_at() { return dump_list().empty() ? 0 : dump_list().front(); }
+inline bool dump_now(std::uint64_t present) {
+    for (const std::uint64_t n : dump_list())
+        if (n == present) return true;
+    return false;
 }
 
 inline std::mutex& mutex() {

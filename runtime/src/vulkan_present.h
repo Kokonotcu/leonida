@@ -693,7 +693,7 @@ private:
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
             ++presented_;
-            if (debug_targets::dump_at() && presented_ == debug_targets::dump_at()) dump_targets();
+            if (debug_targets::dump_at() && debug_targets::dump_now(presented_)) dump_targets();
             if (planes) ++composed_;
             if (tearing) {
                 last_tore_ = true;
@@ -1296,7 +1296,8 @@ private:
                 }
                 const double n = double(b.width) * b.height;
                 char name[160];
-                std::snprintf(name, sizeof name, "target_%llx_%ux%u_f%d.ppm", static_cast<unsigned long long>(id),
+                std::snprintf(name, sizeof name, "p%llu_target_%llx_%ux%u_f%d.ppm",
+                              static_cast<unsigned long long>(presented_), static_cast<unsigned long long>(id),
                               b.width, b.height, int(b.format));
                 const std::string path = (capture_dir_.empty() ? std::string(".") : capture_dir_) + "/" + name;
                 if (std::FILE* f = std::fopen(path.c_str(), "wb")) {

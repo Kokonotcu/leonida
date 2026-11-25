@@ -98,6 +98,42 @@ void note_title_texture_write(const void* address, std::size_t size);
 void start_transient_watch(leonida::VulkanContext* context);
 namespace {
 
+// Whether [host, host + bytes) may be offered to a host import (VK_EXT_external_memory_host). NVIDIA refuses an import
+// of memory that is not plain read-write (-2), and after one such refusal it refuses every host import for the rest of
+// the device's life while device-local allocations still work (heapimport `alias` test, 2026-11-25, RTX 3080 Laptop;
+// boykopovar/AnyPS5#1022 on Linux). Runs 26-28 lost their page-table imports from 0.7-1.2 GiB on, which fits one
+// read-only page (the title-heap dirty watch keeps heap pages read-only) inside a 2 MiB window import. So nothing goes
+// to the driver unless every page is committed read-write (PAGE_READWRITE or PAGE_EXECUTE_READWRITE, no guard,
+// no-cache or write-combine bit) and none lies in a range whose protection we flip (rt::xmem::g_protect_watched).
+bool host_range_importable(const void* host, std::uint64_t bytes) {
+    const auto begin = reinterpret_cast<std::uintptr_t>(host);
+    const std::uintptr_t end = begin + bytes;
+    if (const auto watched = rt::xmem::g_protect_watched.load(std::memory_order_acquire); watched && watched(begin, end)) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 4)
+            std::fprintf(stderr, "[rt] d3d12: host range %p + %#llx overlaps a dirty-watched title heap: not imported\n",
+                         host, static_cast<unsigned long long>(bytes));
+        return false;
+    }
+    for (std::uintptr_t at = begin; at < end;) {
+        MEMORY_BASIC_INFORMATION region{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region))) return false;
+        const DWORD protect = region.Protect & 0xFF;
+        if (region.State != MEM_COMMIT || (protect != PAGE_READWRITE && protect != PAGE_EXECUTE_READWRITE) ||
+            (region.Protect & (PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE))) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 8)
+                std::fprintf(stderr, "[rt] d3d12: host range %p + %#llx not imported: region %p state %#lx protect %#lx "
+                                     "(only committed read-write memory goes to the driver)\n",
+                             host, static_cast<unsigned long long>(bytes), region.BaseAddress, region.State,
+                             region.Protect);
+            return false;
+        }
+        at = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+    }
+    return true;
+}
+
 // Live VkDeviceMemory objects the layer holds (the device's vkAllocateMemory/vkFreeMemory go through these).
 PFN_vkAllocateMemory g_real_allocate_memory = nullptr;
 PFN_vkFreeMemory g_real_free_memory = nullptr;
@@ -1419,6 +1455,10 @@ struct DeviceState {
         buffer = VK_NULL_HANDLE;
         imported = VK_NULL_HANDLE;
         types = 0;
+        if (!host_range_importable(host, bytes)) {
+            last_import_result = VK_ERROR_INVALID_EXTERNAL_HANDLE;  // ours: not offered to the driver
+            return 0;
+        }
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
         VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
@@ -4515,7 +4555,7 @@ public:
             const auto region_end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
             at = region_end - base;
         }
-        if (!importable) return E_NOTIMPL;
+        if (!importable || !host_range_importable(base_address, bytes)) return E_NOTIMPL;
         const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
         VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
         external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -4573,7 +4613,8 @@ public:
             DeviceState::SharedImport* shared = device_.find_shared_import(window, types);
             if (!shared && !device_.shared_imports.count(window.first)) {
                 VkMemoryHostPointerPropertiesEXT whost{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-                if (device_.get_host_pointer_properties(device_.info.device,
+                if (host_range_importable(reinterpret_cast<const void*>(window.first), window.second - window.first) &&
+                    device_.get_host_pointer_properties(device_.info.device,
                                                         VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                                         reinterpret_cast<void*>(window.first), &whost) == VK_SUCCESS) {
                     const std::uint32_t wtypes = whost.memoryTypeBits & types;
@@ -11537,6 +11578,7 @@ public:
             log_once("OpenExistingHeapFromAddress (no VK_EXT_external_memory_host; existing heaps are not supported)", 0);
             return d3d12_trace::result(method, E_NOTIMPL);
         }
+        if (!host_range_importable(address, size)) return d3d12_trace::result(method, E_INVALIDARG);
         const VkDeviceSize alignment = state_.info.host_pointer_alignment;
         if ((reinterpret_cast<std::uintptr_t>(address) | size) & (alignment - 1)) {
             log_once("OpenExistingHeapFromAddress: range not aligned to minImportedHostPointerAlignment; alignment",

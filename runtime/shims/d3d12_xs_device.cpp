@@ -358,9 +358,20 @@ bool protect_pages(std::uintptr_t first, std::size_t pages, DWORD protect) {
     return true;
 }
 
+// rt::xmem::g_protect_watched: whether [begin, end) overlaps a watched heap (its pages flip between read-only and
+// read-write, so it is never offered to a host import).
+bool overlaps_dirty_watch(std::uintptr_t begin, std::uintptr_t end) {
+    for (const DirtyWatch& w : g_dirty_watches) {
+        const std::uintptr_t b = w.begin.load(std::memory_order_acquire);
+        if (b && begin < w.end.load(std::memory_order_acquire) && b < end) return true;
+    }
+    return false;
+}
+
 // A watch slot for [title, title + bytes) with its pages read-only, or -1 (the heap keeps the whole compare).
 int start_dirty_watch(std::uint8_t* title, std::size_t bytes) {
     if (!title_heap_dirty_enabled() || !bytes) return -1;
+    rt::xmem::g_protect_watched.store(&overlaps_dirty_watch, std::memory_order_release);
     static std::once_flag handler_once;
     static bool handler = false;
     std::call_once(handler_once, [] { handler = AddVectoredExceptionHandler(1, &title_heap_write_fault) != nullptr; });
