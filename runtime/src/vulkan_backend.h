@@ -139,6 +139,7 @@ struct VulkanDeviceFunctions {
     X(vkCmdDrawMeshTasksIndirectEXT) X(vkCmdDrawMeshTasksIndirectCountEXT)                                    \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)                                                              \
+    X(vkCmdBeginQueryIndexedEXT) X(vkCmdEndQueryIndexedEXT) /* optional: VK_EXT_transform_feedback (D3D-302) */  \
     X(vkCmdWriteBufferMarkerAMD) X(vkGetDeviceFaultInfoEXT) /* optional: device-lost diagnostics (LEONIDA_DRED); vkGetPipelineCacheData is above */
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
@@ -174,6 +175,9 @@ struct VulkanDeviceFunctions {
         return vkCmdBeginRendering && vkCmdEndRendering && vkCmdBindVertexBuffers2 && vkCmdSetPrimitiveTopology &&
                vkCmdSetPrimitiveRestartEnable && vkCmdSetViewportWithCount && vkCmdSetScissorWithCount;
     }
+    // VK_EXT_transform_feedback is enabled on the device: the indexed-query entry points are loaded, so an
+    // SO_STATISTICS heap can be a real transform-feedback pool (D3D-302).
+    bool transform_feedback = false;
 };
 
 // Both kinds of compute resolve use the same storage buffer, descriptor set and pipeline layout.
@@ -1199,6 +1203,8 @@ public:
                   GraphicsIndirectCapabilities indirect = {})
         : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
+        // VK_EXT_transform_feedback: enabled on the device when its indexed-query entry points resolved (D3D-302).
+        vk.transform_feedback = vk.vkCmdBeginQueryIndexedEXT && vk.vkCmdEndQueryIndexedEXT;
         if (loaded_ && gpu_labels_.initialize(device, get)) {
             replay_.gpu_label = [this](VkCommandBuffer cb, const label::Write& write) { gpu_labels_.record(cb, write); };
         }
@@ -1234,6 +1240,11 @@ public:
         replay_.reset_query_pool = vk.vkCmdResetQueryPool;
         replay_.begin_query = vk.vkCmdBeginQuery;
         replay_.end_query = vk.vkCmdEndQuery;
+        // VK_EXT_transform_feedback (D3D-302), loaded when the device enabled it: indexed SO_STATISTICS queries.
+        if (vk.transform_feedback) {
+            replay_.begin_query_indexed = vk.vkCmdBeginQueryIndexedEXT;
+            replay_.end_query_indexed = vk.vkCmdEndQueryIndexedEXT;
+        }
         replay_.write_timestamp = vk.vkCmdWriteTimestamp;
         replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
         replay_.bind_pipeline = vk.vkCmdBindPipeline;
@@ -1480,12 +1491,13 @@ public:
     // device-local memory, and must set VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT. LEONIDA_INDIRECT_CLAMP=0 turns the
     // pass off at replay time.
     void enable_indirect_clamp(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceMemoryProperties& memory,
-                               const VkPhysicalDeviceLimits& limits, ScratchBuffers::Allocate allocate) {
+                               const VkPhysicalDeviceLimits& limits, ScratchBuffers::Allocate allocate,
+                               std::vector<std::uint32_t> families = {}) {
         std::unique_lock lock(resource_mutex_);
         replay_.require_indirect_clamp = indirect_clamp_enabled();
         if (!replay_.require_indirect_clamp) return;
         indirect_clamp_ = std::make_unique<IndirectArgumentClamp>(get, device_, memory, limits, std::move(allocate),
-                                                                 device_fault_.get());
+                                                                 device_fault_.get(), std::move(families));
         if (!indirect_clamp_->loaded()) {
             indirect_clamp_.reset();
             return;
@@ -1764,32 +1776,42 @@ public:
     }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
+    // Guarded by pipeline_mutex_ (separate from resource_mutex_) so shader compilation on one queue does not block
+    // resource registration or destruction on the render thread.
     void add_pipeline(std::uintptr_t id, const ComputePipeline& pipeline, const char* shader = nullptr) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         pipelines_[id] = pipeline;
         if (shader && device_fault_) device_fault_->pipeline_names[id] = {shader};
     }
     void remove_pipeline(std::uintptr_t id) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         pipelines_.erase(id);
         graphics_pipelines_.erase(id);
         if (device_fault_) device_fault_->pipeline_names.erase(id);
     }
     void add_graphics_pipeline(std::uintptr_t id, const GraphicsPipeline& pipeline,
                                const CheckpointShaders* shaders = nullptr) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         graphics_pipelines_[id] = pipeline;
         if (shaders && device_fault_) device_fault_->pipeline_names[id] = *shaders;
     }
-    // Workers for the pipelines a submission needs and that are not built yet. Null (the default): each is built where
-    // prepare() meets it, on the submitting thread. Replacing it waits for submissions that are compiling, and ends the
-    // workers it had.
+    // Workers for the pipelines a submission needs and that are not built yet. Null (the default): compiled serially on
+    // the submitting thread once resource_mutex_ is released. Replacing it waits for submissions that are compiling, and
+    // ends the workers it had.
     void set_pipeline_workers(std::unique_ptr<PipelineWorkers> workers) {
-        std::unique_lock lock(resource_mutex_);
+        std::unique_lock lock(pipeline_mutex_);
         pipeline_workers_.swap(workers);
     }
+    // For the large pipelines of a submission: the memory they may use while they compile together
+    // (PipelineCompiles::build), and what is kept while they do (LargeModuleGate::Demand). None (the default): they compile
+    // one after another.
+    void set_large_compiles(std::function<std::uint64_t()> budget, std::function<std::shared_ptr<void>()> demand) {
+        std::unique_lock lock(pipeline_mutex_);
+        large_compile_budget_ = std::move(budget);
+        large_compile_demand_ = std::move(demand);
+    }
     PipelineWorkers::Stats pipeline_worker_stats() {
-        std::shared_lock lock(resource_mutex_);
+        std::shared_lock lock(pipeline_mutex_);
         return pipeline_workers_ ? pipeline_workers_->stats() : PipelineWorkers::Stats{};
     }
     // Configure before queue creation, when the selected queue family supports compute.
@@ -2048,7 +2070,7 @@ public:
         return true;
     }
     const char* diagnostic_compute_name(std::uintptr_t id) {
-        std::shared_lock lock(resource_mutex_);
+        std::shared_lock lock(pipeline_mutex_);
         if (!device_fault_) return nullptr;
         const auto it = device_fault_->pipeline_names.find(id);
         return it == device_fault_->pipeline_names.end() ? nullptr : it->second[0];
@@ -2780,6 +2802,7 @@ private:
     mutable std::mutex queue_records_mutex_;
     std::vector<QueueRecord> queue_records_;
     VkSemaphore lost_submission_ = VK_NULL_HANDLE;  // the queue whose vkQueueSubmit returned VK_ERROR_DEVICE_LOST
+    alignas(64) std::shared_mutex pipeline_mutex_;  // shared for prepare/compile/emit pipeline lookups, unique for add/remove/workers
     alignas(64) std::shared_mutex resource_mutex_;  // shared for prepare lookups, unique for add/remove
     alignas(64) std::mutex tracker_mutex_;
     alignas(64) std::mutex views_mutex_;
@@ -2824,6 +2847,8 @@ private:
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
     std::unique_ptr<PipelineWorkers> pipeline_workers_;
+    std::function<std::uint64_t()> large_compile_budget_;
+    std::function<std::shared_ptr<void>()> large_compile_demand_;
     std::unordered_map<std::uint64_t, VkAccelerationStructureKHR> acceleration_structures_;
     LayoutTracker tracker_;
     std::mutex storage_mutex_;  // a leaf lock: guards storage_pending_ and zero_pending_ only
@@ -3866,7 +3891,7 @@ private:
         static std::unordered_set<std::uintptr_t> given_up;
         std::vector<std::uintptr_t> ids;
         {
-            std::shared_lock lock(context_.resource_mutex_);
+            std::shared_lock lock(context_.pipeline_mutex_);  // the pipeline table's lock (upstream)
             for (const CommandList* list : lists)
                 for (const auto& command : list->commands()) {
                     std::uintptr_t id = 0;
@@ -3915,7 +3940,7 @@ private:
             for (;;) {
                 bool pending = false;
                 {
-                    std::shared_lock lock(context_.resource_mutex_);
+                    std::shared_lock lock(context_.pipeline_mutex_);  // the pipeline table's lock (upstream)
                     const auto it = context_.pipelines_.find(id);
                     pending = it != context_.pipelines_.end() && it->second.pending;
                 }
@@ -4013,10 +4038,14 @@ private:
                     }
                 }
         }
-        // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
-        // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
-        // prepare() only if a list actually converts a depth24_as_float copy, and otherwise right before
-        // bindless_prepare_/emit() through submit() so bindless flushes, layout emits, and submissions stay in order.
+        // Lock hierarchy: state_mutex_ -> pipeline_mutex_ -> resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
+        // Shared pipeline_lock keeps the registered pipelines (add/remove_pipeline take it uniquely) alive through
+        // prepare and recording (upstream's; our pipeline states compile in the background, so it is never held
+        // across a compile here). Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is
+        // acquired lazily during prepare() only if a list actually converts a depth24_as_float copy, and otherwise right
+        // before bindless_prepare_/emit() through submit() so bindless flushes, layout emits, and submissions stay in
+        // order.
+        std::shared_lock pipeline_lock(context_.pipeline_mutex_);
         std::shared_lock resource_lock(context_.resource_mutex_);
         std::unique_lock tracker_lock(context_.tracker_mutex_, std::defer_lock);
         // Declared after tracker_lock so any early return after depth24_->prepare() retires uncommitted scratch/pools
@@ -4428,6 +4457,7 @@ private:
             const bool ended = context_.observe_result(context_.vk.vkEndCommandBuffer(command_buffer),
                                                       "vkEndCommandBuffer") == VK_SUCCESS;
             resource_lock.unlock();
+            pipeline_lock.unlock();
             const bool submitted = ended && submit(command_buffer, VK_NULL_HANDLE, 0);
             if (!submitted) discard();
             if (submitted && uploaded) publish_bindless_upload();
@@ -4621,7 +4651,8 @@ private:
                     std::chrono::duration_cast<std::chrono::milliseconds>(phase_clock::now() - start).count());
             }
         } submit_timer{*this};
-        resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
+        resource_lock.unlock();  // release resource_mutex_ and pipeline_mutex_ before vkQueueSubmit while keeping tracker_lock held
+        pipeline_lock.unlock();
         const bool wait_previous = ordered_timestamps && submitted_;
         if (wait_previous) {
             waits_.push_back(progress_);
@@ -5520,7 +5551,8 @@ private:
     std::vector<PreparedList> prepared_;
     std::uint32_t open_labels_ = 0;  // queue labels begun and not ended
     bool ok_ = false;
-    // Wait-before-Signal. state_mutex_ is outermost (before resource_mutex_ -> tracker_mutex_ -> submit_mutex_) and
+    // Wait-before-Signal. state_mutex_ is outermost (before pipeline_mutex_ -> resource_mutex_ -> tracker_mutex_ ->
+    // submit_mutex_) and
     // guards the members above that execute, signal, wait and marker touch.
     std::mutex state_mutex_;
     std::deque<Deferred> held_;

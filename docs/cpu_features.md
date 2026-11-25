@@ -87,3 +87,21 @@ fallback stay with the emulation.
 
 Switches: `LEONIDA_CPU_PATCH=0` leaves every site to the emulation; `LEONIDA_CPU_SITES=<file>` reads the sites from
 another file than `cpu_sites.txt` beside `gta6rt.exe`.
+### Hosts without AVX
+
+Measured on one host: Intel Xeon X5675 (Westmere, SSE4.2; no AVX, AVX2, FMA, BMI2 or XSAVE), Fedora 44,
+`wine-11.21 (Staging)`, Intel SDE 10.13.1, and a local `gta6rt.exe` build from 2026-11-24.
+
+- **What works without AVX:** building the native Linux runtime and Vulkan test tools (`ctest`), running the Vulkan GPU
+  suite (`scripts/run_gpu_tests.py`), shader translation and asset export (`make_game.py` stages).
+- **Running `gta6rt` directly:** `--init` and `--run` exit 4 at the AVX preflight. With `LEONIDA_SKIP_CPU_CHECK=1`,
+  the preflight is skipped and the guest faults on its first AVX instruction.
+- **Under Intel SDE (`sde64 -hsw`):** without `-chip_check_disable 1`, SDE aborts on `clzero` instead of raising
+  `SIGILL` for `gta6rt`'s handler. With `-chip_check_disable 1`, the guest passes its first AVX instruction and reaches
+  `InitializeApiImplEx2` (offline) after ~110 s, then stops before any window or D3D12 call: SDE traps an `int 3`
+  without `-raise-int3`, and with `-raise-int3` the process terminates with `SIGSEGV` (`LEONIDA_SKIP_INT3=1` with
+  `--trace` did not change this, recording `0` `int3_skipped` events). Adding `-ptr-raise` causes Pin to abort with an
+  internal instrumentation error under Wine's exception handling.
+- **Outcome on this host:** no useful path to boot `gta6rt --run` was found under SDE + Wine.
+
+Not measured: other emulators (such as QEMU TCG with AVX2) or Rosetta 2.

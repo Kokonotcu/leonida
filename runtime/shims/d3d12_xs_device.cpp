@@ -52,6 +52,7 @@
 // WindowPresenter. Other builds of this file (mock and COM tests) keep the refused-slot behaviour.
 #include "xbox_present.h"
 #include "title_window.h"
+#include "title_hud.h"
 #include "package_splash.h"
 #include "startup_trace.h"
 #endif
@@ -1961,6 +1962,7 @@ struct PresentState {
     }
     HWND window = nullptr;  // the runtime's own fallback window, when the title has no window to present in
     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
+    std::unique_ptr<TitleHud> hud;  // LEONIDA_TITLE_HUD: counters in the window's title bar (title_hud.h)
 };
 
 void destroy_present_state(void* present_state) {
@@ -2131,6 +2133,7 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
         std::fprintf(stderr, "[rt] d3d12_xs: frame interval %u us replayed (0x%08lx), origin event (0x%08lx)\n",
                      interval, static_cast<unsigned long>(set), static_cast<unsigned long>(armed));
     }
+    if (TitleHud::enabled()) state->hud = std::make_unique<TitleHud>(target);
     if (splash_only) device->present_state = pending.release();
     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p: %s, client area %ldx%ld)\n",
                  static_cast<void*>(target),
@@ -2151,10 +2154,11 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
     if (std::uint64_t ours = 0; present_through_sink(self, plane_count, planes, params, ours)) return ours;
     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
-    return hr_to_u64(state->xbox->PresentX(
-        static_cast<UINT>(plane_count),
-        reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
-        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params)));
+    const HRESULT result = state->xbox->PresentX(
+        static_cast<UINT>(plane_count), reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
+        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params));
+    if (SUCCEEDED(result) && state->hud) state->hud->note_present();
+    return hr_to_u64(result);
 }
 
 #else  // !LEONIDA_VULKAN_DEVICE: this translation unit stands alone (mock and COM tests)

@@ -337,16 +337,17 @@ What is implemented (all of it testable without the game):
 - **UAV clears** (`ClearUnorderedAccessViewUint` / `ClearUnorderedAccessViewFloat`). The CPU handle's slot is read
   while recording as the GFX10 descriptor a shader would load (section 3.4), so the clear works with any
   view-creation code that writes them and with descriptors the game builds itself; the GPU handle is not needed.
-  A T# gives the view's format (FORMAT plus DST_SEL, which tells BGRA from RGBA), mip and layers; a 3D view clears
-  every slice of its mip. A V# gives a byte range: its address minus the resource's `GetGPUVirtualAddress`, and
+  A T# gives the view's format (FORMAT plus DST_SEL, which tells BGRA from RGBA), mip and layers. A tagged 3D
+  UAV selects `FirstWSlice` and `WSize`. An untagged 3D T# covers every slice of the bound resource's selected
+  mip. A V# gives a byte range: its address minus the resource's `GetGPUVirtualAddress`, and
   NUM_RECORDS bytes (stride 0, no format: raw), records (a stride: structured) or elements (a format: typed). A view
   that reaches past the end of the buffer stops there, as the hardware's bounds check would.
   - Values follow D3D's rules (`runtime/src/uav_clear.h`): Uint copies the low bits of each value into its channel
     with no conversion, whatever the format's type; Float converts (UNORM/SNORM clamp and round to nearest, NaN is
-    0; 16-bit and the packed 11/10-bit floats round to nearest even). A raw or structured view takes value 0 for
-    every 32-bit word (Float: its bits). D3D11 calls Float on an integer view invalid and D3D12 does not say; here
-    the value is converted (toward zero, clamped, NaN 0) so the result is defined. These are checked against
-    hand-computed elements in `d3d12_uav_clear_test`.
+    0; 16-bit and the packed 11/10-bit floats round toward zero, a finite value too large becoming the largest
+    finite). A raw or structured view takes value 0 for every 32-bit word (Float: its bits). D3D11 calls Float on an
+    integer view invalid and D3D12 does not say; here the value is converted (toward zero, clamped, NaN 0) so the
+    result is defined. These are checked against hand-computed elements in `d3d12_uav_clear_test`.
   - Buffers: elements of up to 4 bytes repeat in every aligned word, so `vkCmdFillBuffer` writes the aligned middle
     and `vkCmdCopyBuffer` copies the unaligned ends from it (an 8-bit view at an odd offset, say). 8- and 16-byte
     elements are written with `vkCmdUpdateBuffer` (up to 64 KiB) and doubled with copies. A rectangle is an
@@ -366,16 +367,18 @@ What is implemented (all of it testable without the game):
   - Textures: the values become one element of the view's format, and that element is cleared into the image as
     the value that decodes it in the image's own format, so a typeless texture viewed as UINT gets exactly the bits
     asked for. Exact for every typed-UAV format except the SNORM pattern `0x80..` (Vulkan writes -1.0 as `0x81..`)
-    and NaN payloads. A whole view is `vkCmdClearColorImage`; rectangles are `vkCmdClearAttachments` in a
-    dynamic-rendering scope, so a texture created with `ALLOW_UNORDERED_ACCESS` also gets `COLOR_ATTACHMENT` usage
-    when its format supports it. Both run in place in `GENERAL`, the UAV layout. Rectangle clears of volumes, or of
-    formats without attachment support, are refused as `unsupported`.
+    and NaN payloads on the Vulkan color-clear paths. A whole, matching-format 3D mip uses `vkCmdClearColorImage`.
+    Direct lists can use `vkCmdClearAttachments` for rectangles on attachment-capable 1D/2D images.
+    Unpredicated partial 3D W ranges (`FirstWSlice`/`WSize`) and 3D XY rectangles use the same transfer path
+    on direct and compute lists. It encodes the clear value in the view format, fills up to 64 KiB of scratch,
+    and copies tiles one Z slice at a time in `GENERAL`. This requires matching view and backing formats, with
+    the existing exception for emulated `R9G9B9E5` on `R32_UINT`.
   - The clear is fenced as the UAV state widened to transfers, so a following UAV barrier, transition, or enhanced
     barrier from `SYNC_CLEAR_UNORDERED_ACCESS_VIEW` sees it.
-  - Under `SetPredication`, a whole-view texture clear runs as one rectangle through the attachment path, as
-    render-target clears do, so conditional rendering applies. Buffer clears, and texture clears that cannot use an
-    attachment, are transfers that conditional rendering does not cover; they run unconditionally and are counted
-    with the copies (`unpredicated_copies`).
+  - Under `SetPredication`, a direct list clears an attachment-capable 1D/2D UAV through its attachment view.
+    A whole view becomes one rectangle so conditional rendering applies. Buffer clears and the direct-list
+    whole-mip transfer fallback run unconditionally and count toward `unpredicated_copies`. Direct and compute
+    lists refuse predicated partial-W or rectangular 3D clears before submission.
 - **Layout tracking** (`LayoutTracker`): the current Vulkan layout of every image subresource, so barriers start
   from the real layout instead of the application's `before`. This is how implicit promotion and decay work: a
   texture in `COMMON` sits in `GENERAL`, which every promotable access can use, so a later barrier naming the
@@ -2027,8 +2030,8 @@ The layer's descriptor model:
   The emulated RGB9E5 raw `R32_UINT` storage view is formatted and is exempt. Vulkan 1.3 permits these SPIR-V
   capabilities even without the legacy `shaderStorageImage{Read,Write}WithoutFormat` feature bits. The
   caller-owned device test leaves both legacy bits off and masks each per-format bit to verify safe rejection.
-  `ClearUnorderedAccessView*` refuses partial W ranges and 1D/3D format reinterprets: the transfer clear
-  cannot target a slice interval or guarantee preserving the reinterpreted bits.
+  `ClearUnorderedAccessView*` reads the W range from these descriptor bytes even after a descriptor copy.
+  General 1D/3D backing-format reinterpretation remains unsupported.
   Shader access to the new UAVs requires `robustImageAccess` (whole-mip CPU clears do not).
   A separate native D3D12 probe on the RTX 4090 and UHD 770 clipped typed writes to the view's W range.
   WARP 10.0.26100.9818 rebased the view but did not clip writes past a finite `WSize` in that probe. The
@@ -2505,7 +2508,12 @@ Pipeline creation:
   creation counter on an injected clock, and the worker on short intervals (no GPU).
   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
   bindings and the standard 144-byte push-constant range.
-  The runtime writes its own `pipeline_cache.session.bin` on device teardown. A compatible session file
+  The runtime writes its own `pipeline_cache.session.bin` on device teardown, and, since a title never releases its
+  device, when `gta6rt` ends with the device alive: at the run's exit, at a console close and from an
+  unhandled-exception filter (a fault in the title or its DLLs, the int3 after a device loss). The title's own
+  `SetUnhandledExceptionFilter` is served by the runtime, which keeps its filter first and passes the exception on.
+  That exit write (`save_pipeline_caches_at_exit`, `shims/d3d12_compile_exit.h`) waits 1 s for a build still running
+  on a title thread, then writes the pipelines finished so far, with 3 s for the write itself. A compatible session file
   initializes the live cache directly if there is no offline seed. With both files present the session cache
   merges into the offline seed. `LEONIDA_DIRECT_SESSION_CACHE=0` also uses a merge when only the session exists.
   The files must match the Vulkan vendor, device and pipeline-cache UUID. Vulkan supplies an opaque snapshot.
@@ -2567,9 +2575,7 @@ Pipeline creation:
   is when each is compiled alone, so a PSO released meanwhile waits for the submission. The workers have ended before
   the session cache is read at device teardown. `LEONIDA_PIPELINE_THREADS=<n>` sets the workers: unset, half the
   logical processors and at most 8; `0` compiles each pipeline on the submitting thread where `prepare()` meets it.
-  Graphics pipelines of 1 MiB of SPIR-V or more, and compute pipelines over 128 KiB (`LEONIDA_SERIAL_BIG_COMPILES`),
-  are compiled one after another beside the smaller ones, because a compile takes the driver some hundred bytes of
-  memory for each byte of SPIR-V ([pipeline_check.md](pipeline_check.md)); so are the variants of one PSO.
+  Large pipelines (below) are compiled within a memory budget, and the variants of one PSO one after another.
   `LEONIDA_ASYNC_PIPELINES=1` is not changed: its builds stay on the compile worker. Measured with synthetic programs
   never compiled before and the warm-up off (RTX 3080, NVIDIA 621.24, Windows 11, 16 logical processors, 8 workers,
   three runs each): the first submission of 192 graphics pipelines takes 126 to 143 ms instead of 861 to 882, of 192
@@ -2577,6 +2583,29 @@ Pipeline creation:
   holds about 50 MiB more (the driver keeps memory for each thread that compiles). One `VkPipelineCache` is enough: one
   cache per thread, merged, was about as fast. Tested by `pipeline_workers`, `replay_pipeline_compiles` and
   `d3d12_pipeline_workers`.
+- Large pipelines: a compile takes the driver some hundred bytes of memory for each byte of SPIR-V
+  ([pipeline_check.md](pipeline_check.md), "Limiting concurrent compilation of large modules"), so compute modules over
+  128 KiB and graphics pipelines of 1 MiB or more compile side by side only while their estimates (512 bytes for each
+  byte of SPIR-V) fit a budget: three quarters of the smaller of the free RAM and the room under the commit limit, read
+  again whenever a place at the gate (`runtime/src/large_module_gate.h`, one for the process) is given or returned. One
+  always gets in when none is, so a pipeline larger than the budget compiles alone. An estimate counts in full until
+  the compile ends, although the driver has taken part of it by then. They get in in the order they came; while the
+  first in line does not fit, the next behind it that does may pass, as long as all that have passed it would fit the
+  budget together with it, so that a stream of small ones does not keep it out. The ones a submission waits for (and
+  those of `LEONIDA_ASYNC_PIPELINES`) go before the warm-up's, which take a quarter of the budget at most and none while
+  a submission that has large ones is compiling on its workers. A thread that waits for its place holds no PSO's lock,
+  and one that has a place waits for none. `PipelineCompiles::build` gives a submission
+  as many jobs for large ones as its smallest could be in at once, largest first; where the next one does not fit, the
+  job compiles small ones in the meantime. `LEONIDA_SERIAL_BIG_COMPILES=1` compiles them one after another instead, as
+  before there was a budget, `=0` has no limit, `LEONIDA_BIG_COMPILE_BUDGET_MB` fixes the budget. Measured with
+  synthetic integer modules never compiled before and the warm-up off (RTX 3080, NVIDIA 621.24, Ryzen 7 5800X3D, 8
+  workers and the submitting thread, three alternating runs each): the first submission of 16 modules of 256 KiB takes
+  0.8 s instead of 4.0 to 4.8 s, 16 of 512 KiB 2.0 to 2.2 s instead of 10.2 to 11.4, 15 of 1 MiB 5.8 to 6.1 s instead
+  of 29.2 to 31.2, 12 of 0.5 to 2 MiB 8.0 to 10.5 s instead of 38.9 to 39.9. While the 15 of 1 MiB compile, private
+  memory peaks 656 to 676 MiB over what it was, instead of 140 to 147 (one compile takes 85 to 131 bytes for each byte
+  of SPIR-V here, and the driver keeps memory for each thread that compiles). With a budget of 1536 MiB, two at once,
+  they take 18.5 s and peak 202 MiB over. Not measured: other drivers, and the title. Tested by `big_compile_gate`,
+  `replay_pipeline_compiles` and `d3d12_big_compute`.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
@@ -3978,15 +4007,20 @@ Implemented (`QueryHeap` in `runtime/shims/d3d12_vulkan_device.cpp`, the query c
   (`compare_invalid_arguments`, "query heap:", RTX 5070 / 621.14): `E_INVALIDARG` for no queries, a node other than
   node 0, or a type past `PIPELINE_STATISTICS1` (7), checked before the output; a valid description with a null
   output is then `E_UNEXPECTED`, not `S_FALSE`.
-- **Stream-output statistics** (D3D-302). The layer has no stream output: a graphics PSO with `StreamOutput`
-  entries is refused and `SOSetTargets` is not implemented, so no primitive reaches a stream and every
-  `SO_STATISTICS_STREAM0..3` query counts 0 written and 0 needed. An `SO_STATISTICS` heap is therefore made without
-  a `VkQueryPool`: `BeginQuery`/`EndQuery` record nothing in Vulkan (D3D12's call rules are still kept, and the
+- **Stream-output statistics** (D3D-302). The layer still refuses `StreamOutput` PSOs and does not implement
+  `SOSetTargets`, so no primitive reaches a stream yet. With `VK_EXT_transform_feedback` enabled on the device
+  (`D3D-TRANSFORM-FEEDBACK-DEVICE`) and its `transformFeedbackQueries` property set, an `SO_STATISTICS` heap is a
+  real `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` pool begun and ended indexed on the stream
+  (`vkCmdBeginQueryIndexedEXT` / `vkCmdEndQueryIndexedEXT`), and `ResolveQueryData` copies the two 64-bit results per
+  query (16 bytes: `NumPrimitivesWritten`, `PrimitivesStorageNeeded`), in the same order; with no stream output they
+  are 0. A stream at or above the device's `maxTransformFeedbackStreams` runs nothing and resolves zero, as if the
+  heap had no pool. Without the feature, the property, or a nonzero `maxTransformFeedbackStreams`, the heap is made
+  without a `VkQueryPool`: `BeginQuery`/`EndQuery` run nothing in Vulkan (D3D12's call rules are still kept, and the
   heap's queries track ended or not as the others do), they overlap no other query, and `ResolveQueryData` writes
-  zeros (`vkCmdFillBuffer`, 16 bytes per query: `NumPrimitivesWritten`, `PrimitivesStorageNeeded`), with no
-  statistics split since nothing is dispatched. When stream output lands, the heap becomes a
-  `VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT` pool begun with `vkCmdBeginQueryIndexedEXT` on the stream, whose two
-  results are in the same order.
+  zeros (`vkCmdFillBuffer`, 16 bytes per query), with no statistics split since nothing is dispatched. Two
+  overlapping `SO_STATISTICS` queries on one stream would be two active indexed queries in one pool
+  (`VUID-vkCmdBeginQueryIndexedEXT-queryPool-04753`), so `prepare()` refuses such a list
+  (`ReplayResult::invalid_query`); queries on different streams are fine.
 - **Recording.** The list keeps D3D12's rules for the calls: timestamps only have `EndQuery`; every other query is
   begun and ended in the same list with the same type, is not begun again while it runs, and is not resolved while
   it runs; resolve offsets are multiples of 8. A list closed with a query still running reports `E_INVALIDARG` and
