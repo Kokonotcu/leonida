@@ -900,6 +900,9 @@ struct GraphicsPipeline {
     // makes no progress for ~30 s; boot 67 died so).
     std::function<bool()> ready;
     std::function<void()> request;
+    // The same for the other configurations (variant's `unbound`): false when it is not built yet, in which case the
+    // call has queued its build and the draw is left out. Null: variant() builds inline.
+    std::function<bool(std::uint32_t unbound)> variant_ready;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
     // Shader objects instead of `pipeline` (LEONIDA_SHADER_OBJECTS=1, docs/aot_pipelines.md): binds the PSO's
     // shaders and sets every state the pipeline would have baked in, the viewport and scissor (with count), and the
@@ -1237,6 +1240,7 @@ struct PreparedDraw {
     // lock across both), so it is not copied.
     const GraphicsPipeline* graphics = nullptr;
     VkPipeline pipeline = VK_NULL_HANDLE;  // graphics->pipeline, or its variant for the slots the draw leaves unbound
+    bool variant_pending = false;  // the variant is still being built (GraphicsPipeline::variant_ready): left out
     std::vector<Attachment> colors;  // by slot; id 0 = unbound
     Attachment depth;
     std::vector<VkBuffer> vertex_buffers;
@@ -1255,6 +1259,7 @@ struct PreparedDraw {
     void reset() {
         graphics = nullptr;
         pipeline = VK_NULL_HANDLE;
+        variant_pending = false;
         colors.clear();
         depth = {};
         vertex_buffers.clear();
@@ -2651,6 +2656,10 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         unbound |= GraphicsPipeline::rect_list;
     // Shader objects bake no attachment formats: an unbound slot is just an attachment without a view.
     if ((unbound || pipeline->deferred) && !pipeline->bind_shaders) {
+        if (pipeline->variant_ready && !pipeline->variant_ready(unbound)) {
+            p.variant_pending = true;  // built in the background; the caller leaves this draw out
+            return ReplayResult::success;
+        }
         p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
         if (!p.pipeline) return ReplayResult::unsupported;
     } else if (pipeline->upgrade) {
@@ -3779,6 +3788,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 p.draw = std::uint32_t(out.draw_count++);
                 if (const auto r = detail::prepare_draw(*ind->state, resolve, vk, prepared_draw); r != ReplayResult::success)
                     return r;
+                if (prepared_draw.variant_pending) {  // its configuration is built in the background: left out
+                    --out.draw_count;
+                    p.skip = true;
+                    continue;
+                }
             }
             // Root arguments and views per record: generated commands (vulkan_indirect.h) where the device has them
             // and can run this call, on the pipeline or the shader objects in effect. Otherwise the draw or dispatch
@@ -3937,6 +3951,13 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 r != ReplayResult::success) {
                 detail::count_draw(detail::DrawOutcome::failed, int(r));
                 return r;
+            }
+            if (prepared_draw.variant_pending) {
+                // Its pipeline configuration is being built in the background: left out, as a pending base one is.
+                --out.draw_count;
+                p.skip = true;
+                detail::count_draw(detail::DrawOutcome::stub);
+                continue;
             }
             detail::count_draw(detail::DrawOutcome::prepared);
             if (const GraphicsPipeline* named = vk.graphics_pipeline ? vk.graphics_pipeline(draw->pipeline) : nullptr;

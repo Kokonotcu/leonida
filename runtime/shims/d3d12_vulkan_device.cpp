@@ -6253,6 +6253,10 @@ public:
                         Release();
                     });
                 };
+                // The other configurations (slots a draw leaves unbound, rect lists) the same way: built inline they
+                // held the submitting thread in NVIDIA's compiler, with its queue's lock, past the title's 30 s
+                // watchdog (an uncached pipeline in the first loading screen).
+                graphics_.variant_ready = [this](std::uint32_t unbound) { return variant_ready_or_request(unbound); };
             }
         }
 
@@ -6774,6 +6778,23 @@ private:
         };
     }
 
+    // Whether the configuration for `unbound` exists; when not, its build is queued on the compile workers (once) and
+    // the caller leaves the draw out. Never waits: a build in progress holds variants_mutex_, which reads as not ready.
+    bool variant_ready_or_request(std::uint32_t unbound) {
+        {
+            std::unique_lock lock(variants_mutex_, std::try_to_lock);
+            if (!lock.owns_lock()) return false;
+            if (variants_.count(unbound)) return true;
+            if (!variants_requested_.insert(unbound).second) return false;
+        }
+        AddRef();
+        device_.compile_enqueue([this, unbound] {
+            variant(unbound);
+            Release();
+        });
+        return false;
+    }
+
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
     VkPipeline variant(std::uint32_t unbound) {
         std::lock_guard lock(variants_mutex_);
@@ -6800,6 +6821,7 @@ private:
     bool layout_bindless_ = false;
     std::mutex variants_mutex_;
     std::map<std::uint32_t, VkPipeline> variants_;
+    std::set<std::uint32_t> variants_requested_;  // queued by variant_ready_or_request (under variants_mutex_)
     std::atomic<bool> base_built_{false};      // variant 0 exists (GraphicsPipeline::ready)
     std::atomic<bool> base_requested_{false};  // its background build was asked for (GraphicsPipeline::request)
     std::uint32_t vs_outputs_ = 0;              // the VS's output locations: the rect-list geometry shader's size
@@ -12121,21 +12143,34 @@ HRESULT create_stub_pipeline_state(ID3D12Device* device, REFIID riid, void** out
     return d->create_stub_pipeline(riid, out);
 }
 
-// copy_from_title with the title's pages read under a guard, as the hashes are (guarded_title_hash): the title may
-// unmap a page between the readability check and the copy (retail 1.0.2.1, an access violation in the copy's pack).
-// False when the copy failed or faulted; a faulted copy's staging memory is not released (rare).
-bool guarded_copy_from_title(Resource* resource, const std::uint8_t* title, const rt::xg::ResourceLayout& layout,
-                             const leonida::xg_console::Layout* console) {
+// The title's bytes copied under a guard (the title may unmap a page between the readability check and the read).
+// No lock and no C++ object lives inside the __try: an access violation caught by __except skips destructors (/EHsc).
+bool guarded_title_read(std::uint8_t* out, const std::uint8_t* title, std::size_t bytes) {
     __try {
         ::leonida_quiet_av = 1;
-        const bool copied =
-            console ? resource->copy_from_console(title, *console) : resource->copy_from_title(title, layout);
+        std::memcpy(out, title, bytes);
         ::leonida_quiet_av = 0;
-        return copied;
+        return true;
     } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
         ::leonida_quiet_av = 0;
         return false;
     }
+}
+
+// copy_from_title / copy_from_console from a private copy of the title's bytes. They used to read the title's pages
+// themselves inside the guard, in the middle of cpu_copy and the locks it holds: a page the title unmapped there
+// faulted, the __except left those locks held for good, and the next submission blocked on them holding its queue's
+// lock, with the title's five loading-screen render workers behind it (its watchdog then ended the run).
+bool guarded_copy_from_title(Resource* resource, const std::uint8_t* title, const rt::xg::ResourceLayout& layout,
+                             const leonida::xg_console::Layout* console) {
+    const std::size_t bytes = console ? static_cast<std::size_t>(console->size)
+                                      : static_cast<std::size_t>(layout.size_bytes);
+    // A plain local buffer, not a thread_local one: a thread_local with a destructor gives gta6rt.exe a TLS callback,
+    // and the title's threads then hung at their start under the runtime's own loader (0.8 s into the boot).
+    if (!bytes) return false;
+    std::vector<std::uint8_t> copy(bytes);
+    if (!guarded_title_read(copy.data(), title, bytes)) return false;
+    return console ? resource->copy_from_console(copy.data(), *console) : resource->copy_from_title(copy.data(), layout);
 }
 
 void sync_title_textures() {

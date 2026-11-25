@@ -2880,11 +2880,9 @@ private:
     }
 
     // Before the lists are prepared: every compute pipeline their dispatches use that is still being compiled
-    // (LEONIDA_ASYNC_PSO, LEONIDA_LAZY_COMPUTE) is started and waited for, up to 8 s each, instead of its dispatches
-    // being left out. A left-out dispatch is not a missing frame but missing work: the retail title's GPU heap
-    // (CS_DefragHeap_*) then walked metadata an earlier dispatch never wrote, looped on the GPU without end, and the
-    // title's 30 s watchdog ended the run. A pipeline that is still not ready after its wait is not waited for again
-    // (its dispatches are left out, as before). LEONIDA_COMPUTE_WAIT=0: no waiting.
+    // (LEONIDA_ASYNC_PSO, LEONIDA_LAZY_COMPUTE) is started and waited for, within the budget below, instead of its
+    // dispatches being left out at once: a left-out dispatch is missing work, not a missing frame. A pipeline still
+    // not ready when the budget runs out has its dispatches left out, as before. LEONIDA_COMPUTE_WAIT=0: no waiting.
     void wait_for_pending_compute(std::span<const CommandList* const> lists) {
         static const bool enabled = [] {
             const char* v = std::getenv("LEONIDA_COMPUTE_WAIT");
@@ -2916,8 +2914,28 @@ private:
                 }
         }
         if (ids.empty()) return;
-        const auto start = std::chrono::steady_clock::now();
-        const auto deadline = start + std::chrono::seconds(8);  // for the whole submission: stub PSOs never finish
+        // A budget, not a promise: waits that add up hold the title's render threads, and a loading-screen frame that
+        // took over 30 s ended the run in the title's watchdog (uncached wave64-emulated compiles after the corpus was
+        // re-translated: 23 s of waits in 15 s). Each submission waits at most 1 s, and all of them together at most
+        // 4 s in any 15 s window; past that a dispatch is left out (its compile goes on, and the pipeline cache
+        // checkpoint keeps it for the next run).
+        using clock = std::chrono::steady_clock;
+        static std::mutex budget_mutex;
+        static clock::time_point window_start{};
+        static clock::duration window_spent{};
+        const auto start = clock::now();
+        clock::duration allowed{};
+        {
+            std::lock_guard g(budget_mutex);
+            if (start - window_start > std::chrono::seconds(15)) {
+                window_start = start;
+                window_spent = {};
+            }
+            const clock::duration left = std::chrono::seconds(4) - window_spent;
+            allowed = std::min<clock::duration>(std::chrono::seconds(1), left > clock::duration{} ? left : clock::duration{});
+        }
+        const auto deadline = start + allowed;
+        std::size_t left_out = 0;
         for (const std::uintptr_t id : ids) {
             for (;;) {
                 bool pending = false;
@@ -2927,21 +2945,23 @@ private:
                     pending = it != context_.pipelines_.end() && it->second.pending;
                 }
                 if (!pending) break;
-                if (std::chrono::steady_clock::now() > deadline) {
-                    std::lock_guard g(given_up_mutex);
-                    given_up.insert(id);
-                    std::fprintf(stderr, "[rt] compute wait: a pipeline is still compiling after 8 s; its dispatches "
-                                         "are left out\n");
+                if (clock::now() >= deadline) {
+                    ++left_out;
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
         }
+        const clock::duration spent = clock::now() - start;
+        {
+            std::lock_guard g(budget_mutex);
+            window_spent += spent;
+        }
         static std::atomic<int> told{0};
-        const double ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        if (told.fetch_add(1, std::memory_order_relaxed) < 16 || ms > 1000)
-            std::fprintf(stderr, "[rt] compute wait: %zu compiling pipeline(s) waited for, %.0f ms\n", ids.size(), ms);
+        const double ms = std::chrono::duration<double, std::milli>(spent).count();
+        if (told.fetch_add(1, std::memory_order_relaxed) < 16 || ms > 500)
+            std::fprintf(stderr, "[rt] compute wait: %zu compiling pipeline(s), %.0f ms, %zu still compiling (left out)\n",
+                         ids.size(), ms, left_out);
     }
 
     ReplayResult execute_lists(std::span<const CommandList* const> lists, std::span<const CommandList* const> identity,

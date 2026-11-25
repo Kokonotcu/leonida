@@ -44,12 +44,26 @@ inline std::uint64_t override_mb() {
     return mb;
 }
 
+// An Xbox Series S title gets less: 8 GiB (ASSUMPTION: the documented ~8 GB a Series S game may use of its 10 GB).
+// With LEONIDA_DEVICE_TYPE=6 (Series S) the title is told that, so it sizes its pools as on that console; told
+// 13.5 GiB it committed ~13.7 GiB of pools on top of the GPU copies of its textures and ran a 32 GB PC out of memory
+// in the first loading screen.
+inline constexpr std::uint64_t kSeriesSTitleBudget = 8 * kGiB;
+
+inline bool series_s() {
+    char value[8] = {};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_DEVICE_TYPE", value, sizeof(value));
+    return n == 1 && value[0] == '6';
+}
+
 // What the title is told, computed once per process (the answer must not change under the title).
 inline std::uint64_t limit() {
     static const std::uint64_t value = [] {
         MEMORYSTATUSEX ms{sizeof(ms)};
         const std::uint64_t physical = GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys : 0;
-        return budget_for(physical, override_mb());
+        const std::uint64_t mb = override_mb();
+        const std::uint64_t budget = budget_for(physical, mb);
+        return !mb && series_s() && budget > kSeriesSTitleBudget ? kSeriesSTitleBudget : budget;
     }();
     return value;
 }
