@@ -1566,7 +1566,7 @@ class Gen:
     def modify_f(self, f, a):
         return self.tof(self.modify(self.tou(f), a))
 
-    def host_addr(self, xbox_va):
+    def host_addr(self, xbox_va, bases=None):
         """Xbox GPU virtual address (ulong id) -> host buffer device address. A VA below 4 GiB is an offset in the
         runtime's GPU address arena: heap base (push constant dwords 32..33) + VA. The base is %heap_base, built
         once in the entry block (HEAP_BASE_ENTRY): it was six instructions at every access.
@@ -1576,7 +1576,9 @@ class Gen:
         of GTA6-BootTest's gpumem.h, with device addresses as entries): dir[(va >> 32) & 0xffff] is a 1-based chunk
         number, chunk[(va >> 16) & 0xffff] the device address of that 64 KiB page. An address with no entry reads
         and writes a scratch page instead of faulting (a wild pointer hangs an NVIDIA queue for good).
-        Branch-free: both table loads always run (the table is small and stays cached)."""
+        Branch-free: both table loads always run (the table is small and stays cached).
+        `bases`: the (directory, chunks, scratch) addresses an earlier call that dominates this one left in
+        self.host_bases, so a second translation for the same access (page_span) does not build them again."""
         self.uses_heap = True
         self.cu(1), self.cu(2)        # member indices of the push-constant block, declared before assembly
         direct = self.tmp()
@@ -1584,6 +1586,15 @@ class Gen:
         if not PAGE_TABLE:
             return direct
         t = self.tmp
+        made = []
+
+        def base(k, off):
+            """heap_base + off: bases[k] when given, else built here (where it always was: same ids as before)."""
+            if bases is not None:
+                made.append(bases[k])
+            else:
+                made.append(add("%heap_base", self.cl(off)))
+            return made[-1]
 
         def load_u32(addr):
             p, v = t(), t()
@@ -1603,7 +1614,7 @@ class Gen:
         self.emit(f"{idx} = OpBitwiseAnd %uint {hi32} {self.cu(0xFFFF)}")
         self.emit(f"{idx64} = OpUConvert %ulong {idx}")
         self.emit(f"{doff} = OpShiftLeftLogical %ulong {idx64} {self.cl(2)}")
-        raw = load_u32(add(add("%heap_base", self.cl(PAGE_TABLE_DIR)), doff))
+        raw = load_u32(add(base(0, PAGE_TABLE_DIR), doff))
         # dir[0] (VAs below 4 GiB) names a chunk only with PAGE_TABLE_LOW_TAG in its high half (note_low_va): any
         # other word there (an older runtime's 0, a test's fill pattern) keeps the direct heap_base + VA.
         tag, tagged, low_slot, slot = t(), t(), t(), t()
@@ -1622,7 +1633,7 @@ class Gen:
         self.emit(f"{page} = OpShiftRightLogical %ulong {xbox_va} {self.cl(16)}")
         self.emit(f"{page_idx} = OpBitwiseAnd %ulong {page} {self.cl(0xFFFF)}")
         self.emit(f"{poff} = OpShiftLeftLogical %ulong {page_idx} {self.cl(3)}")
-        eaddr = add(add(add("%heap_base", self.cl(PAGE_TABLE_DIR + PAGE_TABLE_DIR_BYTES)), coff), poff)
+        eaddr = add(add(base(1, PAGE_TABLE_DIR + PAGE_TABLE_DIR_BYTES), coff), poff)
         lo, hi_word = load_u32(eaddr), load_u32(add(eaddr, self.cl(4)))
         lo64, hi64, hish, entry, mapped_ok, ok, low, mapped, r = (t() for _ in range(9))
         self.emit(f"{lo64} = OpUConvert %ulong {lo}")
@@ -1633,7 +1644,8 @@ class Gen:
         self.emit(f"{ok} = OpLogicalAnd %bool {has} {mapped_ok}")
         self.emit(f"{low} = OpBitwiseAnd %ulong {xbox_va} {self.cl(0xFFFF)}")
         paged = add(entry, low)
-        null = add(add("%heap_base", self.cl(PAGE_TABLE_SCRATCH)), low)
+        null = add(base(2, PAGE_TABLE_SCRATCH), low)
+        self.host_bases = tuple(made)
         self.emit(f"{mapped} = OpSelect %ulong {ok} {paged} {null}")
         # Below 4 GiB the directory load read dir[0], which no title VA uses. The runtime gives it a chunk whose
         # entries are the VAs below 4 GiB shaders may address (the arena and the buffers outside it, identity
@@ -1646,6 +1658,70 @@ class Gen:
         self.emit(f"{use_direct} = OpLogicalAnd %bool {arena} {nohas}")
         self.emit(f"{r} = OpSelect %ulong {use_direct} {direct} {mapped}")
         return r
+
+    def page_span(self, va, bases):
+        """For an access of more than one dword whose first byte is at Xbox VA `va` (a ulong id): what span_dword_ptr
+        needs to translate each later dword, or None without the page table.
+
+        host_addr translates one 64 KiB page. Adding k * 4 to the first dword's host address is right only while the
+        access stays in that page: the title maps its physical pages scattered, so the next VA page is usually not the
+        next host page, and a dword past the boundary read garbage or, stored, overwrote unrelated memory. An access
+        of at most 16 bytes (or, swizzled, 3 * 256 + 4) crosses at most one boundary, so the next page's translation is
+        enough: (low, hb1) with low = va & 0xffff (uint) and hb1 = host_addr(next page) + low - 0x10000, the host
+        address the first byte would have if its page were mapped where the next one is. A dword `off` bytes on uses
+        hb1 + off when low + off reaches 0x10000, else host + off (span_dword_ptr). Below 4 GiB the same holds: the
+        arena's identity entries are contiguous, so hb1 is host there, and the direct path (no dir[0] chunk) gives
+        heap_base + va for both. Costs a second table walk (its directory word is the first one's, cached).
+        `bases`: self.host_bases after the host_addr(va) this one goes with (it must dominate this code)."""
+        if not PAGE_TABLE:
+            return None
+        t = self.tmp
+        nx, nxt = t(), t()
+        self.emit(f"{nx} = OpBitwiseOr %ulong {va} {self.cl(0xFFFF)}")
+        self.emit(f"{nxt} = OpIAdd %ulong {nx} {self.cl(1)}")
+        host1 = self.host_addr(nxt, bases)
+        lo32, low, low64, h1l, hb1 = (t() for _ in range(5))
+        self.emit(f"{lo32} = OpUConvert %uint {va}")
+        self.emit(f"{low} = OpBitwiseAnd %uint {lo32} {self.cu(0xFFFF)}")
+        self.emit(f"{low64} = OpUConvert %ulong {low}")
+        self.emit(f"{h1l} = OpIAdd %ulong {host1} {low64}")
+        self.emit(f"{hb1} = OpISub %ulong {h1l} {self.cl(0x10000)}")
+        return low, hb1
+
+    def host_span(self, va, multi=True):
+        """(host_addr(va), page_span(va) when `multi`, else None): the translation of an access's first byte and, for
+        one of more than one dword, of the page after it."""
+        host = self.host_addr(va)
+        return host, (self.page_span(va, self.host_bases) if multi else None)
+
+    def span_dword_ptr(self, host, span, off, ok=None):
+        """%_ptr_PSB_uint to the dword `off` bytes (a Python int above 0, or a uint id) after the first byte of an
+        access, `host` its first byte's host address and `span` page_span's: hb1 + off past the 64 KiB boundary, host +
+        off before it. With `ok` (a bool id) false, the first dword instead (callers whose dword is out of range read
+        an in-range one and drop it). The pointer is an element of a PSB array converted from that address, as
+        every other title-memory access here (global_byte_ptr): MoltenVK read a load through a %_ptr_PSB_uint
+        converted directly as 0 (buf_dword_ptr, #1864)."""
+        low, hb1 = span
+        t = self.tmp
+        cross, base, h = t(), t(), t()
+        if isinstance(off, int):
+            self.emit(f"{cross} = OpUGreaterThanEqual %bool {low} {self.cu(0x10000 - off)}")
+            off64 = self.cl(off)
+        else:
+            s, off64 = t(), t()
+            self.emit(f"{s} = OpIAdd %uint {low} {off}")
+            self.emit(f"{cross} = OpUGreaterThanEqual %bool {s} {self.cu(0x10000)}")
+            self.emit(f"{off64} = OpUConvert %ulong {off}")
+        self.emit(f"{base} = OpSelect %ulong {cross} {hb1} {host}")
+        self.emit(f"{h} = OpIAdd %ulong {base} {off64}")
+        if ok is not None:
+            h2 = t()
+            self.emit(f"{h2} = OpSelect %ulong {ok} {h} {host}")
+            h = h2
+        arr, p = t(), t()
+        self.emit(f"{arr} = OpConvertUToPtr %_ptr_PSB_arr {h}")
+        self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {arr} {self.cu(0)}")
+        return p
 
     def tof(self, u):
         """The %float with the bits of %uint u. Bitcasting a tou result back gives tou's argument (Gen.bitcast_from),
@@ -2408,7 +2484,8 @@ class Gen:
         vd = a[0]
         addr, _, in_b, raw_parts, step = self.buffer_address(a, mods, parts=True)
         act = self.active_b()
-        ptr, host = self.tmp(), self.host_addr(addr)
+        ptr = self.tmp()
+        host, span = self.host_span(addr, n > 1)
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
 
         def guarded(cond, dwords):
@@ -2420,7 +2497,7 @@ class Gen:
             self.emit(f"{lbl_do} = OpLabel")
             loaded = []
             for i in dwords:
-                p, v_do = self.buf_dword_ptr(ptr, host, step, i), self.tmp()
+                p, v_do = self.buf_dword_ptr(ptr, host, step, i, span=span), self.tmp()
                 self.emit(f"{v_do} = OpLoad %uint {p} Aligned 4")
                 loaded.append(v_do)
             self.emit(f"OpBranch {lbl_end}")
@@ -2476,6 +2553,7 @@ class Gen:
         self.emit(f"{aligned} = OpISub %ulong {addr} {b64}")
         self.emit(f"{sh} = OpShiftLeftLogical %uint {b3} {self.cu(3)}")
         ptr, host = self.tmp(), self.host_addr(aligned)
+        bases = self.host_bases if PAGE_TABLE else None
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
         p0, w0 = self.buf_dword_ptr(ptr, host, step, 0), self.tmp()
         self.emit(f"{w0} = OpLoad %uint {p0} Aligned 4")
@@ -2484,21 +2562,40 @@ class Gen:
         if nbytes == 1:
             self.emit(f"{val} = {ext} %uint {w0} {sh} {self.cu(8)}")
         else:
-            cross, idx1, w1, lo_part, hi_byte, hi_sh, crossed, raw = (self.tmp() for _ in range(8))
+            cross, w1, lo_part, hi_byte, hi_sh, crossed, raw = (self.tmp() for _ in range(7))
             self.emit(f"{cross} = OpIEqual %bool {b3} {self.cu(3)}")
-            self.emit(f"{idx1} = OpSelect %uint {cross} {self.cu(1)} {self.cu(0)}")
-            p1 = self.buf_dword_ptr(ptr, host, step, idx1, same_base=True)   # idx1 0: the dword p0 reads
-            self.emit(f"{w1} = OpLoad %uint {p1} Aligned 4")
+            # At byte 3 the high byte is in the access's next dword (`step` bytes on when swizzled), which may be in
+            # the next 64 KiB page: it is read, through its own translation, only then (a selection, so the common
+            # case pays no second table walk). Its own address, never p0's: see buf_dword_ptr (#1864).
+            lbl_x, lbl_xe = self.tmp() + "_x", self.tmp() + "_xe"
+            pre_x = self.current_label_placeholder()
+            self.emit(f"OpSelectionMerge {lbl_xe} None")
+            self.emit(f"OpBranchConditional {cross} {lbl_x} {lbl_xe}")
+            self.emit(f"{lbl_x} = OpLabel")
+            if step is None:
+                off1 = self.cl(4)
+            else:
+                off1 = self.tmp()
+                self.emit(f"{off1} = OpUConvert %ulong {step}")
+            va1, arr1, p1, w1x = (self.tmp() for _ in range(4))
+            self.emit(f"{va1} = OpIAdd %ulong {aligned} {off1}")
+            self.emit(f"{arr1} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(va1, bases)}")
+            self.emit(f"{p1} = OpAccessChain %_ptr_PSB_uint {arr1} {self.cu(0)}")
+            self.emit(f"{w1x} = OpLoad %uint {p1} Aligned 4")
+            self.emit(f"OpBranch {lbl_xe}")
+            self.emit(f"{lbl_xe} = OpLabel")
+            self.emit(f"{w1} = OpPhi %uint {w1x} {lbl_x} {self.cu(0)} {pre_x}")
             self.emit(f"{lo_part} = OpShiftRightLogical %uint {w0} {sh}")
             self.emit(f"{hi_byte} = OpBitFieldUExtract %uint {w1} {self.cu(0)} {self.cu(8)}")
             self.emit(f"{hi_sh} = OpShiftLeftLogical %uint {hi_byte} {self.cu(8)}")
             self.emit(f"{crossed} = OpBitwiseOr %uint {lo_part} {hi_sh}")
             self.emit(f"{raw} = OpSelect %uint {cross} {crossed} {lo_part}")
             self.emit(f"{val} = {ext} %uint {raw} {self.cu(0)} {self.cu(16)}")
+        done = self.current_label_placeholder()     # lbl_do, or the high-byte selection's merge block
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
         res = self.tmp()
-        self.emit(f"{res} = OpPhi %uint {val} {lbl_do} {self.cu(0)} {pre_label}")
+        self.emit(f"{res} = OpPhi %uint {val} {done} {self.cu(0)} {pre_label}")
         self.dst(vd, res)
 
     # GFX10 buffer formats (from Mesa src/amd/registers/gfx10-rsrc.json, GFX10_FORMAT):
@@ -3648,12 +3745,21 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
-        ptr, host = self.tmp(), self.host_addr(aligned)
+        # An element of more than 4 bytes, or of 4 at a byte offset, spans dwords that may be in two 64 KiB pages
+        # (page_span); a 1- or 2-byte one is in one dword (an odd 2-byte one is out of range above).
+        multi = fixed_fmt is None or self.FORMATS.get(fixed_fmt, (0,))[0] > 2
+        ptr = self.tmp()
+        host, span = self.host_span(aligned, multi)
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
         loaded = []
         for i in range(5):
             ok, idx, v = self.tmp(), self.tmp(), self.tmp()
             self.emit(f"{ok} = OpULessThan %bool {self.cu(i)} {need}")
+            if span is not None and i:
+                p = self.span_dword_ptr(host, span, 4 * i, ok=ok)     # past `need`: dword 0 again
+                self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
+                loaded.append(v)
+                continue
             self.emit(f"{idx} = OpSelect %uint {ok} {self.cu(i)} {self.cu(0)}")
             p = self.buf_dword_ptr(ptr, host, step, idx)
             self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
@@ -3887,15 +3993,33 @@ class Gen:
 
     def store_small(self, addr, value, nbytes):
         """A 1- or 2-byte element store (typed buffer stores of 8/16-bit formats) at `addr`: `nbytes` is 1 or 2, or a
-        uint id that is one of them; byte k of `value` goes to addr + k (one translation: a 2-byte element is
-        2-byte aligned, so both bytes are in one 64 KiB page)."""
+        uint id that is one of them; byte k of `value` goes to addr + k. A 2-byte element is normally 2-byte aligned, so
+        both bytes are in one 64 KiB page and one translation serves; at an odd address ending a page (low 16 bits
+        0xffff) byte 1 is in the next page and gets its own (a selection: the common case pays no second table walk)."""
         host = self.host_addr(addr)
+        bases = self.host_bases if PAGE_TABLE else None
         self.store_byte(addr, value, host)
         if nbytes == 1:
             return
         hi, host1 = self.tmp(), self.tmp()
         self.emit(f"{hi} = OpShiftRightLogical %uint {value} {self.cu(8)}")
         self.emit(f"{host1} = OpIAdd %ulong {host} {self.cl(1)}")
+        if PAGE_TABLE:
+            lo, low, edge, va1, hsel = (self.tmp() for _ in range(5))
+            lx, le = self.tmp() + "_pg", self.tmp() + "_pge"
+            self.emit(f"{lo} = OpUConvert %uint {addr}")
+            self.emit(f"{low} = OpBitwiseAnd %uint {lo} {self.cu(0xFFFF)}")
+            self.emit(f"{edge} = OpIEqual %bool {low} {self.cu(0xFFFF)}")
+            pre = self.current_label_placeholder()
+            self.emit(f"OpSelectionMerge {le} None")
+            self.emit(f"OpBranchConditional {edge} {lx} {le}")
+            self.emit(f"{lx} = OpLabel")
+            self.emit(f"{va1} = OpIAdd %ulong {addr} {self.cl(1)}")
+            hx = self.host_addr(va1, bases)
+            self.emit(f"OpBranch {le}")
+            self.emit(f"{le} = OpLabel")
+            self.emit(f"{hsel} = OpPhi %ulong {hx} {lx} {host1} {pre}")
+            host1 = hsel
         if nbytes == 2:
             self.store_byte(None, hi, host1)
             return
@@ -4001,6 +4125,7 @@ class Gen:
                 self.emit(f"{b64} = OpUConvert %ulong {b3}")
                 self.emit(f"{al} = OpISub %ulong {full} {b64}")
                 self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
+                bases = self.host_bases if PAGE_TABLE else None
                 self.emit(f"{p0} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
                 self.emit(f"{w} = OpLoad %uint {p0} Aligned 4")
                 self.emit(f"{shb} = OpShiftLeftLogical %uint {b3} {self.cu(3)}")
@@ -4015,7 +4140,11 @@ class Gen:
                     self.emit(f"OpSelectionMerge {lbl_cend} None")
                     self.emit(f"OpBranchConditional {cross} {lbl_cross} {lbl_cend}")
                     self.emit(f"{lbl_cross} = OpLabel")
-                    self.emit(f"{p1} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(1)}")
+                    # the next dword through its own translation: it may be in the next 64 KiB page
+                    al4, arr1 = self.tmp(), self.tmp()
+                    self.emit(f"{al4} = OpIAdd %ulong {al} {self.cl(4)}")
+                    self.emit(f"{arr1} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al4, bases)}")
+                    self.emit(f"{p1} = OpAccessChain %_ptr_PSB_uint {arr1} {self.cu(0)}")
                     self.emit(f"{w1} = OpLoad %uint {p1} Aligned 4")
                     self.emit(f"{hi_byte} = OpBitFieldUExtract %uint {w1} {self.cu(0)} {self.cu(8)}")
                     self.emit(f"{hi_sh} = OpShiftLeftLogical %uint {hi_byte} {self.cu(8)}")
@@ -4027,10 +4156,10 @@ class Gen:
                 vals.append(v)
             else:
                 ptr = self.tmp()
-                self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+                host, span = self.host_span(full, n > 1)
+                self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
                 for i in range(n):
-                    p, v = self.tmp(), self.tmp()
-                    self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                    p, v = self.buf_dword_ptr(ptr, host, None, i, span=span), self.tmp()
                     self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
                     vals.append(v)
             done_lbl = self.current_label_placeholder()
@@ -4049,32 +4178,38 @@ class Gen:
             self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
             self.emit(f"{lbl_do} = OpLabel")
             ptr = self.tmp()
-            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+            host, span = self.host_span(full, n > 1)
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
             for i in range(n):
-                p = self.tmp()
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                p = self.buf_dword_ptr(ptr, host, None, i, span=span)
                 self.emit(f"OpStore {p} {vals[i]} Aligned 4")
             self.emit(f"OpBranch {lbl_end}")
             self.emit(f"{lbl_end} = OpLabel")
 
-    def buf_dword_ptr(self, arr, host, step, i, same_base=False):
+    def buf_dword_ptr(self, arr, host, step, i, span=None):
         """Pointer to dword i (a Python int or a uint id) of a buffer access whose first dword is at host address
         `host`, `arr` the same address as a PSB array: arr[i] for the linear layout (step None), else host + i * step
         in scratch-swizzle mode (SWIZZLE_ENABLE=1, idxen=0, ADD_TID_ENABLE=1), where dword k is 4 * index_stride
-        bytes after dword k - 1 (buffer_address). `same_base` indexes `arr` by i * index_stride instead of converting a
-        second address to a pointer: on MoltenVK (Apple M4) a load through a second pointer converted from the same
-        address as one through `arr` returned wrong values (#1864, @sovljanskii: buffer_load_ushort at byte 2 of a
-        dword read 0)."""
+        bytes after dword k - 1 (buffer_address). Never a %_ptr_PSB_uint converted from the address `arr` has: on
+        MoltenVK (Apple M4) a load through one returned wrong values (#1864, @sovljanskii: buffer_load_ushort at byte 2
+        of a dword read 0; buffer_load_sub now reads its next dword through that dword's own address). With `span`
+        (page_span of the access's first byte) every dword after the first is translated by its own 64 KiB page
+        (span_dword_ptr)."""
         ix = self.cu(i) if isinstance(i, int) else i
+        if span is not None and not (isinstance(i, int) and i == 0):
+            if step is None:
+                if isinstance(i, int):
+                    off = 4 * i
+                else:
+                    off = self.tmp()
+                    self.emit(f"{off} = OpShiftLeftLogical %uint {i} {self.cu(2)}")
+            else:
+                off = self.tmp()
+                self.emit(f"{off} = OpIMul %uint {ix} {step}")
+            return self.span_dword_ptr(host, span, off)
         p = self.tmp()
         if step is None or i == 0:
             self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {arr} {ix}")
-            return p
-        if same_base:                       # step = 4 * index_stride: dword i is element i * index_stride of arr
-            q, k = self.tmp(), self.tmp()
-            self.emit(f"{q} = OpShiftRightLogical %uint {step} {self.cu(2)}")
-            self.emit(f"{k} = OpIMul %uint {ix} {q}")
-            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {arr} {k}")
             return p
         o, o64, h = self.tmp(), self.tmp(), self.tmp()
         self.emit(f"{o} = OpIMul %uint {ix} {step}")
@@ -4586,7 +4721,8 @@ class Gen:
         if words is not None and per is not None and len(words) > 1:
             # modes 0 and 3: every dword is stored only if it ends inside (measured: a store that straddles the edge
             # writes the dwords before it); a store past the end of the buffer is a host-memory hazard otherwise
-            ptr, host = self.tmp(), self.host_addr(addr)
+            ptr = self.tmp()
+            host, span = self.host_span(addr)
             self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
             for i, w in enumerate(words):
                 cond, lbl_do, lbl_end = self.tmp(), self.tmp() + "_do", self.tmp() + "_end"
@@ -4594,7 +4730,7 @@ class Gen:
                 self.emit(f"OpSelectionMerge {lbl_end} None")
                 self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
                 self.emit(f"{lbl_do} = OpLabel")
-                p = self.buf_dword_ptr(ptr, host, step, i)
+                p = self.buf_dword_ptr(ptr, host, step, i, span=span)
                 self.emit(f"OpStore {p} {w} Aligned 4")
                 self.emit(f"OpBranch {lbl_end}")
                 self.emit(f"{lbl_end} = OpLabel")
@@ -4613,11 +4749,17 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {act} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
-        ptr, host = self.tmp(), self.host_addr(addr)
+        ptr = self.tmp()
+        # more than one dword (dwordxN, or a format element above 4 bytes): each dword through its own page (page_span)
+        if words is not None:
+            multi = len(words) > 1
+        else:
+            multi = fixed_fmt is None or self.FORMATS.get(fixed_fmt, (0,))[0] > 4
+        host, span = self.host_span(addr, multi)
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
         if words is not None:
             for i, w in enumerate(words):
-                p = self.buf_dword_ptr(ptr, host, step, i)
+                p = self.buf_dword_ptr(ptr, host, step, i, span=span)
                 self.emit(f"OpStore {p} {w} Aligned 4")
         else:
             fmt, comps, f32, fl, icomps = plans
@@ -4688,7 +4830,7 @@ class Gen:
                     words = self.encode_format(fcs + [self.cu(0)] * 4, ics + [self.cu(0)] * 4, code)
                     if size >= 4:
                         for k, w in enumerate(words[:size // 4]):
-                            pp = self.buf_dword_ptr(ptr, host, step, k)
+                            pp = self.buf_dword_ptr(ptr, host, step, k, span=span)
                             self.emit(f"OpStore {pp} {w} Aligned 4")
                     else:
                         # 1- or 2-byte element: byte stores, so neighbours are kept (store_small)
@@ -4704,7 +4846,7 @@ class Gen:
                     self.emit(f"OpSelectionMerge {le} None")
                     self.emit(f"OpBranchConditional {big} {lk} {le}")
                     self.emit(f"{lk} = OpLabel")
-                    pp = self.buf_dword_ptr(ptr, host, step, k)
+                    pp = self.buf_dword_ptr(ptr, host, step, k, span=span)
                     self.emit(f"OpStore {pp} {words[k]} Aligned 4")
                     self.emit(f"OpBranch {le}")
                     self.emit(f"{le} = OpLabel")
@@ -12719,7 +12861,8 @@ class Gen:
         self.emit(f"{addr} = OpBitwiseOr %ulong {sh} {l64}")
         self.emit(f"{full} = OpIAdd %ulong {addr} {o64}")
         ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+        host, span = self.host_span(full, n > 1)       # up to 64 bytes: may cross a 64 KiB page (page_span)
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
         self.uses_psb = True
         lim = None
         lim_val = None
@@ -12765,11 +12908,14 @@ class Gen:
             got_in = []
             for i in range(n):
                 idx, p, got, val = (self.tmp() for _ in range(4))
-                if i == 0:
-                    idx = self.cu(0)
+                if i and span is not None:
+                    p = self.span_dword_ptr(host, span, 4 * i, ok=oks[i])    # out of range: dword 0 again
                 else:
-                    self.emit(f"{idx} = OpSelect %uint {oks[i]} {self.cu(i)} {self.cu(0)}")
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {idx}")
+                    if i == 0:
+                        idx = self.cu(0)
+                    else:
+                        self.emit(f"{idx} = OpSelect %uint {oks[i]} {self.cu(i)} {self.cu(0)}")
+                    self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {idx}")
                 self.emit(f"{got} = OpLoad %uint {p} Aligned 4")
                 if i == 0:
                     val = got
@@ -12787,12 +12933,12 @@ class Gen:
             if i in guarded:
                 v = guarded[i]
             elif lim is None:
-                self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                p = self.buf_dword_ptr(ptr, host, None, i, span=span)
                 self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
             else:                   # a bound known at translate time (lim_val, constant offset): fold each dword
                 end_val = imm + 4 * i + 4
                 if lim_val >= end_val:
-                    self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+                    p = self.buf_dword_ptr(ptr, host, None, i, span=span)
                     self.emit(f"{v} = OpLoad %uint {p} Aligned 4")
                 else:
                     v = self.cu(0)
@@ -14941,11 +15087,20 @@ class Gen:
         e(f"{off} = OpShiftLeftLogical %ulong {nm} {self.cl(3)}")
         e(f"{addr} = OpIAdd %ulong {base} {off}")
         ptr = T()
-        e(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+        host = self.host_addr(addr)
+        bases = self.host_bases if PAGE_TABLE else None
+        e(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
+        # A node is 64-byte aligned (base in 256-byte units, node id in 8-byte units of 8): its first 64 bytes are in
+        # one 64 KiB page, the second half of a 128-byte box32 node may be in the next (page_span, set in the box block).
+        box_span = []
 
         def ldw(i):
-            pp, v = T(), T()
-            e(f"{pp} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+            if i >= 16 and box_span[0] is not None:
+                pp = self.span_dword_ptr(host, box_span[0], 4 * i)
+            else:
+                pp = T()
+                e(f"{pp} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(i)}")
+            v = T()
             e(f"{v} = OpLoad %uint {pp} Aligned 4")
             return v
 
@@ -15130,6 +15285,7 @@ class Gen:
         e(f"OpSelectionMerge {L['end2']} None")
         e(f"OpBranchConditional {is_box} {L['box']} {L['oth']}")
         e(f"{L['box']} = OpLabel")
+        box_span.append(self.page_span(addr, bases))
         dist, idx = [], []
         for i in range(4):
             child = ldw(i)
