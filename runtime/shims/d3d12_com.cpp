@@ -1167,6 +1167,23 @@ public:
             }
         }
         const std::uint64_t built = cmd.dst_va;
+        // The title-memory ranges the build reads and writes get their page-table entries now, on the recording
+        // thread, rather than in the submission (g_title_range_prefetch). Same sizes as the replay maps.
+        if (const auto prefetch = g_title_range_prefetch.load(std::memory_order_acquire)) {
+            leonida::XdxrLayout layout;
+            if (layout.compute(leonida::VulkanContext::xdxr_elements(cmd), cmd.is_tlas,
+                               leonida::VulkanContext::xdxr_box16(cmd))) {
+                prefetch(cmd.dst_va, layout.size);
+                prefetch(cmd.scratch_va, layout.scratch);
+            }
+            if (cmd.is_tlas && !cmd.instance_pointers)
+                prefetch(cmd.instances_va, std::uint64_t(cmd.instance_count) * 64);
+            for (const auto& t : cmd.triangles) {
+                prefetch(t.vertex_va, std::uint64_t(t.vertex_count) * t.vertex_stride);
+                prefetch(t.index_va, std::uint64_t(t.index_count) * (t.index_type == 1 ? 2 : 4));
+                prefetch(t.transform_va, 48);
+            }
+        }
         const bool recorded = list_.build_acceleration_structure(std::move(cmd));
         check(recorded);
         if (!recorded) return;
@@ -2137,14 +2154,17 @@ public:
             };
             if (ms(entered, done) > 500) {
                 static std::atomic<int> told{0};
-                if (told.fetch_add(1, std::memory_order_relaxed) < 200)
+                const leonida::VulkanQueue::ExecuteTiming t = queue_.last_timing();
+                if (told.fetch_add(1, std::memory_order_relaxed) < 400)
                     std::fprintf(stderr, "[rt] d3d12: slow ExecuteCommandLists %lld ms (%u lists, %zu commands first): "
                                          "queue lock %lld, heap sync %lld, page requests %lld, page binds %lld, "
-                                         "texture sync %lld, record+submit %lld\n",
+                                         "texture sync %lld, record+submit %lld (room %u, compute wait %u, prepare %u, "
+                                         "record %u, submit %u)\n",
                                  ms(entered, done), count, recorded.empty() ? std::size_t(0) : recorded[0]->commands().size(),
                                  ms(entered, locked), ms(locked, heaps_synced), ms(heaps_synced, pages_required),
                                  ms(pages_required, pages_flushed), ms(pages_flushed, textures_synced),
-                                 ms(textures_synced, done));
+                                 ms(textures_synced, done), t.room_ms, t.compute_wait_ms, t.prepare_ms, t.record_ms,
+                                 t.submit_ms);
             }
         }
         {

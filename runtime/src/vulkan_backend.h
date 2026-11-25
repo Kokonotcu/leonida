@@ -2732,6 +2732,15 @@ public:
     // Waits on the CPU until what this queue has submitted so far is done: its own timeline, without the device's
     // submit lock, so other queues keep submitting, and without waiting for anything submitted after (review D9;
     // idle() waits for the whole VkQueue, which D3D12 queues may share, and blocks every submission meanwhile).
+    // Where the last execute_lists spent its time (the device's slow-submission log): waiting for room in the ring,
+    // for compiling compute pipelines, preparing the lists, recording them (acquire through vkEndCommandBuffer), and
+    // submitting.
+    struct ExecuteTiming {
+        std::uint32_t room_ms = 0, compute_wait_ms = 0, prepare_ms = 0, record_ms = 0, submit_ms = 0;
+    };
+    ExecuteTiming last_timing() const { return last_timing_; }
+    ExecuteTiming last_timing_{};
+
     // This queue's timeline and the value of its latest submission (VulkanContext::note_upload).
     VkSemaphore progress_semaphore() const { return progress_; }
     std::uint64_t submitted_value() {
@@ -3042,8 +3051,18 @@ private:
 
     ReplayResult execute_lists(std::span<const CommandList* const> lists, std::span<const CommandList* const> identity,
                                std::span<const BreadcrumbRing::Names> held_names) {
+        using phase_clock = std::chrono::steady_clock;
+        const auto phase_start = phase_clock::now();
+        last_timing_ = {};
+        const auto phase_ms = [](phase_clock::time_point a, phase_clock::time_point b) {
+            return static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count());
+        };
         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
+        const auto room = phase_clock::now();
         wait_for_pending_compute(lists);
+        last_timing_.room_ms = phase_ms(phase_start, room);
+        last_timing_.compute_wait_ms = phase_ms(room, phase_clock::now());
+        const auto prepare_start = phase_clock::now();
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
                 for (const auto& command : list->commands())
@@ -3335,6 +3354,8 @@ private:
             }
         }
 
+        last_timing_.prepare_ms = phase_ms(prepare_start, phase_clock::now());
+        const auto record_start = phase_clock::now();
         CommandSlot* slot = acquire();
         if (!slot) {
             failure_.reason = "no command slot";
@@ -3546,6 +3567,15 @@ private:
             }
         }
         const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
+        last_timing_.record_ms = phase_ms(record_start, phase_clock::now());
+        const struct SubmitTimer {
+            VulkanQueue& q;
+            phase_clock::time_point start = phase_clock::now();
+            ~SubmitTimer() {
+                q.last_timing_.submit_ms = static_cast<std::uint32_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(phase_clock::now() - start).count());
+            }
+        } submit_timer{*this};
         resource_lock.unlock();  // release resource_mutex_ before vkQueueSubmit while keeping tracker_lock held
         const bool wait_previous = ordered_timestamps && submitted_;
         if (wait_previous) {

@@ -98,6 +98,22 @@ namespace rt::d3d12 {
 void note_title_texture_write(const void* address, std::size_t size);
 namespace {
 
+// Live VkDeviceMemory objects the layer holds (the device's vkAllocateMemory/vkFreeMemory go through these).
+PFN_vkAllocateMemory g_real_allocate_memory = nullptr;
+PFN_vkFreeMemory g_real_free_memory = nullptr;
+std::atomic<long> g_live_allocations{0};
+VKAPI_ATTR VkResult VKAPI_CALL counted_allocate_memory(VkDevice device, const VkMemoryAllocateInfo* info,
+                                                       const VkAllocationCallbacks* callbacks, VkDeviceMemory* memory) {
+    const VkResult r = g_real_allocate_memory(device, info, callbacks, memory);
+    if (r == VK_SUCCESS) g_live_allocations.fetch_add(1, std::memory_order_relaxed);
+    return r;
+}
+VKAPI_ATTR void VKAPI_CALL counted_free_memory(VkDevice device, VkDeviceMemory memory,
+                                               const VkAllocationCallbacks* callbacks) {
+    if (memory) g_live_allocations.fetch_sub(1, std::memory_order_relaxed);
+    g_real_free_memory(device, memory, callbacks);
+}
+
 // xmem's physical pages into the title page table (rt::xmem::g_page_mapped, g_section_released): defined after
 // DeviceState, for the one device that has the table (g_page_table_state).
 void physical_page_mapped(std::uintptr_t address, void* backing, void* section, std::uint64_t bytes);
@@ -1037,6 +1053,7 @@ struct DeviceState {
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceMemory memory = VK_NULL_HANDLE;
             VkDeviceAddress address = 0;
+            std::uint32_t users = 0;  // window pages whose entry points into it (set_window_page)
         };
         std::map<std::uintptr_t, Chunk> imported;                  // host start -> chunk
         std::unordered_map<std::uint64_t, std::uintptr_t> window;  // window page VA -> its page's host memory
@@ -1051,9 +1068,11 @@ struct DeviceState {
         // from xmem replaces it at once.
         std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> settled;
         std::unordered_map<std::uintptr_t, std::chrono::steady_clock::time_point> failed_chunks;  // host start
-        std::uint64_t chunk_bytes = 0, chunk_failures = 0;
+        std::uint64_t chunk_bytes = 0, chunk_failures = 0, chunks_released = 0, chunks_made = 0;
     } title_pages;
-    static constexpr std::uint64_t kPhysicalChunk = 4ull << 20;  // 16 MiB pinned 2 GiB for 1 MiB demands
+    // 2 MiB: imported memory is pinned, and the driver refused imports past about 3.4 GiB in all (1.2 GiB of 4 MiB
+    // chunks, most of each unused, beside 2.2 GiB imported by address); 16 MiB chunks pinned 2 GiB for 1 MiB demands.
+    static constexpr std::uint64_t kPhysicalChunk = 2ull << 20;
     static constexpr std::chrono::milliseconds kSettledFor{500}, kFailedChunkFor{5000};
     VkResult last_import_result = VK_SUCCESS;  // import_host's vkAllocateMemory, for the failure log
 
@@ -1266,6 +1285,13 @@ struct DeviceState {
             if (backing < previous->second.end) return previous;
         }
         if (!make) return title_pages.imported.end();
+        // Past the kept amount, idle chunks (no window page in them) go before a new one is imported (chunk_unused).
+        if (title_pages.chunk_bytes > kKeptChunkBytes)
+            for (auto idle = title_pages.imported.begin(); idle != title_pages.imported.end();) {
+                const auto next = std::next(idle);
+                if (!idle->second.users) chunk_unused(idle);
+                idle = next;
+            }
         const std::uintptr_t start = section + (backing - section) / kPhysicalChunk * kPhysicalChunk;
         const std::uintptr_t end = std::min<std::uintptr_t>(start + kPhysicalChunk, section + bytes);
         const auto now = std::chrono::steady_clock::now();
@@ -1285,18 +1311,22 @@ struct DeviceState {
             if ((n & (n - 1)) == 0)
                 std::fprintf(stderr, "[rt] d3d12: physical pages %#llx + %#llx could not be imported for the page "
                                      "table (memory types 0x%x, VkResult %d, error %lu; %llu failures, %llu MiB "
-                                     "imported)\n",
+                                     "imported; %ld device memory objects live, %zu imports by address)\n",
                              static_cast<unsigned long long>(start), static_cast<unsigned long long>(end - start),
                              types, static_cast<int>(last_import_result), GetLastError(),
                              static_cast<unsigned long long>(n),
-                             static_cast<unsigned long long>(title_pages.chunk_bytes >> 20));
+                             static_cast<unsigned long long>(title_pages.chunk_bytes >> 20),
+                             g_live_allocations.load(std::memory_order_relaxed), title_pages.imports.size());
             return title_pages.imported.end();
         }
         title_pages.chunk_bytes += end - start;
-        const std::size_t n = title_pages.imported.size() + 1;
+        const std::uint64_t n = ++title_pages.chunks_made;
         if ((n & (n - 1)) == 0)
-            std::fprintf(stderr, "[rt] d3d12: physical pages: %zu section imports, %llu MiB\n", n,
-                         static_cast<unsigned long long>(title_pages.chunk_bytes >> 20));
+            std::fprintf(stderr, "[rt] d3d12: physical pages: %llu section imports made, %zu held (%llu MiB), %llu "
+                                 "given back\n",
+                         static_cast<unsigned long long>(n), title_pages.imported.size() + 1,
+                         static_cast<unsigned long long>(title_pages.chunk_bytes >> 20),
+                         static_cast<unsigned long long>(title_pages.chunks_released));
         return title_pages.imported.emplace(start, chunk).first;
     }
 
@@ -1308,11 +1338,20 @@ struct DeviceState {
         const bool make = want || title_pages.wanted.count(address);
         std::uint64_t value = 0;
         const auto host = reinterpret_cast<std::uintptr_t>(backing);
+        auto chunk = title_pages.imported.end();
         if (backing) {
-            const auto chunk = physical_chunk(host, reinterpret_cast<std::uintptr_t>(section), bytes, make);
+            chunk = physical_chunk(host, reinterpret_cast<std::uintptr_t>(section), bytes, make);
             if (chunk != title_pages.imported.end()) value = chunk->second.address + (host - chunk->first);
         }
+        // The chunk the entry pointed into before loses a user, the new one gains one (chunk_unused frees idle ones).
+        auto before = title_pages.imported.end();
+        if (const auto old = title_pages.window.find(address); old != title_pages.window.end())
+            before = chunk_holding(old->second);
         if (!set_page_entry(address, value)) return;
+        if (value) ++chunk->second.users;
+        if (before != title_pages.imported.end() && before->second.users && --before->second.users == 0 &&
+            before != chunk)
+            chunk_unused(before);
         if (value) {
             if (title_pages.mapped.insert(address).second) ++title_pages.pages;
             title_pages.window[address] = host;
@@ -1328,6 +1367,28 @@ struct DeviceState {
             else
                 title_pages.settled.erase(address);
         }
+    }
+
+    // With title_pages.mutex held: the chunk import holding host address `host`, or end().
+    std::map<std::uintptr_t, TitlePages::Chunk>::iterator chunk_holding(std::uintptr_t host) {
+        auto it = title_pages.imported.upper_bound(host);
+        if (it == title_pages.imported.begin()) return title_pages.imported.end();
+        --it;
+        return host < it->second.end ? it : title_pages.imported.end();
+    }
+
+    // With title_pages.mutex held: no window page points into chunk `it` any more. Past kKeptChunkBytes of imports it
+    // is given back (destroyed once the work submitted so far is done): the driver pins what is imported, and chunks
+    // whose pages the title had remapped elsewhere piled up until it refused every import (VK_ERROR_OUT_OF_DEVICE_MEMORY
+    // at 1.1-1.9 GiB of chunks in the loading screen, after which the GPU read scratch pages and the run died).
+    static constexpr std::uint64_t kKeptChunkBytes = 512ull << 20;
+    void chunk_unused(std::map<std::uintptr_t, TitlePages::Chunk>::iterator it) {
+        if (title_pages.chunk_bytes <= kKeptChunkBytes) return;
+        context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, it->second.buffer);
+        context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, it->second.memory);
+        title_pages.chunk_bytes -= it->second.end - it->first;
+        ++title_pages.chunks_released;
+        title_pages.imported.erase(it);
     }
 
     // With title_pages.mutex held: a section's view goes away (rt::xmem::g_section_released). Its pages are unmapped
@@ -2117,13 +2178,14 @@ struct DeviceState {
     // compile of the title's big ray-tracing compute shaders, and the twelve workers compiling several at once took
     // the 32 GB PC into paging in the first loading screen (traced with LEONIDA_LOG_BIG_ALLOCS=2, 2026-11-25: ten GiB
     // from nvgpucomp64 in the last minute, then 20 s stalls and the title's watchdog). Smaller ones run in parallel.
-    // LEONIDA_HEAVY_COMPILES: how many may run at once (default 1); LEONIDA_HEAVY_SPIRV_KB: from what SPIR-V size.
+    // LEONIDA_HEAVY_COMPILES: how many may run at once (default 1); LEONIDA_HEAVY_SPIRV_KB: from what SPIR-V size
+    // (default 512 KiB; graphics count their stages together).
     std::mutex heavy_compile_mutex;
     unsigned heavy_compiles = 0;
     static std::size_t heavy_compile_words() {
         static const std::size_t words = [] {
             const char* v = std::getenv("LEONIDA_HEAVY_SPIRV_KB");
-            const unsigned long long kb = v && *v ? std::strtoull(v, nullptr, 10) : 1024;
+            const unsigned long long kb = v && *v ? std::strtoull(v, nullptr, 10) : 512;
             return static_cast<std::size_t>(kb * 1024 / 4);
         }();
         return words;
@@ -3144,6 +3206,13 @@ void physical_section_released(void* section, std::uint64_t bytes) {
     if (!state) return;
     std::lock_guard lock(state->title_pages.mutex);
     state->release_section(reinterpret_cast<std::uintptr_t>(section), bytes);
+}
+
+// rt::d3d12::g_title_range_prefetch: a title range's page-table entries (map_title_memory).
+void prefetch_title_range(std::uint64_t va, std::uint64_t bytes) {
+    if (!(va >> 32) || !bytes) return;
+    if (DeviceState* const state = g_page_table_state.load(std::memory_order_acquire))
+        state->map_title_memory(static_cast<std::uintptr_t>(va), bytes);
 }
 
 // The Vulkan format for a texture this layer can create, with the D24 fallback; VK_FORMAT_UNDEFINED, after a log
@@ -4782,6 +4851,8 @@ private:
             device_.release_resource(memory, !submitted);
             return hr;
         };
+        using copy_clock = std::chrono::steady_clock;
+        const auto copy_started = copy_clock::now();
         memory = device_.allocate_resource(VK_NULL_HANDLE, staging.buffer,
                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                            write ? 0 : VK_MEMORY_PROPERTY_HOST_CACHED_BIT, nullptr, false, true);
@@ -4789,7 +4860,27 @@ private:
         if (!memory || !mapped ||
             vk.vkBindBufferMemory(dev, staging.buffer, memory.memory, memory.offset) != VK_SUCCESS)
             return release(E_OUTOFMEMORY);
+        const auto allocated = copy_clock::now();
         if (write) pack(static_cast<std::byte*>(mapped), pitch);
+        const auto packed = copy_clock::now();
+        // A slow staged copy, by phase (the title-texture sync held a submission for 47 s, 2026-11-25).
+        const struct CopyReport {
+            copy_clock::time_point start, allocated, packed;
+            VkDeviceSize bytes;
+            ~CopyReport() {
+                const auto ms = [](copy_clock::duration d) {
+                    return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
+                };
+                const auto end = copy_clock::now();
+                if (end - start < std::chrono::milliseconds(500)) return;
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) >= 100) return;
+                std::fprintf(stderr, "[rt] d3d12: slow staged copy %lld ms (%llu KiB): staging memory %lld, detile %lld, "
+                                     "staging submit %lld\n",
+                             ms(end - start), static_cast<unsigned long long>(bytes >> 10), ms(allocated - start),
+                             ms(packed - allocated), ms(end - packed));
+            }
+        } copy_report{copy_started, allocated, packed, staging.size};
 
         // The staging buffer is a resource only for the length of this call; its ID is its binding's address,
         // which no COM resource can share.
@@ -7124,12 +7215,21 @@ public:
                 const VkShaderModule module = words.empty() ? VK_NULL_HANDLE : device_.shader_modules().acquire(words);
                 info.stage.module = module;
                 VkPipeline made = VK_NULL_HANDLE;
+                const auto started = std::chrono::steady_clock::now();
                 const VkResult r = module ? device_.create_pipeline(
                     [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
                         return vkf.vkCreateComputePipelines(device_.info.device, cache, 1, &create, nullptr, &made);
                     },
                     info) : VK_ERROR_INITIALIZATION_FAILED;
                 if (heavy) device_.heavy_end();
+                // Slow compiles by name and size: what the heavy-compile threshold should catch (the driver's
+                // compiler reserves up to 2 GiB for the slowest).
+                const double seconds =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+                if (seconds >= 3.0)
+                    std::fprintf(stderr, "[rt] d3d12: compute pipeline %s compiled in %.1f s (%zu KiB of SPIR-V%s)\n",
+                                 compute_entry_ ? compute_entry_->name.c_str() : "?", seconds, words.size() / 256,
+                                 heavy ? ", heavy slot" : "");
                 if (module) device_.shader_modules().release(module);
                 if (r == VK_SUCCESS) {
                     leonida::ComputePipeline ready = pipeline_;
@@ -7284,16 +7384,30 @@ private:
                                      leonida::pso::spirv_hash(words)});
             modules.push_back(gs);
         }
-        if (gpl_) return link(recipe, modules, unbound == 0);
+        const auto started = std::chrono::steady_clock::now();
+        const auto report_slow = [&](const char* how) {
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            if (seconds < 3.0) return;
+            std::string names;
+            for (const auto& stage : recipe.stages) names += (names.empty() ? "" : " + ") + stage.name;
+            std::fprintf(stderr, "[rt] d3d12: graphics pipeline %s (%s) built in %.1f s (%zu KiB of SPIR-V)\n",
+                         names.c_str(), how, seconds, spirv_words_ == std::size_t(-1) ? 0 : spirv_words_ / 256);
+        };
+        if (gpl_) {
+            const VkPipeline linked = link(recipe, modules, unbound == 0);
+            report_slow("libraries");
+            return linked;
+        }
         const leonida::pso::GraphicsCreateInfo create(recipe, modules, graphics_.layout);
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (device_.create_pipeline(
-                [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& info) {
-                    return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &info,
-                                                                         nullptr, &pipeline);
-                },
-                create.info) != VK_SUCCESS)
-            return VK_NULL_HANDLE;
+        const VkResult made = device_.create_pipeline(
+            [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& info) {
+                return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1, &info, nullptr,
+                                                                     &pipeline);
+            },
+            create.info);
+        report_slow("monolithic");
+        if (made != VK_SUCCESS) return VK_NULL_HANDLE;
         if (leonida::pso::Recorder* recorder = device_.pso_recorder()) recorder->record(recipe);
         device_.pipeline_created();
         return pipeline;
@@ -7400,12 +7514,33 @@ private:
             if (!variants_requested_.insert(unbound).second) return false;
         }
         AddRef();
-        device_.compile_enqueue([this, unbound] {
-            variant(unbound);
-            Release();
-        });
+        device_.compile_enqueue([this, unbound] { variant_job(unbound); });
         return false;
     }
+
+    // The background build of variant_ready_or_request; holds its reference, parked or not. A pipeline of large
+    // shaders waits for the heavy-compile slot as a large compute shader does (DeviceState::heavy_begin): the title's
+    // tiled-lighting pipelines took 23-33 s each, a dozen at once, in the first loading screen.
+    void variant_job(std::uint32_t unbound) {
+        const bool heavy = spirv_words() >= DeviceState::heavy_compile_words();
+        if (heavy && !device_.heavy_begin([this, unbound] { variant_job(unbound); })) return;
+        variant(unbound);
+        if (heavy) device_.heavy_end();
+        Release();
+    }
+
+    // The SPIR-V words of this PSO's shaders (the deferred modules' sources), counted once.
+    std::size_t spirv_words() {
+        std::lock_guard lock(variants_mutex_);
+        if (spirv_words_ != std::size_t(-1)) return spirv_words_;
+        std::size_t words = 0;
+        const leonida::ShaderLibrary* library = device_.library();
+        for (const DeferredModule& d : module_sources_)
+            words += !d.words.empty() ? d.words.size() : library && d.entry ? library->spirv(*d.entry).size() : 0;
+        spirv_words_ = words;
+        return words;
+    }
+    std::size_t spirv_words_ = std::size_t(-1);
 
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
     VkPipeline variant(std::uint32_t unbound) {
@@ -8458,6 +8593,15 @@ public:
                                                                       info.buffer_device_address);
         state_.context->mesh_queries = info.mesh_shader_queries;
         state_.context->set_depth_range_unrestricted(info.depth_range_unrestricted);
+        // Every vkAllocateMemory and vkFreeMemory of the layer counted (g_live_allocations): the title page table's
+        // host imports start failing with VK_ERROR_OUT_OF_DEVICE_MEMORY at 1-3.4 GiB imported, and the driver's
+        // allocation-count limit (maxMemoryAllocationCount, 4096 on NVIDIA's Windows driver) is the suspect.
+        g_real_allocate_memory = state_.context->vk.vkAllocateMemory;
+        g_real_free_memory = state_.context->vk.vkFreeMemory;
+        if (g_real_allocate_memory && g_real_free_memory) {
+            state_.context->vk.vkAllocateMemory = &counted_allocate_memory;
+            state_.context->vk.vkFreeMemory = &counted_free_memory;
+        }
         // The pipeline cache (with the file an earlier session saved: 130 MB on the retail boot) is created off the
         // title's thread too: made lazily it cost the first PSO the file read and vkCreatePipelineCache on the render
         // thread, and its checkpoint clock only started there. pipeline_cache() is call_once: a PSO that comes first
@@ -8530,6 +8674,9 @@ public:
         } else {
             std::fprintf(stderr, "[rt] d3d12: physical pages are not in the title page table (no host imports)\n");
         }
+        // Acceleration-structure builds map their title ranges while they are recorded (d3d12_com.h).
+        if (state_.arena.mapped && state_.get_host_pointer_properties)
+            rt::d3d12::g_title_range_prefetch.store(&prefetch_title_range, std::memory_order_release);
         // LEONIDA_LOG_BIG_ALLOCS=2: the driver's module is loaded now (src/big_alloc_log.h, iat::install).
         leonida::big_alloc_log::iat::install();
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
@@ -12957,9 +13104,39 @@ void note_title_texture_write(const void* address, std::size_t size) {
     writes.emplace_back(begin, begin + size);
 }
 
+// Where a slow sync_title_textures spent its time (over 1 s: logged at its end). It held the submission for 47 s in
+// the first loading screen (2026-11-25), with every other submitting thread waiting behind it.
+struct SyncStats {
+    long long ready_ns = 0, hash_ns = 0, copy_ns = 0, longest_ns = 0;
+    std::size_t copies = 0, copy_bytes = 0;
+    std::uint32_t longest_width = 0, longest_height = 0, longest_format = 0;
+};
+struct SyncTimer {
+    long long& into;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    explicit SyncTimer(long long& target) : into(target) {}
+    ~SyncTimer() { into += (std::chrono::steady_clock::now() - start).count(); }
+};
+
 void sync_title_textures() {
     if (!g_title_texture_count.load(std::memory_order_acquire)) return;  // one load when nothing is registered
     const auto now = std::chrono::steady_clock::now();
+    SyncStats sync_stats;
+    const struct SyncReport {
+        SyncStats& s;
+        std::chrono::steady_clock::time_point start;
+        ~SyncReport() {
+            const auto ms = [](long long ns) { return ns / 1000000; };
+            const long long total = (std::chrono::steady_clock::now() - start).count();
+            if (total < 1000000000LL) return;
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) >= 200) return;
+            std::fprintf(stderr, "[rt] d3d12: slow title texture sync %lld ms: readability %lld, hashes %lld, %zu copies "
+                                 "(%zu MiB) %lld, longest copy %lld ms (%ux%u format %u)\n",
+                         ms(total), ms(s.ready_ns), ms(s.hash_ns), s.copies, s.copy_bytes >> 20, ms(s.copy_ns),
+                         ms(s.longest_ns), s.longest_width, s.longest_height, s.longest_format);
+        }
+    } sync_report{sync_stats, now};
     std::lock_guard lock(title_texture_mutex());
     // The long watch is paid from a byte budget that refills at kTitleTextureRecheckRate: hashing every texture
     // the title placed on every submission ran the boot at 1 frame per second (retail 1.0.2.1).
@@ -13122,6 +13299,7 @@ void sync_title_textures() {
         // unreadable is retried every 250 ms (the guarded hashes below cover what changes in between).
         const std::uint64_t generation = rt::xmem::g_map_generation.load(std::memory_order_acquire);
         const bool known_readable = t->readable && (t->readable_generation == generation || now < t->readable_until);
+        const SyncTimer ready_timer(sync_stats.ready_ns);
         if (!known_readable) {
             if (!t->readable && now < t->readable_until) continue;  // found unreadable lately
             t->readable_until = now + std::chrono::milliseconds(250);
@@ -13141,7 +13319,10 @@ void sync_title_textures() {
             t->readable = false;
             t->readable_until = now + std::chrono::seconds(1);
         };
-        if (!guarded_probe_hash(t->title, span, probe)) {
+        const auto hash_start = std::chrono::steady_clock::now();
+        const bool probed = guarded_probe_hash(t->title, span, probe);
+        sync_stats.hash_ns += (std::chrono::steady_clock::now() - hash_start).count();
+        if (!probed) {
             faulted();
             continue;
         }
@@ -13149,7 +13330,10 @@ void sync_title_textures() {
             if (probe == t->probe) continue;
             hash = 0;  // changed: copied below without a full hash
         } else if (check == Check::full) {
-            if (!guarded_title_hash(t->title, span, hash)) {
+            const auto full_start = std::chrono::steady_clock::now();
+            const bool hashed = guarded_title_hash(t->title, span, hash);
+            sync_stats.hash_ns += (std::chrono::steady_clock::now() - full_start).count();
+            if (!hashed) {
                 faulted();
                 continue;
             }
@@ -13160,7 +13344,21 @@ void sync_title_textures() {
             }
         }
         t->dirty = false;
-        if (!guarded_copy_from_title(t->resource, t->title, *t->layout, t->console.get(), first_mip)) {
+        const auto copy_start = std::chrono::steady_clock::now();
+        const bool copied_now = guarded_copy_from_title(t->resource, t->title, *t->layout, t->console.get(), first_mip);
+        {
+            const auto ns = (std::chrono::steady_clock::now() - copy_start).count();
+            sync_stats.copy_ns += ns;
+            ++sync_stats.copies;
+            sync_stats.copy_bytes += span;
+            if (ns > sync_stats.longest_ns) {
+                sync_stats.longest_ns = ns;
+                sync_stats.longest_width = t->width;
+                sync_stats.longest_height = t->height;
+                sync_stats.longest_format = t->format;
+            }
+        }
+        if (!copied_now) {
             faulted();
             log_once("a title-placed texture could not be copied from the title's pages; it keeps its texels; "
                      "dimension",

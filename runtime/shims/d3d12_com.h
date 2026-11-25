@@ -594,4 +594,11 @@ inline leonida::QueryHeapId query_heap_id(const ID3D12QueryHeap* heap) {
     return reinterpret_cast<leonida::QueryHeapId>(heap);
 }
 
+// Gives a title-memory range (VA at or above 4 GiB, bytes) its title page table entries ahead of the submission that
+// uses it: set by the Vulkan device once its page table exists, called while an acceleration-structure build is
+// recorded (on the title's recording thread). The replay maps those ranges too, under the queue lock, where a host
+// import of the build's inputs cost up to 13 s in the first loading screen (2026-11-25).
+using TitleRangeFn = void (*)(std::uint64_t va, std::uint64_t bytes);
+inline std::atomic<TitleRangeFn> g_title_range_prefetch{nullptr};
+
 }  // namespace rt::d3d12
