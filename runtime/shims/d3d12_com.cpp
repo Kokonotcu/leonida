@@ -9,6 +9,10 @@
 #include "log_seen.h"
 #include "../src/debug_targets.h"
 #include "../src/gfx10_descriptors.h"
+#include "../src/quiet_av.h"  // read_title_word's guarded read
+
+#include <chrono>
+#include <deque>
 
 #include <algorithm>
 #include <intrin.h>
@@ -256,6 +260,12 @@ public:
     }
 
     const leonida::CommandList& commands() const { return list_; }
+    // The console memory waits recorded into this list (list slots 73, 74; note_list_memory_wait), in order.
+    const std::vector<ListMemoryWait>& memory_waits() const { return memory_waits_; }
+    void add_memory_wait(ListMemoryWait wait) {
+        wait.position = list_.commands().size();
+        memory_waits_.push_back(wait);
+    }
     // The pipeline states and root signatures the recording names (it holds a reference to each until Reset).
     const std::vector<IUnknown*>& pinned() const { return held_; }
     UINT front_stencil_ref() const { return front_stencil_ref_; }
@@ -306,6 +316,7 @@ public:
         render_pass_open_ = false;
         render_pass_resolves_.clear();
         calls_.clear();
+        memory_waits_.clear();
         release_held();  // what the old recording used: it was replayed at ExecuteCommandLists
         reset_state(state);  // Reset returns every list state to its default
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) set_initial_pipeline(state);  // reset_state holds it
@@ -1546,6 +1557,7 @@ private:
     CommandAllocator* allocator_ = nullptr;  // referenced while the list is open
     leonida::CommandList list_;
     bool invalid_ = false;
+    std::vector<ListMemoryWait> memory_waits_;  // add_memory_wait; cleared by Reset
     bool render_pass_open_ = false;  // between BeginRenderPass and EndRenderPass
     std::vector<RenderPassResolve> render_pass_resolves_;
     UINT front_stencil_ref_ = 0;
@@ -1986,6 +1998,218 @@ private:
     std::shared_ptr<std::atomic<int>> held_ = std::make_shared<std::atomic<int>>(0);  // CPU signals not applied yet
 };
 
+// ---- Console memory waits (ListMemoryWait, d3d12_com.h) ----
+// A batch whose lists wait on memory that does not hold yet is held on the CPU (queue_holds.h) behind a wait on the
+// queue's own memory-wait fence. A watcher thread polls the cells; once a batch's cells hold (or after kMemoryWaitLimit)
+// it copies the title's heaps and textures again (what the title wrote after submitting: per-draw tables the culling
+// shaders read as V#s and counts, zeros or stale at submission, hung the GPU in lib_cs_01405/01406/01410, run 18) and
+// signals the fence, which releases the batch: recorded and submitted then. Design after five-star-recomp
+// (docs/d3d12x-shim.md, "Memory waits": per-queue fences signalled by a watcher, 5 s limit, timed-out addresses not
+// waited for again, waits on cells the list itself wrote before dropped, everything released at a present).
+
+// The title's word at `va` (4 or 8 bytes); false when its page is not readable. No C++ objects here: __try.
+bool read_title_word(std::uint64_t va, std::uint32_t width, std::uint64_t& out) {
+    if (!va || (va & (width - 1))) return false;
+    __try {
+        ::leonida_quiet_av = 1;
+        out = width == 8 ? *reinterpret_cast<const volatile std::uint64_t*>(va)
+                         : *reinterpret_cast<const volatile std::uint32_t*>(va);
+        ::leonida_quiet_av = 0;
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                 : EXCEPTION_CONTINUE_SEARCH) {
+        ::leonida_quiet_av = 0;
+        return false;
+    }
+}
+
+bool memory_wait_holds(const ListMemoryWait& w) {
+    std::uint64_t m = 0;
+    if (!read_title_word(w.va, w.width, m)) return false;
+    m &= w.mask;
+    const std::uint64_t v = w.value & w.mask;
+    switch (w.op) {
+    case D3D12_COMPARISON_FUNC_NEVER: return false;
+    case D3D12_COMPARISON_FUNC_LESS: return m < v;
+    case D3D12_COMPARISON_FUNC_EQUAL: return m == v;
+    case D3D12_COMPARISON_FUNC_LESS_EQUAL: return m <= v;
+    case D3D12_COMPARISON_FUNC_GREATER: return m > v;
+    case D3D12_COMPARISON_FUNC_NOT_EQUAL: return m != v;
+    case D3D12_COMPARISON_FUNC_GREATER_EQUAL: return m >= v;
+    default: return true;  // ALWAYS, or a value we do not know
+    }
+}
+
+constexpr auto kMemoryWaitLimit = std::chrono::seconds(5);
+
+struct MemoryWaitBatch {
+    std::vector<ListMemoryWait> waits;
+    std::uint64_t value = 0;
+    std::chrono::steady_clock::time_point since;
+};
+
+// One per CommandQueue that held a batch on a memory wait.
+struct MemoryWaitQueue {
+    explicit MemoryWaitQueue(leonida::VulkanContext& context) : fence(context, 0) {}
+    leonida::VulkanFence fence;
+    std::mutex mutex;
+    std::deque<MemoryWaitBatch> pending;  // in submission order
+    std::uint64_t next = 0;               // the last fence value handed out
+};
+
+class MemoryWaitWatcher {
+public:
+    static MemoryWaitWatcher& get() {
+        static MemoryWaitWatcher* const watcher = new MemoryWaitWatcher;  // never destroyed: its thread is detached
+        return *watcher;
+    }
+    bool timed_out(std::uint64_t va) {
+        std::lock_guard lock(mutex_);
+        return timed_out_.count(va) != 0;
+    }
+    // A batch held on `queue`'s fence at `batch.value` (after VulkanQueue::wait was called for it).
+    void hold(const std::shared_ptr<MemoryWaitQueue>& queue, MemoryWaitBatch batch) {
+        {
+            std::lock_guard q(queue->mutex);
+            queue->pending.push_back(std::move(batch));
+        }
+        {
+            std::lock_guard lock(mutex_);
+            if (std::find(queues_.begin(), queues_.end(), queue) == queues_.end()) queues_.push_back(queue);
+            ++pending_;
+            if (!started_) {
+                started_ = true;
+                std::thread([this] { run(); }).detach();
+            }
+        }
+        cv_.notify_one();
+        const std::uint64_t n = ++held_total_;
+        if ((n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12: %llu batches held on console memory waits\n",
+                         static_cast<unsigned long long>(n));
+    }
+    // Every held batch released now (a present, a queue going away).
+    void release_all(const char* why, MemoryWaitQueue* only = nullptr) {
+        std::vector<std::pair<std::shared_ptr<MemoryWaitQueue>, std::uint64_t>> release;
+        {
+            std::lock_guard lock(mutex_);
+            for (const auto& queue : queues_) {
+                if (only && queue.get() != only) continue;
+                std::lock_guard q(queue->mutex);
+                if (queue->pending.empty()) continue;
+                release.emplace_back(queue, queue->pending.back().value);
+                pending_ -= queue->pending.size();
+                queue->pending.clear();
+            }
+            if (only) std::erase_if(queues_, [&](const auto& q) { return q.get() == only; });
+        }
+        if (release.empty()) return;
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 8)
+            std::fprintf(stderr, "[rt] d3d12: console memory waits released (%s)\n", why);
+        signal(release);
+    }
+
+private:
+    MemoryWaitWatcher() = default;
+
+    // What the title wrote since its batches were submitted reaches the GPU first, then the fences let them run.
+    static void signal(const std::vector<std::pair<std::shared_ptr<MemoryWaitQueue>, std::uint64_t>>& release) {
+        rt::d3d12_xs::sync_title_heaps();
+        sync_title_textures();
+        for (const auto& [queue, value] : release) queue->fence.signal(value);
+    }
+
+    void run() {
+        for (;;) {
+            std::vector<std::shared_ptr<MemoryWaitQueue>> queues;
+            {
+                std::unique_lock lock(mutex_);
+                cv_.wait(lock, [this] { return pending_ > 0; });
+                queues = queues_;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            std::vector<std::pair<std::shared_ptr<MemoryWaitQueue>, std::uint64_t>> release;
+            std::vector<std::uint64_t> timed;  // added to timed_out_ after the queue locks (lock order: mutex_ first)
+            std::size_t popped = 0;
+            for (const auto& queue : queues) {
+                std::lock_guard q(queue->mutex);
+                std::uint64_t value = 0;
+                while (!queue->pending.empty()) {
+                    MemoryWaitBatch& batch = queue->pending.front();
+                    bool all = true;
+                    for (const ListMemoryWait& w : batch.waits) all = all && memory_wait_holds(w);
+                    if (!all && now - batch.since < kMemoryWaitLimit) break;
+                    const auto waited =
+                        std::chrono::duration_cast<std::chrono::milliseconds>(now - batch.since).count();
+                    if (!all) {
+                        for (const ListMemoryWait& w : batch.waits) {
+                            if (memory_wait_holds(w)) continue;
+                            timed.push_back(w.va);
+                            std::uint64_t m = 0;
+                            read_title_word(w.va, w.width, m);
+                            static int told = 0;
+                            if (told++ < 16)
+                                std::fprintf(stderr, "[rt] d3d12: console memory wait timed out after %lld ms: %#llx "
+                                                     "(%u bytes, mask %#llx) op %u value %#llx, memory %#llx; not "
+                                                     "waited for again\n",
+                                             static_cast<long long>(waited), static_cast<unsigned long long>(w.va),
+                                             w.width, static_cast<unsigned long long>(w.mask), w.op,
+                                             static_cast<unsigned long long>(w.value),
+                                             static_cast<unsigned long long>(m));
+                        }
+                    } else {
+                        static std::atomic<int> told{0};
+                        if (waited >= 100 && told.fetch_add(1, std::memory_order_relaxed) < 24)
+                            std::fprintf(stderr, "[rt] d3d12: console memory wait met after %lld ms (%zu waits, first "
+                                                 "%#llx)\n",
+                                         static_cast<long long>(waited), batch.waits.size(),
+                                         static_cast<unsigned long long>(batch.waits.front().va));
+                    }
+                    value = batch.value;
+                    queue->pending.pop_front();
+                    ++popped;
+                }
+                if (value) release.emplace_back(queue, value);
+            }
+            if (popped || !timed.empty()) {
+                std::lock_guard lock(mutex_);
+                pending_ -= popped;
+                timed_out_.insert(timed.begin(), timed.end());
+            }
+            if (!release.empty()) signal(release);
+            std::this_thread::sleep_for(std::chrono::microseconds(250));
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<std::shared_ptr<MemoryWaitQueue>> queues_;
+    std::size_t pending_ = 0;
+    bool started_ = false;
+    std::set<std::uint64_t> timed_out_;
+    std::atomic<std::uint64_t> held_total_{0};
+};
+
+// The waits of `list` a batch must hold for: not NEVER/ALWAYS ones, not on a cell the same list wrote before the wait
+// (met in order on the GPU), not on an address that timed out before, and not those that hold already.
+void unmet_memory_waits(const GraphicsCommandList& list, std::vector<ListMemoryWait>& out) {
+    const auto& waits = list.memory_waits();
+    if (waits.empty()) return;
+    const auto& commands = list.commands().commands();
+    for (const ListMemoryWait& w : waits) {
+        if (w.op == D3D12_COMPARISON_FUNC_NEVER || w.op == D3D12_COMPARISON_FUNC_ALWAYS) continue;
+        bool written = false;
+        for (std::size_t i = 0; i < w.position && i < commands.size() && !written; ++i)
+            if (const auto* write = std::get_if<leonida::WriteImmediate>(&commands[i]))
+                written = write->address + 4 > w.va && write->address < w.va + w.width;
+        if (written) continue;
+        if (MemoryWaitWatcher::get().timed_out(w.va)) continue;
+        if (memory_wait_holds(w)) continue;
+        out.push_back(w);
+    }
+}
+
 class CommandQueue final
     : public Child<CommandQueue, ID3D12CommandQueueStubs, ID3D12Object, ID3D12DeviceChild, ID3D12Pageable,
                     ID3D12CommandQueue> {
@@ -2030,6 +2254,8 @@ public:
           vk_queue_(queue), family_(family), clock_(clock) {}
 
     ~CommandQueue() override {
+        // Batches held on this queue's memory waits run now: nothing would release them later.
+        if (mem_waits_) MemoryWaitWatcher::get().release_all("queue released", mem_waits_.get());
         if (!stamp_.pool) return;
         const VkDevice device = context_.device();
         stamp_.destroy_query_pool(device, stamp_.queries, nullptr);
@@ -2060,11 +2286,15 @@ public:
         // the sync is device-wide and coalesced (one sync serves every call that arrived before it began), so the
         // title's submitting threads no longer queue behind each other's syncs on a queue lock. Textures these lists
         // copy into are the GPU's from now on, and are left out of it (note_title_textures_copied).
+        // The console memory waits these lists make that do not hold yet (unmet_memory_waits): the batch is held until
+        // they do (MemoryWaitWatcher), below.
+        std::vector<ListMemoryWait> memory_waits;
         {
             std::vector<std::uintptr_t> copied_into;
             for (UINT i = 0; i < count && lists; ++i) {
                 const GraphicsCommandList* list = GraphicsCommandList::from(lists[i]);
                 if (!list) continue;
+                unmet_memory_waits(*list, memory_waits);
                 for (const auto& command : list->commands().commands()) {
                     if (const auto* copy = std::get_if<leonida::CopyTexture>(&command)) {
                         if (!copy->dst.footprint) copied_into.push_back(static_cast<std::uintptr_t>(copy->dst.resource));
@@ -2164,6 +2394,12 @@ public:
                     std::fprintf(stderr, "[rt] d3d12_xs: list order: execute list %p with %zu commands\n",
                                  static_cast<void*>(lists[i]), recorded[i]->commands().size());
         }
+        if (!memory_waits.empty()) {
+            if (!mem_waits_) mem_waits_ = std::make_shared<MemoryWaitQueue>(context_);
+            const std::uint64_t value = ++mem_waits_->next;
+            queue_.wait(mem_waits_->fence.semaphore(), value);  // no Signal submitted for it: the batch is held
+            MemoryWaitWatcher::get().hold(mem_waits_, {std::move(memory_waits), value, slow_clock::now()});
+        }
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
         {
@@ -2178,11 +2414,12 @@ public:
                     std::fprintf(stderr, "[rt] d3d12: slow ExecuteCommandLists %lld ms (%u lists, %zu commands first): "
                                          "queue lock %lld, heap sync %lld, page requests %lld, page binds %lld, "
                                          "texture sync %lld, record+submit %lld (room %u, compute wait %u, prepare %u, "
-                                         "record %u, submit %u)\n",
+                                         "record %u of which title maps %u, submit %u)\n",
                                  ms(entered, done), count, recorded.empty() ? std::size_t(0) : recorded[0]->commands().size(),
                                  ms(textures_synced, locked), ms(locked, heaps_synced), ms(heaps_synced, pages_required),
                                  ms(pages_required, pages_flushed), ms(entered, textures_synced),
                                  ms(pages_flushed, done), t.room_ms, t.compute_wait_ms, t.prepare_ms, t.record_ms,
+                                 t.title_map_ms,
                                  t.submit_ms);
             }
         }
@@ -2492,6 +2729,7 @@ private:
     // Destroyed after queue_ has waited idle, so the handle cannot be reused prematurely.
     std::shared_ptr<void> queue_lease_;
     leonida::VulkanQueue queue_;
+    std::shared_ptr<MemoryWaitQueue> mem_waits_;  // made at the first batch held on a console memory wait
     leonida::ReplayResult last_result_ = leonida::ReplayResult::success;
     // The ExecuteCommandLists failure causes already reported (result, command kind, VkResult), under mutex_.
     std::set<std::tuple<int, std::string, int>> reported_failures_;
@@ -2511,6 +2749,26 @@ private:
 };
 
 }  // namespace
+
+bool note_list_memory_wait(void* pc_list, const ListMemoryWait& wait) {
+    GraphicsCommandList* const list = GraphicsCommandList::from(static_cast<IUnknown*>(pc_list));
+    if (!list) return false;
+    list->add_memory_wait(wait);
+    return true;
+}
+
+bool note_list_memory_wait_words(void* pc_list, std::uint64_t va, std::uint32_t op, std::uint64_t value,
+                                 std::uint64_t mask, std::uint32_t width) {
+    ListMemoryWait wait;
+    wait.va = va;
+    wait.op = op;
+    wait.value = value;
+    wait.mask = mask;
+    wait.width = width;
+    return note_list_memory_wait(pc_list, wait);
+}
+
+void release_memory_waits(const char* why) { MemoryWaitWatcher::get().release_all(why); }
 
 HRESULT create_command_queue(leonida::VulkanContext& context, VkQueue queue, std::uint32_t queue_family,
                              const D3D12_COMMAND_QUEUE_DESC& desc, REFIID riid, void** out, IUnknown* device,

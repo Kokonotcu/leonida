@@ -49,6 +49,11 @@
 
 namespace leonida {
 
+// This thread's time in the device's title-memory mapping (DeviceState::map_title_memory, host imports), in ns: a
+// recording that maps title memory holds resource_mutex_ shared meanwhile (ExecuteTiming::title_map_ms). A plain
+// integer: no thread_local with a destructor in gta6rt.
+inline thread_local std::uint64_t g_title_map_ns = 0;
+
 // A CPU-written Vulkan-address instance pointer array, kept until the submission that builds with it completes.
 // Completed stages are pooled per queue and reused, so a per-frame TLAS build does not allocate memory each frame.
 struct KhrInstanceStage {
@@ -3038,6 +3043,7 @@ public:
     // submitting.
     struct ExecuteTiming {
         std::uint32_t room_ms = 0, compute_wait_ms = 0, prepare_ms = 0, record_ms = 0, submit_ms = 0;
+        std::uint32_t title_map_ms = 0;  // of record: mapping title memory into the page table (g_title_map_ns)
     };
     ExecuteTiming last_timing() const { return last_timing_; }
     ExecuteTiming last_timing_{};
@@ -3382,6 +3388,32 @@ private:
             }
         } khr_guard{this};
         std::function<void(bool)> bindless_commit;
+        // The title memory the commands' root arguments name (detail::map_title_user_data, called again while
+        // recording) is mapped here, before resource_mutex_: its host imports took up to 3.7 s of one submission's
+        // recording (run 16, 2026-11-25), with the mutex held shared, so every resource creation (which takes it
+        // exclusively) and then every other queue's recording waited behind it. The addresses are in the recorded
+        // commands themselves; the record-time calls then find them mapped.
+        if (context_.replay_.map_title) {
+            std::unordered_set<std::uint64_t> seen;
+            const auto map_pairs = [&](const auto& user_data) {
+                for (std::size_t i = 0; i + 1 < user_data.size(); ++i) {
+                    const std::uint64_t va = std::uint64_t(user_data[i]) | (std::uint64_t(user_data[i + 1]) << 32);
+                    if (va >> 32 == 0 || va >> 47) continue;
+                    if (seen.insert(va).second) context_.replay_.map_title(va);
+                }
+            };
+            for (const CommandList* list : lists)
+                for (const auto& command : list->commands()) {
+                    if (const auto* draw = std::get_if<Draw>(&command)) {
+                        map_pairs(draw->user_data);
+                    } else if (const auto* dispatch = std::get_if<Dispatch>(&command)) {
+                        map_pairs(dispatch->user_data);
+                    } else if (const auto* ind = std::get_if<ExecuteIndirect>(&command);
+                               ind && ind->kind == IndirectKind::dispatch && ind->pipeline) {
+                        map_pairs(ind->user_data);
+                    }
+                }
+        }
         // Lock hierarchy: resource_mutex_ -> tracker_mutex_ -> submit_mutex_.
         // Shared read-lock allows concurrent prepare() across queues; tracker_mutex_ is acquired lazily during
         // prepare() only if a list actually converts a depth24_as_float copy, and otherwise right before
@@ -3658,6 +3690,7 @@ private:
 
         last_timing_.prepare_ms = phase_ms(prepare_start, phase_clock::now());
         const auto record_start = phase_clock::now();
+        const std::uint64_t title_map_before = g_title_map_ns;
         CommandSlot* slot = acquire();
         if (!slot) {
             failure_.reason = "no command slot";
@@ -3870,6 +3903,7 @@ private:
         }
         const bool ended = context_.vk.vkEndCommandBuffer(command_buffer) == VK_SUCCESS;
         last_timing_.record_ms = phase_ms(record_start, phase_clock::now());
+        last_timing_.title_map_ms = static_cast<std::uint32_t>((g_title_map_ns - title_map_before) / 1000000);
         const struct SubmitTimer {
             VulkanQueue& q;
             phase_clock::time_point start = phase_clock::now();

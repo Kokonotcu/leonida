@@ -63,6 +63,12 @@
 #include <utility>
 #include <vector>
 
+namespace rt::d3d12 {
+// d3d12_com.cpp: a console memory wait (list slots 73, 74) recorded into our PC list `pc_list` (ListMemoryWait).
+bool note_list_memory_wait_words(void* pc_list, std::uint64_t va, std::uint32_t op, std::uint64_t value,
+                                 std::uint64_t mask, std::uint32_t width);
+}
+
 namespace rt::d3d12_xs {
 namespace {
 
@@ -1878,6 +1884,25 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                                      Slot, static_cast<unsigned long long>(value), static_cast<unsigned long long>(a1),
                                      (Slot == 72 && (a4 & 3)) ? " (timestamp)" : "");
                 }
+                return 0;
+            }
+            if constexpr (Slot == 73 || Slot == 74) {
+                // Wait32BitValueX(address, comparison, value, mask) / Wait64BitValueX(address, comparison, value,
+                // flags): the queue goes on once (memory & mask) op value holds (five-star-recomp docs/d3d12x-shim.md,
+                // list slots 73, 74; slot 74 compares all 64 bits and its fourth word is flags). Dropped, the lists
+                // ran before the title had written what they read (rt::d3d12::ListMemoryWait).
+                const std::uint32_t op = static_cast<std::uint32_t>(a2);
+                const std::uint64_t value = Slot == 74 ? a3 : (a3 & 0xFFFFFFFFull);
+                const std::uint64_t mask = Slot == 74 ? ~0ull : (a4 & 0xFFFFFFFFull);
+                const bool noted =
+                    a1 && rt::d3d12::note_list_memory_wait_words(self->real, a1, op, value, mask, Slot == 74 ? 8u : 4u);
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 8)
+                    std::fprintf(stderr, "[rt] d3d12_xs: list slot %u: memory wait at %#llx op %u value %#llx mask "
+                                         "%#llx%s\n",
+                                 Slot, static_cast<unsigned long long>(a1), op, static_cast<unsigned long long>(value),
+                                 static_cast<unsigned long long>(mask),
+                                 noted ? "" : " (not recorded: not one of our lists)");
                 return 0;
             }
             if constexpr (Slot == 148) {

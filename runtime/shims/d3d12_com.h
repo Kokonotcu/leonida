@@ -343,6 +343,24 @@ void sync_title_textures();
 // The title textures (by resource id) a submission copies into: the GPU's from now on, never refreshed from the
 // title's memory again (on the console the copy wrote that memory; here only the image).
 void note_title_textures_copied(const std::vector<std::uintptr_t>& ids);
+
+// A console memory wait (Wait32BitValueX / Wait64BitValueX, console list slots 73 and 74): the queue does not go on
+// until `(memory at va & mask) op value` holds (op a D3D12_COMPARISON_FUNC). The title writes what a list reads after
+// submitting it (descriptor tables, counts) and then the cell the list waits on (five-star-recomp
+// docs/d3d12x-shim.md, "Memory waits"; XCL list_x.rs PendingWait: design followed, no code taken).
+struct ListMemoryWait {
+    std::uint64_t va = 0;
+    std::uint64_t mask = ~0ull;
+    std::uint64_t value = 0;
+    std::uint32_t op = 0;     // D3D12_COMPARISON_FUNC
+    std::uint32_t width = 8;  // bytes compared: 4 or 8
+    std::size_t position = 0; // commands recorded before it in its list
+};
+// Records a wait into the console list proxy's PC list (`pc_list`, our GraphicsCommandList). False if it is not one.
+bool note_list_memory_wait(void* pc_list, const ListMemoryWait& wait);
+// Releases every batch held on a memory wait (at a present: the writer may come from the presenting thread,
+// five-star-recomp and victory-gta6 do the same).
+void release_memory_waits(const char* why);
 // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
 VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
 

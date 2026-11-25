@@ -1246,6 +1246,33 @@ struct DeviceState {
     // shader reads the scratch page there instead of faulting. False when nothing could be mapped. Pages of
     // physical-page windows are never imported by address: their entries follow xmem's mappings (set_window_page).
     bool map_title_memory(std::uintptr_t address, std::uint64_t bytes) {
+        // Where a slow call (50 ms or more) went: the window walk (xmem's page visit, chunk imports in it), the
+        // VirtualQuery of other pages, and their host imports (run 16: recordings spent up to 3.7 s in here).
+        struct MapTimer {
+            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+            long long window_ns = 0, query_ns = 0, import_ns = 0;
+            unsigned imports = 0;
+            std::uint64_t address = 0, bytes = 0;
+            ~MapTimer() {
+                const long long total =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+                leonida::g_title_map_ns += static_cast<std::uint64_t>(total);
+                if (total < 50000000LL) return;
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 150)
+                    std::fprintf(stderr, "[rt] d3d12: slow title map %lld ms at %#llx + %#llx: window walk %lld, "
+                                         "VirtualQuery %lld, %u imports %lld\n",
+                                 total / 1000000, static_cast<unsigned long long>(address),
+                                 static_cast<unsigned long long>(bytes), window_ns / 1000000, query_ns / 1000000,
+                                 imports, import_ns / 1000000);
+            }
+        } map_timer;
+        map_timer.address = address;
+        map_timer.bytes = bytes;
+        const auto since = [](std::chrono::steady_clock::time_point t) {
+            return static_cast<long long>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count());
+        };
         constexpr std::uint64_t page = 0x10000, max_run = 64ull << 20;
         if (!arena.mapped || !get_host_pointer_properties || !bytes || address >> 48) return false;
         const std::uint64_t first = address & ~(page - 1), end = (address + bytes + page - 1) & ~(page - 1);
@@ -1264,8 +1291,11 @@ struct DeviceState {
             if (all) return some;
         }
         // Window pages first, outside title_pages.mutex: xmem calls back with its own lock held, then takes ours.
-        if (const auto visit = rt::xmem::g_window_pages.load(std::memory_order_acquire))
+        if (const auto visit = rt::xmem::g_window_pages.load(std::memory_order_acquire)) {
+            const auto t = std::chrono::steady_clock::now();
             visit(first, end, &physical_page_wanted);
+            map_timer.window_ns += since(t);
+        }
         // The pages to import are claimed under title_pages.mutex, looked up and imported without it (VirtualQuery and
         // the driver's host import take milliseconds; every recording that names title memory waited behind them, a
         // submission's record phase took 0.4-2.7 s, run 04:31 sample_164), and committed under it again. A page another
@@ -1304,8 +1334,10 @@ struct DeviceState {
                 MEMORY_BASIC_INFORMATION region{};
                 // A view (MEM_MAPPED) is a physical page in a window: its entry is set_window_page's, as an import
                 // here would keep the page mapped now after the title maps another.
-                if (!VirtualQuery(reinterpret_cast<const void*>(q), &region, sizeof(region)) ||
-                    region.State != MEM_COMMIT || region.Type == MEM_MAPPED ||
+                const auto tq = std::chrono::steady_clock::now();
+                const bool queried = VirtualQuery(reinterpret_cast<const void*>(q), &region, sizeof(region)) != 0;
+                map_timer.query_ns += since(tq);
+                if (!queried || region.State != MEM_COMMIT || region.Type == MEM_MAPPED ||
                     (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_NOACCESS)))
                     break;
                 // The region VirtualQuery describes has these attributes throughout: its pages need no query of their
@@ -1326,7 +1358,10 @@ struct DeviceState {
             Run r;
             r.p = p;
             r.q = q;
+            const auto ti = std::chrono::steady_clock::now();
             r.device_address = import_host(reinterpret_cast<void*>(p), q - p, r.buffer, r.imported, r.types);
+            map_timer.import_ns += since(ti);
+            ++map_timer.imports;
             runs.push_back(r);
             i = j;
         }
@@ -1578,8 +1613,13 @@ struct DeviceState {
             // Settled only for a page a command asked for (nothing mapped there, or its chunk refused): a remap of a page
             // no command has asked for yet (xmem's notice, no import made) settled it too, every remap renewed that, and
             // the first command that asked for it found it settled and never imported it (black frames, 2026-11-25).
+            // Nothing mapped there: settled until xmem maps it, which it tells (physical_page_mapped, here again), not
+            // only for kSettledFor. Re-walked every 500 ms, the window pages a root argument's 1 MiB range covered cost
+            // 50-340 ms per map_title_memory under xmem's and our locks, inside recordings (run 17, "window walk").
+            // A page whose chunk was refused is retried after the usual time.
             if (want || title_pages.wanted.count(address))
-                title_pages.settled[address] = std::chrono::steady_clock::now();
+                title_pages.settled[address] =
+                    backing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point::max();
             else
                 title_pages.settled.erase(address);
         }
@@ -14285,6 +14325,9 @@ HRESULT WindowPresenter::present_blank(UINT sync_interval) {
 }
 
 HRESULT WindowPresenter::present_planes(const leonida::PresentPlanes& planes, UINT sync_interval, bool tear) {
+    // Batches held on console memory waits run before the present waits for the frame's work: their writer may come
+    // from this thread after the present (five-star-recomp docs/d3d12x-shim.md, "Memory waits").
+    release_memory_waits("present");
     return present_result(presenter_->present_planes(planes, sync_interval > 0, tear));
 }
 
