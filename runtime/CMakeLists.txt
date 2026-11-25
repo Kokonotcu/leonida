@@ -188,6 +188,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     shims/bcrypt_rng.cpp
     shims/xapu_chad.cpp
     shims/dstorage.cpp
+    shims/xbox_bvh_builder.cpp
     src/bcpack_victory.cpp
   )
   # dstorage.cpp's guarded_move turns an access violation in a title's buffer into E_DSTORAGE_ACCESS_VIOLATION with

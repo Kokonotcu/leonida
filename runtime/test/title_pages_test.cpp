@@ -171,18 +171,34 @@ int main() {
         pages.release(10);
         EXPECT(pages.stats().pages == 0);
 
-        // The page budget: within it every mip; past it a new streamed texture leaves its mip 0 (4 tiles) out, and one
-        // bound already keeps what it has.
-        pages.set_budget(2 * 64 * 1024);
+        // The page budget: within it every mip; past it a new streamed texture leaves out its mips of more than 2 pages
+        // (mip 0, 4 tiles); past 5/4 of it every mip before the tail; one bound already keeps what it has.
+        pages.set_budget(5 * 64 * 1024);
         EXPECT(pages.place(12, reinterpret_cast<VkImage>(22), tiles, types, 0x6000000, bytes, true));
         EXPECT(pages.require_mip(12, 0));
         EXPECT(pages.first_mip(12) == 0 && pages.stats().pages == 6);  // within budget when it was bound
         EXPECT(pages.place(13, reinterpret_cast<VkImage>(23), tiles, types, 0x7000000, bytes, true));
         EXPECT(pages.require_mip(13, 0));
-        EXPECT(pages.first_mip(13) == 1 && pages.stats().pages == 8);  // mip 1 (1 tile) and the tail page
+        EXPECT(pages.first_mip(13) == 1 && pages.stats().pages == 8);  // 6 of 5: mip 1 (1 tile) and the tail page
+        EXPECT(pages.place(14, reinterpret_cast<VkImage>(24), tiles, types, 0x8000000, bytes, true));
+        EXPECT(pages.require_mip(14, 0));
+        EXPECT(pages.first_mip(14) == 2 && pages.stats().pages == 9);  // 8 of 5, past 5/4: the tail page alone
+        EXPECT(pages.first_mip(12) == 0);  // bound before: kept
+        // One level and no tail (UI art): kept whole however far past the budget.
+        std::vector<TitlePages::Tile> art(4);
+        for (std::uint32_t i = 0; i < 4; ++i) {
+            art[i].mip = 0;
+            art[i].offset = {std::int32_t(i) * 128, 0, 0};
+            art[i].extent = {128, 128, 1};
+        }
+        EXPECT(pages.place(15, reinterpret_cast<VkImage>(25), art, types, 0x9000000, 4 * 64 * 1024, true));
+        EXPECT(pages.require_mip(15, 0));
+        EXPECT(pages.first_mip(15) == 0 && pages.stats().pages == 13);
         pages.take();
         pages.release(12);
         pages.release(13);
+        pages.release(14);
+        pages.release(15);
         pages.set_budget(0);
         EXPECT(pages.stats().pages == 0);
     }

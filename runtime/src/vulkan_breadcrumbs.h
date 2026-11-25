@@ -27,9 +27,11 @@
 #include <vulkan/vulkan.h>
 
 #include "command_list.h"
+#include "debug_targets.h"  // arena_mapped: the stuck dispatch's descriptors in a hang report
 #include "vulkan_memory.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
@@ -248,6 +250,9 @@ public:
         bool progress_safe = true;            // level 2: its slot's earlier owners can write nothing more into it
         std::vector<std::uint32_t> positions;  // the command index of each op, for the per-op markers
         std::vector<std::uintptr_t> pipelines;  // the PSO id of each draw or dispatch op (0 for the others)
+        // A dispatch's group counts and its first four user-data words (0 for the other ops): a hang report then
+        // says whether a dispatch was huge or what it was pointed at.
+        std::vector<std::array<std::uint32_t, 11>> details;
     };
     // A submitted list as the breadcrumbs see it now.
     struct Entry {
@@ -258,6 +263,7 @@ public:
         std::uint64_t queue_id = 0;
         std::wstring list_name, queue_name;
         std::vector<std::uintptr_t> pipelines;  // as Mark::pipelines
+        std::vector<std::array<std::uint32_t, 11>> details;  // as Mark::details
         bool progress_known = false;      // GPU breadcrumbs: completed_ops is what the progress word says
         bool no_slot = false;             // level 2 with every slot busy: no GPU marker, progress unknown
         std::uint32_t completed_ops = 0;  // operations finished, in order (D3D12's *pLastBreadcrumbValue)
@@ -353,8 +359,14 @@ public:
                 m.ops.push_back(op);
                 m.positions.push_back(static_cast<std::uint32_t>(i));
                 std::uintptr_t pso = 0;
-                if (const auto* d = std::get_if<Dispatch>(&commands[i])) pso = d->pipeline;
-                else if (const auto* g = std::get_if<Draw>(&commands[i])) pso = g->pipeline;
+                std::array<std::uint32_t, 11> detail{};
+                if (const auto* d = std::get_if<Dispatch>(&commands[i])) {
+                    pso = d->pipeline;
+                    detail = {d->x, d->y, d->z, d->user_data[0], d->user_data[1], d->user_data[2], d->user_data[3],
+                              d->user_data[4], d->user_data[5], d->user_data[6], d->user_data[7]};
+                }
+                m.details.push_back(detail);
+                if (const auto* g = std::get_if<Draw>(&commands[i])) pso = g->pipeline;
                 else if (const auto* x = std::get_if<ExecuteIndirect>(&commands[i]))
                     pso = x->pipeline ? x->pipeline : (x->state ? x->state->pipeline : 0);
                 m.pipelines.push_back(pso);
@@ -481,6 +493,7 @@ public:
             const BreadcrumbState state =
                 words ? breadcrumb_state(read(m->slot, 0), read(m->slot, 1), m->tag) : BreadcrumbState::unknown;
             Entry e{m->tag, m->list_id, m->ops, state, m->queue_id, m->list_name, m->queue_name, m->pipelines};
+            e.details = m->details;
             e.no_slot = gpu_ && m->slot == kNoSlot;
             if (state == BreadcrumbState::completed) {
                 e.progress_known = true;  // the end word: every operation finished
@@ -575,9 +588,24 @@ private:
             for (std::size_t k = from; k < to; ++k) {
                 const std::uintptr_t pso = k < e.pipelines.size() ? e.pipelines[k] : 0;
                 const std::string name = pso ? breadcrumb_pso_name(pso) : std::string();
-                std::fprintf(out, "[rt] d3d12 DRED:     %s op %zu %s%s%s\n", k == at ? "->" : "  ", k,
+                std::fprintf(out, "[rt] d3d12 DRED:     %s op %zu %s%s%s", k == at ? "->" : "  ", k,
                              breadcrumb_op_name(e.ops[k]), pso ? " pso " : "",
                              pso ? (name.empty() ? "(unnamed)" : name.c_str()) : "");
+                if (k < e.details.size() && (e.details[k][0] | e.details[k][1] | e.details[k][2])) {
+                    const auto& d = e.details[k];
+                    std::fprintf(out, " groups %u x %u x %u, user data %08x %08x %08x %08x %08x %08x %08x %08x", d[0], d[1],
+                                 d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]);
+                    // The descriptors a word names when it is an address in the GPU address arena (the V# a shader
+                    // loads through it): 4 dwords each, for the stuck operation.
+                    if (k == at && debug_targets::arena_mapped)
+                        for (int w = 3; w < 11; ++w)
+                            if (d[w] >= 0x10000 && d[w] % 4 == 0 && d[w] + 16 <= debug_targets::arena_size) {
+                                const auto* v = reinterpret_cast<const std::uint32_t*>(debug_targets::arena_mapped + d[w]);
+                                std::fprintf(out, "\n[rt] d3d12 DRED:          at user data %d (%#x): %08x %08x %08x %08x",
+                                             w - 3, d[w], v[0], v[1], v[2], v[3]);
+                            }
+                }
+                std::fprintf(out, "\n");
             }
         }
     }

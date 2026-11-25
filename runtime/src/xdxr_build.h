@@ -125,6 +125,12 @@ public:
 
     bool loaded() const { return loaded_; }
     void set_max_groups(std::uint32_t groups) { max_groups_ = groups ? groups : min_max_groups; }
+    // Paged addressing (xdxr_build.comp FLAG_PAGED): every address handed to record_* is then an application (console)
+    // GPU virtual address, translated by the shader at each access: below 4 GiB the device address `arena` + VA, at
+    // or above it the title-memory page table at the start of the arena (the translated shaders' Gen.host_addr), an
+    // address with no entry the arena's scratch page. `arena`: the arena's device address, 0 for plain addresses.
+    void set_paged(std::uint64_t arena) { paged_ = arena; }
+    std::uint64_t paged() const { return paged_; }
     std::uint32_t max_groups() const { return max_groups_; }
 
     // Records a bottom-level build into `dst` (layout.size bytes) using `scratch` (layout.scratch bytes). `layout`
@@ -149,6 +155,7 @@ public:
         }
         if (total != layout.elements) return false;
         Push p = base(layout, dst, scratch);
+        page(p);
         if (pair && !update_from) p.flags |= flag_pair;
         if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
         std::uint32_t first = 0;
@@ -181,6 +188,7 @@ public:
             return false;
         Push p = base(layout, dst, scratch);
         p.bias = split(bias);
+        page(p);  // paged: BLAS addresses in the instances are application VAs, translated like the rest
         if (update_from) refit_begin(cb, layout, p, update_from); else begin(cb, layout, p);
         if (layout.elements) {
             Push t = p;
@@ -200,6 +208,7 @@ public:
         if (src == dst) return true;
         vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         Push p{};
+        page(p);
         p.mode = mode_copy_as;
         p.src0 = split(src);
         p.dst = split(dst);
@@ -218,6 +227,7 @@ public:
                                  &b, 0, nullptr, 0, nullptr);
         vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         Push p{};
+        page(p);
         p.mode = mode_postbuild;
         p.src0 = split(src);
         p.dst = split(dst);
@@ -240,7 +250,7 @@ private:
                       sort_size = 0, elements_off = 0, nodes_off = 0, parents_off = 0, total_size = 0, flags = 0;
         std::uint32_t base = 0;   // the first thread of this dispatch in its step (dispatch() sets it)
     };
-    enum : std::uint32_t { flag_tlas = 1, flag_box16 = 2, flag_pair = 4 };  // xdxr_build.comp FLAG_*
+    enum : std::uint32_t { flag_tlas = 1, flag_box16 = 2, flag_pair = 4, flag_paged = 8 };  // xdxr_build.comp FLAG_*
     static_assert(sizeof(Push) == 108, "push constants must match xdxr_build.comp");
     static constexpr std::uint32_t min_max_groups = 65535;   // the least maxComputeWorkGroupCount[0] Vulkan allows
 
@@ -418,6 +428,12 @@ private:
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     VkPipeline pipeline_ = VK_NULL_HANDLE;
     std::uint32_t max_groups_ = min_max_groups;
+    std::uint64_t paged_ = 0;  // set_paged
+    void page(Push& p) const {
+        if (!paged_) return;
+        p.flags |= flag_paged;
+        p.bias = split(paged_);
+    }
     bool loaded_ = false;
 };
 

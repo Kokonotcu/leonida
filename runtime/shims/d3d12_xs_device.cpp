@@ -1850,11 +1850,44 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 return 0;
             }
             if constexpr (Slot == 148) {
-                static std::atomic<bool> logged{false};
-                if (!logged.exchange(true, std::memory_order_relaxed))
-                    std::fprintf(stderr,
-                                 "[rt] d3d12_xs: console list slot 148 AllocateUploadMemory stub called (size %llu, align %llu)\n",
-                                 static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2));
+                // AllocateUploadMemory(size, alignment): memory the caller writes on the CPU and names by the same
+                // pointer as a GPU address in the list's commands (XboxBvhBuilder.dll's build inputs; five-star-recomp
+                // docs/d3d12x-shim.md, slot 148). It returned null here, and the builder threw E_FAIL (an uncaught
+                // C++ exception, three minutes into the first loading screen). A 64 MiB ring of title-range memory
+                // ([8 GiB, 1 TiB), as xmem places the title's own: the page table resolves such an address for the
+                // GPU), handed out in order and reused when it wraps; the builder's requests are a few hundred bytes
+                // that live until their list has run.
+                constexpr std::uint64_t kRing = 64ull << 20;
+                static std::uint8_t* const ring = [] {
+                    using Alloc2 = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
+                    const auto alloc2 = reinterpret_cast<Alloc2>(
+                        GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "VirtualAlloc2"));
+                    MEM_ADDRESS_REQUIREMENTS requirements{};
+                    requirements.LowestStartingAddress = reinterpret_cast<PVOID>(std::uintptr_t{8} << 30);
+                    requirements.HighestEndingAddress = reinterpret_cast<PVOID>((std::uintptr_t{1} << 40) - 1);
+                    MEM_EXTENDED_PARAMETER parameter{};
+                    parameter.Type = MemExtendedParameterAddressRequirements;
+                    parameter.Pointer = &requirements;
+                    void* memory = alloc2 ? alloc2(GetCurrentProcess(), nullptr, kRing, MEM_RESERVE | MEM_COMMIT,
+                                                   PAGE_READWRITE, &parameter, 1)
+                                          : nullptr;
+                    if (!memory) memory = VirtualAlloc(nullptr, kRing, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                    std::fprintf(stderr, "[rt] d3d12_xs: list slot 148 AllocateUploadMemory: a %llu MiB ring at %p\n",
+                                 static_cast<unsigned long long>(kRing >> 20), memory);
+                    return static_cast<std::uint8_t*>(memory);
+                }();
+                static std::atomic<std::uint64_t> head{0};
+                const std::uint64_t size = a1;
+                std::uint64_t align = a2 ? a2 : 16;
+                if (align & (align - 1)) align = 256;  // not a power of two: the strictest a GPU address needs here
+                if (!ring || size == 0 || size > kRing / 4) return 0;
+                std::uint64_t old = head.load(std::memory_order_relaxed);
+                for (;;) {
+                    std::uint64_t start = (old + align - 1) & ~(align - 1);
+                    if (start + size > kRing) start = 0;  // wrap
+                    if (head.compare_exchange_weak(old, start + size, std::memory_order_relaxed))
+                        return reinterpret_cast<std::uint64_t>(ring + start);
+                }
             }
             return 0;
         } else {

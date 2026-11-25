@@ -329,11 +329,16 @@ struct Window {
 struct Section {
     HANDLE handle;
     void* scratch;
-    explicit Section(HANDLE h) : handle(h), scratch(MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, 0)) {}
+    uint64_t bytes;
+    Section(HANDLE h, uint64_t size) : handle(h), scratch(MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, 0)), bytes(size) {}
     Section(const Section&) = delete;
     Section& operator=(const Section&) = delete;
     ~Section() {
-        if (scratch) UnmapViewOfFile(scratch);
+        if (scratch) {
+            if (const auto released = rt::xmem::g_section_released.load(std::memory_order_acquire))
+                released(scratch, bytes);
+            UnmapViewOfFile(scratch);
+        }
         CloseHandle(handle);
     }
 };
@@ -729,41 +734,94 @@ void* virtual_alloc_paged(void* address, SIZE_T size, DWORD allocation_type, DWO
 }
 
 // With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
-bool unmap_page(uintptr_t address) {
-    const FaultLockExclusive lock;
-    const auto it = g_mapped.find(address);
-    if (it == g_mapped.end()) return true;
-    if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
-                                       MEM_PRESERVE_PLACEHOLDER)) {
-        return false;
+// With g_phys_mutex held: tells the GPU page table (rt::xmem::g_page_mapped) what the window page at `address` shows.
+void notify_page_to(rt::xmem::PageMappedFn told, uintptr_t address, const MappedPage* mapped) {
+    if (!told) return;
+    if (!mapped || !mapped->section->scratch) {
+        told(address, nullptr, nullptr, 0);
+        return;
     }
-    forget_page_address(it->second.page, address);
-    g_mapped.erase(it);
-    rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
+    void* const base = mapped->section->scratch;
+    told(address, static_cast<uint8_t*>(base) + mapped->offset, base, mapped->section->bytes);
+}
+void notify_page(uintptr_t address, const MappedPage* mapped) {
+    notify_page_to(rt::xmem::g_page_mapped.load(std::memory_order_acquire), address, mapped);
+}
+
+// With g_phys_mutex held. Unmaps the page at `address` if one is mapped there; the address becomes a placeholder again.
+// `notify`: false when a new page is mapped there right after (map_page tells the page table once).
+bool unmap_page(uintptr_t address, bool notify = true) {
+    {
+        const FaultLockExclusive lock;
+        const auto it = g_mapped.find(address);
+        if (it == g_mapped.end()) return true;
+        if (!placeholder_api().unmap_view2(GetCurrentProcess(), reinterpret_cast<void*>(address),
+                                           MEM_PRESERVE_PLACEHOLDER)) {
+            return false;
+        }
+        forget_page_address(it->second.page, address);
+        g_mapped.erase(it);
+        rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
+    }
+    if (notify) notify_page(address, nullptr);
     return true;
 }
 
 // With g_phys_mutex held. Maps physical page `page` (0: unmap) at the 64 KiB-aligned `address`, replacing what was
 // mapped there. The caller has found the window.
 bool map_page(uintptr_t address, uint64_t page, DWORD protect) {
-    if (!unmap_page(address)) return false;
+    const bool had = g_mapped.count(address) != 0;
+    if (!unmap_page(address, page == 0)) return false;
     if (page == 0) return true;
     const auto it = g_pages.find(page);
     if (it == g_pages.end()) {
+        if (had) notify_page(address, nullptr);
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
     void* const target = reinterpret_cast<void*>(address);
-    if (!isolate_placeholder(target, kPhysicalPageSize)) return false;
-    const FaultLockExclusive lock;
-    void* const view = placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target,
-                                                   it->second.offset, kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER,
-                                                   protect, nullptr, 0);
-    if (!view) return false;
-    g_mapped[address] = MappedPage{page, it->second.section, it->second.offset};
-    g_page_addresses.emplace(page, address);
-    rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
+    const MappedPage* mapped = nullptr;
+    {
+        const FaultLockExclusive lock;
+        void* const view = isolate_placeholder(target, kPhysicalPageSize)
+            ? placeholder_api().map_view3(it->second.section->handle, GetCurrentProcess(), target, it->second.offset,
+                                          kPhysicalPageSize, MEM_REPLACE_PLACEHOLDER, protect, nullptr, 0)
+            : nullptr;
+        if (view) {
+            mapped = &(g_mapped[address] = MappedPage{page, it->second.section, it->second.offset});
+            g_page_addresses.emplace(page, address);
+            rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
+        }
+    }
+    if (!mapped) {
+        if (had) notify_page(address, nullptr);
+        return false;
+    }
+    notify_page(address, mapped);
     return true;
+}
+
+// rt::xmem::g_window_pages: every page of [start, end) in a physical-page window, with what it shows.
+uint64_t visit_window_pages(uintptr_t start, uintptr_t end, rt::xmem::PageMappedFn fn) {
+    const std::lock_guard lock(g_phys_mutex);
+    uint64_t count = 0;
+    for (uintptr_t page = start & ~(kPhysicalPageSize - 1); page < end; page += kPhysicalPageSize) {
+        if (const auto it = g_mapped.find(page); it != g_mapped.end()) {
+            ++count;
+            notify_page_to(fn, page, &it->second);
+        } else if (find_window(page, kPhysicalPageSize)) {
+            ++count;
+            fn(page, nullptr, nullptr, 0);
+        }
+    }
+    return count;
+}
+
+// rt::xmem::g_mapped_pages: every window page mapped now, with what it shows.
+uint64_t visit_mapped_pages(rt::xmem::PageMappedFn fn) {
+    const std::lock_guard lock(g_phys_mutex);
+    for (const auto& [address, mapped] : g_mapped) notify_page_to(fn, address, &mapped);
+    return g_mapped.size();
 }
 
 DWORD view_protect(const Window& window);
@@ -916,6 +974,8 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
     rt::xmem::g_commit_range.store(&rt::xmem::commit_physical_range, std::memory_order_release);
     rt::xmem::g_transfer_physical.store(&rt::xmem::transfer_physical, std::memory_order_release);
     rt::xmem::g_mirror_address.store(&locked_mirror_of, std::memory_order_release);
+    rt::xmem::g_window_pages.store(&visit_window_pages, std::memory_order_release);
+    rt::xmem::g_mapped_pages.store(&visit_mapped_pages, std::memory_order_release);
     const uint64_t bytes = count * kPhysicalPageSize;  // below 2^37: count is below 2^21
     const HANDLE handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE,
                                              static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
@@ -928,7 +988,7 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         *page_count = 0;
         return FALSE;
     }
-    const auto section = std::make_shared<Section>(handle);
+    const auto section = std::make_shared<Section>(handle, bytes);
     if (!section->scratch) {
         *page_count = 0;
         return FALSE;

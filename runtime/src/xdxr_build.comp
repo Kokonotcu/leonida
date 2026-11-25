@@ -88,6 +88,11 @@ const uint TRI0 = 0u, TRI1 = 1u, BOX16 = 4u, BOX32 = 5u, INSTANCE = 6u;
 const uint LEAF = 0x80000000u;              // a binary child that is a sorted element, not an inner node
 const uint REMAP_IDENTITY = 0x09u;
 const uint FLAG_TLAS = 1u, FLAG_BOX16 = 2u, FLAG_PAIR = 4u;  // pc.flags; xdxr_build.h XdxrBuilder flag_*
+// FLAG_PAGED: addresses are application GPU VAs and pc.bias is the runtime's arena (XdxrBuilder::set_paged); each
+// access is translated as the translated title shaders do it (tools/rdna2spirv.py Gen.host_addr, PAGE_TABLE_*).
+const uint FLAG_PAGED = 8u;
+const uint PAGE_TABLE_SCRATCH = 0x10000u, PAGE_TABLE_DIR = 0x30000u, PAGE_TABLE_DIR_BYTES = 0x40000u,
+           PAGE_TABLE_CHUNK_BYTES = 0x80000u;
 const uint FLAG_BOTTOM_LEVEL = 0x80000000u, VERSION_2403 = 6u, INST_IDENTITY_ROTATION = 0x80000000u,
            INST_FLAGS_MASK = 0xc0000000u;
 
@@ -128,7 +133,24 @@ uvec2 add64(uvec2 a, uvec2 b) {
     uint lo = uaddCarry(a.x, b.x, carry);
     return uvec2(lo, a.y + b.y + carry);
 }
-Words at(uvec2 base, uint byte_offset) { return Words(add(base, byte_offset)); }
+// The device address of application address `va` (FLAG_PAGED; otherwise `va` already is one). Below 4 GiB: an offset
+// in the arena. At or above: dir[(va >> 32) & 0xffff] is a 1-based chunk number, chunk[(va >> 16) & 0xffff] the
+// device address of that 64 KiB page; no entry reads and writes the scratch page instead of faulting.
+uvec2 device_address(uvec2 va) {
+    if ((pc.flags & FLAG_PAGED) == 0u) return va;
+    if (va.y == 0u) return add64(pc.bias, va);
+    uint slot = Words(add(pc.bias, PAGE_TABLE_DIR + 4u * (va.y & 0xffffu))).w[0];
+    uint low = va.x & 0xffffu;
+    if (slot != 0u) {
+        uvec2 e = add(pc.bias, PAGE_TABLE_DIR + PAGE_TABLE_DIR_BYTES + (slot - 1u) * PAGE_TABLE_CHUNK_BYTES +
+                               8u * (va.x >> 16));
+        Words entry = Words(e);
+        uvec2 page = uvec2(entry.w[0], entry.w[1]);
+        if (page.x != 0u || page.y != 0u) return add(page, low);
+    }
+    return add(pc.bias, PAGE_TABLE_SCRATCH + low);
+}
+Words at(uvec2 base, uint byte_offset) { return Words(device_address(add(base, byte_offset))); }
 uint load(uvec2 base, uint byte_offset) { return at(base, byte_offset).w[0]; }
 void store(uvec2 base, uint byte_offset, uint v) { at(base, byte_offset).w[0] = v; }
 void storef(uvec2 base, uint byte_offset, float v) { store(base, byte_offset, floatBitsToUint(v)); }
@@ -243,7 +265,7 @@ uint index_of(uint i) {
     // at an address that is 2 mod 4. Read the aligned word that holds index i (clearing the low bits cannot borrow
     // from the high half of the address) and take its half.
     uvec2 a = add(pc.src1, 2u * i);
-    uint word = Words(uvec2(a.x & ~3u, a.y)).w[0];
+    uint word = at(uvec2(a.x & ~3u, a.y), 0u).w[0];
     return (a.x & 2u) != 0u ? word >> 16 : word & 0xffffu;
 }
 vec3 transformed(vec3 p) {
@@ -295,7 +317,7 @@ void build_instance(uint i) {
     vec3 lo = vec3(uintBitsToFloat(0x7f800000u)), hi = -lo;
     uint root = INVALID;
     if (!is_null(blas_va)) {
-        uvec2 blas = add64(blas_va, pc.bias);
+        uvec2 blas = (pc.flags & FLAG_PAGED) != 0u ? blas_va : add64(blas_va, pc.bias);  // paged: at() translates
         root = load(blas, 48u);
         vec3 blo = vec3(uintBitsToFloat(load(blas, 16u)), uintBitsToFloat(load(blas, 20u)), uintBitsToFloat(load(blas, 24u)));
         vec3 bhi = vec3(uintBitsToFloat(load(blas, 28u)), uintBitsToFloat(load(blas, 32u)), uintBitsToFloat(load(blas, 36u)));

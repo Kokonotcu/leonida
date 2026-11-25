@@ -395,20 +395,36 @@ private:
     // Binds the tiles of streamed texture `t` from mip max(want, floor) on (its mip tail and metadata with any), and
     // unbinds those before it. True when it bound a tile (its bytes are uploaded again: take_remapped). A tile the pool
     // has no page for stays unbound (reads zero).
-    // Mips of streamed texture `t` left out for the page budget (set_budget): none within it; past it the most detailed
-    // mip of a texture whose mip 0 takes 4 pages or more, and past 5/4 of it the next one too. A texture without a mip
-    // chain (UI art), or one the GPU writes, keeps every mip.
+    // Mips of streamed texture `t` left out for the page budget (set_budget): none within it. Past it, the mips that take
+    // more than 2 pages; past 5/4 of it every mip before the mip tail (the tail, one page, stays). The mips left out
+    // are the views' clamp (first_mip). A texture with a single level outside a tail (UI art, a loading-screen card),
+    // or one the GPU writes, keeps every mip: leaving its only level out drew nothing.
+    //
+    // Until 2026-11-25 only textures whose mip 0 took 4 pages or more lost a mip or two, so the loading screen's 34,000
+    // streamed textures (155 KiB of pages each on average, one 64 KiB page at least for a tail) took 5.3 GB against a
+    // 3.5 GB budget; the card heap ran out and the driver then refused even host-memory imports
+    // (VK_ERROR_OUT_OF_DEVICE_MEMORY), after which the GPU read scratch pages and hung.
     std::uint32_t budget_floor(const Target& t) const {
         if (!budget_pages_ || t.gpu_written) return 0;
         const std::size_t used = pages_.size() + extra_.size();
         if (used <= budget_pages_) return 0;
-        std::size_t mip_tiles[2] = {};
+        std::uint32_t levels = 0;  // levels outside the mip tail: 1 + the largest mip of a non-opaque tile
+        bool tail = false;
+        for (const Tile& tile : t.tiles) {
+            if (tile.opaque) {
+                tail = tail || (tile.flags & VK_SPARSE_MEMORY_BIND_METADATA_BIT) == 0;
+                continue;
+            }
+            levels = std::max(levels, tile.mip + 1);
+        }
+        if (levels == 0 || (levels == 1 && !tail)) return 0;
+        if (used > budget_pages_ + budget_pages_ / 4) return tail ? levels : levels - 1;
+        std::vector<std::size_t> per_mip(levels, 0);
         for (const Tile& tile : t.tiles)
-            if (!tile.opaque && tile.mip < 2) ++mip_tiles[tile.mip];
-        std::uint32_t drop = 0;
-        if (mip_tiles[0] >= 4) drop = 1;
-        if (drop && used > budget_pages_ + budget_pages_ / 4 && mip_tiles[1] >= 4) drop = 2;
-        return drop;
+            if (!tile.opaque) ++per_mip[tile.mip];
+        for (std::uint32_t m = 0; m < levels; ++m)
+            if (per_mip[m] <= 2) return m;
+        return tail ? levels : levels - 1;
     }
 
     bool fit(std::uintptr_t id, Target& t) {

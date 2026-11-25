@@ -43,4 +43,25 @@ inline void note_title_written(const void* address, std::size_t size) {
 // VirtualQuery again (one call per 64 KiB view) until it changes.
 inline std::atomic<std::uint64_t> g_map_generation{0};
 
+// The GPU's view of physical pages (the D3D12 layer's title page table). A page's own memory is its 64 KiB in the
+// whole-section view of the section behind it (`section`, `section_bytes`), which stays at one address while the
+// section lives, whatever window the page is mapped into. The page table points each window address at that memory,
+// so a remap is one entry: an import of the window's views instead pins the pages mapped there at import time, and
+// the GPU went on reading those after the title had mapped others (stale BVH inputs, then a hung GPU).
+//
+// `g_page_mapped(address, backing, section, section_bytes)`: the window page at `address` now shows `backing` (null:
+// nothing). Called by xmem with its page lock held, after the host mapping changed.
+using PageMappedFn = void (*)(std::uintptr_t address, void* backing, void* section, std::uint64_t section_bytes);
+inline std::atomic<PageMappedFn> g_page_mapped{nullptr};
+// A section's whole-section view is about to be unmapped (its last page freed and unmapped), with xmem's lock held.
+using SectionReleasedFn = void (*)(void* section, std::uint64_t section_bytes);
+inline std::atomic<SectionReleasedFn> g_section_released{nullptr};
+// Calls `fn` for every 64 KiB page of [start, end) inside a physical-page window, mapped (with its backing) or not
+// (null), with xmem's page lock held, and returns how many there were. Set by xmem when it first hands out pages.
+using WindowPagesFn = std::uint64_t (*)(std::uintptr_t start, std::uintptr_t end, PageMappedFn fn);
+inline std::atomic<WindowPagesFn> g_window_pages{nullptr};
+// Calls `fn` for every window page mapped now (the page table's start), with xmem's page lock held; how many.
+using MappedPagesFn = std::uint64_t (*)(PageMappedFn fn);
+inline std::atomic<MappedPagesFn> g_mapped_pages{nullptr};
+
 }

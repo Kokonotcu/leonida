@@ -97,6 +97,12 @@ namespace rt::d3d12 {
 void note_title_texture_write(const void* address, std::size_t size);
 namespace {
 
+// xmem's physical pages into the title page table (rt::xmem::g_page_mapped, g_section_released): defined after
+// DeviceState, for the one device that has the table (g_page_table_state).
+void physical_page_mapped(std::uintptr_t address, void* backing, void* section, std::uint64_t bytes);
+void physical_page_wanted(std::uintptr_t address, void* backing, void* section, std::uint64_t bytes);
+void physical_section_released(void* section, std::uint64_t bytes);
+
 // Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
 // increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
 constexpr UINT kDescriptorSize = descriptor_size;
@@ -1023,7 +1029,32 @@ struct DeviceState {
         std::vector<std::pair<VkBuffer, VkDeviceMemory>> imports;
         std::map<std::uint64_t, std::pair<std::uint64_t, VkBuffer>> runs;  // import start VA -> (end VA, buffer)
         std::uint64_t pages = 0, refused = 0;
+        // Physical pages (rt::xmem::g_page_mapped): a window page's entry points into an import of its section's
+        // whole-section view, made in chunks of kPhysicalChunk, so a remap changes the entry and nothing else.
+        struct Chunk {
+            std::uintptr_t end = 0;
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkDeviceAddress address = 0;
+        };
+        std::map<std::uintptr_t, Chunk> imported;                  // host start -> chunk
+        std::unordered_map<std::uint64_t, std::uintptr_t> window;  // window page VA -> its page's host memory
+        // Window pages a command has asked for (map_title_memory): their entries follow every remap, importing a
+        // chunk when the new page needs one. Another remap only gets an entry when its chunk is imported already:
+        // importing every page the title maps locked 4 GiB of RAM in the first 20 s of the boot.
+        std::unordered_set<std::uint64_t> wanted;
+        // Window pages with nothing to map just now (no page mapped there, or its chunk could not be imported), and
+        // when that was seen: map_title_memory runs for every command's root arguments, and asking xmem and the
+        // driver again each time (a failed import retried per command) slowed the submissions until the title's GPU
+        // watchdog fired (run 2026-11-25 00:32, stacks in import_host). An entry holds for kSettledFor; a mapping
+        // from xmem replaces it at once.
+        std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> settled;
+        std::unordered_map<std::uintptr_t, std::chrono::steady_clock::time_point> failed_chunks;  // host start
+        std::uint64_t chunk_bytes = 0, chunk_failures = 0;
     } title_pages;
+    static constexpr std::uint64_t kPhysicalChunk = 4ull << 20;  // 16 MiB pinned 2 GiB for 1 MiB demands
+    static constexpr std::chrono::milliseconds kSettledFor{500}, kFailedChunkFor{5000};
+    VkResult last_import_result = VK_SUCCESS;  // import_host's vkAllocateMemory, for the failure log
 
     // A title VA (at or above 4 GiB) as a buffer and offset, for what binds a VkBuffer rather than reading through
     // the page table: vertex and index views, copies (VulkanContext::buffer_at falls back to this). Memory not
@@ -1033,6 +1064,7 @@ struct DeviceState {
         for (int attempt = 0; attempt < 2; ++attempt) {
             {
                 std::lock_guard lock(title_pages.mutex);
+                if (window_buffer_at(va, size, buffer, offset)) return true;
                 auto it = title_pages.runs.upper_bound(va);
                 if (it != title_pages.runs.begin()) {
                     --it;
@@ -1051,14 +1083,30 @@ struct DeviceState {
 
     // Gives every committed 64 KiB page of [address, address + bytes) a page-table entry, importing the pages that
     // have none in runs of at most 64 MiB. A page that is not committed (or write-combined) stays unmapped: the
-    // shader reads the scratch page there instead of faulting. False when nothing could be mapped.
+    // shader reads the scratch page there instead of faulting. False when nothing could be mapped. Pages of
+    // physical-page windows are never imported by address: their entries follow xmem's mappings (set_window_page).
     bool map_title_memory(std::uintptr_t address, std::uint64_t bytes) {
         constexpr std::uint64_t page = 0x10000, max_run = 64ull << 20;
         if (!arena.mapped || !get_host_pointer_properties || !bytes || address >> 48) return false;
-        auto& vk = context->vk;
-        const VkDevice device = info.device;
-        std::lock_guard lock(title_pages.mutex);
         const std::uint64_t first = address & ~(page - 1), end = (address + bytes + page - 1) & ~(page - 1);
+        {
+            std::lock_guard lock(title_pages.mutex);
+            const auto now = std::chrono::steady_clock::now();
+            bool all = true, some = false;
+            for (std::uint64_t p = first; p < end && all; p += page) {
+                if (title_pages.mapped.count(p)) {
+                    some = true;
+                    continue;
+                }
+                const auto s = title_pages.settled.find(p);
+                all = s != title_pages.settled.end() && now - s->second < kSettledFor;
+            }
+            if (all) return some;
+        }
+        // Window pages first, outside title_pages.mutex: xmem calls back with its own lock held, then takes ours.
+        if (const auto visit = rt::xmem::g_window_pages.load(std::memory_order_acquire))
+            visit(first, end, &physical_page_wanted);
+        std::lock_guard lock(title_pages.mutex);
         bool any = false;
         for (std::uint64_t p = first; p < end;) {
             if (title_pages.mapped.count(p)) {
@@ -1070,61 +1118,31 @@ struct DeviceState {
             std::uint64_t q = p;
             while (q < end && q - p < max_run && !title_pages.mapped.count(q)) {
                 MEMORY_BASIC_INFORMATION region{};
+                // A view (MEM_MAPPED) is a physical page in a window: its entry is set_window_page's, as an import
+                // here would keep the page mapped now after the title maps another.
                 if (!VirtualQuery(reinterpret_cast<const void*>(q), &region, sizeof(region)) ||
-                    region.State != MEM_COMMIT || (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_NOACCESS)))
+                    region.State != MEM_COMMIT || region.Type == MEM_MAPPED ||
+                    (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_NOACCESS)))
                     break;
                 q += page;
             }
-            if (q == p) {  // not committed: left unmapped
+            if (q == p) {  // not committed: left unmapped (asked again after kSettledFor)
                 ++title_pages.refused;
+                title_pages.settled[p] = std::chrono::steady_clock::now();
                 p += page;
                 continue;
             }
             const VkDeviceSize run = q - p;
-            VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
-            external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-            VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
-            create.size = run;
-            create.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
-            share(create);
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceMemory imported = VK_NULL_HANDLE;
-            VkMemoryHostPointerPropertiesEXT host{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
-            VkMemoryRequirements requirements{};
-            bool ok = vk.vkCreateBuffer(device, &create, nullptr, &buffer) == VK_SUCCESS;
-            if (ok) {
-                vk.vkGetBufferMemoryRequirements(device, buffer, &requirements);
-                ok = get_host_pointer_properties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
-                                                 reinterpret_cast<void*>(p), &host) == VK_SUCCESS;
-            }
-            const std::uint32_t types = ok ? host.memoryTypeBits & requirements.memoryTypeBits : 0;
-            if (types) {
-                VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
-                import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-                import.pHostPointer = reinterpret_cast<void*>(p);
-                VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
-                flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-                for (std::uint32_t i = 0; i < memory.memoryTypeCount && !imported; ++i) {
-                    if (!(types & (1u << i))) continue;
-                    VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
-                    allocate.allocationSize = run;
-                    allocate.memoryTypeIndex = i;
-                    if (vk.vkAllocateMemory(device, &allocate, nullptr, &imported) != VK_SUCCESS)
-                        imported = VK_NULL_HANDLE;
-                }
-            }
-            VkDeviceAddress device_address = 0;
-            if (imported && vk.vkBindBufferMemory(device, buffer, imported, 0) == VK_SUCCESS) {
-                VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-                bda.buffer = buffer;
-                device_address = vk.vkGetBufferDeviceAddress(device, &bda);
-            }
+            std::uint32_t types = 0;
+            const VkDeviceAddress device_address =
+                import_host(reinterpret_cast<void*>(p), run, buffer, imported, types);
             if (!device_address) {
-                if (buffer) vk.vkDestroyBuffer(device, buffer, nullptr);
-                if (imported) vk.vkFreeMemory(device, imported, nullptr);
+                // Not asked again for kFailedChunkFor: a refused import retried by every command held title_pages.mutex
+                // through one failing driver call after another (run 2026-11-25 00:55, stacks in map_title_memory).
+                const auto later = std::chrono::steady_clock::now() + (kFailedChunkFor - kSettledFor);
+                for (std::uint64_t v = p; v < q; v += page) title_pages.settled[v] = later;
                 if (!title_pages.refused)
                     std::fprintf(stderr, "[rt] d3d12: title memory %#llx + %#llx could not be imported for the page "
                                          "table (memory types 0x%x)\n",
@@ -1135,23 +1153,8 @@ struct DeviceState {
             }
             title_pages.imports.emplace_back(buffer, imported);
             title_pages.runs[p] = {q, buffer};
-            auto* dir = reinterpret_cast<volatile std::uint32_t*>(arena.mapped + kPageTableDir);
             for (std::uint64_t v = p; v < q; v += page) {
-                const std::uint32_t d = static_cast<std::uint32_t>((v >> 32) & 0xFFFF);
-                std::uint32_t slot = dir[d];
-                if (!slot) {
-                    if (title_pages.chunks == kPageTableChunks) {
-                        std::fprintf(stderr, "[rt] d3d12: title page table full (%u chunks); %#llx stays unmapped\n",
-                                     kPageTableChunks, static_cast<unsigned long long>(v));
-                        break;
-                    }
-                    slot = ++title_pages.chunks;
-                }
-                auto* entries = reinterpret_cast<volatile std::uint64_t*>(arena.mapped + kPageTableDir +
-                                                                           kPageTableDirBytes +
-                                                                           (slot - 1) * kPageTableChunkBytes);
-                entries[(v >> 16) & 0xFFFF] = device_address + (v - p);
-                dir[d] = slot;  // after the entry: a shader that sees the chunk sees its page
+                if (!set_page_entry(v, device_address + (v - p))) break;
                 title_pages.mapped.insert(v);
                 ++title_pages.pages;
             }
@@ -1166,6 +1169,211 @@ struct DeviceState {
             p = q;
         }
         return any;
+    }
+
+    // `bytes` of host memory at `host` as a device-addressable buffer (VK_EXT_external_memory_host): its device
+    // address, 0 when the driver refuses it (nothing is left behind then; `types`: the memory types it offered).
+    VkDeviceAddress import_host(void* host, VkDeviceSize bytes, VkBuffer& buffer, VkDeviceMemory& imported,
+                                std::uint32_t& types) {
+        auto& vk = context->vk;
+        const VkDevice device = info.device;
+        buffer = VK_NULL_HANDLE;
+        imported = VK_NULL_HANDLE;
+        types = 0;
+        VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+        external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+        VkBufferCreateInfo create{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+        create.size = bytes;
+        create.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                       VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        share(create);
+        VkMemoryHostPointerPropertiesEXT properties{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+        VkMemoryRequirements requirements{};
+        bool ok = vk.vkCreateBuffer(device, &create, nullptr, &buffer) == VK_SUCCESS;
+        if (ok) {
+            vk.vkGetBufferMemoryRequirements(device, buffer, &requirements);
+            ok = get_host_pointer_properties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host,
+                                             &properties) == VK_SUCCESS;
+        }
+        types = ok ? properties.memoryTypeBits & requirements.memoryTypeBits : 0;
+        if (types) {
+            VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+            import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+            import.pHostPointer = host;
+            VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
+            flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+            for (std::uint32_t i = 0; i < memory.memoryTypeCount && !imported; ++i) {
+                if (!(types & (1u << i))) continue;
+                VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags};
+                allocate.allocationSize = bytes;
+                allocate.memoryTypeIndex = i;
+                last_import_result = vk.vkAllocateMemory(device, &allocate, nullptr, &imported);
+                if (last_import_result != VK_SUCCESS) imported = VK_NULL_HANDLE;
+            }
+        }
+        VkDeviceAddress device_address = 0;
+        if (imported && vk.vkBindBufferMemory(device, buffer, imported, 0) == VK_SUCCESS) {
+            VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            bda.buffer = buffer;
+            device_address = vk.vkGetBufferDeviceAddress(device, &bda);
+        }
+        if (!device_address) {
+            if (buffer) vk.vkDestroyBuffer(device, buffer, nullptr);
+            if (imported) vk.vkFreeMemory(device, imported, nullptr);
+            buffer = VK_NULL_HANDLE;
+            imported = VK_NULL_HANDLE;
+        }
+        return device_address;
+    }
+
+    // With title_pages.mutex held: the page-table entry of the 64 KiB page at title VA `v` becomes `value` (a device
+    // address, 0: the scratch page). False when the table is full (`v` stays unmapped).
+    bool set_page_entry(std::uint64_t v, std::uint64_t value) {
+        auto* dir = reinterpret_cast<volatile std::uint32_t*>(arena.mapped + kPageTableDir);
+        const std::uint32_t d = static_cast<std::uint32_t>((v >> 32) & 0xFFFF);
+        std::uint32_t slot = dir[d];
+        bool fresh = false;
+        if (!slot) {
+            if (!value) return true;  // no chunk: every page of it reads the scratch already
+            if (title_pages.chunks == kPageTableChunks) {
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 4)
+                    std::fprintf(stderr, "[rt] d3d12: title page table full (%u chunks); %#llx stays unmapped\n",
+                                 kPageTableChunks, static_cast<unsigned long long>(v));
+                return false;
+            }
+            slot = ++title_pages.chunks;
+            fresh = true;
+        }
+        auto* entries = reinterpret_cast<volatile std::uint64_t*>(arena.mapped + kPageTableDir + kPageTableDirBytes +
+                                                                   (slot - 1) * kPageTableChunkBytes);
+        entries[(v >> 16) & 0xFFFF] = value;
+        if (fresh) dir[d] = slot;  // after the entry: a shader that sees the chunk sees its page
+        return true;
+    }
+
+    // With title_pages.mutex held: the chunk import holding `backing` (host memory of a page of the section viewed at
+    // `section`, `bytes` long), made when there is none and `make`. end() when there is none.
+    std::map<std::uintptr_t, TitlePages::Chunk>::iterator physical_chunk(std::uintptr_t backing,
+                                                                          std::uintptr_t section, std::uint64_t bytes,
+                                                                          bool make) {
+        auto it = title_pages.imported.upper_bound(backing);
+        if (it != title_pages.imported.begin()) {
+            const auto previous = std::prev(it);
+            if (backing < previous->second.end) return previous;
+        }
+        if (!make) return title_pages.imported.end();
+        const std::uintptr_t start = section + (backing - section) / kPhysicalChunk * kPhysicalChunk;
+        const std::uintptr_t end = std::min<std::uintptr_t>(start + kPhysicalChunk, section + bytes);
+        const auto now = std::chrono::steady_clock::now();
+        if (const auto f = title_pages.failed_chunks.find(start);
+            f != title_pages.failed_chunks.end() && now - f->second < kFailedChunkFor)
+            return title_pages.imported.end();
+        TitlePages::Chunk chunk;
+        chunk.end = end;
+        std::uint32_t types = 0;
+        // The section is SEC_RESERVE (xmem commits a page when the title first touches it); an import needs it
+        // committed. Physical pages are memory the title allocated to use, as on the console.
+        if (VirtualAlloc(reinterpret_cast<void*>(start), end - start, MEM_COMMIT, PAGE_READWRITE))
+            chunk.address = import_host(reinterpret_cast<void*>(start), end - start, chunk.buffer, chunk.memory, types);
+        if (!chunk.address) {
+            title_pages.failed_chunks[start] = now;
+            const std::uint64_t n = ++title_pages.chunk_failures;
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: physical pages %#llx + %#llx could not be imported for the page "
+                                     "table (memory types 0x%x, VkResult %d, error %lu; %llu failures, %llu MiB "
+                                     "imported)\n",
+                             static_cast<unsigned long long>(start), static_cast<unsigned long long>(end - start),
+                             types, static_cast<int>(last_import_result), GetLastError(),
+                             static_cast<unsigned long long>(n),
+                             static_cast<unsigned long long>(title_pages.chunk_bytes >> 20));
+            return title_pages.imported.end();
+        }
+        title_pages.chunk_bytes += end - start;
+        const std::size_t n = title_pages.imported.size() + 1;
+        if ((n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12: physical pages: %zu section imports, %llu MiB\n", n,
+                         static_cast<unsigned long long>(title_pages.chunk_bytes >> 20));
+        return title_pages.imported.emplace(start, chunk).first;
+    }
+
+    // With title_pages.mutex held: the window page at `address` shows `backing` (null: nothing), see
+    // rt::xmem::g_page_mapped. `want`: a command asked for it (map_title_memory).
+    void set_window_page(std::uint64_t address, void* backing, void* section, std::uint64_t bytes, bool want) {
+        if (!arena.mapped || !get_host_pointer_properties) return;
+        if (want) title_pages.wanted.insert(address);
+        const bool make = want || title_pages.wanted.count(address);
+        std::uint64_t value = 0;
+        const auto host = reinterpret_cast<std::uintptr_t>(backing);
+        if (backing) {
+            const auto chunk = physical_chunk(host, reinterpret_cast<std::uintptr_t>(section), bytes, make);
+            if (chunk != title_pages.imported.end()) value = chunk->second.address + (host - chunk->first);
+        }
+        if (!set_page_entry(address, value)) return;
+        if (value) {
+            if (title_pages.mapped.insert(address).second) ++title_pages.pages;
+            title_pages.window[address] = host;
+            title_pages.settled.erase(address);
+        } else {
+            if (title_pages.mapped.erase(address)) --title_pages.pages;
+            title_pages.window.erase(address);
+            // Settled only for a page a command asked for (nothing mapped there, or its chunk refused): a remap of a page
+            // no command has asked for yet (xmem's notice, no import made) settled it too, every remap renewed that, and
+            // the first command that asked for it found it settled and never imported it (black frames, 2026-11-25).
+            if (want || title_pages.wanted.count(address))
+                title_pages.settled[address] = std::chrono::steady_clock::now();
+            else
+                title_pages.settled.erase(address);
+        }
+    }
+
+    // With title_pages.mutex held: a section's view goes away (rt::xmem::g_section_released). Its pages are unmapped
+    // everywhere by now; its imports are destroyed once the work submitted so far is done.
+    void release_section(std::uintptr_t section, std::uint64_t bytes) {
+        for (auto it = title_pages.imported.lower_bound(section);
+             it != title_pages.imported.end() && it->first < section + bytes;) {
+            context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, it->second.buffer);
+            context->defer_destroy(leonida::DeferredDeletionQueue::Kind::device_memory, it->second.memory);
+            title_pages.chunk_bytes -= it->second.end - it->first;
+            it = title_pages.imported.erase(it);
+        }
+        for (auto it = title_pages.window.begin(); it != title_pages.window.end();) {
+            if (it->second >= section && it->second < section + bytes) {
+                set_page_entry(it->first, 0);
+                if (title_pages.mapped.erase(it->first)) --title_pages.pages;
+                it = title_pages.window.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // With title_pages.mutex held: title_buffer_at for a window page, `size` cut where the physical pages behind
+    // the following window pages stop being the next ones of the same chunk.
+    bool window_buffer_at(std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
+        constexpr std::uint64_t page = 0x10000;
+        const std::uint64_t base = va & ~(page - 1);
+        const auto at = title_pages.window.find(base);
+        if (at == title_pages.window.end()) return false;
+        auto chunk = title_pages.imported.upper_bound(at->second);
+        if (chunk == title_pages.imported.begin()) return false;
+        --chunk;
+        if (at->second >= chunk->second.end) return false;
+        const std::uint64_t want = size ? size : 1;
+        std::uint64_t reach = base + page;  // end of the contiguous run
+        while (reach < va + want) {
+            const auto next = title_pages.window.find(reach);
+            if (next == title_pages.window.end() || next->second != at->second + (reach - base) ||
+                next->second >= chunk->second.end)
+                break;
+            reach += page;
+        }
+        buffer = chunk->second.buffer;
+        offset = at->second - chunk->first + (va - base);
+        size = std::min<std::uint64_t>(want, reach - va);
+        return true;
     }
 
     // The memory types a sparse buffer can bind, asked of the driver with a throwaway sparse buffer on first use (a
@@ -2859,6 +3067,30 @@ struct DeviceState {
     }
 };
 
+// The device whose title page table follows xmem's physical pages (set once its arena exists, cleared before it goes).
+std::atomic<DeviceState*> g_page_table_state{nullptr};
+
+void physical_page_mapped(std::uintptr_t address, void* backing, void* section, std::uint64_t bytes) {
+    DeviceState* const state = g_page_table_state.load(std::memory_order_acquire);
+    if (!state) return;
+    std::lock_guard lock(state->title_pages.mutex);
+    state->set_window_page(address, backing, section, bytes, false);
+}
+
+void physical_page_wanted(std::uintptr_t address, void* backing, void* section, std::uint64_t bytes) {
+    DeviceState* const state = g_page_table_state.load(std::memory_order_acquire);
+    if (!state) return;
+    std::lock_guard lock(state->title_pages.mutex);
+    state->set_window_page(address, backing, section, bytes, true);
+}
+
+void physical_section_released(void* section, std::uint64_t bytes) {
+    DeviceState* const state = g_page_table_state.load(std::memory_order_acquire);
+    if (!state) return;
+    std::lock_guard lock(state->title_pages.mutex);
+    state->release_section(reinterpret_cast<std::uintptr_t>(section), bytes);
+}
+
 // The Vulkan format for a texture this layer can create, with the D24 fallback; VK_FORMAT_UNDEFINED, after a log
 // line, when it cannot. Committed and placed textures share it so both refuse the same formats for the same reason.
 Format texture_format(const DeviceState& device, const D3D12_RESOURCE_DESC& desc) {
@@ -4547,11 +4779,20 @@ private:
             if (staging_queue->ok()) {
                 const leonida::CommandList* lists[] = {&list};
                 result = staging_queue->execute(lists);
-                // Only this copy's own submission (review D9: was vkQueueWaitIdle under the submit lock). Other
-                // queues need no wait: D3D12 asks the application to have seen the texture's GPU work complete before
-                // a CPU copy, and that host wait, then this submission, orders it before the copy.
-                if (result == leonida::ReplayResult::success && !staging_queue->wait_submitted())
-                    result = leonida::ReplayResult::unsupported;
+                if (result == leonida::ReplayResult::success) {
+                    if (write) {
+                        // A write is not waited for on the host: every queue's next submission waits for it on the
+                        // GPU (note_upload), and the staging memory goes after the submissions so far. One host wait
+                        // per texture, behind the title-page binds on the GPU, held the submitting thread for
+                        // seconds in the loading screen (34,000 streamed textures; the title's GPU watchdog fired).
+                        device_.context->note_upload(staging_queue->progress_semaphore(),
+                                                     staging_queue->submitted_value());
+                    } else if (!staging_queue->wait_submitted()) {
+                        // A read: only this copy's own submission (review D9: was vkQueueWaitIdle under the submit
+                        // lock). D3D12 asks the application to have seen the texture's GPU work complete first.
+                        result = leonida::ReplayResult::unsupported;
+                    }
+                }
             }
         }
         device_.context->remove_resource(staging_id);
@@ -4560,7 +4801,7 @@ private:
             return release(E_FAIL, true);
         }
         if (!write) unpack(static_cast<const std::byte*>(mapped), pitch);
-        return release(S_OK);
+        return release(S_OK, write);
     }
 
     bool cpu_visible() const {
@@ -8208,6 +8449,23 @@ public:
         if (info.host_pointer_alignment)
             state_.get_host_pointer_properties = reinterpret_cast<PFN_vkGetMemoryHostPointerPropertiesEXT>(
                 get_device(info.device, "vkGetMemoryHostPointerPropertiesEXT"));
+        // The title page table follows xmem's physical pages (set_window_page): pages mapped from now on as xmem maps
+        // them, the ones mapped already right here. After the loader above: create_arena runs before it.
+        if (state_.arena.mapped && state_.get_host_pointer_properties) {
+            g_page_table_state.store(&state_, std::memory_order_release);
+            rt::xmem::g_section_released.store(&physical_section_released, std::memory_order_release);
+            rt::xmem::g_page_mapped.store(&physical_page_mapped, std::memory_order_release);
+            if (const auto all = rt::xmem::g_mapped_pages.load(std::memory_order_acquire)) {
+                const std::uint64_t pages = all(&physical_page_mapped);
+                std::lock_guard lock(state_.title_pages.mutex);
+                std::fprintf(stderr, "[rt] d3d12: physical pages: %llu mapped at device creation, %zu section imports, "
+                                     "%llu MiB\n",
+                             static_cast<unsigned long long>(pages), state_.title_pages.imported.size(),
+                             static_cast<unsigned long long>(state_.title_pages.chunk_bytes >> 20));
+            }
+        } else {
+            std::fprintf(stderr, "[rt] d3d12: physical pages are not in the title page table (no host imports)\n");
+        }
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
         state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
             return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -8316,20 +8574,23 @@ public:
             std::uint32_t sparse_families = 0;
             for (std::uint32_t f = 0; f < family_count && f < 32; ++f)
                 if (families[f].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) sparse_families |= 1u << f;
-            // Blocks through allocate_type's VRAM budget check, keeping 512 MiB of the budget for what is made after
-            // them (render targets, buffers, the driver's own): past it they come from system memory.
+            // Blocks through allocate_type's VRAM budget check, keeping 1.5 GiB of the budget for what is made after
+            // them (render targets, buffers, the driver's own): past it they come from system memory. With 512 MiB
+            // the pages took the card to its budget in the first loading screen, the rest pushed it over, and the
+            // driver then refused host-memory imports (VK_ERROR_OUT_OF_DEVICE_MEMORY), which the title page table
+            // needs for physical pages (runs of 2026-11-25).
             DeviceState* const device_state = &state_;
             state_.context->enable_title_pages(state_.memory, sparse_families,
                                                [device_state](std::uint32_t type, VkDeviceSize size) {
                                                    return device_state->allocate_type(type, size, false, nullptr,
-                                                                                      VkDeviceSize(512) << 20);
+                                                                                      VkDeviceSize(1536) << 20);
                                                });
             state_.title_pages_3d = info.features.sparseResidencyImage3D == VK_TRUE;
-            // The page budget (TitlePages::set_budget): LEONIDA_TITLE_PAGES_MB, else 3.5 GB, which with the render
+            // The page budget (TitlePages::set_budget): LEONIDA_TITLE_PAGES_MB, else 3 GB, which with the render
             // targets and buffers keeps an 8 GB card's VRAM and a 32 GB PC's commit; past it new streamed textures
-            // leave their most detailed mip out (their views start at the first mip bound).
+            // bind fewer mips (budget_floor; their views start at the first mip bound).
             if (leonida::TitlePages* pages = state_.context->title_pages()) {
-                std::uint64_t mb = 3584;
+                std::uint64_t mb = 3072;
                 if (const std::wstring v = environment_text(L"LEONIDA_TITLE_PAGES_MB"); !v.empty())
                     mb = std::wcstoull(v.c_str(), nullptr, 10);
                 pages->set_budget(mb << 20);
@@ -8622,6 +8883,10 @@ public:
             [state = &state_](std::uint64_t va, std::uint64_t& size, VkBuffer& buffer, VkDeviceSize& offset) {
                 return state->title_buffer_at(va, size, buffer, offset);
             });
+        // A whole title range a command reaches through the page table (the XDXR builder's inputs and outputs).
+        state_.context->set_title_range_mapper([state = &state_](std::uint64_t va, std::uint64_t bytes) {
+            state->map_title_memory(va, bytes);
+        });
         // A title address in a draw's or dispatch's root arguments: the MiB from its 64 KiB page gets page-table
         // entries (committed pages only) before the command runs.
         state_.context->set_title_mapper([state = &state_](std::uint64_t va) {
@@ -8651,6 +8916,11 @@ public:
     }
 
     ~Device() override {
+        if (DeviceState* expected = &state_;
+            g_page_table_state.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel)) {
+            rt::xmem::g_page_mapped.store(nullptr, std::memory_order_release);
+            rt::xmem::g_section_released.store(nullptr, std::memory_order_release);
+        }
         if (library_preload_.joinable()) library_preload_.join();
         if (pipeline_cache_preload_.joinable()) pipeline_cache_preload_.join();
         if (state_.context) {

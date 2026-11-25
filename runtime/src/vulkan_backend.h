@@ -1163,31 +1163,44 @@ public:
                            (!b.update || (b.build_flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) != 0);
                 };
                 replay_.xdxr_record = [this](VkCommandBuffer cb, const BuildAccelerationStructure& b) {
-                    // Every address is a console VA in the GPU address arena: the device address is heap_base + VA,
-                    // and the BLAS addresses in instance descs get the same bias.
-                    const std::uint64_t base = replay_.heap_base;
+                    // Every address is a console VA. The builder translates them itself (XdxrBuilder::set_paged): an
+                    // arena VA is heap_base + VA, a title VA (at or above 4 GiB: XboxBvhBuilder's builds, in the
+                    // title's own memory) goes through the title page table, as the translated shaders read it.
+                    // Before, heap_base + a title VA was a wild device address.
+                    xdxr_->set_paged(replay_.heap_base);
                     XdxrLayout layout;
                     layout.compute(xdxr_elements(b), b.is_tlas, xdxr_box16(b));
+                    map_title_range(b.dst_va, layout.size);
+                    map_title_range(b.scratch_va, layout.scratch);
                     // PERFORM_UPDATE refits the source (the destination itself when no source is given, as D3D12
                     // allows for an in-place update); a full build otherwise.
-                    const std::uint64_t from = b.update ? base + (b.src_va ? b.src_va : b.dst_va) : 0;
+                    const std::uint64_t from = b.update ? (b.src_va ? b.src_va : b.dst_va) : 0;
+                    if (from && from != b.dst_va) map_title_range(from, layout.size);
                     if (b.is_tlas) {
-                        xdxr_->record_tlas(cb, layout, b.instances_va ? base + b.instances_va : 0, base + b.dst_va,
-                                           base + b.scratch_va, base, from);
+                        map_title_range(b.instances_va, std::uint64_t(b.instance_count) * 64);
+                        xdxr_->record_tlas(cb, layout, b.instances_va, b.dst_va, b.scratch_va, 0, from);
                     } else {
+                        for (const auto& t : b.triangles) {
+                            map_title_range(t.vertex_va, std::uint64_t(t.vertex_count) * t.vertex_stride);
+                            map_title_range(t.index_va, std::uint64_t(t.index_count) * (t.index_type == 1 ? 2 : 4));
+                            map_title_range(t.transform_va, 48);
+                        }
                         std::vector<XdxrTriangles> geometries;
-                        xdxr_inputs(b, &geometries, base);
-                        xdxr_->record_blas(cb, layout, geometries, base + b.dst_va, base + b.scratch_va, from,
-                                           xdxr_pair(b));
+                        xdxr_inputs(b, &geometries, 0);
+                        xdxr_->record_blas(cb, layout, geometries, b.dst_va, b.scratch_va, from, xdxr_pair(b));
                     }
                 };
                 replay_.xdxr_copy = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t bytes) {
-                    const std::uint64_t base = replay_.heap_base;
-                    xdxr_->record_copy(cb, base + src, base + dst, bytes);
+                    xdxr_->set_paged(replay_.heap_base);
+                    map_title_range(src, bytes);
+                    map_title_range(dst, bytes);
+                    xdxr_->record_copy(cb, src, dst, bytes);
                 };
                 replay_.xdxr_postbuild = [this](VkCommandBuffer cb, std::uint64_t src, std::uint64_t dest) {
-                    const std::uint64_t base = replay_.heap_base;
-                    xdxr_->record_postbuild(cb, base + src, base + dest);
+                    xdxr_->set_paged(replay_.heap_base);
+                    map_title_range(src, XdxrLayout::header_size);
+                    map_title_range(dest, 8);
+                    xdxr_->record_postbuild(cb, src, dest);
                 };
             } else {
                 xdxr_.reset();
@@ -1467,6 +1480,15 @@ public:
     void set_title_mapper(std::function<void(std::uint64_t)> mapper) {
         std::unique_lock lock(resource_mutex_);
         replay_.map_title = std::move(mapper);
+    }
+    // Page-table entries for a whole title range (va, bytes) before a command that reads or writes it through the
+    // table (the XDXR builder's paged addresses). Called while commands are recorded, like map_title.
+    void set_title_range_mapper(std::function<void(std::uint64_t, std::uint64_t)> mapper) {
+        std::unique_lock lock(resource_mutex_);
+        title_range_mapper_ = std::move(mapper);
+    }
+    void map_title_range(std::uint64_t va, std::uint64_t bytes) {
+        if (va >> 32 && bytes && title_range_mapper_) title_range_mapper_(va, bytes);
     }
 
     // Pipelines are registered by an opaque id (the PSO object) for as long as the PSO lives.
@@ -2212,6 +2234,7 @@ private:
     std::unordered_map<ResourceId, ResourceBinding> resources_;
     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
     TitleBufferLookup title_buffer_at_;      // buffer_at's fallback for title addresses (set_title_buffer_lookup)
+    std::function<void(std::uint64_t, std::uint64_t)> title_range_mapper_;  // set_title_range_mapper
     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
     std::unordered_map<std::uintptr_t, GraphicsPipeline> graphics_pipelines_;
@@ -2255,6 +2278,24 @@ private:
     VkSemaphore title_pages_semaphore_ = VK_NULL_HANDLE;
     std::uint64_t title_pages_value_ = 0;
     std::uint64_t title_pages_version_ = 0;
+    // Uploads submitted without a host wait (the device's staged texture writes): per staging queue timeline, the
+    // latest value; every queue's next submission waits for the ones it has not seen (note_upload). Under
+    // storage_mutex_.
+    std::vector<std::pair<VkSemaphore, std::uint64_t>> upload_values_;
+    std::uint64_t upload_version_ = 0;
+
+public:
+    void note_upload(VkSemaphore semaphore, std::uint64_t value) {
+        if (!semaphore || !value) return;
+        std::lock_guard lock(storage_mutex_);
+        auto it = std::find_if(upload_values_.begin(), upload_values_.end(),
+                               [&](const auto& e) { return e.first == semaphore; });
+        if (it == upload_values_.end()) upload_values_.emplace_back(semaphore, value);
+        else it->second = std::max(it->second, value);
+        ++upload_version_;
+    }
+
+private:
     std::unique_ptr<Depth24Converter> depth24_;
     std::unique_ptr<ScratchBuffers> scratch_;  // copies staged through a buffer (depth <-> colour)
     std::unique_ptr<IndirectExpander> indirect_;  // multi-argument command signatures
@@ -2691,6 +2732,13 @@ public:
     // Waits on the CPU until what this queue has submitted so far is done: its own timeline, without the device's
     // submit lock, so other queues keep submitting, and without waiting for anything submitted after (review D9;
     // idle() waits for the whole VkQueue, which D3D12 queues may share, and blocks every submission meanwhile).
+    // This queue's timeline and the value of its latest submission (VulkanContext::note_upload).
+    VkSemaphore progress_semaphore() const { return progress_; }
+    std::uint64_t submitted_value() {
+        std::lock_guard state(state_mutex_);
+        return submitted_;
+    }
+
     bool wait_submitted() {
         std::uint64_t value = 0;
         {
@@ -3407,6 +3455,15 @@ private:
                 wait_values_.push_back(context_.title_pages_value_);
             }
             title_pages_seen_ = context_.title_pages_version_;
+            // Uploads made on the staging queues without a host wait (note_upload): this submission may read them.
+            if (context_.upload_version_ != upload_seen_) {
+                for (const auto& [semaphore, value] : context_.upload_values_)
+                    if (semaphore != progress_) {
+                        waits_.push_back(semaphore);
+                        wait_values_.push_back(value);
+                    }
+                upload_seen_ = context_.upload_version_;
+            }
             if (kind_ != QueueKind::copy && runs_shaders)
                 storage_images.assign(context_.storage_pending_.begin(), context_.storage_pending_.end());
             if (!storage_images.empty()) context_.storage_pending_.clear();
@@ -4251,6 +4308,7 @@ private:
     std::uint64_t storage_init_seen_ = 0;  // the storage_init_version_ this queue has waited for
     std::uint64_t bindless_upload_seen_ = 0;  // the bindless_upload_version_ this queue has waited for
     std::uint64_t title_pages_seen_ = 0;      // the title_pages_version_ this queue has waited for
+    std::uint64_t upload_seen_ = 0;           // the upload_version_ this queue has waited for
     std::uint64_t last_sparse_ = 0;
     std::deque<PendingBindings> pending_bindings_;
     std::vector<VkSemaphore> waits_;
