@@ -804,6 +804,8 @@ std::atomic<unsigned long long> g_dedicated_bytes{0}, g_new_blocks{0};
 // Live device memory by kind, for the allocation-count limit (4096 on NVIDIA's Windows driver): resources with an
 // allocation of their own, and suballocator blocks (made less given back).
 std::atomic<long long> g_dedicated_live{0}, g_blocks_freed{0};
+// Title-placed buffers' host imports (create_host_buffer): a buffer's own, and shared windows (DeviceState::SharedImport).
+std::atomic<long long> g_buffer_imports_own{0}, g_buffer_imports_shared{0};
 // Title-placed textures made, by console layout & 0x1ff (0x100 + swizzle mode).
 std::array<std::atomic<unsigned>, 0x200> g_console_layout_count{};
 std::size_t live_title_texture_stats(unsigned long long& bytes);  // under title_texture_mutex
@@ -1038,6 +1040,69 @@ struct DeviceState {
     // calls on other threads keep their own submissions.
     struct StagedBatch;  // after MemoryRange
     std::atomic<StagedBatch*> staged_batch{nullptr};
+
+    // Title-placed buffers' host imports, shared per 2 MiB window of one allocation (create_host_buffer): one
+    // VkDeviceMemory per buffer took ~3,600 of the ~5,000 device memory objects alive when the driver refused imports
+    // (NVIDIA counts them against maxMemoryAllocationCount, 4096; run 04:11). A buffer binds at its offset in its
+    // window's import; the last buffer of a window frees it.
+    struct SharedImport {
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        std::uint64_t start = 0, end = 0;  // host addresses
+        std::uint32_t type = 0;
+        std::uint32_t users = 0;
+    };
+    std::mutex shared_imports_mutex;
+    std::map<std::uint64_t, SharedImport> shared_imports;  // by window start
+    static constexpr std::uint64_t kSharedImportWindow = 2ull << 20;
+
+    // The window a buffer at host range [start, end) shares: 2 MiB aligned, clipped to the allocation that holds `start`,
+    // every page committed and neither write-combined nor uncached. {0, 0} when there is none (the buffer imports its
+    // own range).
+    static std::pair<std::uint64_t, std::uint64_t> shared_import_window(std::uint64_t start, std::uint64_t end) {
+        MEMORY_BASIC_INFORMATION first{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(start), &first, sizeof(first))) return {0, 0};
+        const auto allocation = reinterpret_cast<std::uint64_t>(first.AllocationBase);
+        std::uint64_t lo = std::max(allocation, start & ~(kSharedImportWindow - 1));
+        std::uint64_t hi = (end + kSharedImportWindow - 1) & ~(kSharedImportWindow - 1);
+        // Walk from lo: each region must belong to the same allocation and be committed, plain memory.
+        for (std::uint64_t at = lo; at < hi;) {
+            MEMORY_BASIC_INFORMATION r{};
+            if (!VirtualQuery(reinterpret_cast<const void*>(at), &r, sizeof(r)) ||
+                reinterpret_cast<std::uint64_t>(r.AllocationBase) != allocation || r.State != MEM_COMMIT ||
+                (r.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_GUARD | PAGE_NOACCESS))) {
+                if (at < end) return {0, 0};  // the buffer's own pages are not plain committed memory
+                hi = at;                      // the window stops where the plain committed memory does
+                break;
+            }
+            at = reinterpret_cast<std::uint64_t>(r.BaseAddress) + r.RegionSize;
+        }
+        return {lo, hi};
+    }
+
+    // With shared_imports_mutex held: the import of `window` usable with `types` (a user added), or null.
+    SharedImport* find_shared_import(std::pair<std::uint64_t, std::uint64_t> window, std::uint32_t types) {
+        const auto it = shared_imports.find(window.first);
+        if (it == shared_imports.end() || it->second.end < window.second || !(types & (1u << it->second.type)))
+            return nullptr;
+        ++it->second.users;
+        return &it->second;
+    }
+
+    // One user of the import at `start` goes. The last one waits for the work submitted so far (the title may free the
+    // pages right after) and frees the memory.
+    void release_shared_import(std::uint64_t start) {
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        {
+            std::lock_guard lock(shared_imports_mutex);
+            const auto it = shared_imports.find(start);
+            if (it == shared_imports.end() || --it->second.users) return;
+            memory = it->second.memory;
+            shared_imports.erase(it);
+        }
+        context->wait_retire_ticket(context->submitted_retire_ticket());
+        context->vk.vkFreeMemory(info.device, memory, nullptr);
+        --g_buffer_imports_shared;
+    }
     std::atomic<std::thread::id> staged_batch_owner{};
 
     // Opens `batch` for this thread's staged writes, or (null) closes it and makes what it holds: one execute per
@@ -1126,6 +1191,8 @@ struct DeviceState {
         // from xmem replaces it at once.
         std::unordered_map<std::uint64_t, std::chrono::steady_clock::time_point> settled;
         std::unordered_map<std::uintptr_t, std::chrono::steady_clock::time_point> failed_chunks;  // host start
+        std::unordered_set<std::uint64_t> importing;  // pages a map_title_memory call imports outside the lock
+        std::unordered_set<std::uintptr_t> importing_chunks;  // chunk starts physical_chunk imports outside it
         std::uint64_t chunk_bytes = 0, chunk_failures = 0, chunks_released = 0, chunks_made = 0;
     } title_pages;
     // 2 MiB: imported memory is pinned, and the driver refused imports past about 3.4 GiB in all (1.2 GiB of 4 MiB
@@ -1184,17 +1251,41 @@ struct DeviceState {
         // Window pages first, outside title_pages.mutex: xmem calls back with its own lock held, then takes ours.
         if (const auto visit = rt::xmem::g_window_pages.load(std::memory_order_acquire))
             visit(first, end, &physical_page_wanted);
-        std::lock_guard lock(title_pages.mutex);
+        // The pages to import are claimed under title_pages.mutex, looked up and imported without it (VirtualQuery and
+        // the driver's host import take milliseconds; every recording that names title memory waited behind them, a
+        // submission's record phase took 0.4-2.7 s, run 04:31 sample_164), and committed under it again. A page another
+        // thread is importing is left to it.
         bool any = false;
-        for (std::uint64_t p = first; p < end;) {
-            if (title_pages.mapped.count(p)) {
-                p += page;
-                any = true;
-                continue;
+        std::vector<std::uint64_t> claimed;  // pages this call imports
+        {
+            std::lock_guard lock(title_pages.mutex);
+            const auto now = std::chrono::steady_clock::now();
+            for (std::uint64_t p = first; p < end; p += page) {
+                if (title_pages.mapped.count(p)) {
+                    any = true;
+                    continue;
+                }
+                const auto s = title_pages.settled.find(p);
+                if (s != title_pages.settled.end() && now - s->second < kSettledFor) continue;
+                if (!title_pages.importing.insert(p).second) continue;
+                claimed.push_back(p);
             }
-            // The run of unmapped, committed pages from p.
+        }
+        struct Run {
+            std::uint64_t p = 0, q = 0;
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory imported = VK_NULL_HANDLE;
+            VkDeviceAddress device_address = 0;
+            std::uint32_t types = 0;
+        };
+        std::vector<Run> runs;
+        std::vector<std::uint64_t> refused_pages;
+        for (std::size_t i = 0; i < claimed.size();) {
+            const std::uint64_t p = claimed[i];
+            // The run of claimed, committed pages from p (consecutive in `claimed`).
             std::uint64_t q = p;
-            while (q < end && q - p < max_run && !title_pages.mapped.count(q)) {
+            std::size_t j = i;
+            while (j < claimed.size() && claimed[j] == q && q - p < max_run) {
                 MEMORY_BASIC_INFORMATION region{};
                 // A view (MEM_MAPPED) is a physical page in a window: its entry is set_window_page's, as an import
                 // here would keep the page mapped now after the title maps another.
@@ -1207,21 +1298,36 @@ struct DeviceState {
                 // a title render thread in VirtualQuery during a 10 s stall (run 03:21, stacks_1).
                 const std::uint64_t region_end =
                     reinterpret_cast<std::uint64_t>(region.BaseAddress) + region.RegionSize;
-                do q += page;
-                while (q < end && q < region_end && q - p < max_run && !title_pages.mapped.count(q));
+                do {
+                    q += page;
+                    ++j;
+                } while (j < claimed.size() && claimed[j] == q && q < region_end && q - p < max_run);
             }
             if (q == p) {  // not committed: left unmapped (asked again after kSettledFor)
-                ++title_pages.refused;
-                title_pages.settled[p] = std::chrono::steady_clock::now();
-                p += page;
+                refused_pages.push_back(p);
+                ++i;
                 continue;
             }
+            Run r;
+            r.p = p;
+            r.q = q;
+            r.device_address = import_host(reinterpret_cast<void*>(p), q - p, r.buffer, r.imported, r.types);
+            runs.push_back(r);
+            i = j;
+        }
+        std::lock_guard lock(title_pages.mutex);
+        for (const std::uint64_t p : claimed) title_pages.importing.erase(p);
+        for (const std::uint64_t p : refused_pages) {
+            ++title_pages.refused;
+            title_pages.settled[p] = std::chrono::steady_clock::now();
+        }
+        for (const Run& r : runs) {
+            const std::uint64_t p = r.p, q = r.q;
             const VkDeviceSize run = q - p;
-            VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceMemory imported = VK_NULL_HANDLE;
-            std::uint32_t types = 0;
-            const VkDeviceAddress device_address =
-                import_host(reinterpret_cast<void*>(p), run, buffer, imported, types);
+            VkBuffer buffer = r.buffer;
+            VkDeviceMemory imported = r.imported;
+            const std::uint32_t types = r.types;
+            const VkDeviceAddress device_address = r.device_address;
             if (!device_address) {
                 // Not asked again for kFailedChunkFor: a refused import retried by every command held title_pages.mutex
                 // through one failing driver call after another (run 2026-11-25 00:55, stacks in map_title_memory).
@@ -1232,12 +1338,12 @@ struct DeviceState {
                                          "table (memory types 0x%x)\n",
                                  static_cast<unsigned long long>(p), static_cast<unsigned long long>(run), types);
                 title_pages.refused += run / page;
-                p = q;
                 continue;
             }
             title_pages.imports.emplace_back(buffer, imported);
             title_pages.runs[p] = {q, buffer};
             for (std::uint64_t v = p; v < q; v += page) {
+                if (title_pages.mapped.count(v)) continue;  // mapped meanwhile (a window page's remap)
                 if (!set_page_entry(v, device_address + (v - p))) break;
                 title_pages.mapped.insert(v);
                 ++title_pages.pages;
@@ -1250,7 +1356,6 @@ struct DeviceState {
                              static_cast<unsigned long long>(title_pages.pages / 16), title_pages.chunks,
                              static_cast<unsigned long long>(title_pages.refused));
             any = true;
-            p = q;
         }
         return any;
     }
@@ -1345,9 +1450,13 @@ struct DeviceState {
 
     // With title_pages.mutex held: the chunk import holding `backing` (host memory of a page of the section viewed at
     // `section`, `bytes` long), made when there is none and `make`. end() when there is none.
+    // `lock`: title_pages.mutex as the caller holds it; the import is made with it released (the driver's host import
+    // takes milliseconds, and every recording that names title memory waited behind it: run 04:31, sample_184), the
+    // chunk marked as being imported meanwhile.
     std::map<std::uintptr_t, TitlePages::Chunk>::iterator physical_chunk(std::uintptr_t backing,
                                                                           std::uintptr_t section, std::uint64_t bytes,
-                                                                          bool make) {
+                                                                          bool make,
+                                                                          std::unique_lock<std::mutex>* lock = nullptr) {
         auto it = title_pages.imported.upper_bound(backing);
         if (it != title_pages.imported.begin()) {
             const auto previous = std::prev(it);
@@ -1367,13 +1476,29 @@ struct DeviceState {
         if (const auto f = title_pages.failed_chunks.find(start);
             f != title_pages.failed_chunks.end() && now - f->second < kFailedChunkFor)
             return title_pages.imported.end();
+        if (title_pages.importing_chunks.count(start)) return title_pages.imported.end();  // another thread's import
         TitlePages::Chunk chunk;
         chunk.end = end;
         std::uint32_t types = 0;
+        if (lock) {
+            title_pages.importing_chunks.insert(start);
+            lock->unlock();
+        }
         // The section is SEC_RESERVE (xmem commits a page when the title first touches it); an import needs it
         // committed. Physical pages are memory the title allocated to use, as on the console.
         if (VirtualAlloc(reinterpret_cast<void*>(start), end - start, MEM_COMMIT, PAGE_READWRITE))
             chunk.address = import_host(reinterpret_cast<void*>(start), end - start, chunk.buffer, chunk.memory, types);
+        if (lock) {
+            lock->lock();
+            title_pages.importing_chunks.erase(start);
+            // Imported meanwhile by another call (it saw no mark yet when it began)? Keep that one.
+            auto again = title_pages.imported.upper_bound(backing);
+            if (again != title_pages.imported.begin() && backing < std::prev(again)->second.end) {
+                if (chunk.buffer) context->vk.vkDestroyBuffer(info.device, chunk.buffer, nullptr);
+                if (chunk.memory) context->vk.vkFreeMemory(info.device, chunk.memory, nullptr);
+                return std::prev(again);
+            }
+        }
         if (!chunk.address) {
             title_pages.failed_chunks[start] = now;
             const std::uint64_t n = ++title_pages.chunk_failures;
@@ -1381,7 +1506,8 @@ struct DeviceState {
                 std::fprintf(stderr, "[rt] d3d12: physical pages %#llx + %#llx could not be imported for the page "
                                      "table (memory types 0x%x, VkResult %d, error %lu; %llu failures, %llu MiB "
                                      "imported; %ld device memory objects live: %zu imports by address, %zu chunks, "
-                                     "%lld resources of their own, %lld suballocator blocks, %zu title page blocks)\n",
+                                     "%lld resources of their own, %lld suballocator blocks, %zu title page blocks, "
+                                     "%lld placed-buffer imports of their own, %lld shared windows)\n",
                              static_cast<unsigned long long>(start), static_cast<unsigned long long>(end - start),
                              types, static_cast<int>(last_import_result), GetLastError(),
                              static_cast<unsigned long long>(n),
@@ -1389,7 +1515,8 @@ struct DeviceState {
                              g_live_allocations.load(std::memory_order_relaxed), title_pages.imports.size(),
                              title_pages.imported.size(), g_dedicated_live.load(),
                              static_cast<long long>(g_new_blocks.load()) - g_blocks_freed.load(),
-                             context->title_pages() ? context->title_pages()->stats().blocks : std::size_t(0));
+                             context->title_pages() ? context->title_pages()->stats().blocks : std::size_t(0),
+                             g_buffer_imports_own.load(), g_buffer_imports_shared.load());
             return title_pages.imported.end();
         }
         title_pages.chunk_bytes += end - start;
@@ -1405,7 +1532,8 @@ struct DeviceState {
 
     // With title_pages.mutex held: the window page at `address` shows `backing` (null: nothing), see
     // rt::xmem::g_page_mapped. `want`: a command asked for it (map_title_memory).
-    void set_window_page(std::uint64_t address, void* backing, void* section, std::uint64_t bytes, bool want) {
+    void set_window_page(std::uint64_t address, void* backing, void* section, std::uint64_t bytes, bool want,
+                         std::unique_lock<std::mutex>* lock = nullptr) {
         if (!arena.mapped || !get_host_pointer_properties) return;
         if (want) title_pages.wanted.insert(address);
         const bool make = want || title_pages.wanted.count(address);
@@ -1413,7 +1541,7 @@ struct DeviceState {
         const auto host = reinterpret_cast<std::uintptr_t>(backing);
         auto chunk = title_pages.imported.end();
         if (backing) {
-            chunk = physical_chunk(host, reinterpret_cast<std::uintptr_t>(section), bytes, make);
+            chunk = physical_chunk(host, reinterpret_cast<std::uintptr_t>(section), bytes, make, lock);
             if (chunk != title_pages.imported.end()) value = chunk->second.address + (host - chunk->first);
         }
         // The chunk the entry pointed into before loses a user, the new one gains one (chunk_unused frees idle ones).
@@ -3291,15 +3419,15 @@ std::atomic<DeviceState*> g_page_table_state{nullptr};
 void physical_page_mapped(std::uintptr_t address, void* backing, void* section, std::uint64_t bytes) {
     DeviceState* const state = g_page_table_state.load(std::memory_order_acquire);
     if (!state) return;
-    std::lock_guard lock(state->title_pages.mutex);
-    state->set_window_page(address, backing, section, bytes, false);
+    std::unique_lock lock(state->title_pages.mutex);
+    state->set_window_page(address, backing, section, bytes, false, &lock);
 }
 
 void physical_page_wanted(std::uintptr_t address, void* backing, void* section, std::uint64_t bytes) {
     DeviceState* const state = g_page_table_state.load(std::memory_order_acquire);
     if (!state) return;
-    std::lock_guard lock(state->title_pages.mutex);
-    state->set_window_page(address, backing, section, bytes, true);
+    std::unique_lock lock(state->title_pages.mutex);
+    state->set_window_page(address, backing, section, bytes, true, &lock);
 }
 
 void physical_section_released(void* section, std::uint64_t bytes) {
@@ -3942,7 +4070,14 @@ public:
         }
         if (image_address_) device_.forget_image(image_address_);
         device_.context->remove_resource(id());
-        if (host_import_) {
+        if (host_import_ && shared_import_) {
+            // On a window's shared import: the buffer goes after the work submitted so far, the import with its last
+            // buffer (release_shared_import waits for the submitted work before it frees the memory).
+            if (buffer_) device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::buffer, buffer_);
+            buffer_ = VK_NULL_HANDLE;
+            device_.release_shared_import(shared_import_);
+            shared_import_ = 0;
+        } else if (host_import_) {
             // VK_EXT_external_memory_host needs the caller's pages to stay valid for the imported memory's whole
             // lifetime, and a title may free them right after releasing the resource. So the memory is not left to
             // the deferred queue (freed after the *next* submission retires): wait for what was submitted, then
@@ -3950,7 +4085,10 @@ public:
             device_.context->wait_retire_ticket(device_.context->submitted_retire_ticket());
             auto& vk = device_.context->vk;
             if (buffer_) vk.vkDestroyBuffer(device_.info.device, buffer_, nullptr);
-            if (memory_) vk.vkFreeMemory(device_.info.device, memory_.memory, nullptr);
+            if (memory_) {
+                vk.vkFreeMemory(device_.info.device, memory_.memory, nullptr);
+                --g_buffer_imports_own;
+            }
             buffer_ = VK_NULL_HANDLE;
             memory_ = {};
         }
@@ -4270,8 +4408,64 @@ public:
         import.pHostPointer = base_address;
         VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &import};
         flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        // The import of the 2 MiB window around the buffer, shared with the other buffers on it (DeviceState::
+        // SharedImport); the buffer's own import below when there is no such window or it cannot be made.
+        if (const auto window = DeviceState::shared_import_window(base, base + bytes);
+            window.second > window.first && window.first <= base && base + bytes <= window.second) {
+            std::lock_guard lock(device_.shared_imports_mutex);
+            DeviceState::SharedImport* shared = device_.find_shared_import(window, types);
+            if (!shared && !device_.shared_imports.count(window.first)) {
+                VkMemoryHostPointerPropertiesEXT whost{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+                if (device_.get_host_pointer_properties(device_.info.device,
+                                                        VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                                        reinterpret_cast<void*>(window.first), &whost) == VK_SUCCESS) {
+                    const std::uint32_t wtypes = whost.memoryTypeBits & types;
+                    VkImportMemoryHostPointerInfoEXT wimport{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
+                    wimport.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+                    wimport.pHostPointer = reinterpret_cast<void*>(window.first);
+                    VkMemoryAllocateFlagsInfo wflags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &wimport};
+                    wflags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+                    VkDeviceMemory made = VK_NULL_HANDLE;
+                    std::uint32_t made_type = 0;
+                    for (const VkMemoryPropertyFlags want :
+                         {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
+                          VkMemoryPropertyFlags(0)}) {
+                        for (std::uint32_t i = 0; i < device_.memory.memoryTypeCount && !made; ++i) {
+                            if (!(wtypes & (1u << i)) || (device_.memory.memoryTypes[i].propertyFlags & want) != want)
+                                continue;
+                            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                                                          need_bda ? static_cast<const void*>(&wflags) : &wimport};
+                            allocate.allocationSize = window.second - window.first;
+                            allocate.memoryTypeIndex = i;
+                            if (vk.vkAllocateMemory(device_.info.device, &allocate, nullptr, &made) == VK_SUCCESS)
+                                made_type = i;
+                            else
+                                made = VK_NULL_HANDLE;
+                        }
+                        if (made) break;
+                    }
+                    if (made) {
+                        ++g_buffer_imports_shared;
+                        auto& entry = device_.shared_imports[window.first];
+                        entry = {made, window.first, window.second, made_type, 1};
+                        shared = &entry;
+                    }
+                }
+            }
+            if (shared) {
+                const VkDeviceSize at = (base - window.first) + bind_offset;
+                if (at % requirements.alignment == 0 &&
+                    vk.vkBindBufferMemory(device_.info.device, buffer_, shared->memory, at) == VK_SUCCESS) {
+                    shared_import_ = window.first;
+                    memory_flags_ = device_.memory.memoryTypes[shared->type].propertyFlags;
+                } else {
+                    --shared->users;  // not bound: the entry stays for the others (or is freed at the device's end)
+                }
+            }
+        }
         // Host-visible and coherent first, as the caller's pages are; then any type both the import and the
         // buffer take.
+        if (!shared_import_)
         for (const VkMemoryPropertyFlags want :
              {VkMemoryPropertyFlags(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT),
               VkMemoryPropertyFlags(0)}) {
@@ -4288,9 +4482,12 @@ public:
             }
             if (memory_) break;
         }
-        if (!memory_) return E_OUTOFMEMORY;
-        if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_.memory, bind_offset) != VK_SUCCESS)
-            return E_OUTOFMEMORY;
+        if (!shared_import_) {
+            if (!memory_) return E_OUTOFMEMORY;
+            ++g_buffer_imports_own;  // freed with the resource (its destructor), or below on a failed bind
+            if (vk.vkBindBufferMemory(device_.info.device, buffer_, memory_.memory, bind_offset) != VK_SUCCESS)
+                return E_OUTOFMEMORY;
+        }
         mapped_ = address;
         host_import_ = true;
         va_ = start;
@@ -5092,6 +5289,7 @@ private:
     std::uint64_t buffer_va_ = 0;
     std::uint64_t gpu_va_ = 0;
     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
+    std::uint64_t shared_import_ = 0;  // host_import_ on a window's shared import: its start (DeviceState::SharedImport)
     bool evicted_ = false;      // evict_title_image: no image any more
     bool paged_ = false;        // on the title's shared pages (vulkan_title_pages.h): no memory_ of its own
     bool reserved_ = false;
@@ -13408,6 +13606,10 @@ void sync_title_textures() {
     }
     for (std::size_t n = 0; n < count; ++n) {
         const auto& t = textures[(cursor + n) % count];
+        // Nothing due on this submission (dirty, mapped, or a watched one whose next check has come; see the checks
+        // below): skipped before the title pages' locks and the span. Two locks and a span for each of ~35,000
+        // textures on every submission were ~15 ms of every ExecuteCommandLists in the loading screen.
+        if (!t->dirty && !(t->copied && (t->mapped || (t->watch && now >= t->next_check)))) continue;
         // On the title's pages and not bound now (a streamed texture no view has asked a mip of, or its bind not made
         // yet): nothing to copy into. Left as it is (dirty stays), so it is copied once it is bound.
         const bool paged = pages && t->resource->paged();

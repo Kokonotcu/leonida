@@ -295,6 +295,13 @@ struct DirtyWatch {
     std::atomic<std::uint8_t>* dirty = nullptr;  // one byte per page; never freed (a late fault may still read it)
     DWORD writable = 0;
     DWORD readonly = 0;
+    // Orders a fault's (mark dirty, open the page) against a sync's (clear, re-protect). Without it a fault that marked
+    // the page, then lost the CPU while the sync cleared and re-protected it, opened the page afterwards: writable and
+    // clean, so no later write faulted and the page was never copied again. The title's per-draw descriptor tables
+    // (written by the CPU into the heap's pool) then stayed stale on the GPU, and programs read old vertex floats as
+    // their V#s: CS_DefragHeap_ProcessFreeRequests took a count of 0 and looped 2^32 times (run 04:24), and
+    // CS_Prop_BatchCull read 300.0, 1000.0 as a V# (runs 01:06, 02:19).
+    SRWLOCK lock = SRWLOCK_INIT;
 };
 DirtyWatch g_dirty_watches[16];
 
@@ -307,11 +314,13 @@ LONG CALLBACK title_heap_write_fault(EXCEPTION_POINTERS* info) {
         const std::uintptr_t begin = w.begin.load(std::memory_order_acquire);
         if (!begin || at < begin || at >= w.end.load(std::memory_order_acquire)) continue;
         const std::size_t page = (at - begin) / kTitleDirtyPage;
+        AcquireSRWLockExclusive(&w.lock);  // against the sync's clear + re-protect (DirtyWatch::lock)
         w.dirty[page].store(1, std::memory_order_release);  // before the page opens (see above)
         DWORD old = 0;
-        if (!VirtualProtect(reinterpret_cast<void*>(begin + page * kTitleDirtyPage), kTitleDirtyPage, w.writable, &old))
-            return EXCEPTION_CONTINUE_SEARCH;
-        return EXCEPTION_CONTINUE_EXECUTION;
+        const bool opened =
+            VirtualProtect(reinterpret_cast<void*>(begin + page * kTitleDirtyPage), kTitleDirtyPage, w.writable, &old);
+        ReleaseSRWLockExclusive(&w.lock);
+        return opened ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -458,10 +467,16 @@ void sync_title_heap(TitleHeapSync& s, TitleSamplerSlotsFn sampler_slots, TitleH
         length = (std::min)(offset == 0 ? first_chunk : kTitleSyncChunk, s.bytes - offset);
         if (watch_begin) {
             const std::size_t page = (title_at + offset - watch_begin) / kTitleDirtyPage;
-            if (!watch->dirty[page].load(std::memory_order_relaxed) || !watch->dirty[page].exchange(0)) continue;
-            DWORD old = 0;
-            VirtualProtect(reinterpret_cast<void*>(watch_begin + page * kTitleDirtyPage), kTitleDirtyPage,
-                           watch->readonly, &old);
+            if (!watch->dirty[page].load(std::memory_order_relaxed)) continue;
+            AcquireSRWLockExclusive(&watch->lock);  // a fault's mark + open cannot land between these two
+            const bool was_dirty = watch->dirty[page].exchange(0) != 0;
+            if (was_dirty) {
+                DWORD old = 0;
+                VirtualProtect(reinterpret_cast<void*>(watch_begin + page * kTitleDirtyPage), kTitleDirtyPage,
+                               watch->readonly, &old);
+            }
+            ReleaseSRWLockExclusive(&watch->lock);
+            if (!was_dirty) continue;
         }
         ++stats.chunks_compared;
         if (std::memcmp(s.title + offset, s.shadow.get() + offset, length) == 0) continue;
