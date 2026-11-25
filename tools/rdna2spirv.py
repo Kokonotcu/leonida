@@ -1997,6 +1997,18 @@ class Gen:
             b = self.wave_equal(b, cond == "eq", half=wave_equal_half)
         self.write_compare_result(b, dst, scalar, exec_only)
 
+    def wave64_mask_pair(self, dst: dict) -> dict:
+        """The SGPR pair a wave64 VALU mask result really writes. The corpus is disassembled by llvm-mc in its
+        default 32-lane mode, which prints a wave64 v_cmp_*_e64 destination as one SGPR (s64) although the hardware
+        writes the aligned pair s[64:65]. Stored as one register, a later 64-bit SALU read of s[64:65] gave lanes
+        32-63 their bit from a stale s65 (mask_src takes the high SGPR there): the exec mask of a loop such as
+        s_and_saveexec_b64 / s_andn2_wrexec_b64 over that pair never emptied, and the retail title's
+        CS_DefragHeap_ComputeRelocations and CS_Prop_BatchCull looped on the GPU without end (NVIDIA, emulated wave64).
+        The same per-lane 0 / ~0 goes to both registers, as mask_dst does for a written pair."""
+        if self.wave64 and dst.get("k") == "sgpr" and dst.get("n", 1) == 1 and dst["r"] % 2 == 0 and dst["r"] < 104:
+            return dict(dst, n=2)
+        return dst
+
     def write_compare_result(self, b: str, dst: dict | None, scalar: bool, exec_only: bool) -> None:
         r = self.tmp()
         # Lane masks are all-ones/zero per invocation (one lane), SCC is 1/0. A VOPC result bit is 0 for lanes
@@ -2006,6 +2018,8 @@ class Gen:
             bm = self.tmp()
             self.emit(f"{bm} = OpLogicalAnd %bool {b} {self.active_b()}")
         self.emit(f"{r} = OpSelect %uint {bm} {self.cu(1 if scalar else 0xFFFFFFFF)} {self.cu(0)}")
+        if not scalar and dst is not None:
+            dst = self.wave64_mask_pair(dst)
         if scalar:
             self.emit(f"OpStore %scc {r}")
         elif dst is None:          # v_cmpx: EXEC &= cond

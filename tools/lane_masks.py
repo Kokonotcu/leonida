@@ -172,7 +172,12 @@ def step(state, ins, wave64=True):
         return
     if op.startswith("v_cmp"):
         # Handle v_cmp before VGPR clobber (defensive for 2-operand forms with implicit vcc).
-        put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else a[0], MASK, wave64)
+        d = {"k": "special", "t": "vcc"} if len(a) == 2 else a[0]
+        # A wave64 e64 destination printed as one SGPR (llvm-mc's 32-lane listing) is the aligned pair the hardware
+        # writes (rdna2spirv Translator.wave64_mask_pair): its halves are the mask's low and high words.
+        if wave64 and d.get("k") == "sgpr" and d.get("n", 1) == 1 and d["r"] % 2 == 0 and d["r"] < 104:
+            d = dict(d, n=2)
+        put(state, d, MASK, wave64)
         return
     if op == "v_swap_b32":
         written = set()
