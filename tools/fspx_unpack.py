@@ -205,14 +205,33 @@ def branch_targets_inside(asm: str, size: int) -> bool:
 
 def branch_closed_end(code: bytes, start: int, mcpu: str, disasm) -> int | None:
     """The end (after its s_endpgm) of the shortest range from `start` through an aligned s_endpgm whose branches all
-    stay inside it, or None. Tried from the first s_endpgm on."""
+    stay inside it, or None. Tried from the first s_endpgm on. The code is decoded once, through the last aligned
+    s_endpgm, and each candidate end is checked against the branches before it: a decode per candidate took 15+
+    minutes for a large FidelityFX program (llvm-mc ~30 s each, dozens of s_endpgm).
+
+    The decode is rdna2_decode's, not llvm-mc's: that range runs into the data after the code, and llvm-mc repeats
+    its whole one-line input in every invalid-word warning (a 244 KB program: 1.2 MB per warning, 13.5 GB of stderr,
+    OOM-killed on a 16 GB machine, 2026-11-25). Its instructions also carry their real byte offsets, where a listing
+    loses the invalid words and every branch after the first one comes out at a wrong pc."""
+    candidates = []
     pos = code.find(ENDPGM, start)
     while pos >= 0:
         if (pos - start) % 4 == 0:
-            asm, invalid, _ = disasm.disasm(code[start:pos + 4], mcpu, compute=True)
-            if asm.strip() and branch_targets_inside(asm, pos + 4 - start):
-                return pos + 4
+            candidates.append(pos + 4)
         pos = code.find(ENDPGM, pos + 1)
+    if not candidates:
+        return None
+    decoded = disasm.rdna2_decode.decode_bytes(code[start:candidates[-1]], mcpu=mcpu, wave32=True)
+    branches = []
+    for ins in decoded["insns"]:
+        if ins["op"] == "s_branch" or ins["op"].startswith("s_cbranch_"):
+            args = ins["args"]
+            if args and args[0].get("k") == "imm":
+                branches.append((ins["pc"], ins["pc"] + 4 + 4 * args[0]["v"]))
+    for end in candidates:
+        size = end - start
+        if all(0 <= target < size for pc, target in branches if pc < size):
+            return end
     return None
 
 

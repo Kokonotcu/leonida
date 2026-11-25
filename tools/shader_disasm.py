@@ -19,6 +19,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -116,15 +117,47 @@ def run_mc(code: bytes, mcpu: str):
     """One llvm-mc pass over `code`: (listing, invalid word count, stderr), or ("", count, reason) when it failed."""
     text = " ".join(f"0x{b:02x}" for b in code)
     try:
-        p = subprocess.run(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
-                           input=text, capture_output=True, text=True, errors="replace",
-                           creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+        p = subprocess.Popen(MC + ["--disassemble", f"-triple={TRIPLE}", f"-mcpu={mcpu}", "-show-encoding"],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     except OSError as e:
         return "", 0, str(e)
-    bad = p.stderr.count("invalid instruction encoding")
+
+    def feed():
+        try:
+            p.stdin.write(text.encode())
+        except OSError:
+            pass  # llvm-mc exited early; its stderr says why
+        finally:
+            try:
+                p.stdin.close()
+            except OSError:
+                pass
+
+    stdout = []
+    threads = [threading.Thread(target=feed), threading.Thread(target=lambda: stdout.append(p.stdout.read()))]
+    for t in threads:
+        t.start()
+    # Each diagnostic echoes its source line, and the input is one line of 5 bytes per code byte: a 239 KB FSPX
+    # program made every warning 1.2 MB, and capturing them (capture_output) took 13.5 GB until the process was
+    # OOM-killed (2026-11-25). Only the message lines are kept; the echoed input and the caret under it are dropped
+    # as they arrive. The warnings' columns still name the byte offsets (invalid_offsets).
+    kept = []
+    for raw in p.stderr:
+        line = raw.decode(errors="replace")
+        body = line.strip()
+        if body.startswith("0x") or not body.strip("^~ "):
+            continue
+        kept.append(line.replace("\r\n", "\n"))
+    for t in threads:
+        t.join()
+    p.wait()
+    err = "".join(kept)
+    out = (stdout[0] if stdout else b"").decode(errors="replace").replace("\r\n", "\n")
+    bad = err.count("invalid instruction encoding")
     if p.returncode != 0:
-        return "", bad, p.stderr.strip() or f"llvm-mc exited with code {p.returncode}"
-    return p.stdout, bad, p.stderr
+        return "", bad, err.strip() or f"llvm-mc exited with code {p.returncode}"
+    return out, bad, err
 
 
 ENCODING = re.compile(r"; encoding: \[([^\]]*)\]")
