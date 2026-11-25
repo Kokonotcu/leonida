@@ -2035,7 +2035,12 @@ public:
 
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
         constexpr auto method = "ID3D12CommandQueue::ExecuteCommandLists";
+        // Phase times of a slow call (over 500 ms), logged at the end: the loading screen froze for 20 s at a time
+        // with every submitting thread queued on this lock, and the holder's stack did not say which phase it was in.
+        using slow_clock = std::chrono::steady_clock;
+        const auto entered = slow_clock::now();
         std::lock_guard lock(mutex_);
+        const auto locked = slow_clock::now();
         if (count > 0 && !lists) {
             note_once("ExecuteCommandLists: null command list array with non-zero count");
             last_result_ = leonida::ReplayResult::unsupported;
@@ -2092,6 +2097,7 @@ public:
         }
         // LEONIDA_TITLE_HEAP_SYNC: what changed in title-backed shader-visible heaps reaches their real heaps first.
         rt::d3d12_xs::sync_title_heaps();
+        const auto heaps_synced = slow_clock::now();
         // A streamed title texture these lists copy into is the GPU's from now on: all its mips are bound (a copy into
         // an unbound tile is lost; the glyph atlas, filled by copies, lost its letters), before the binds are made.
         if (leonida::TitlePages* pages = context_.title_pages())
@@ -2105,9 +2111,12 @@ public:
                 }
         // Title textures on shared pages bound (and superseded ones unbound) before anything copies into them or the
         // lists sample them (vulkan_title_pages.h).
+        const auto pages_required = slow_clock::now();
         queue_.flush_title_pages();
+        const auto pages_flushed = slow_clock::now();
         // What the title wrote into the pages of its slot-133 textures reaches their images before the lists run.
         sync_title_textures();
+        const auto textures_synced = slow_clock::now();
         std::uint64_t in_batch = 0;  // draws in this batch, counted before execute can consume the lists
         for (const auto* commands : recorded)
             for (const auto& command : commands->commands())
@@ -2121,6 +2130,23 @@ public:
         }
         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
+        {
+            const auto done = slow_clock::now();
+            const auto ms = [](slow_clock::time_point a, slow_clock::time_point b) {
+                return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count());
+            };
+            if (ms(entered, done) > 500) {
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 200)
+                    std::fprintf(stderr, "[rt] d3d12: slow ExecuteCommandLists %lld ms (%u lists, %zu commands first): "
+                                         "queue lock %lld, heap sync %lld, page requests %lld, page binds %lld, "
+                                         "texture sync %lld, record+submit %lld\n",
+                                 ms(entered, done), count, recorded.empty() ? std::size_t(0) : recorded[0]->commands().size(),
+                                 ms(entered, locked), ms(locked, heaps_synced), ms(heaps_synced, pages_required),
+                                 ms(pages_required, pages_flushed), ms(pages_flushed, textures_synced),
+                                 ms(textures_synced, done));
+            }
+        }
         {
             // Submission counters, printed at powers of two: batches, lists, recorded draws, and failed batches.
             static std::atomic<std::uint64_t> batches{0}, total_lists{0}, draws{0}, failures{0};

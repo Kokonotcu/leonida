@@ -2990,9 +2990,10 @@ private:
         if (ids.empty()) return;
         // A budget, not a promise: waits that add up hold the title's render threads, and a loading-screen frame that
         // took over 30 s ended the run in the title's watchdog (uncached wave64-emulated compiles after the corpus was
-        // re-translated: 23 s of waits in 15 s). Each submission waits at most 1 s, and all of them together at most
-        // 4 s in any 15 s window; past that a dispatch is left out (its compile goes on, and the pipeline cache
-        // checkpoint keeps it for the next run).
+        // re-translated: 23 s of waits in 15 s). Each submission waits at most 250 ms, and all of them together at
+        // most 1.5 s in any 15 s window; past that a dispatch is left out (its compile goes on, and the pipeline cache
+        // checkpoint keeps it for the next run). With 1 s and 4 s, the loading screen's slow-submission log
+        // (2026-11-25) showed one ~1000 ms wait after another, each holding the queue lock and every thread behind it.
         using clock = std::chrono::steady_clock;
         static std::mutex budget_mutex;
         static clock::time_point window_start{};
@@ -3005,8 +3006,9 @@ private:
                 window_start = start;
                 window_spent = {};
             }
-            const clock::duration left = std::chrono::seconds(4) - window_spent;
-            allowed = std::min<clock::duration>(std::chrono::seconds(1), left > clock::duration{} ? left : clock::duration{});
+            const clock::duration left = std::chrono::milliseconds(1500) - window_spent;
+            allowed = std::min<clock::duration>(std::chrono::milliseconds(250),
+                                                left > clock::duration{} ? left : clock::duration{});
         }
         const auto deadline = start + allowed;
         std::size_t left_out = 0;

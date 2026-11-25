@@ -129,7 +129,9 @@ SaveResult save(Get get, Snapshot snapshot, Write write, std::size_t loaded_byte
 
 // ---- Checkpoints while the device lives ----
 
-constexpr std::chrono::seconds default_checkpoint_interval{60};
+// 180 s: each checkpoint has the driver serialize the whole cache and copies it (about 260 MB in the first loading
+// screen, 2026-11-25: four 260 MB buffers in four minutes, while the PC was short of memory).
+constexpr std::chrono::seconds default_checkpoint_interval{180};
 // After the first checkpoint line, at most one line per this long.
 constexpr std::chrono::seconds checkpoint_log_interval{300};
 

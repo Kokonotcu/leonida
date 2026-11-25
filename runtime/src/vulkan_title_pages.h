@@ -314,6 +314,9 @@ public:
         std::size_t streamed = 0, streamed_unbound = 0;  // streamed textures, those no view has asked a mip of yet
         std::size_t streamed_with_ends = 0, streamed_trimmed = 0;  // with a console mip order; with mips not their own
         std::uint64_t placed = 0;
+        // Streamed textures by the pages they hold now (1, 2-4, 5-16, more), and those pages: what the 64 KiB page
+        // granularity costs (every texture's mip tail takes a page of its own).
+        std::size_t size_textures[4] = {}, size_pages[4] = {};
     };
     Stats stats() const {
         std::lock_guard lock(mutex_);
@@ -325,6 +328,13 @@ public:
             s.streamed_unbound += t.streamed && t.bound_mip == kNoMip;
             s.streamed_with_ends += t.streamed && !t.ends.empty();
             s.streamed_trimmed += t.streamed && t.floor > 0;
+            if (t.streamed) {
+                const std::size_t held = static_cast<std::size_t>(std::count(t.bound.begin(), t.bound.end(), true));
+                if (!held) continue;
+                const int bucket = held == 1 ? 0 : held <= 4 ? 1 : held <= 16 ? 2 : 3;
+                ++s.size_textures[bucket];
+                s.size_pages[bucket] += held;
+            }
         }
         s.pages = pages_.size() + extra_.size();
         s.blocks = blocks_.size();

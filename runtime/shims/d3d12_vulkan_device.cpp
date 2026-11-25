@@ -26,6 +26,7 @@
 #include "../src/xg_console_layout.h"  // title textures in the console's tiled layout
 #include "xg_linear_layout.h"  // title-placed textures: the texture computer's layout
 #include "../src/arena_size.h"
+#include "../src/big_alloc_log.h"
 #include "../src/shader_module_cache.h"
 #include "../src/synthetic_va.h"
 #include "../src/gfx10_descriptors.h"
@@ -2112,6 +2113,54 @@ struct DeviceState {
     bool compile_stop = false;
     std::vector<std::thread> compile_workers;
 
+    // Large shaders compile one at a time (HeavyCompile): NVIDIA's compiler (nvgpucomp64.dll) reserves 0.7-2 GiB per
+    // compile of the title's big ray-tracing compute shaders, and the twelve workers compiling several at once took
+    // the 32 GB PC into paging in the first loading screen (traced with LEONIDA_LOG_BIG_ALLOCS=2, 2026-11-25: ten GiB
+    // from nvgpucomp64 in the last minute, then 20 s stalls and the title's watchdog). Smaller ones run in parallel.
+    // LEONIDA_HEAVY_COMPILES: how many may run at once (default 1); LEONIDA_HEAVY_SPIRV_KB: from what SPIR-V size.
+    std::mutex heavy_compile_mutex;
+    unsigned heavy_compiles = 0;
+    static std::size_t heavy_compile_words() {
+        static const std::size_t words = [] {
+            const char* v = std::getenv("LEONIDA_HEAVY_SPIRV_KB");
+            const unsigned long long kb = v && *v ? std::strtoull(v, nullptr, 10) : 1024;
+            return static_cast<std::size_t>(kb * 1024 / 4);
+        }();
+        return words;
+    }
+    static unsigned heavy_compile_limit() {
+        static const unsigned limit = [] {
+            const char* v = std::getenv("LEONIDA_HEAVY_COMPILES");
+            const unsigned long n = v && *v ? std::strtoul(v, nullptr, 10) : 1;
+            return static_cast<unsigned>(n ? n : 1);
+        }();
+        return limit;
+    }
+    // A compile worker never waits for a slot (the small compiles behind it would): a large job that finds none is
+    // parked and queued again when a large compile ends. True: the slot is the caller's, heavy_end gives it back.
+    std::deque<std::function<void()>> heavy_parked;
+    bool heavy_begin(std::function<void()> retry) {
+        std::lock_guard lock(heavy_compile_mutex);
+        if (heavy_compiles < heavy_compile_limit()) {
+            ++heavy_compiles;
+            return true;
+        }
+        heavy_parked.push_back(std::move(retry));
+        return false;
+    }
+    void heavy_end() {
+        std::function<void()> next;
+        {
+            std::lock_guard lock(heavy_compile_mutex);
+            --heavy_compiles;
+            if (!heavy_parked.empty()) {
+                next = std::move(heavy_parked.front());
+                heavy_parked.pop_front();
+            }
+        }
+        if (next) compile_enqueue(std::move(next));
+    }
+
     void compile_enqueue(std::function<void()> job) {
         std::lock_guard lock(compile_mutex);
         if (compile_stop) return;
@@ -2971,7 +3020,7 @@ struct DeviceState {
 
     // Where image and buffer memory sits: per memory type with blocks, live resources and title textures.
     void print_memory_stats(std::uint32_t new_type, VkDeviceSize new_block) {
-        char text[768];
+        char text[1536];
         int n = std::snprintf(text, sizeof(text), "[rt] d3d12: memory: %llu blocks made; a %llu KiB range in type %u;",
                               (unsigned long long)g_new_blocks.load(), (unsigned long long)(new_block >> 10), new_type);
         for (std::uint32_t t = 0; t < memory.memoryTypeCount && n > 0 && n < int(sizeof(text)) - 96; ++t) {
@@ -3003,6 +3052,12 @@ struct DeviceState {
                                (unsigned long long)(s.local_blocks * leonida::TitlePages::kPage *
                                                     leonida::TitlePages::kBlockPages >> 20),
                                (unsigned long long)s.placed);
+            if (n > 0 && std::size_t(n) < sizeof(text))
+                n += std::snprintf(text + n, sizeof(text) - n,
+                                   " streamed by pages held: 1: %zu (%zu MiB), 2-4: %zu (%zu MiB), 5-16: %zu (%zu MiB), "
+                                   "more: %zu (%zu MiB);",
+                                   s.size_textures[0], s.size_pages[0] >> 4, s.size_textures[1], s.size_pages[1] >> 4,
+                                   s.size_textures[2], s.size_pages[2] >> 4, s.size_textures[3], s.size_pages[3] >> 4);
         }
         // The console layouts of the title-placed textures made so far (layout & 0x1ff: 0x100 + swizzle mode), the most
         // common first.
@@ -7048,9 +7103,14 @@ public:
 
     // Compiles an async compute pipeline on DeviceState's workers and swaps it in when done (LEONIDA_ASYNC_PSO).
     void start_async_compile() {
+        AddRef();
+        device_.compile_enqueue([this] { compile_async(); });
+    }
+
+    // The compile job of start_async_compile; holds the reference start_async_compile took (parked or not).
+    void compile_async() {
         {
-            AddRef();
-            device_.compile_enqueue([this] {
+            {
                 auto& vkf = device_.context->vk;
                 VkComputePipelineCreateInfo info = async_compute_->info;
                 if (async_compute_->has_required) info.stage.pNext = &async_compute_->required;
@@ -7058,6 +7118,9 @@ public:
                 const leonida::ShaderLibrary* library = device_.library();
                 const std::vector<std::uint32_t> words =
                     library && compute_entry_ ? library->spirv(*compute_entry_) : std::vector<std::uint32_t>{};
+                // A large shader waits for the heavy-compile slot (DeviceState::heavy_begin), parked off the worker.
+                const bool heavy = words.size() >= DeviceState::heavy_compile_words();
+                if (heavy && !device_.heavy_begin([this] { compile_async(); })) return;
                 const VkShaderModule module = words.empty() ? VK_NULL_HANDLE : device_.shader_modules().acquire(words);
                 info.stage.module = module;
                 VkPipeline made = VK_NULL_HANDLE;
@@ -7066,6 +7129,7 @@ public:
                         return vkf.vkCreateComputePipelines(device_.info.device, cache, 1, &create, nullptr, &made);
                     },
                     info) : VK_ERROR_INITIALIZATION_FAILED;
+                if (heavy) device_.heavy_end();
                 if (module) device_.shader_modules().release(module);
                 if (r == VK_SUCCESS) {
                     leonida::ComputePipeline ready = pipeline_;
@@ -7079,7 +7143,7 @@ public:
                              int(r));
                 }
                 Release();
-            });
+            }
         }
     }
 
@@ -8466,6 +8530,8 @@ public:
         } else {
             std::fprintf(stderr, "[rt] d3d12: physical pages are not in the title page table (no host imports)\n");
         }
+        // LEONIDA_LOG_BIG_ALLOCS=2: the driver's module is loaded now (src/big_alloc_log.h, iat::install).
+        leonida::big_alloc_log::iat::install();
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU.
         state_.context->enable_copy_scratch(get_device, [this](const VkMemoryRequirements& requirements) {
             return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);

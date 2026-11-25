@@ -167,7 +167,7 @@ int main() {
 
     EXPECT(SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_DIR", caches.wstring().c_str()));
     EXPECT(SetEnvironmentVariableW(L"LEONIDA_PIPELINE_CACHE_PERSIST", nullptr) || GetLastError() == ERROR_ENVVAR_NOT_FOUND);
-    set_checkpoint_seconds(nullptr);  // sessions 1 to 4 end long before the default 60 s checkpoint
+    set_checkpoint_seconds(nullptr);  // sessions 1 to 4 end long before the default 180 s checkpoint
     const fs::path saved = caches / leonida::pipeline_cache::file_name(identity);
     const auto run = [&] { return run_session(d, library, root_blob, container); };
     const auto valid_file = [&] {

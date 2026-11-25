@@ -220,7 +220,7 @@ int test_checkpoint_interval() {
     CHECK(parse_checkpoint_seconds("999999999") == 999999999s);
     for (const char* bad : {"", "-1", "+5", "1.5", "5s", " 5", "abc", "1234567890"})
         CHECK(!parse_checkpoint_seconds(bad));
-    CHECK(leonida::pipeline_cache::default_checkpoint_interval == 60s);
+    CHECK(leonida::pipeline_cache::default_checkpoint_interval == 180s);
     return 0;
 }
 
