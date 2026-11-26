@@ -63,6 +63,7 @@
 #include "../src/submit_phases.h"
 #include "../src/pipeline_cache_store.h"
 #include "../src/large_module_gate.h"
+#include "../src/dev_status.h"
 #include "../src/conservative_raster.h"
 #include "../src/resource_detile.h"
 #include "../src/console_texture_layout.h"
@@ -8285,8 +8286,8 @@ public:
             // No host pointer: this is DEFAULT-heap arena memory the GPU may write, so its mapped bytes can be
             // stale. host_at() must not treat it as a CPU-written instance pointer list.
             // A default-heap AS resource is one of these ranges: a GENERIC acceleration structure covers it where
-            // it sits. It is named by its real device address (heap base + offset), as instance descriptors and
-            // BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
+            // it sits. It is named by its device address (heap base + offset, as the driver reports it), as instance
+            // descriptors and BuildRaytracingAccelerationStructure hand that address to the driver, not a console VA.
             if (device_.info.ray_tracing &&
                 initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE &&
                 vk.vkCreateAccelerationStructureKHR) {
@@ -8297,7 +8298,27 @@ public:
                 asci.type = VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR;
                 if (vk.vkCreateAccelerationStructureKHR(device_.info.device, &asci, nullptr, &accel_) == VK_SUCCESS) {
                     gpu_va_ = device_.arena.address + va_;
+                    // An instance names its BLAS by a value obtained from vkGetAccelerationStructureDeviceAddressKHR
+                    // (VUID-vkCmdBuildAccelerationStructuresKHR-pInfos-12281), so ask for it, as the committed path
+                    // below does. For GENERIC the spec only promises that these addresses keep the offsets between
+                    // the structures of one buffer; drivers return buffer address + offset (vkd3d-proton checks the
+                    // same). If one ever does not, the driver's address is the one instances must hold.
+                    if (vk.vkGetAccelerationStructureDeviceAddressKHR) {
+                        VkAccelerationStructureDeviceAddressInfoKHR dai{
+                            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR};
+                        dai.accelerationStructure = accel_;
+                        const std::uint64_t as_va =
+                            vk.vkGetAccelerationStructureDeviceAddressKHR(device_.info.device, &dai);
+                        if (as_va && as_va != gpu_va_) {
+                            log_once("GENERIC acceleration structure address is not its buffer address + offset; "
+                                     "arena offset in KiB:", int(arena_offset_ / 1024));
+                            buffer_va_ = gpu_va_;
+                            gpu_va_ = as_va;
+                        }
+                    }
                     device_.context->register_acceleration_structure(gpu_va_, accel_);
+                    if (buffer_va_ && buffer_va_ != gpu_va_)
+                        device_.context->register_acceleration_structure(buffer_va_, accel_);
                 }
             }
             device_.context->add_resource(id(), binding);
@@ -14290,6 +14311,15 @@ std::timed_mutex exit_cache_mutex;
 std::vector<DeviceState*> exit_cache_devices;
 std::atomic<bool> exit_cache_saved{false};
 
+// VK_EXT_memory_budget read from a device's info: the reader a device publishes for the title HUD and the dev overlay
+// (src/memory_figures.h), and vulkan_vram_budget. Not available without the extension.
+leonida::VramBudget read_vram_budget(const VulkanDeviceInfo& info) {
+    if (!info.memory_budget || !info.get_instance_proc || !info.instance) return {};
+    const auto get = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceMemoryProperties2"));
+    return leonida::query_vram_budget(get, info.physical);
+}
+
 // The Vulkan objects create_vulkan_device_standalone made, destroyed with the device.
 struct OwnedRuntime {
     PFN_vkDestroyDevice destroy_device = nullptr;
@@ -14334,6 +14364,11 @@ public:
             std::lock_guard lock(exit_cache_mutex);
             exit_cache_devices.push_back(&state_);
         }
+        // The GPU memory figure of the title HUD and the dev overlay: the newest device with VK_EXT_memory_budget.
+        if (info.memory_budget)
+            leonida::memory_figures::publish_vram_reader(
+                [](const void* context) { return read_vram_budget(static_cast<const DeviceState*>(context)->info); },
+                &state_);
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);
         copy_users_.resize(info.copy_queues.size(), 0);
@@ -14460,8 +14495,10 @@ public:
                     VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT | VK_SAMPLE_COUNT_16_BIT;
                 state_.no_output_sample_counts =
                     static_cast<UINT>(props.limits.framebufferNoAttachmentsSampleCounts & kD3D12SampleCounts);
-                state_.f16_half_top_location = leonida::f16_half_top_location(
-                    props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
+                state_.f16_half_top_location = info.f16_half_top_location != 0
+                    ? info.f16_half_top_location
+                    : leonida::f16_half_top_location(
+                          props.limits.maxVertexOutputComponents, props.limits.maxFragmentInputComponents);
             }
             if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
                     info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
@@ -15406,6 +15443,7 @@ public:
     }
 
     ~Device() override {
+        leonida::memory_figures::withdraw_vram_reader(&state_);  // waits for a read of this device in progress
         {
             // Before anything goes: an exit save in progress finishes with this device first.
             std::lock_guard lock(exit_cache_mutex);
@@ -21290,6 +21328,21 @@ const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12Pi
     return p && (p->compute() || p->graphics()) ? &p->subgroup_requests() : nullptr;
 }
 
+bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector<std::uint32_t>>& words,
+                          std::string& why) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (!p) {
+        why = "not a PipelineState";
+        return false;
+    }
+    // merge: our pipeline states keep their modules, not the edited words of each stage (upstream's lazy pipelines
+    // keep them for their first build).
+    (void)p;
+    words.clear();
+    why = "this layer's pipeline states do not keep stage words after creation";
+    return false;
+}
+
 long live_pipeline_states() { return live_pipeline_state_count.load(); }
 
 bool write_placed_buffer_view(ID3D12Device* device, bool unordered, const void* view, std::uint64_t address,
@@ -21412,6 +21465,11 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
     if (auto* d = Device::from<Device>(real ? real : device)) return &d->state().info;
     return nullptr;
+}
+
+leonida::VramBudget vulkan_vram_budget(ID3D12Device* device) {
+    const VulkanDeviceInfo* info = vulkan_device_info(device);
+    return info ? read_vram_budget(*info) : leonida::VramBudget{};
 }
 
 std::uint64_t title_shadow_refresh_queries(ID3D12Device* device) {
@@ -23490,6 +23548,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.custom_border_color) device_extensions.push_back(custom_border_name);
     if (info.null_descriptor || info.robust_index_view) device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
     if (info.host_pointer_alignment) device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    // Optional: VK_EXT_memory_budget gives the GPU memory in use and the budget (vulkan_vram_budget, the title HUD).
+    info.memory_budget = has_device_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (info.memory_budget) device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     leonida::DeviceFaultFeatures fault_features;
     const bool aftermath = leonida::aftermath::enable();  // already on, before the instance: see above
     char device_fault[2]{};

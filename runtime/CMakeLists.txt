@@ -271,6 +271,21 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
     target_compile_options(root_sig_test PRIVATE /W4 /permissive- /utf-8)
     target_link_options(root_sig_test PRIVATE /OPT:NOREF)
 
+    # The flag mask keeps every public root-signature flag: helpers over [0, 0xFFFF], the shims against the host
+    # serializer and deserializer (old upstream PR 7140).
+    add_executable(root_sig_public_flags_test
+      test/root_sig_public_flags_test.cpp
+      shims/registry.cpp
+      shims/d3d12_xs.cpp
+      shims/d3d12_xs_device.cpp
+      shims/d3d12_xs_pso_stream.cpp
+      shims/presentx_capture.cpp  # d3d12_xs_device.cpp routes the opt-in PresentX slots to the capture
+    )
+    target_link_libraries(root_sig_public_flags_test PRIVATE gta6rt_d3d12_xs_rootsig ${D3D12_LIBRARY})
+    target_compile_definitions(root_sig_public_flags_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(root_sig_public_flags_test PRIVATE /W4 /permissive- /utf-8)
+    target_link_options(root_sig_public_flags_test PRIVATE /OPT:NOREF)
+
     # RTS0 parser oracle: synthetic descriptors only, serialized by the real PC
     # d3d12.dll and parsed back by rt::rootsig::parse_rts0. A layout mismatch
     # fails here with the blob bytes, never silently in a draw.
@@ -514,7 +529,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(registry_init_and_classify_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(registry_init_and_classify_test PRIVATE /OPT:NOREF)
 
-  # LEONIDA_SKIP_INT3 (shims/startup_trace.h): its own executable, the variable is read once per process.
+  # LEONIDA_SKIP_INT3 (shims/startup_trace.h): each case runs in a child process with its own environment.
   add_executable(int3_skip_test
     test/int3_skip_test.cpp
     shims/registry.cpp
@@ -868,6 +883,16 @@ if(BUILD_TESTING)
     target_link_libraries(title_hud_test PRIVATE Vulkan::Headers user32 psapi)
     add_test(NAME title_hud COMMAND title_hud_test)
   endif()
+
+  # LEONIDA_DEV_OVERLAY's text and the phase bookkeeping behind it (src/dev_overlay.h): no window, GPU or game file.
+  find_package(Threads REQUIRED)
+  add_executable(dev_overlay_test test/dev_overlay_test.cpp)
+  target_include_directories(dev_overlay_test PRIVATE src)
+  target_link_libraries(dev_overlay_test PRIVATE Threads::Threads)
+  if(WIN32)
+    target_link_libraries(dev_overlay_test PRIVATE user32 gdi32 psapi)
+  endif()
+  add_test(NAME dev_overlay COMMAND dev_overlay_test)
 
   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
@@ -1556,6 +1581,9 @@ if(BUILD_TESTING)
   if(TARGET root_sig_test)
     add_test(NAME root_sig COMMAND root_sig_test)
   endif()
+  if(TARGET root_sig_public_flags_test)
+    add_test(NAME root_sig_public_flags COMMAND root_sig_public_flags_test)
+  endif()
   add_executable(command_list_test test/command_list_test.cpp)
   add_test(NAME command_list COMMAND command_list_test)
   # Which SPIR-V modules declare a storage image or buffer they may write (src/spirv_stores.h), on hand-built words.
@@ -1841,6 +1869,7 @@ if(BUILD_TESTING)
   endif()
   if(WIN32 AND TARGET dstorage_test)
     add_test(NAME dstorage COMMAND dstorage_test)
+    set_tests_properties(dstorage PROPERTIES TIMEOUT 120)
   endif()
   if(WIN32 AND TARGET xgameruntime_test)
     add_test(NAME xgameruntime COMMAND xgameruntime_test)
@@ -3583,6 +3612,13 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_heap_properties_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_heap_properties COMMAND d3d12_heap_properties_test)
     set_tests_properties(d3d12_heap_properties PROPERTIES SKIP_RETURN_CODE 77)
+    # The title HUD's VRAM figure from VK_EXT_memory_budget (rt::d3d12::vulkan_vram_budget) on a real device.
+    add_executable(d3d12_vram_budget_test test/d3d12_vram_budget_test.cpp)
+    target_link_libraries(d3d12_vram_budget_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
+    target_compile_definitions(d3d12_vram_budget_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(d3d12_vram_budget_test PRIVATE /W4 /permissive- /utf-8)
+    add_test(NAME d3d12_vram_budget COMMAND d3d12_vram_budget_test)
+    set_tests_properties(d3d12_vram_budget PROPERTIES SKIP_RETURN_CODE 77)
 
     # CreateHeap description / null-output capability-probe parity against host D3D12 + WARP, and CopyDescriptors heap-type guard.
     add_executable(d3d12_heap_desc_parity_test test/d3d12_heap_desc_parity_test.cpp)
@@ -4335,7 +4371,7 @@ if(TARGET Vulkan::Headers)
     target_compile_definitions(dxgi_host_parity_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(dxgi_host_parity_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_host_parity COMMAND dxgi_host_parity_test)
-    set_tests_properties(dxgi_host_parity PROPERTIES SKIP_RETURN_CODE 77)
+    set_tests_properties(dxgi_host_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
     # Host-parity test for DXGI waitable swap chain frame-latency semaphore behavior.
     add_executable(dxgi_waitable_latency_test test/dxgi_waitable_latency_test.cpp)
@@ -4344,7 +4380,7 @@ if(TARGET Vulkan::Headers)
     target_compile_options(dxgi_waitable_latency_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME dxgi_waitable_latency COMMAND dxgi_waitable_latency_test)
     set_tests_properties(dxgi_waitable_latency PROPERTIES
-      SKIP_RETURN_CODE 77
+      SKIP_RETURN_CODE 77 TIMEOUT 120
       FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # Synthetic (no GPU): VulkanSwapchain's DXGI BufferCount contract when Vulkan returns more images than the

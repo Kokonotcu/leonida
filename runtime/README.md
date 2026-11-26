@@ -133,7 +133,14 @@ with the seed on stderr; a seed of 0 uses a fixed non-zero state. Unset, the hos
 ## PE loader
 
 `src/pe_loader.cpp` maps x86-64 images at their preferred base, or elsewhere (with relocations) when
-that base is taken, copies headers and sections, applies `IMAGE_REL_BASED_DIR64` relocations, binds
+that base is taken. An image with a relocation table is moved and fixed up whatever `IMAGE_FILE_RELOCS_STRIPPED`
+says; without one, the flag refuses the move, and an image with the flag clear is moved with nothing fixed up (the
+loader logs that). The Windows 11 (build 26200) loader does the same in these three cases, as Zombins2 measured
+with synthetic DLLs in a review of old pull request 8847 of the original repository, which is no longer readable.
+Open question from the same measurement: Windows also refused flag-set DLLs without a relocation directory at a free
+preferred base (error 487, linker-built `/FIXED` DLLs included), and why is not known; the loader still maps those
+at their base, as before. It copies headers and sections, applies `IMAGE_REL_BASED_DIR64` and `HIGHLOW` relocations
+(rejecting the other types, such as `HIGH`, `LOW` and `HIGHADJ`, which no x64 MSVC image contains), binds
 imports by name or ordinal, parses the export table, sets section protections, and registers the
 image's x64 unwind table (`.pdata`) with `RtlAddFunctionTable`, so exceptions raised in or passing
 through a mapped image are dispatched and stack walks can step over its frames. The table is validated
@@ -401,6 +408,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_PASS_TRACE` | unset | *Diagnostic.* `n`, with `LEONIDA_DEVICE_FAULT=1`: in the frame after every `n`-th present, each submission logs its compute programs in order, repeats folded (`src/vulkan_backend.h`), for the frame's pass order. |
 | `LEONIDA_GPU_LATENCY` | unset | *Diagnostic.* `1` logs, every 10 s for each queue kind, how long the GPU took from a submission's `vkQueueSubmit` to it being seen done, and the share of the wall time the queue had work (`src/vulkan_backend.h`). |
 | `LEONIDA_SUBMIT_PHASES_SECONDS` | `5` | *Diagnostic.* The period, in seconds, of the always-on line that says how many submissions there were and where their CPU time went, phase by phase (`src/submit_phases.h`). `0` turns the line off. |
+| `LEONIDA_DEV_OVERLAY` | unset | *Diagnostic, Windows.* `1` draws what the runtime is doing over the top left corner of the title's window (`src/dev_overlay.h`): frame and submission rate, a submission's CPU time by phase, the phase running now, pipeline builds, indirect draws, cores, free RAM, and the private memory and GPU memory (`src/memory_figures.h`, shared with `LEONIDA_TITLE_HUD`; the GPU figure is the device's `VK_EXT_memory_budget`, `VRAM n/a` without it). |
 | `LEONIDA_SAMPLE_MS` | unset | *Diagnostic.* `ms` starts the thread sampler (`src/thread_sampler.h`): every `ms` milliseconds each thread of the process that used CPU since the last look is suspended just long enough to copy its context, its stack is unwound afterwards, and a periodic report lists the busiest threads and their most frequent call chains (eight frames, innermost first). |
 | `LEONIDA_SAMPLE_REPORT_S` | `10` | *Diagnostic.* Seconds between two reports of the thread sampler (`LEONIDA_SAMPLE_MS`). |
 | `LEONIDA_SAMPLE_WAITS` | unset | *Diagnostic.* `1` makes the thread sampler sample waiting threads too, not only those that used CPU, and list each thread's most frequent chain, so a thread that waits shows where. |
@@ -612,11 +620,12 @@ from the ANSI code page.
 | `tls_callback` | before each TLS callback the Loader runs (process attach and detach; thread events run under the Windows loader lock and are not traced) | `module`, `at` (module+RVA), `reason` |
 | `dllmain` | after `DllMain(DLL_PROCESS_ATTACH)` returns | `module`, `result` |
 | `unimplemented_call` | first call of each unimplemented import | `import` (`dll!name`), `caller` (module+RVA) |
+| `delay_import_unimplemented` | at load, for each delay import that binds to an unimplemented thunk (Windows would raise `0xC06D007E`/`0xC06D007F` at its first call; [runtime_imports.md](../docs/runtime_imports.md#delay-imports-and-thread-events-where-the-loader-differs-from-windows)) | `module`, `import` (`dll!name`) |
 | `xmem_attributes` | the first `XMemAlloc`, `XMemFree`, `XMemAllocDefault`, `XMemFreeDefault` and `XMemVirtualAlloc` for each distinct raw attribute word (not every allocation) | `api`, `attributes`, `size` (not for the frees), `caller` (module+RVA) |
 | `xmem_virtual_alloc` | the first `XMemVirtualAlloc` for each distinct (type, attributes, protect) | `api`, `type`, `attributes`, `protect`, `size`, `caller` |
 | `xmem_physical_pages` | the first `XMemAllocatePhysicalPages` for each distinct attribute word | `api`, `attributes`, `pages`, `caller` |
 | `file_open_failed` | a guest `CreateFileW`/`CreateFile2` that fails (at most 256 events) | `api`, `path` (as the title passed it), `error` (Win32), `caller` (module+RVA) |
-| `int3_skipped` | with `LEONIDA_SKIP_INT3` set: first int3 at each address, which is then stepped over | `at` (module+RVA) |
+| `int3_skipped` | with `LEONIDA_SKIP_INT3` set when the trace opens: first int3 at each address, which is then stepped over (after 4096 distinct addresses, a new one is logged each time it is hit) | `at` (module+RVA) |
 | `thread_stack` | with `LEONIDA_HANG_DUMP=<seconds>` set: once, that many seconds after `trace_open`, one per thread of the process | `tid`, `stack` (up to 16 frames) |
 | `debug_string` | `OutputDebugStringA/W` with no debugger attached | `text` |
 | `exception` | any exception, before handlers run | `code`, `at`, `access`/`address` for access violations, `cpp` for C++ throws, `stack` (up to 16 frames) |

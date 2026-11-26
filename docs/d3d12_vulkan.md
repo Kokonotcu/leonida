@@ -808,7 +808,14 @@ descriptor, as D3D12 refuses it), and stencil-plane views (`PlaneSlice` 1, as
 `X24_TYPELESS_G8_UINT` or `X32_TYPELESS_G8X24_UINT`) are an 8_UINT T# that set 0 shows through the stencil
 aspect, in its float-typed sampled arrays like other single-sampled UINT views. Other gaps include descriptors
 the game writes itself, which need
-the execute-time scan of section 3.4 (only descriptors made through the device are registered); the literal S#s of shaders (`literal_samplers` in the index),
+the execute-time scan of section 3.4 (only descriptors made through the device are registered). A retail
+descriptor heap census (BL-4, measuring the primary 1,245,184-slot console CBV/SRV/UAV heap across submissions
+50, 500, and 5000 on RTX 5070 / Windows 11) confirms the slot distribution: 910,244 empty slots; 327,543 single-dword
+free-list links (`value = slot_index + 1`, ending at `0xFFFFFFFF`); 261 T# with layer-assigned addresses above 4 GiB;
+5,840 V# (3,024 with a null base, 2,816 with a sub-4-GiB arena base); 1,296 slots containing interleaved constant data
+(IEEE-754 floats); and zero bare 32-bit GPU addresses. Console descriptors do not store standalone 32-bit pointer words;
+buffer and image base addresses are packed into standard 48-bit V# and T# records conforming to the arena layout
+(modeled by model-level reference contract suite `tests/test_descriptor_address_translation.py`); the literal S#s of shaders (`literal_samplers` in the index),
 which `rt::d3d12::register_samplers` registers without a heap slot but which nothing passes to it yet (the call at
 pipeline creation comes with the shader index, #291);
 custom border colours without VK_EXT_custom_border_color, and minimum/maximum filters, anisotropy or mirror-once addressing without the Vulkan
@@ -1904,7 +1911,10 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    No sampler-indexing entry had a matched layout. Putting the resource heap first when both flags are set, then the
    sampler in the next dword, remains a hypothesis. D3D-329's adjacent SGPR examples alone do not establish it.
    The runtime snapshots the bound resource and sampler heap pointers in that order after the explicit
-   arguments for direct and indirect compute dispatches with an inline signature. An unbound heap contributes
+   arguments for direct and indirect compute dispatches with an inline signature. Bound console descriptor heap
+   base addresses are remapped through `console_descriptor_table_va` so that user SGPRs receive the arena copy's
+   shader virtual address (where GPU descriptor reads land, preventing `READ_INVALID` device loss during world
+   load), while unshadowed host heaps remain unchanged. An unbound heap contributes
    zero, and rebinding affects later commands. A heap that cannot fit in the inline user data is reported once,
    and a signature whose compute arguments spill gets nothing written (logged once). Set
    `LEONIDA_COMPUTE_DIRECT_HEAPS=0` to restore the previous compute arguments.
@@ -2246,7 +2256,21 @@ sets them, and it does so twice.
 
 `amd_fidelityfx_upscaler_xbox.dll` does neither. Its 29 `RTS0` parts carry `Flags = 0`, and no instruction in it uses
 the constant `0x3000000`. So the bits are not a property of every console root signature; this builder adds them. The
-game executable is not in the package, so whether its root signatures carry them is open.
+retail executable's root signatures do not carry them either (old upstream PR 7140): its direct call passes a 1.1
+description with `Flags = 0x80` (`LOCAL_ROOT_SIGNATURE`), and its root-signature decoder reads `Flags` as a
+zero-extended 16-bit value.
+
+The mask stays unconditional, because it can't touch a public flag: it clears bits 24-31
+(`kXboxRootSignatureFlagHighByte`, `runtime/shims/d3d12_xs_rootsig.h`), and every public
+`D3D12_ROOT_SIGNATURE_FLAGS` value is in bits 0-11 (the highest is `SAMPLER_HEAP_DIRECTLY_INDEXED`, `0x800`). So it is
+safe on every descriptor and blob, whatever built it. `root_sig_public_flags_test` pins this:
+
+- the helpers keep every flag value in `[0, 0xFFFF]`;
+- the shims' serializers give the host's blob byte for byte for each public flag the host takes. Where the host
+  refuses only `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` or `SAMPLER_HEAP_DIRECTLY_INDEXED` (Windows 10's in-box `d3d12.dll`),
+  they serialize on purpose: the blob is the host's blob without those bits, with the full flags in `RTS0` and a valid
+  container hash (`kDirectlyIndexedFlags`, `runtime/shims/d3d12_xs_rootsig.h`);
+- a blob with `0x03000080` comes back as `0x80`.
 
 **Version 1.2 on older runtimes.** The in-box `d3d12.dll` of Windows 10 (measured on 22H2, 10.0.19045, without the
 Agility SDK) and of Windows 11 23H2 (#361) serializes root signatures only up to 1.1. On Windows 10 it rejects even an
@@ -3719,7 +3743,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `WaitFrameEventX` (device slot 80) is one `PresentX` accepts, while a token that was never issued is still refused.
   A frame presented before the origin event
   is armed is not paced (`PresentX` does not hold it for a vblank), so it is shown at once and never waits for a vblank:
-  blank presents of a loading screen do not delay the first wait. A wait that comes late returns at once
+  blank presents of a loading screen do not delay the first wait. At most `latency` frames are in flight once the event
+  is armed: a present into a full queue (several presents with no wait between them) replaces the newest queued frame
+  and takes its vblank, like a mailbox, so the replaced frame is never shown (no display statistic) and the older ones
+  keep their vblanks. However many presents come between two waits, the next wait passes when the oldest frame is
+  shown. A wait that comes late returns at once
   with the newest passed origin; the missed ones are skipped. A finite timeout gives
   `HRESULT_FROM_WIN32(WAIT_TIMEOUT)`; nothing registered, or suspended, gives `HRESULT_FROM_WIN32(ERROR_INVALID_STATE)`.
   `LEONIDA_PRESENT_UNCAP` (any non-empty value other than "0", read when the object is made) takes the frame-rate
@@ -3735,8 +3763,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   `SuspendX`/`ResumeX` so suspended pauses are excluded), computing nearest-rank `p50`/`p95`/`p99` and the mean drift
   against the active target interval (`FramePacer::pacing_summary()`). On teardown after at least one present,
   `XboxPresentation` logs a single `[rt] present: pacing summary ...` line on stderr, which `tools/boot_trace.py`
-  surfaces beside the D3D12 call counts. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
-  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode) and by
+  surfaces beside the D3D12 call counts. The intervals are between `PresentX` calls, not between frames shown: a frame
+  replaced in a full queue (see the latency limit above) still counts as a present with its real interval, so the
+  percentiles describe the title's present cadence, and a burst of presents between two waits shows up as short
+  intervals. Confirmed on a fake clock by `frame_pacer_test` (known 100-frame distribution,
+  positive and negative drift, ring-buffer wrap-around, suspend/resume exclusion, uncapped mode, replaced frames) and by
   `tests/test_boot_trace.py`.
 - *`PresentX`*: 0 planes presents a black frame (no token needed). 1 plane blits plane 0's first resource (a
   single-sample 2D colour texture in `PRESENT`) to the swapchain image, limited to `pSrcViewRects[0]` when set
@@ -3984,7 +4015,8 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
   (placement, point/bilinear, alpha overlay, HDR10 and PQ conversions, refusals; against a CPU model), token errors,
   statistics, suspend/resume, `ImmediateThresholdPercent` with a late frame at several thresholds (immediate mode
   chosen, or not for 0, below the lateness, on time) and with `LEONIDA_PRESENT_NO_TEAR=1`, 30 frames at 60 Hz in real
-  time; skipped, exit 77, without a Vulkan device). `frame_pacer_test` also sweeps `decide_present_sync`.
+  time; skipped, exit 77, without a Vulkan device). `frame_pacer_test` also sweeps `decide_present_sync`, and checks
+  that 1000 presents between two waits leave at most `latency` frames in flight (latency 1, 2 and 3).
 
 ### 4.6 Queries
 

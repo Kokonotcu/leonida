@@ -17,10 +17,8 @@ PackResult pack(const RootSignature& sig) {
             out.error = "unknown root parameter type";
             return out;
         }
-        if (p.type == ParamType::Constants && p.num_values == 0) {
-            out.error = "root constant parameter needs at least 1 dword";
-            return out;
-        }
+        // A constant parameter of 0 values is valid (the host serializer warns, CreateRootSignature answers S_OK):
+        // it takes no dwords, so it gets no provenance entry and the parameters after it pack as if it were absent.
         const uint32_t dwords = p.type == ParamType::Table          ? 2
                                 : p.type == ParamType::Descriptor   ? 2
                                                                     : p.num_values;
@@ -75,15 +73,12 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
             out.error = "unknown root parameter type";
             return out;
         }
-        if (p.type == ParamType::Constants && p.num_values == 0) {
-            out.error = "root constant parameter needs at least 1 dword";
-            return out;
-        }
         cost += param_cost(p.type, p.num_values);
         if (cost > kMaxD3d12Cost) {
             out.error = "root signature exceeds the 64-dword D3D12 cost limit";
             return out;
         }
+        // 0 for a constant parameter of 0 values, which then shares its first SGPR with the next parameter.
         const uint64_t dwords = stage_dwords(p.type, p.num_values);
         if (!spilling && next + dwords > kMaxUserSgprs) spilling = true;
         if (!spilling) {
@@ -96,10 +91,9 @@ StagePackResult pack_stage(const RootSignature& sig, Stage stage) {
             refused = "root parameter " + std::to_string(i) + " does not fit in the user SGPRs from s" +
                       std::to_string(out.base) + " (spill array not modelled: where a graphics stage's spill pointer " +
                       "goes is not measured)";
-        if (refused.empty() && p.type == ParamType::Table)
-            refused = "root parameter " + std::to_string(i) +
-                      " is a descriptor table in the compute spill array (its size there is not measured)";
-        // Packed in root order, no alignment: a constant 1 dword per value, a root descriptor 2 (its 64-bit VA).
+        // Packed in root order, no alignment: a constant 1 dword per value, a root descriptor 2 (its 64-bit VA), a
+        // descriptor table 1 (its heap offset, as in the user SGPRs; upstream's model, root_signature_test), a constant
+        // of 0 values none.
         first.push_back(static_cast<uint32_t>(kMaxUserSgprs + spill_at));
         spill.push_back(static_cast<uint32_t>(spill_at));
         spill_at += dwords;

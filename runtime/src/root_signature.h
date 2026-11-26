@@ -115,7 +115,8 @@ constexpr uint32_t kMaxD3d12Cost = 64;
 // Packs root parameters in order. Static samplers consume no dwords.
 // Fails (ok == false) when the signature needs more than 32 user SGPRs
 // (spill layout unknown: refuse, do not guess) or exceeds the 64-dword
-// D3D12 cost limit, or holds more than 64 root parameters.
+// D3D12 cost limit, or holds more than 64 root parameters. A constant
+// parameter of 0 values takes no dwords, as on the host.
 [[nodiscard]] PackResult pack(const RootSignature& sig);
 
 // The console layout of root arguments in a stage's user SGPRs (docs/d3d12_vulkan.md section 3.5, D3D-448).
@@ -191,7 +192,7 @@ struct StagePackResult {
     bool ok = false;
     std::string error;            // set when !ok; names the refusing parameter
     // !ok only because a parameter or heap base would spill where the spill is not modelled (any graphics spill; a
-    // table or heap base in the compute spill), not because the signature breaks a D3D12 limit.
+    // heap base in the compute spill), not because the signature breaks a D3D12 limit.
     bool spills = false;
     Stage stage = Stage::Compute;
     uint32_t base = 0;            // stage_base(stage)
@@ -214,8 +215,9 @@ struct StagePackResult {
 }
 
 // Lays the parameters out for `stage` in the console layout, then the heap bases the signature's flags ask for.
-// Fails like pack() on more than 64 parameters, an unknown parameter type, a constant parameter of 0 values or the
-// 64-dword cost limit, and on any parameter or heap base that would spill where the spill is not modelled.
+// Fails like pack() on more than 64 parameters, an unknown parameter type or the 64-dword cost limit. Compute spills
+// any trailing parameters from the first one that does not fit whole into spill_dword; non-compute stages refuse any
+// spill. A constant parameter of 0 values takes no SGPRs and no spill dwords (upstream, D3D-942).
 [[nodiscard]] StagePackResult pack_stage(const RootSignature& sig, Stage stage);
 
 // D3D12 cost of one parameter against the 64-dword limit.
