@@ -4206,7 +4206,8 @@ struct DeviceState {
         chunk.end = end;
         std::uint32_t types = 0;
         if (VirtualAlloc(reinterpret_cast<void*>(start), end - start, MEM_COMMIT, PAGE_READWRITE))
-            chunk.address = import_host(reinterpret_cast<void*>(start), end - start, chunk.buffer, chunk.memory, types);
+            chunk.address = import_host(reinterpret_cast<void*>(start), end - start, chunk.buffer, chunk.memory, types,
+                                        &physical_chunk_types);
         std::lock_guard lock(title_pages.mutex);
         title_pages.importing_chunks.erase(start);
         std::vector<std::uint64_t> waiters;
@@ -4448,8 +4449,13 @@ struct DeviceState {
 
     // `bytes` of host memory at `host` as a device-addressable buffer (VK_EXT_external_memory_host): its device
     // address, 0 when the driver refuses it (nothing is left behind then; `types`: the memory types it offered).
+    // `known_types`: memory imported the same way before (the physical section's chunks: one pagefile-backed section,
+    // read-write throughout) offers the same memory types, so the driver is asked for them once
+    // (vkGetMemoryHostPointerPropertiesEXT, half of each import's 34-105 ms with the process's ~75,000 regions) and
+    // the answer kept here; a failed import clears it, so the next one asks again.
+    std::atomic<std::uint32_t> physical_chunk_types{0};
     VkDeviceAddress import_host(void* host, VkDeviceSize bytes, VkBuffer& buffer, VkDeviceMemory& imported,
-                                std::uint32_t& types) {
+                                std::uint32_t& types, std::atomic<std::uint32_t>* known_types = nullptr) {
         auto& vk = context->vk;
         const VkDevice device = info.device;
         buffer = VK_NULL_HANDLE;
@@ -4476,7 +4482,11 @@ struct DeviceState {
         // Never beside a sparse bind in the driver (VulkanContext::driver_heavy_mutex).
         std::unique_lock heavy(context->driver_heavy_mutex());
         bool ok = vk.vkCreateBuffer(device, &create, nullptr, &buffer) == VK_SUCCESS;
-        if (ok) {
+        const std::uint32_t known = known_types ? known_types->load(std::memory_order_acquire) : 0;
+        if (ok && known) {
+            vk.vkGetBufferMemoryRequirements(device, buffer, &requirements);
+            properties.memoryTypeBits = known;
+        } else if (ok) {
             vk.vkGetBufferMemoryRequirements(device, buffer, &requirements);
             const auto tp = std::chrono::steady_clock::now();
             const VkResult pr = get_host_pointer_properties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
@@ -4484,6 +4494,7 @@ struct DeviceState {
             ok = pr == VK_SUCCESS;
             if (!ok) last_import_result = pr;
             import_timing.properties = std::chrono::steady_clock::now() - tp;
+            if (ok && known_types) known_types->store(properties.memoryTypeBits, std::memory_order_release);
         }
         types = ok ? properties.memoryTypeBits & requirements.memoryTypeBits : 0;
         const auto ta = std::chrono::steady_clock::now();
@@ -4549,6 +4560,7 @@ struct DeviceState {
             if (imported) vk.vkFreeMemory(device, imported, nullptr);
             buffer = VK_NULL_HANDLE;
             imported = VK_NULL_HANDLE;
+            if (known_types && known) known_types->store(0, std::memory_order_release);  // ask the driver next time
         }
         return device_address;
     }
@@ -4628,7 +4640,8 @@ struct DeviceState {
         // The section is SEC_RESERVE (xmem commits a page when the title first touches it); an import needs it
         // committed. Physical pages are memory the title allocated to use, as on the console.
         if (VirtualAlloc(reinterpret_cast<void*>(start), end - start, MEM_COMMIT, PAGE_READWRITE))
-            chunk.address = import_host(reinterpret_cast<void*>(start), end - start, chunk.buffer, chunk.memory, types);
+            chunk.address = import_host(reinterpret_cast<void*>(start), end - start, chunk.buffer, chunk.memory, types,
+                                        &physical_chunk_types);
         if (lock) {
             lock->lock();
             title_pages.importing_chunks.erase(start);
@@ -11789,7 +11802,14 @@ public:
         // into the mapping for a read range, and uploads the CPU's writes at Unmap and before submissions. The pages
         // handed out below never see what the GPU wrote into the image (xbox_linear_texture_map read stale bytes).
         // A refusal (pages gone after a shared mapping) falls back to the pages, as before.
-        if (title_linear_ && image_ && va_ && data &&
+        // LEONIDA_LINEAR_MAP_READBACK=1 only, for now: with it on, every boot died 2-3 min in on a title structure that
+        // GPU data (half-float +-65504 bounds, an RGBA16F target's contents) had overwritten; the read-back may write
+        // past what the title gave the lease (under investigation).
+        static const bool readback = [] {
+            const char* v = std::getenv("LEONIDA_LINEAR_MAP_READBACK");
+            return v && v[0] == '1';
+        }();
+        if (readback && title_linear_ && image_ && va_ && data &&
             (desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
             if (SUCCEEDED(map_title_texture(subresource, read, data))) return S_OK;
             *data = nullptr;

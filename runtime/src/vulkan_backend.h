@@ -1814,6 +1814,11 @@ public:
         std::shared_lock lock(resource_mutex_);
         return replay_.map_title;
     }
+    // The range mapper the same way (the lists' vertex and index buffers, before the queue's lock).
+    std::function<void(std::uint64_t, std::uint64_t)> title_range_mapper() {
+        std::shared_lock lock(resource_mutex_);
+        return title_range_mapper_;
+    }
     // Page-table entries for a whole title range (va, bytes) before a command that reads or writes it through the
     // table (the XDXR builder's paged addresses). Called while commands are recorded, like map_title.
     void set_title_range_mapper(std::function<void(std::uint64_t, std::uint64_t)> mapper) {

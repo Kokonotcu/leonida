@@ -42,6 +42,7 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 namespace rt::d3d12 {
@@ -2919,18 +2920,36 @@ public:
     // recording held the lock, one 0.5-1 s driver import after another kept every other ExecuteCommandLists on the
     // queue waiting (24.5 s once) until the title's GPU watchdog fired; deferred to a worker instead, a shader read
     // the scratch page for a page not imported yet and hung the GPU (lib_cs_02006, 2026-11-25 21:2x).
+    // LEONIDA_PREMAP=1 only: with it on, three boots of three (and none of 330 before) died 2-3 min in on a title
+    // structure that GPU data (half-float +-65504 bounds) had overwritten (exe+0x35A4245 reading -1). A page mapped here
+    // changes its page-table entry from the scratch page to the title's memory while earlier submissions may still be
+    // running and writing through that address, so their stores land in memory the title has given to something else.
+    static bool premap_enabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_PREMAP");
+            return v && v[0] == '1';
+        }();
+        return on;
+    }
     void map_title_root_arguments(UINT count, ID3D12CommandList* const* lists) {
-        if (!lists || !count) return;
+        if (!lists || !count || !premap_enabled()) return;
         const std::function<void(std::uint64_t)> map = context_.title_mapper();
         if (!map) return;
-        std::vector<std::uint64_t> seen;  // the 64 KiB pages asked for already in this call
+        // Vertex and index buffers at title addresses too: prepare_draw finds them through the same imports
+        // (title_buffer_at), and imported there, under the lock, one submission's prepare phase took 3.8 s.
+        const std::function<void(std::uint64_t, std::uint64_t)> map_range = context_.title_range_mapper();
+        std::unordered_set<std::uint64_t> seen_ranges;  // buffer starts asked for already in this call
+        const auto range = [&](std::uint64_t va, std::uint64_t bytes) {
+            if (!map_range || !bytes || va >> 32 == 0 || va >> 47) return;
+            if (!seen_ranges.insert(va).second) return;
+            map_range(va, bytes);
+        };
+        std::unordered_set<std::uint64_t> seen;  // the 64 KiB pages asked for already in this call
         const auto scan = [&](const std::array<std::uint32_t, 32>& s) {
             for (std::size_t i = 0; i + 1 < s.size(); ++i) {
                 const std::uint64_t va = std::uint64_t(s[i]) | (std::uint64_t(s[i + 1]) << 32);
                 if (va >> 32 == 0 || va >> 47) continue;  // as map_title_user_data (vulkan_replay.h) takes them
-                const std::uint64_t page = va & ~std::uint64_t(0xFFFF);
-                if (std::find(seen.begin(), seen.end(), page) != seen.end()) continue;
-                seen.push_back(page);
+                if (!seen.insert(va & ~std::uint64_t(0xFFFF)).second) continue;
                 map(va);
             }
         };
@@ -2938,9 +2957,17 @@ public:
             const GraphicsCommandList* list = GraphicsCommandList::from(lists[i]);
             if (!list) continue;
             for (const auto& command : list->commands().commands()) {
-                if (const auto* d = std::get_if<leonida::Dispatch>(&command)) scan(d->user_data);
-                else if (const auto* g = std::get_if<leonida::Draw>(&command)) scan(g->user_data);
-                else if (const auto* e = std::get_if<leonida::ExecuteIndirect>(&command)) scan(e->user_data);
+                if (const auto* d = std::get_if<leonida::Dispatch>(&command)) {
+                    scan(d->user_data);
+                } else if (const auto* g = std::get_if<leonida::Draw>(&command)) {
+                    scan(g->user_data);
+                    if (g->indexed) range(g->index.va, g->index.size);
+                    if (g->views)
+                        for (const leonida::VertexBufferView& v : g->views->vertex_buffers)
+                            if (v.va) range(v.va, v.size);
+                } else if (const auto* e = std::get_if<leonida::ExecuteIndirect>(&command)) {
+                    scan(e->user_data);
+                }
             }
         }
     }
@@ -3147,6 +3174,9 @@ public:
             }
         }
         // (The title-texture sync ran before the queue lock, above.)
+        // The descriptor-table scans and sampled-view preparation above end here (the slow line's "sample tables": one
+        // submission's record+submit took 7 s with every replay phase near 0, 2026-11-25 21:47).
+        const auto samples_ready = slow_clock::now();
         std::uint64_t in_batch = 0;  // draws in this batch, counted before execute can consume the lists
         for (const auto* commands : recorded)
             for (const auto& command : commands->commands())
@@ -3233,12 +3263,13 @@ public:
                 if (told.fetch_add(1, std::memory_order_relaxed) < 400)
                     std::fprintf(stderr, "[rt] d3d12: slow ExecuteCommandLists %lld ms (%u lists, %zu commands first): "
                                          "queue lock %lld, heap sync %lld, page requests %lld, page binds %lld, "
-                                         "texture sync %lld, record+submit %lld (room %u, compute wait %u, prepare %u, "
-                                         "record %u of which title maps %u, submit %u)\n",
+                                         "texture sync %lld, record+submit %lld (sample tables %lld, room %u, compute wait "
+                                         "%u, prepare %u, record %u of which title maps %u, submit %u)\n",
                                  ms(entered, done), count, recorded.empty() ? std::size_t(0) : recorded[0]->commands().size(),
                                  ms(textures_synced, locked), ms(locked, heaps_synced), ms(heaps_synced, pages_required),
                                  ms(pages_required, pages_flushed), ms(entered, textures_synced),
-                                 ms(pages_flushed, done), t.room_ms, t.compute_wait_ms, t.prepare_ms, t.record_ms,
+                                 ms(pages_flushed, done), ms(pages_flushed, samples_ready), t.room_ms, t.compute_wait_ms,
+                                 t.prepare_ms, t.record_ms,
                                  t.title_map_ms,
                                  t.submit_ms);
             }
