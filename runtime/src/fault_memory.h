@@ -1,76 +1,15 @@
 #pragma once
 
-// LEONIDA_DUMP_TARGETS=<present number>: the colour render targets the title draws into, collected as draws are
-// recorded (d3d12_com.cpp record_draw), written out as PPM images by the presenter at that present
-// (VulkanPresenter::dump_targets), into LEONIDA_CAPTURE's folder. A diagnostic: it shows what each target holds
-// when the presented frame is black, without guessing from side effects.
+// What a device-fault or hang report (src/vulkan_breadcrumbs.h) reads behind a stuck dispatch's descriptor tables:
+// the GPU address arena's CPU mapping and the title's own memory, set up by the device and the d3d12_xs layer.
 
-#include "command_list.h"
-
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <mutex>
-#include <vector>
 
-namespace leonida::debug_targets {
+namespace leonida::fault_memory {
 
-// LEONIDA_DUMP_TARGETS=<n>[,<n>...]: the presents to dump at, in any order.
-inline const std::vector<std::uint64_t>& dump_list() {
-    static const std::vector<std::uint64_t> list = [] {
-        std::vector<std::uint64_t> out;
-        const char* v = std::getenv("LEONIDA_DUMP_TARGETS");
-        while (v && *v) {
-            char* end = nullptr;
-            const unsigned long long n = std::strtoull(v, &end, 10);
-            if (end == v) break;
-            if (n) out.push_back(n);
-            v = *end == ',' ? end + 1 : end;
-            if (*end != ',') break;
-        }
-        return out;
-    }();
-    return list;
-}
-// Non-zero when any dump is asked for (the first present asked).
-inline std::uint64_t dump_at() { return dump_list().empty() ? 0 : dump_list().front(); }
-inline bool dump_now(std::uint64_t present) {
-    for (const std::uint64_t n : dump_list())
-        if (n == present) return true;
-    return false;
-}
-
-inline std::mutex& mutex() {
-    static std::mutex m;
-    return m;
-}
-inline std::vector<ResourceId>& targets() {
-    static std::vector<ResourceId> t;
-    return t;
-}
-
-// A render target a draw writes: the 32 most recently drawn distinct ones (the title recreates some targets every
-// frame, so the first ones seen are gone by the dump).
-inline void note(ResourceId id) {
-    if (!dump_at() || !id) return;
-    std::lock_guard lock(mutex());
-    auto& t = targets();
-    for (auto it = t.begin(); it != t.end(); ++it)
-        if (*it == id) {
-            t.erase(it);
-            break;
-        }
-    t.push_back(id);
-    if (t.size() > 32) t.erase(t.begin());
-}
-
-inline std::vector<ResourceId> snapshot() {
-    std::lock_guard lock(mutex());
-    return targets();
-}
-
-// The GPU address arena's CPU mapping, for diagnostics that read descriptors the shaders will load (set by the
-// device when it creates the arena).
+// The GPU address arena's CPU mapping (set by the device when it creates the arena).
 inline std::uint8_t* arena_mapped = nullptr;
 inline std::uint64_t arena_size = 0;
 // Reads `bytes` of the title's own memory at `va` (its CPU address) when it is committed and readable; false otherwise
@@ -81,8 +20,7 @@ inline bool (*read_title)(std::uint64_t va, void* out, std::size_t bytes) = null
 // d3d12_xs layer). Tells a table the title wrote after its submission's sync from one the sync missed.
 inline bool (*title_heap_of)(const void* real, void* now, void* copied) = nullptr;
 
-// Reads `bytes` at GPU VA `va` for a diagnostic: the arena below 4 GiB, the title's memory above. False when neither
-// holds it.
+// Reads `bytes` at GPU VA `va`: the arena below 4 GiB, the title's memory above. False when neither holds it.
 inline bool read_gpu_va(std::uint64_t va, void* out, std::size_t bytes) {
     if (va < (1ull << 32)) {
         if (!arena_mapped || va + bytes > arena_size) return false;
@@ -131,21 +69,4 @@ inline void log_table(std::FILE* out, int user_data, std::uint32_t table) {
     }
 }
 
-// Logs a draw's user data and, for each dword that is an arena VA, the 8 descriptor words there (a T# / V#).
-inline void log_user_data(const char* what, const std::uint32_t* s, std::size_t n) {
-    std::fprintf(stderr, "[rt] descriptors of %s: user data", what);
-    for (std::size_t i = 0; i < n && i < 16; ++i) std::fprintf(stderr, " %08x", s[i]);
-    std::fprintf(stderr, "\n");
-    if (!arena_mapped) return;
-    for (std::size_t i = 0; i < n && i < 16; ++i) {
-        const std::uint64_t va = s[i];
-        if (va < 0x10000 || va + 128 > arena_size || (va & 3)) continue;
-        const auto* w = reinterpret_cast<const std::uint32_t*>(arena_mapped + va);
-        for (int row = 0; row < 4; ++row)
-            std::fprintf(stderr, "[rt]   s%zu -> arena %#llx+%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n", i,
-                         static_cast<unsigned long long>(va), row * 32, w[8 * row], w[8 * row + 1], w[8 * row + 2],
-                         w[8 * row + 3], w[8 * row + 4], w[8 * row + 5], w[8 * row + 6], w[8 * row + 7]);
-    }
-}
-
-}  // namespace leonida::debug_targets
+}  // namespace leonida::fault_memory

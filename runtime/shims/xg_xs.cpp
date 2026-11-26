@@ -46,7 +46,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -75,60 +74,20 @@ struct Computer {
     Texture texture;
 };
 
-void trace(std::atomic<unsigned>& calls, const char* name, const void* caller, const char* format, ...) {
-    static const bool enabled = [] {
-        char value[2]{};
-        return GetEnvironmentVariableA("LEONIDA_XG_TRACE", value, sizeof(value)) == 1 && value[0] == '1';
-    }();
-    if (!enabled) return;
-    const unsigned call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (call > 1024) return;
-    char details[512];
-    va_list args;
-    va_start(args, format);
-    std::vsnprintf(details, sizeof(details), format, args);
-    va_end(args);
-    std::fprintf(stderr, "[rt] xg_xs: LOCAL DIAGNOSTIC: %s #%u caller=%s %s\n",
-                 name, call, rt::shims::module_offset(reinterpret_cast<uint64_t>(caller)).c_str(), details);
-}
-
-void trace_desc(std::atomic<unsigned>& calls, const char* name, const void* caller,
-                const ResourceDesc* desc, const void* out, uint32_t options,
-                HRESULT hr, uint32_t mode, uint64_t bytes) {
-    if (!desc) {
-        trace(calls, name, caller, "desc=null out=%p options=%#x hr=0x%08x", out, options, uint32_t(hr));
-        return;
-    }
-    trace(calls, name, caller,
-          "dim=%u %llux%ux%u mips=%u fmt=%u samples=%u quality=%u align=%llu layout=%#x flags=%#x "
-          "options=%#x out=%p hr=0x%08x mode=%#x bytes=%llu",
-          desc->dimension, static_cast<unsigned long long>(desc->width), desc->height, unsigned(desc->depth_or_array),
-          unsigned(desc->mips), desc->format, desc->samples, desc->quality, static_cast<unsigned long long>(desc->alignment),
-          desc->layout, desc->flags, options, out, uint32_t(hr), mode, static_cast<unsigned long long>(bytes));
-}
-
 ULONG __stdcall add_ref(Computer* self) {
-    static std::atomic<unsigned> calls{0};
     const ULONG refs = self->texture.layout.planes ? self->refs.fetch_add(1, std::memory_order_relaxed) + 1 : 1;
-    trace(calls, "slot 0", _ReturnAddress(), "this=%p refs=%lu", self, refs);
     return refs;
 }
 
 ULONG __stdcall release(Computer* self) {
-    static std::atomic<unsigned> calls{0};
     const ULONG refs = self->texture.layout.planes ? self->refs.fetch_sub(1, std::memory_order_acq_rel) - 1 : 1;
-    trace(calls, "slot 1", _ReturnAddress(), "this=%p refs=%lu", self, refs);
     if (!refs) delete self;
     return refs;
 }
 
 HRESULT __stdcall get_layout(Computer* self, ResourceLayout* out) {
-    static std::atomic<unsigned> calls{0};
     const auto& layout = self->texture.layout;
     const HRESULT hr = !layout.planes ? E_NOTIMPL : !out ? E_POINTER : S_OK;
-    trace(calls, "slot 2", _ReturnAddress(), "this=%p out=%p hr=0x%08x bytes=%llu align=%llu mips=%u planes=%u",
-          self, out, uint32_t(hr), static_cast<unsigned long long>(layout.size),
-          static_cast<unsigned long long>(layout.alignment), layout.mips, layout.planes);
     if (SUCCEEDED(hr)) {
         *out = {layout.size, layout.alignment, layout.mips, layout.planes, {layout.plane[0]}, layout.dimension, 0};
     }
@@ -136,31 +95,23 @@ HRESULT __stdcall get_layout(Computer* self, ResourceLayout* out) {
 }
 
 uint64_t __stdcall get_size(Computer* self) {
-    static std::atomic<unsigned> calls{0};
     const uint64_t bytes = self->texture.layout.size;
-    trace(calls, "slot 3", _ReturnAddress(), "this=%p bytes=%llu", self, static_cast<unsigned long long>(bytes));
     return bytes;
 }
 
 uint64_t __stdcall get_alignment(Computer* self) {
-    static std::atomic<unsigned> calls{0};
     const uint64_t bytes = self->texture.layout.alignment;
-    trace(calls, "slot 4", _ReturnAddress(), "this=%p bytes=%llu", self, static_cast<unsigned long long>(bytes));
     return bytes;
 }
 
 uint64_t __stdcall get_mip_offset(Computer* self, uint32_t plane, uint32_t level) {
-    static std::atomic<unsigned> calls{0};
     const auto& layout = self->texture.layout;
     const uint64_t offset = plane < layout.planes && level < layout.mips ? layout.plane[plane].mips[level].offset : 0;
-    trace(calls, "slot 5", _ReturnAddress(), "this=%p plane=%u mip=%u offset=%llu",
-          self, plane, level, static_cast<unsigned long long>(offset));
     return offset;
 }
 
 uint64_t __stdcall get_element_offset(Computer* self, uint32_t plane, uint32_t level,
                                       uint64_t x, uint32_t y, uint32_t z, uint32_t sample, uint32_t* bit) {
-    static std::atomic<unsigned> calls{0};
     const auto& t = self->texture;
     uint64_t offset = 0;
     if (bit) *bit = 0;
@@ -171,9 +122,6 @@ uint64_t __stdcall get_element_offset(Computer* self, uint32_t plane, uint32_t l
             offset = address.offset(mip, address.tail_origin(mip), uint32_t(x), y, z);
         }
     }
-    trace(calls, "slot 6", _ReturnAddress(), "this=%p plane=%u mip=%u x=%llu y=%u z=%u sample=%u bit=%p offset=%llu",
-          self, plane, level, static_cast<unsigned long long>(x), y, z, sample, bit,
-          static_cast<unsigned long long>(offset));
     return offset;
 }
 
@@ -204,21 +152,15 @@ HRESULT copy_subresource(const Texture& t, uint32_t plane, uint32_t subresource,
 
 HRESULT __stdcall copy_into(Computer* self, void* dst, uint32_t plane, uint32_t sub, const void* src,
                             uint32_t row, uint32_t slice) {
-    static std::atomic<unsigned> calls{0};
     const HRESULT hr = copy_subresource<true>(self->texture, plane, sub, 0, src, dst, row, slice);
     // The texture's image on the PC GPU is filled from this memory: tell the D3D12 layer it changed.
     if (SUCCEEDED(hr)) leonida::title_texel_writes::note(dst, size_t(self->texture.layout.size));
-    trace(calls, "slot 8", _ReturnAddress(), "this=%p dst=%p plane=%u sub=%u src=%p row=%u slice=%u hr=0x%08x",
-          self, dst, plane, sub, src, row, slice, uint32_t(hr));
     return hr;
 }
 
 HRESULT __stdcall copy_from(Computer* self, void* dst, uint32_t plane, uint32_t sub, uint32_t sample,
                             const void* src, uint32_t row, uint32_t slice) {
-    static std::atomic<unsigned> calls{0};
     const HRESULT hr = copy_subresource<false>(self->texture, plane, sub, sample, src, dst, row, slice);
-    trace(calls, "slot 9", _ReturnAddress(), "this=%p dst=%p plane=%u sub=%u sample=%u src=%p row=%u slice=%u hr=0x%08x",
-          self, dst, plane, sub, sample, src, row, slice, uint32_t(hr));
     return hr;
 }
 
@@ -233,7 +175,6 @@ static_assert(sizeof(PackedMips) == 12 && sizeof(TileShape) == 12 && sizeof(Subr
 
 HRESULT __stdcall get_tiling(Computer* self, uint32_t* total_tiles, PackedMips* packed, TileShape* shape,
                              uint32_t* count, uint32_t first, SubresourceTiling* tilings) {
-    static std::atomic<unsigned> calls{0};
     const auto& t = self->texture;
     const auto& layout = t.layout;
     const auto& p = layout.plane[0];
@@ -263,18 +204,11 @@ HRESULT __stdcall get_tiling(Computer* self, uint32_t* total_tiles, PackedMips* 
         }
         if (count) *count = written;
     }
-    trace(calls, "slot 10", _ReturnAddress(),
-          "this=%p total=%p packed=%p shape=%p count=%p first=%u out=%p requested=%u written=%u "
-          "hr=0x%08x tiles=%u standard=%u tail=%u tile=%ux%u",
-          self, total_tiles, packed, shape, count, first, tilings, requested, written, uint32_t(hr),
-          tiles, p.standard_mips, p.tail_mips, t.tile_width * t.format.side, t.tile_height * t.format.side);
     return hr;
 }
 
 template<size_t Slot>
-HRESULT __stdcall unimplemented_slot(Computer* self) {
-    static std::atomic<unsigned> calls{0};
-    trace(calls, "unknown slot", _ReturnAddress(), "this=%p slot=%zu hr=0x80004001", self, Slot);
+HRESULT __stdcall unimplemented_slot(Computer*) {
     return E_NOTIMPL;
 }
 
@@ -889,9 +823,7 @@ HRESULT __stdcall get_resource_tiling(Computer* c, UINT* tiles, D3D12_PACKED_MIP
 }
 
 template <size_t Slot>
-HRESULT __stdcall unused_slot(Computer* c) {
-    static std::atomic<unsigned> calls{0};
-    trace(calls, "unknown slot (five-star computer)", _ReturnAddress(), "this=%p slot=%zu hr=0x80004001", c, Slot);
+HRESULT __stdcall unused_slot(Computer*) {
     return E_NOTIMPL;
 }
 
@@ -951,7 +883,6 @@ uint32_t suggest(const D3D12_RESOURCE_DESC& desc) {
 }  // namespace fivestar
 
 HRESULT __stdcall XGCreateTextureComputer(const void* desc, void** out) {
-    static std::atomic<unsigned> calls{0};
     ResourceDesc d{};
     if (desc) std::memcpy(&d, desc, sizeof(d));
     Texture t;
@@ -980,7 +911,6 @@ HRESULT __stdcall XGCreateTextureComputer(const void* desc, void** out) {
             hr = port::create(p, out, _ReturnAddress());
         }
     }
-    trace_desc(calls, "create", _ReturnAddress(), desc ? &d : nullptr, out, 0, hr, t.mode, t.layout.size);
     // A refused computer is not harmless: the title's texture lock reads the layout it would have written
     // without checking, so say which descriptions are refused (at most 32 lines).
     static std::atomic<unsigned> refused{0};
@@ -991,26 +921,10 @@ HRESULT __stdcall XGCreateTextureComputer(const void* desc, void** out) {
                      d.dimension, static_cast<unsigned long long>(d.width), d.height, unsigned(d.depth_or_array),
                      unsigned(d.mips), d.format, d.samples, d.layout, d.flags, uint32_t(hr),
                      rt::shims::module_offset(reinterpret_cast<uint64_t>(_ReturnAddress())).c_str());
-    // LOCAL DIAGNOSTIC: LEONIDA_XG_TRACE_FORMAT=<DXGI format> logs the first 256 computers of that format whatever
-    // LEONIDA_XG_TRACE's cap, with the layout the title asked for (which tiling its CPU writes use).
-    static const uint32_t only = [] {
-        char value[8]{};
-        return GetEnvironmentVariableA("LEONIDA_XG_TRACE_FORMAT", value, sizeof(value)) ? uint32_t(atoi(value)) : 0u;
-    }();
-    static std::atomic<unsigned> only_logged{0};
-    if (only && desc && d.format == only && only_logged.fetch_add(1, std::memory_order_relaxed) < 256)
-        std::fprintf(stderr,
-                     "[rt] xg_xs: LOCAL DIAGNOSTIC: computer for format %u: dim=%u %llux%ux%u mips=%u layout=%#x "
-                     "flags=%#x -> mode %u, %llu bytes, hr 0x%08x, caller %s\n",
-                     d.format, d.dimension, static_cast<unsigned long long>(d.width), d.height,
-                     unsigned(d.depth_or_array), unsigned(d.mips), d.layout, d.flags, t.mode,
-                     static_cast<unsigned long long>(t.layout.size), uint32_t(hr),
-                     rt::shims::module_offset(reinterpret_cast<uint64_t>(_ReturnAddress())).c_str());
     return hr;
 }
 
 HRESULT __stdcall XGSuggestSwizzleMode(const void* desc, uint32_t options, uint32_t* out) {
-    static std::atomic<unsigned> calls{0};
     ResourceDesc d{};
     if (desc) std::memcpy(&d, desc, sizeof(d));
     HRESULT hr = E_INVALIDARG;
@@ -1031,7 +945,6 @@ HRESULT __stdcall XGSuggestSwizzleMode(const void* desc, uint32_t options, uint3
             hr = S_OK;
         }
     }
-    trace_desc(calls, "suggest", _ReturnAddress(), desc ? &d : nullptr, out, options, hr, mode, 0);
     return hr;
 }
 

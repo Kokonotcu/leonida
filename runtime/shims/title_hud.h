@@ -8,7 +8,7 @@
 //   Wine leaves at 0; "n/a" when neither has a figure. Both memory figures and their text come from
 //   src/memory_figures.h, which the dev overlay (src/dev_overlay.h) shows as well;
 //   graphics and compute pipelines created, and the seconds spent in vkCreate*Pipelines in the last interval,
-//   which is where an inline compile shows up as a hitch (needs LEONIDA_MEM_PROBE, src/mem_probe.h; else "-");
+//   which is where an inline compile shows up as a hitch (src/pipeline_counters.h; "-" before a device counts them);
 //   time since the first present.
 // The text is set from a thread of its own with SendMessageTimeout, so a busy or hung window thread never holds
 // the present path.
@@ -29,7 +29,7 @@
 #include <thread>
 #include <utility>
 
-#include "../src/mem_probe.h"
+#include "../src/pipeline_counters.h"
 #include "../src/memory_figures.h"
 
 namespace rt::d3d12_xs {
@@ -121,15 +121,11 @@ private:
             const std::wstring video = widen(mf::vram_text(vram));
 
             wchar_t pipelines[128] = L"PSO -";
-            auto& probe = leonida::mem_probe::state();
-            if (probe.installed) {
-                std::uint64_t graphics, compute, ns;
-                {
-                    std::lock_guard lock(probe.mutex);
-                    graphics = probe.graphics_made;
-                    compute = probe.compute_made;
-                    ns = probe.graphics_ns + probe.compute_ns;
-                }
+            auto& counted = leonida::pipeline_counters::counters();
+            if (counted.installed.load(std::memory_order_relaxed)) {
+                const std::uint64_t graphics = counted.graphics.load(std::memory_order_relaxed);
+                const std::uint64_t compute = counted.compute.load(std::memory_order_relaxed);
+                const std::uint64_t ns = counted.create_ns.load(std::memory_order_relaxed);
                 const double compiling = double(ns - last_compile_ns) / 1e9;
                 last_compile_ns = ns;
                 std::swprintf(pipelines, 128, L"PSO %llug %lluc, compiling %.1f s", (unsigned long long)graphics,

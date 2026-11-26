@@ -262,7 +262,7 @@ public:
     }
     // Bumped whenever title_memory_ranges() changes.
     std::uint64_t memory_generation() const { return memory_generation_.load(std::memory_order_acquire); }
-    // LOCAL DIAGNOSTIC (mem probe): every title range, [begin, end), in address order.
+    // Every title range, [begin, end), in address order.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> title_memory_ranges() const {
         std::shared_lock lock(memory_mutex_);
         return {memory_.begin(), memory_.end()};
@@ -369,19 +369,6 @@ public:
     }
     // Bumped by every add and every removal: a copy of mappings() is current while it has not moved.
     std::uint64_t generation() const { return generation_.load(std::memory_order_acquire); }
-    // Diagnostics (fsdraw): the title VA a shader VA was made from, the reverse of translate; a linear scan.
-    bool title_of_shader(std::uint64_t shader_va, std::uint64_t& title_va, std::uint64_t& range_va,
-                         std::uint64_t& range_bytes) const {
-        std::shared_lock lock(mutex_);
-        for (const auto& [va, r] : ranges_)
-            if (shader_va >= r.shader_va && shader_va - r.shader_va < r.end - va) {
-                title_va = va + (shader_va - r.shader_va);
-                range_va = va;
-                range_bytes = r.end - va;
-                return true;
-            }
-        return false;
-    }
     // LEONIDA_CONSOLE_HEAP_GPU: the shader-VA ranges of the ranges removed (or replaced) since the last take, so a
     // GPU table translated through them can drop what it derived. Nothing is kept until recording is turned on.
     void record_removals(bool on) { record_removals_.store(on, std::memory_order_relaxed); }

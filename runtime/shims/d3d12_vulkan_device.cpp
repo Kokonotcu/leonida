@@ -30,7 +30,6 @@
 #include "d3d12_title_buffer_windows.h"
 #include "d3d12_geometry_views.h"
 #include "placed_image_map_note.h"
-#include "d3d12_title_image_census.h"
 #include "d3d12_xs_native_pso.h"
 #include "dxgi_com.h"
 #include "log_seen.h"
@@ -46,7 +45,7 @@
 #include "../src/gfx10_descriptors.h"
 #include "../src/depth24_fragment.h"
 #include "../src/rect_list_gs.h"
-#include "../src/debug_targets.h"
+#include "../src/fault_memory.h"
 #include "xmem.h"
 #include "../src/value_write_sink.h"
 #include "../src/arena_blocks.h"
@@ -92,10 +91,7 @@
 #include "../src/pipeline_cache_persist.h"
 #include "../test/pipeline_cache_snapshot.h"
 #include "../src/vulkan_index_view.h"
-#include "d3d12_compute_input_probe.h"
-#include "../src/fsdraw_probe.h"  // LOCAL DIAGNOSTIC
-#include "../src/local_diagnostics.h"
-#include "../src/mem_probe.h"  // LOCAL DIAGNOSTIC
+#include "../src/pipeline_counters.h"
 #include "../src/vulkan_aftermath.h"
 #include "../src/console_heap_gpu.h"
 
@@ -1382,15 +1378,6 @@ void open_shadow_pages(std::uintptr_t from, std::uintptr_t to) {
     AcquireSRWLockShared(&g_shadow_pages_lock);
     for (ShadowPages* pages : shadow_pages_list()) pages->reopen_range(from, to);
     ReleaseSRWLockShared(&g_shadow_pages_lock);
-}
-
-// fsdraw's backing hook: whether a slot-133 shadow keeps the GPU copy of a title VA (LEONIDA_FSDRAW_PROBE only).
-const char* fsdraw_backing(std::uint64_t title_va) {
-    unsigned covering = 0;
-    AcquireSRWLockShared(&g_shadow_pages_lock);
-    for (ShadowPages* pages : shadow_pages_list()) covering += pages->contains(std::uintptr_t(title_va));
-    ReleaseSRWLockShared(&g_shadow_pages_lock);
-    return covering ? "a slot-133 shadow" : "an alias with no slot-133 shadow (window, geometry view or import)";
 }
 
 // Installs the handler once. false: it couldn't be, and shadows copy every page at every submission.
@@ -2833,7 +2820,6 @@ struct DeviceState {
             refresh_console_heaps();
         }
         heap_ms += std::chrono::duration<double, std::milli>(clock::now() - heaps_start).count();
-        probe_census();  // LOCAL DIAGNOSTIC
         if (!pages) return;
         const leonida::submit_phases::Scope timed(leonida::submit_phases::shadows);
         std::lock_guard lock(shadow_mutex);
@@ -3637,7 +3623,6 @@ struct DeviceState {
     // written in place: the title wrote them itself (or copied them), so no Create*View saw them. Images (T#s) and
     // null slots are skipped; so is a V# already in the arena, so a rewritten one is left alone next time.
     void scan_title_table(std::uint64_t table_va, std::uint32_t descriptors) {
-        probe_table(table_va, descriptors);  // LOCAL DIAGNOSTIC
         VkDeviceSize end = 0;
         bool sampler = false;
         {
@@ -4039,11 +4024,7 @@ struct DeviceState {
             for (const auto& item : items)  // not add_resource: VulkanContext::add_transient_binding
                 context->add_transient_binding(reinterpret_cast<leonida::ResourceId>(item.staging.get()), *item.staging);
             if (ok) {
-                // Where a slow flush waits (the texture sync's "flush" was 140-380 ms, run 13): the staging lock, or
-                // the queue's phases.
-                const auto t0 = std::chrono::steady_clock::now();
                 std::lock_guard lock(staging_mutex);
-                const auto t1 = std::chrono::steady_clock::now();
                 leonida::VulkanQueue& queue = staging_queue_for(family == 1);
                 const leonida::CommandList* lists[] = {&list};
                 {
@@ -4051,19 +4032,6 @@ struct DeviceState {
                     ok = queue.ok() && queue.execute(lists) == leonida::ReplayResult::success;
                 }
                 if (ok) context->note_upload(queue.progress_semaphore(), queue.submitted_value());
-                const auto t2 = std::chrono::steady_clock::now();
-                const auto ms = [](auto d) {
-                    return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
-                };
-                if (ms(t2 - t0) >= 100) {
-                    static std::atomic<int> told{0};
-                    const leonida::VulkanQueue::ExecuteTiming t = queue.last_timing();
-                    if (told.fetch_add(1, std::memory_order_relaxed) < 60)
-                        std::fprintf(stderr, "[rt] d3d12: slow staged-copy flush %lld ms (%zu copies): staging lock %lld, "
-                                             "execute %lld (room %u, compute wait %u, prepare %u, record %u, submit %u)\n",
-                                     ms(t2 - t0), items.size(), ms(t1 - t0), ms(t2 - t1), t.room_ms, t.compute_wait_ms,
-                                     t.prepare_ms, t.record_ms, t.submit_ms);
-                }
             }
             if (!ok) log_once("title texture sync: batched staging copies failed; copies", int(items.size()));
             for (auto& item : items) {
@@ -4308,33 +4276,6 @@ struct DeviceState {
     // shader reads the scratch page there instead of faulting. False when nothing could be mapped. Pages of
     // physical-page windows are never imported by address: their entries follow xmem's mappings (set_window_page).
     bool map_title_memory(std::uintptr_t address, std::uint64_t bytes) {
-        // Where a slow call (50 ms or more) went: the window walk (xmem's page visit, chunk imports in it), the
-        // VirtualQuery of other pages, and their host imports (run 16: recordings spent up to 3.7 s in here).
-        struct MapTimer {
-            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-            long long window_ns = 0, query_ns = 0, import_ns = 0;
-            unsigned imports = 0;
-            std::uint64_t address = 0, bytes = 0;
-            ~MapTimer() {
-                const long long total =
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
-                leonida::g_title_map_ns += static_cast<std::uint64_t>(total);
-                if (total < 50000000LL) return;
-                static std::atomic<int> told{0};
-                if (told.fetch_add(1, std::memory_order_relaxed) < 150)
-                    std::fprintf(stderr, "[rt] d3d12: slow title map %lld ms at %#llx + %#llx: window walk %lld, "
-                                         "VirtualQuery %lld, %u imports %lld\n",
-                                 total / 1000000, static_cast<unsigned long long>(address),
-                                 static_cast<unsigned long long>(bytes), window_ns / 1000000, query_ns / 1000000,
-                                 imports, import_ns / 1000000);
-            }
-        } map_timer;
-        map_timer.address = address;
-        map_timer.bytes = bytes;
-        const auto since = [](std::chrono::steady_clock::time_point t) {
-            return static_cast<long long>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count());
-        };
         constexpr std::uint64_t page = 0x10000, max_run = 64ull << 20;
         if (!arena.mapped || !get_host_pointer_properties || !bytes || address >> 48) return false;
         const std::uint64_t first = address & ~(page - 1), end = (address + bytes + page - 1) & ~(page - 1);
@@ -4354,9 +4295,7 @@ struct DeviceState {
         }
         // Window pages first, outside title_pages.mutex: xmem calls back with its own lock held, then takes ours.
         if (const auto visit = rt::xmem::g_window_pages.load(std::memory_order_acquire)) {
-            const auto t = std::chrono::steady_clock::now();
             visit(first, end, &physical_page_wanted);
-            map_timer.window_ns += since(t);
         }
         // The pages to import are claimed under title_pages.mutex, looked up and imported without it (VirtualQuery and
         // the driver's host import take milliseconds; every recording that names title memory waited behind them, a
@@ -4397,9 +4336,7 @@ struct DeviceState {
                 MEMORY_BASIC_INFORMATION region{};
                 // A view (MEM_MAPPED) is a physical page in a window: its entry is set_window_page's, as an import
                 // here would keep the page mapped now after the title maps another.
-                const auto tq = std::chrono::steady_clock::now();
                 const bool queried = VirtualQuery(reinterpret_cast<const void*>(q), &region, sizeof(region)) != 0;
-                map_timer.query_ns += since(tq);
                 if (!queried || region.State != MEM_COMMIT || region.Type == MEM_MAPPED ||
                     (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE | PAGE_NOACCESS)))
                     break;
@@ -4426,10 +4363,7 @@ struct DeviceState {
             Run r;
             r.p = p;
             r.q = q;
-            const auto ti = std::chrono::steady_clock::now();
             r.device_address = import_host(reinterpret_cast<void*>(p), q - p, r.buffer, r.imported, r.types);
-            map_timer.import_ns += since(ti);
-            ++map_timer.imports;
             runs.push_back(r);
             i = j;
         }
@@ -4512,9 +4446,6 @@ struct DeviceState {
         share(create);
         VkMemoryHostPointerPropertiesEXT properties{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
         VkMemoryRequirements requirements{};
-        struct {
-            std::chrono::steady_clock::duration properties{};
-        } import_timing;
         // Never beside a sparse bind in the driver (VulkanContext::driver_heavy_mutex).
         std::unique_lock heavy(context->driver_heavy_mutex());
         bool ok = vk.vkCreateBuffer(device, &create, nullptr, &buffer) == VK_SUCCESS;
@@ -4524,51 +4455,13 @@ struct DeviceState {
             properties.memoryTypeBits = known;
         } else if (ok) {
             vk.vkGetBufferMemoryRequirements(device, buffer, &requirements);
-            const auto tp = std::chrono::steady_clock::now();
             const VkResult pr = get_host_pointer_properties(device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
                                                             host, &properties);
             ok = pr == VK_SUCCESS;
             if (!ok) last_import_result = pr;
-            import_timing.properties = std::chrono::steady_clock::now() - tp;
             if (ok && known_types) known_types->store(properties.memoryTypeBits, std::memory_order_release);
         }
         types = ok ? properties.memoryTypeBits & requirements.memoryTypeBits : 0;
-        const auto ta = std::chrono::steady_clock::now();
-        // A slow import (30 ms or more) by driver call, with the process's count of address-space regions at the first:
-        // each import held NVIDIA's device lock for 9-130 ms whatever its size (runs 17, 18), and one for over 10 s
-        // stalled every queue into the title's watchdog (run 20, stacks_1: import_host inside the driver, the binder
-        // and a staging submit waiting on its lock). The suspicion: the driver walks the address space, which xmem's
-        // 64 KiB views of physical memory cut into tens of thousands of regions.
-        const struct ImportReport {
-            std::chrono::steady_clock::time_point start;
-            const std::chrono::steady_clock::duration& properties;
-            VkDeviceSize bytes;
-            ~ImportReport() {
-                const auto ms = [](std::chrono::steady_clock::duration d) {
-                    return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
-                };
-                const auto allocate = std::chrono::steady_clock::now() - start;
-                if (ms(allocate + properties) < 30) return;
-                static std::atomic<int> told{0};
-                const int n = told.fetch_add(1, std::memory_order_relaxed);
-                if (n >= 80) return;
-                std::size_t regions = 0;
-                if (n == 0 || n == 40) {  // a walk of the whole address space, twice a run
-                    MEMORY_BASIC_INFORMATION info{};
-                    for (auto* p = static_cast<std::uint8_t*>(nullptr);
-                         VirtualQuery(p, &info, sizeof(info)) == sizeof(info);
-                         p = static_cast<std::uint8_t*>(info.BaseAddress) + info.RegionSize) {
-                        ++regions;
-                        if (static_cast<std::uint8_t*>(info.BaseAddress) + info.RegionSize <= p) break;
-                    }
-                }
-                std::fprintf(stderr, "[rt] d3d12: slow host import %lld ms (%llu KiB): pointer properties %lld, "
-                                     "allocate %lld%s",
-                             ms(allocate + properties), static_cast<unsigned long long>(bytes >> 10), ms(properties),
-                             ms(allocate), regions ? "" : "\n");
-                if (regions) std::fprintf(stderr, "; the process has %zu address-space regions\n", regions);
-            }
-        } import_report{ta, import_timing.properties, bytes};
         if (types) {
             VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT};
             import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
@@ -6713,38 +6606,6 @@ struct DeviceState {
         heap_gpu->set_spans(leonida::ConsoleHeapGpu::ask_table, gpu_ask);
     }
 
-    // Once, when xmem's aliased pages are many: can they be imported as host memory (VK_EXT_external_memory_host)?
-    // A successful import lets the GPU copy the section. Release the diagnostic import after the check.
-    void probe_alias_imports() {
-        static bool probed = false;
-        if (probed) return;
-        std::vector<std::uintptr_t> pages;
-        const std::size_t total = leonida::title_page_aliases::sample(pages, 8);
-        if (total < 256) return;
-        probed = true;
-        int ok = 0;
-        for (const std::uintptr_t va : pages) {
-            VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceMemory imported = VK_NULL_HANDLE;
-            VkDeviceAddress address = 0;
-            MEMORY_BASIC_INFORMATION region{};
-            VirtualQuery(reinterpret_cast<const void*>(va), &region, sizeof(region));
-            const bool done = import_host_range(reinterpret_cast<void*>(va), leonida::title_page_aliases::kPageSize,
-                                                buffer, imported, address);
-            ok += done;
-            std::fprintf(stderr,
-                         "[rt] d3d12: alias import probe: page 0x%llx (state 0x%lx protect 0x%lx type 0x%lx): %s, "
-                         "device address 0x%llx\n",
-                         static_cast<unsigned long long>(va), static_cast<unsigned long>(region.State),
-                         static_cast<unsigned long>(region.Protect), static_cast<unsigned long>(region.Type),
-                         done ? "imported" : "refused", static_cast<unsigned long long>(address));
-            if (buffer) context->vk.vkDestroyBuffer(info.device, buffer, nullptr);
-            if (imported) context->vk.vkFreeMemory(info.device, imported, nullptr);
-        }
-        std::fprintf(stderr, "[rt] d3d12: alias import probe: %d of %zu sampled pages imported (%zu aliased pages)\n", ok,
-                     pages.size(), total);
-    }
-
     // Before the heaps of a refresh: the misses of the passes that are done, the backings and alias ranges gone, the
     // range table. console_heap_mutex held.
     void console_heap_gpu_begin() {
@@ -6754,7 +6615,6 @@ struct DeviceState {
             to += std::chrono::duration<double, std::milli>(now - last).count();
             last = now;
         };
-        probe_alias_imports();
         lap(gpu_counts.part_ms[0]);
         auto& misses = gpu_miss_scratch;
         misses.clear();
@@ -7039,322 +6899,6 @@ struct DeviceState {
         }
         heap.gpu_queued = 0;
         gpu_counts = {};
-    }
-
-    // LOCAL DIAGNOSTIC (desc-probe): which console-heap slots our API wrote and which the title wrote itself, what
-    // the title's own records decode to, and whether the GPU can see them. Title data: the log stays local.
-    struct HeapProbe {
-        std::uint64_t console_va = 0, shader_va = 0;
-        std::size_t slots = 0;
-        bool shadowed = false;
-        std::vector<std::uint64_t> api;   // hash of what our API last wrote to the slot; 0: never
-        std::vector<std::uint8_t> writer; // optional input-probe API origin by slot
-        std::vector<std::uint64_t> seen;  // hash at the last census
-        std::uint64_t api_writes = 0, censuses = 0;
-        int table_dumps = 0, census_dumps = 0;
-        bool told_table = false;
-        // bound tables, since the last census
-        std::uint64_t tables = 0, t_slots = 0, t_zero = 0, t_api = 0, t_title = 0, t_kind[8] = {};
-        int table_logs = 0;
-        std::size_t recent[8] = {};  // the last bound slots, read again at each census
-        unsigned recent_count = 0;
-    };
-    std::mutex probe_mutex;  // never under console_heap_mutex' callees; takes descriptor_mutex inside
-    // LEONIDA_DESC_PROBE=1 turns the diagnostic on (so does the compute input probe, which reads these records). Off
-    // by default: at every submission it hashes each slot of every bound table, and formats a line under
-    // descriptor_mutex for each slot the title wrote itself.
-    static bool probe_enabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("LEONIDA_DESC_PROBE");
-            return (v && *v == '1') || rt::compute_probe::enabled();
-        }();
-        return on;
-    }
-    std::vector<std::unique_ptr<HeapProbe>> probes;
-    std::uint64_t probe_submissions = 0;
-    static constexpr const char* kProbeKinds[8] = {"V# in arena", "V# title memory", "V# other", "T# key known",
-                                                   "T# texture by address", "T# no texture", "other",
-                                                   "free-list link (dword 0 only)"};
-    std::atomic<int> probe_view_logs{0};
-    // Where a Create*View / CopyDescriptors* write landed, for the first ones.
-    void probe_view(const char* what, SIZE_T ptr, UINT count) {
-        if (!probe_enabled() || probe_view_logs.fetch_add(1) >= 48) return;
-        std::lock_guard lock(probe_mutex);
-        for (const auto& p : probes)
-            if (ptr >= p->console_va && ptr < p->console_va + p->slots * kDescriptorSize) {
-                char text[512];
-                probe_kind(reinterpret_cast<const std::uint8_t*>(ptr), text, sizeof(text));
-                std::fprintf(stderr, "[rt] desc-probe: %s x%u -> console heap slot %llu: %s\n", what, count,
-                             static_cast<unsigned long long>((ptr - p->console_va) / kDescriptorSize), text);
-                return;
-            }
-        std::fprintf(stderr, "[rt] desc-probe: %s x%u -> 0x%llx, outside the console heaps\n", what, count,
-                     static_cast<unsigned long long>(ptr));
-    }
-
-    static std::uint64_t probe_hash(const std::uint8_t* p) {
-        std::uint64_t h = 1469598103934665603ull;
-        for (unsigned i = 0; i < kDescriptorSize; ++i) h = (h ^ p[i]) * 1099511628211ull;
-        return h ? h : 1;
-    }
-    static bool probe_zero(const std::uint8_t* p) {
-        std::uint64_t q[4];
-        std::memcpy(q, p, sizeof(q));
-        return !(q[0] | q[1] | q[2] | q[3]);
-    }
-    void probe_add(std::uint64_t console_va, std::uint64_t shader_va, std::size_t slots, bool shadowed) {
-        if (!probe_enabled() && !rt::compute_probe::enabled()) return;
-        auto probe = std::make_unique<HeapProbe>();
-        probe->console_va = console_va;
-        probe->shader_va = shader_va;
-        probe->slots = slots;
-        probe->shadowed = shadowed;
-        probe->api.assign(slots, 0);
-        if (rt::compute_probe::enabled()) probe->writer.resize(slots);
-        probe->seen.assign(slots, 0);
-        std::lock_guard lock(probe_mutex);
-        probes.push_back(std::move(probe));
-        std::fprintf(stderr,
-                     "[rt] desc-probe: console heap 0x%llx, %zu slots, shaders read it at VA 0x%llx (%s); arena size "
-                     "0x%llx: heap_base + VA is %s the arena\n",
-                     static_cast<unsigned long long>(console_va), slots, static_cast<unsigned long long>(shader_va),
-                     !shadowed ? "no GPU view" : shader_va + slots * kDescriptorSize <= arena.size ? "arena copy" : "import",
-                     static_cast<unsigned long long>(arena.size),
-                     shader_va + slots * kDescriptorSize <= arena.size ? "inside" : "PAST");
-    }
-    void probe_remove(std::uint64_t console_va) {
-        if (!probe_enabled()) return;
-        std::lock_guard lock(probe_mutex);
-        std::erase_if(probes, [console_va](const std::unique_ptr<HeapProbe>& p) { return p->console_va == console_va; });
-    }
-    void probe_api(SIZE_T ptr, UINT count, const char* what = "CopyDescriptors") {
-        if (!ptr || !count || !probe_enabled()) return;
-        std::lock_guard lock(probe_mutex);
-        for (const auto& p : probes) {
-            if (ptr < p->console_va || ptr >= p->console_va + p->slots * kDescriptorSize) continue;
-            const std::size_t first = std::size_t((ptr - p->console_va) / kDescriptorSize);
-            for (std::size_t i = first; i < first + count && i < p->slots; ++i) {
-                p->api[i] = probe_hash(reinterpret_cast<const std::uint8_t*>(
-                    static_cast<std::uintptr_t>(p->console_va + i * kDescriptorSize)));
-                if (!p->writer.empty()) p->writer[i] = rt::compute_probe::writer_code(what);
-                ++p->api_writes;
-            }
-        }
-    }
-    // What a slot the title wrote holds (an index into kProbeKinds) and a line saying so.
-    int probe_kind(const std::uint8_t* bytes, char* text, std::size_t size) {
-        namespace g = leonida::gfx10;
-        std::uint32_t w[8];
-        std::memcpy(w, bytes, sizeof(w));
-        int n = std::snprintf(text, size, "%08x %08x %08x %08x %08x %08x %08x %08x |", w[0], w[1], w[2], w[3], w[4],
-                              w[5], w[6], w[7]);
-        if (!(w[1] | w[2] | w[3] | w[4] | w[5] | w[6] | w[7]) && w[0] < 0x200000u) {
-            if (n > 0 && std::size_t(n) < size) std::snprintf(text + n, size - n, " free-list link to slot %u?", w[0]);
-            return 7;
-        }
-        if (n < 0) n = 0;
-        char* rest = text + std::min<std::size_t>(std::size_t(n), size);
-        const std::size_t left = size - std::min<std::size_t>(std::size_t(n), size);
-        if (!(w[3] >> 30)) {
-            g::BufferWords words{w[0], w[1], w[2], w[3]};
-            g::Buffer b{};
-            const bool ok = g::decode(words, b);
-            std::uint64_t lo = 0, hi = 0;
-            const bool title = leonida::title_va_aliases().title_memory(b.address, lo, hi);
-            const std::uint64_t to = leonida::title_va_aliases().shader_va(b.address);
-            const int kind = b.address < arena.size ? 0 : title ? 1 : 2;
-            std::snprintf(rest, left,
-                          " V#%s base 0x%llx stride %u records %u fmt %u dst %u%u%u%u oob %u -> %s%s (upper 16 B %s)",
-                          ok ? "" : "(bad dst)", static_cast<unsigned long long>(b.address), b.stride, b.num_records,
-                          b.format, b.swizzle[0], b.swizzle[1], b.swizzle[2], b.swizzle[3], unsigned(b.oob_select),
-                          kProbeKinds[kind], to != b.address ? " (has a GPU copy)" : "",
-                          (w[4] | w[5] | w[6] | w[7]) ? "set" : "zero");
-            return kind;
-        }
-        g::ImageWords words{w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]};
-        g::Image image{};
-        if (!g::is_image(words) || !g::decode(words, image)) {
-            std::snprintf(rest, left, " neither V# nor valid T# (type %u)", w[3] >> 28);
-            return 6;
-        }
-        int kind = 5;
-        char what[96] = "no texture at that address";
-        {
-            std::lock_guard lock(descriptor_mutex);
-            if (image_entries.count(words)) {
-                kind = 3;
-                std::snprintf(what, sizeof(what), "key registered");
-            } else if (const auto it = images_by_address.find(image.address); it != images_by_address.end()) {
-                kind = 4;
-                std::snprintf(what, sizeof(what), "texture known, this key not registered");
-            }
-        }
-        std::snprintf(rest, left,
-                      " T# base 0x%llx fmt %u type %u %ux%u depth %u mips %u+%u of %u layers %u+%u samples %u dst "
-                      "%u%u%u%u minlod %.2f -> %s",
-                      static_cast<unsigned long long>(image.address), image.format, unsigned(image.type), image.width,
-                      image.height, image.depth, image.first_mip, image.mip_count, image.resource_mips,
-                      image.first_layer, image.layer_count, image.samples, image.swizzle[0], image.swizzle[1],
-                      image.swizzle[2], image.swizzle[3], double(image.min_lod), what);
-        return kind;
-    }
-    // At a descriptor-table scan (ExecuteCommandLists): the slots a bound table in a console heap declares.
-    void probe_table(std::uint64_t table_va, std::uint32_t descriptors) {
-        if (!probe_enabled()) return;
-        std::lock_guard lock(probe_mutex);
-        for (const auto& p : probes) {
-            const std::uint64_t span = p->slots * kDescriptorSize;
-            std::uint64_t at = 0;
-            if (table_va >= p->shader_va && table_va - p->shader_va < span) at = table_va - p->shader_va;
-            else if (table_va >= p->console_va && table_va - p->console_va < span) at = table_va - p->console_va;
-            else continue;
-            const std::size_t first = std::size_t(at / kDescriptorSize);
-            const std::size_t count = std::min<std::size_t>(std::min<std::uint32_t>(descriptors, 1024), p->slots - first);
-            if (!p->told_table) {
-                p->told_table = true;
-                std::fprintf(stderr,
-                             "[rt] desc-probe: first bound table in console heap 0x%llx: VA 0x%llx = slot %zu, %zu "
-                             "slots declared; shaders load it at heap_base + 0x%llx, %s the arena (size 0x%llx)\n",
-                             static_cast<unsigned long long>(p->console_va), static_cast<unsigned long long>(table_va),
-                             first, count, static_cast<unsigned long long>(table_va),
-                             table_va + count * kDescriptorSize <= arena.size ? "inside" : "PAST",
-                             static_cast<unsigned long long>(arena.size));
-            }
-            ++p->tables;
-            p->recent[p->recent_count++ % 8] = first;
-            if (p->table_logs < 40) {
-                ++p->table_logs;
-                char text[512] = "";
-                probe_kind(reinterpret_cast<const std::uint8_t*>(
-                               static_cast<std::uintptr_t>(p->console_va + first * kDescriptorSize)),
-                           text, sizeof(text));
-                std::fprintf(stderr, "[rt] desc-probe: table %llu VA 0x%llx slot %zu (%zu declared) at execute: %s\n",
-                             static_cast<unsigned long long>(p->tables), static_cast<unsigned long long>(table_va),
-                             first, count, text);
-            }
-            for (std::size_t i = first; i < first + count; ++i) {
-                const auto* bytes =
-                    reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(p->console_va + i * kDescriptorSize));
-                ++p->t_slots;
-                if (probe_zero(bytes)) {
-                    ++p->t_zero;
-                    continue;
-                }
-                if (p->api[i] && p->api[i] == probe_hash(bytes)) {
-                    ++p->t_api;
-                    continue;
-                }
-                ++p->t_title;
-                char text[512];
-                const int kind = probe_kind(bytes, text, sizeof(text));
-                ++p->t_kind[kind];
-                if (p->table_dumps < 24) {
-                    ++p->table_dumps;
-                    std::fprintf(stderr, "[rt] desc-probe: table slot %zu (table VA 0x%llx +%zu) %s-written: %s\n", i,
-                                 static_cast<unsigned long long>(table_va), i - first,
-                                 p->api[i] ? "API-then-title" : "title", text);
-                }
-            }
-        }
-    }
-    // Before a submission, after the console heaps' copies are refreshed: the whole heap, now and then.
-    void probe_census() {
-        if (!probe_enabled()) return;
-        const std::uint64_t n = ++probe_submissions;
-        if (n != 1 && n != 64 && n != 512 && n != 2048 && n % 4096) return;
-        std::lock_guard lock(probe_mutex);
-        for (const auto& p : probes) {
-            ++p->censuses;
-            std::uint64_t zero = 0, api = 0, title_new = 0, title_over = 0, changed_no_api = 0, kinds[8] = {};
-            std::uint64_t copy_differs = 0, copy_differs_unrebased = 0;
-            // A copy lies in the arena; an import never does (its device address is outside the arena's).
-            const std::uint8_t* copy =
-                p->shadowed && p->shader_va + p->slots * kDescriptorSize <= arena.size ? arena.mapped + p->shader_va
-                                                                                       : nullptr;
-            for (std::size_t i = 0; i < p->slots; ++i) {
-                const auto* bytes =
-                    reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(p->console_va + i * kDescriptorSize));
-                if (copy && std::memcmp(copy + i * kDescriptorSize, bytes, kDescriptorSize)) {
-                    ++copy_differs;
-                    // A rebased V# differs in its base only (dwords 0 and 1 low half).
-                    std::uint32_t a[8], b[8];
-                    std::memcpy(a, bytes, 32);
-                    std::memcpy(b, copy + i * kDescriptorSize, 32);
-                    const bool rebased = !(a[3] >> 30) && a[2] == b[2] && a[3] == b[3] &&
-                                         (a[1] & 0xFFFF0000u) == (b[1] & 0xFFFF0000u) &&
-                                         !std::memcmp(a + 4, b + 4, 16);
-                    copy_differs_unrebased += !rebased;
-                }
-                const bool is_zero = probe_zero(bytes);
-                const std::uint64_t h = is_zero ? 0 : probe_hash(bytes);
-                if (p->seen[i] != h && p->censuses > 1 && h != p->api[i]) ++changed_no_api;
-                p->seen[i] = h;
-                if (is_zero) {
-                    ++zero;
-                    continue;
-                }
-                if (p->api[i] == h) {
-                    ++api;
-                    continue;
-                }
-                ++(p->api[i] ? title_over : title_new);
-                char text[512];
-                const int kind = probe_kind(bytes, text, sizeof(text));
-                ++kinds[kind];
-                if (p->census_dumps < 40 && kind != 7 && kind != 0) {
-                    ++p->census_dumps;
-                    std::fprintf(stderr, "[rt] desc-probe: census %llu slot %zu %s-written: %s\n",
-                                 static_cast<unsigned long long>(p->censuses), i,
-                                 p->api[i] ? "API-then-title" : "title", text);
-                }
-            }
-            std::fprintf(stderr,
-                         "[rt] desc-probe: census %llu at submission %llu, heap 0x%llx (%zu slots, %llu API writes so "
-                         "far): zero %llu, as our API wrote them %llu, title-written %llu (never API %llu, over an API "
-                         "write %llu), changed since the last census with no API write %llu; title kinds: %s %llu, %s "
-                         "%llu, %s %llu, %s %llu, %s %llu, %s %llu, %s %llu, %s %llu; arena copy differs %llu (not a rebased V# "
-                         "%llu)\n",
-                         static_cast<unsigned long long>(p->censuses), static_cast<unsigned long long>(n),
-                         static_cast<unsigned long long>(p->console_va), p->slots,
-                         static_cast<unsigned long long>(p->api_writes), static_cast<unsigned long long>(zero),
-                         static_cast<unsigned long long>(api), static_cast<unsigned long long>(title_new + title_over),
-                         static_cast<unsigned long long>(title_new), static_cast<unsigned long long>(title_over),
-                         static_cast<unsigned long long>(changed_no_api), kProbeKinds[0],
-                         static_cast<unsigned long long>(kinds[0]), kProbeKinds[1],
-                         static_cast<unsigned long long>(kinds[1]), kProbeKinds[2],
-                         static_cast<unsigned long long>(kinds[2]), kProbeKinds[3],
-                         static_cast<unsigned long long>(kinds[3]), kProbeKinds[4],
-                         static_cast<unsigned long long>(kinds[4]), kProbeKinds[5],
-                         static_cast<unsigned long long>(kinds[5]), kProbeKinds[6],
-                         static_cast<unsigned long long>(kinds[6]), kProbeKinds[7],
-                         static_cast<unsigned long long>(kinds[7]), static_cast<unsigned long long>(copy_differs),
-                         static_cast<unsigned long long>(copy_differs_unrebased));
-            std::fprintf(stderr,
-                         "[rt] desc-probe: bound tables since the last census: %llu tables, %llu slots: zero %llu, API "
-                         "%llu, title-written %llu (%s %llu, %s %llu, %s %llu, %s %llu, %s %llu, %s %llu, %s %llu, %s %llu)\n",
-                         static_cast<unsigned long long>(p->tables), static_cast<unsigned long long>(p->t_slots),
-                         static_cast<unsigned long long>(p->t_zero), static_cast<unsigned long long>(p->t_api),
-                         static_cast<unsigned long long>(p->t_title), kProbeKinds[0],
-                         static_cast<unsigned long long>(p->t_kind[0]), kProbeKinds[1],
-                         static_cast<unsigned long long>(p->t_kind[1]), kProbeKinds[2],
-                         static_cast<unsigned long long>(p->t_kind[2]), kProbeKinds[3],
-                         static_cast<unsigned long long>(p->t_kind[3]), kProbeKinds[4],
-                         static_cast<unsigned long long>(p->t_kind[4]), kProbeKinds[5],
-                         static_cast<unsigned long long>(p->t_kind[5]), kProbeKinds[6],
-                         static_cast<unsigned long long>(p->t_kind[6]), kProbeKinds[7],
-                         static_cast<unsigned long long>(p->t_kind[7]));
-            for (unsigned r = 0; r < std::min(p->recent_count, 8u); ++r) {
-                char text[512] = "";
-                const std::size_t slot = p->recent[r];
-                probe_kind(reinterpret_cast<const std::uint8_t*>(
-                               static_cast<std::uintptr_t>(p->console_va + slot * kDescriptorSize)),
-                           text, sizeof(text));
-                std::fprintf(stderr, "[rt] desc-probe: census %llu: recently bound slot %zu now: %s\n",
-                             static_cast<unsigned long long>(p->censuses), slot, text);
-            }
-            p->tables = p->t_slots = p->t_zero = p->t_api = p->t_title = 0;
-            for (auto& k : p->t_kind) k = 0;
-        }
     }
 
     // One VkPipelineCache for every pipeline the device creates (docs/d3d12_vulkan.md section 3.6): a PSO created a
@@ -8385,23 +7929,12 @@ struct DeviceState {
                     VkFormat image_format, VkImageAspectFlags aspects, bool storage,
                     bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED,
                     bool a8_in_rgba = false, float min_lod_floor = 0.0f) {
-        // LEONIDA_LOG_TSHARP=<GPU address, hex>: every T# registered for a texture at that address, so a T# a shader
-        // reads (LEONIDA_LOG_DESC) can be compared with the ones the hash table knows.
-        if (static const std::uint64_t want = [] {
-                const char* v = std::getenv("LEONIDA_LOG_TSHARP");
-                return v ? std::strtoull(v, nullptr, 16) : 0ull;
-            }();
-            want && image.address == want) {
-            std::fprintf(stderr, "[rt] d3d12: T# registered for %#llx:", static_cast<unsigned long long>(want));
-            for (const std::uint32_t w : words) std::fprintf(stderr, " %08x", w);
-            std::fprintf(stderr, "%s\n", storage ? " (storage)" : "");
-        }
         std::lock_guard lock(descriptor_mutex);
         return bind_image_locked(words, image, vk_image, image_format, aspects, storage, allow_channel_cast,
                                  uint_backed, a8_in_rgba, min_lod_floor);
     }
     // merge: kept both (upstream's split into bind_image_locked / bind_image_views_locked with deferred keys; our A8
-    // target swizzle, title-texture mip floor and T# logs carried through it)
+    // target swizzle and title-texture mip floor carried through it)
     bool bind_image_locked(const leonida::gfx10::ImageWords& words, const leonida::gfx10::Image& image,
                            VkImage vk_image, VkFormat image_format, VkImageAspectFlags aspects, bool storage,
                            bool allow_channel_cast = false, VkFormat uint_backed = VK_FORMAT_UNDEFINED,
@@ -8480,15 +8013,6 @@ struct DeviceState {
         }
         const auto existing = image_entries.find(words);
         if (existing != image_entries.end() && (existing->second.storage || !storage)) return true;
-        // LEONIDA_LOG_TSHARP_8BIT=1: every new T# of an 8-bit format (GFX10 format 1: the glyph atlases), with its
-        // image's address, size and the Vulkan image, to compare with the T#s the text draws read (LEONIDA_LOG_DESC).
-        if (static const bool log_8bit = std::getenv("LEONIDA_LOG_TSHARP_8BIT") != nullptr; log_8bit && image.format == 1) {
-            std::fprintf(stderr, "[rt] d3d12: 8-bit T# registered (address %#llx, %ux%u, image %p):",
-                         static_cast<unsigned long long>(image.address), image.width, image.height,
-                         static_cast<void*>(vk_image));
-            for (const std::uint32_t w : words) std::fprintf(stderr, " %08x", w);
-            std::fprintf(stderr, "%s\n", storage ? " (storage)" : "");
-        }
         // A title T# of a W range of a 3D UAV (Image::sliced, RADV's form) carries its range itself.
         if (image.sliced && !slices.count) slices = {image.first_layer, image.layer_count};
 
@@ -8697,7 +8221,6 @@ struct DeviceState {
             image_entries.emplace(words, entry);
             image_keys.emplace(image.address, words);
         }
-        leonida::fsdraw::note_tsharp(words.data());  // LOCAL DIAGNOSTIC (the key went in above, review D11)
         return true;
     }
 
@@ -8709,26 +8232,6 @@ struct DeviceState {
     void note_image_address(std::uint64_t address, const void* resource) {
         std::lock_guard lock(descriptor_mutex);
         images_by_address[address] = resource;
-    }
-    // LEONIDA_TRACE_TEXTURE=<address>[,<address>...] (hex, the base a T# names): the resource id of an image registered
-    // at that address, so a draw's T# can be followed to the passes that write it (fsdraw rt0, UAV views, copies).
-    static void trace_image(std::uint64_t address, leonida::ResourceId id, const char* where) {
-        static const std::vector<std::uint64_t> traced = [] {
-            std::vector<std::uint64_t> out;
-            const char* v = std::getenv("LEONIDA_TRACE_TEXTURE");
-            for (const char* p = v; p && *p;) {
-                char* end = nullptr;
-                const std::uint64_t a = std::strtoull(p, &end, 16);
-                if (end == p) break;
-                out.push_back(a);
-                p = *end == ',' ? end + 1 : end;
-            }
-            return out;
-        }();
-        if (traced.empty() || std::find(traced.begin(), traced.end(), address) == traced.end()) return;
-        std::fprintf(stderr, "[rt] trace-texture: address 0x%llx is resource 0x%llx (%s)\n",
-                     static_cast<unsigned long long>(address), static_cast<unsigned long long>(id), where);
-        leonida::fsdraw::note_target(id);  // read back with the captures (numbers: mean, nonzero texels)
     }
     // The texture registered at `address` (a title-placed texture's address can be taken over by a later one).
     const void* image_owner(std::uint64_t address) {
@@ -9790,17 +9293,6 @@ const char* barrier_layout_refusal(const D3D12_RESOURCE_DESC& desc, D3D12_BARRIE
 // then address at +0x10 and size at +0x18. The title asserts GetCPUDescriptorHandleForHeapStart() == address.
 // Backing this range with title memory / section 3.3 aliasing is tracked separately; this path only satisfies the
 // observed ABI contract and must not be inferred from normal PC 16-byte CreateDescriptorHeap calls.
-// LOCAL DIAGNOSTIC (desc-probe): records what a descriptor write through our API left in a console-heap slot.
-struct ProbeApiWrite {
-    DeviceState& state;
-    SIZE_T ptr;
-    UINT count;
-    const char* what;
-    ~ProbeApiWrite() {
-        state.probe_api(ptr, count, what);
-        state.probe_view(what, ptr, count);
-    }
-};
 
 struct ConsoleDescriptorHeapDesc {
     D3D12_DESCRIPTOR_HEAP_DESC desc{};
@@ -9837,10 +9329,6 @@ public:
             if (!shadowed_ && (desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
                 log_once("descriptor heap uses console address/size, which no shader reads (no GPU view); type",
                          int(desc_.Type));
-            if (desc_.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&  // LOCAL DIAGNOSTIC
-                (desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE))
-                device.probe_add(console_address_, shadowed_ ? console_shader_va_ : console_address_,
-                                 desc_.NumDescriptors, shadowed_);
             return;
         }
         if ((desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) && device.arena.mapped) {
@@ -9884,7 +9372,6 @@ public:
             const auto first = reinterpret_cast<std::uintptr_t>(cpu_);
             device_.clear_sampler_slots(first, first + std::uintptr_t(desc_.NumDescriptors) * kDescriptorSize);
         }
-        if (console_addressed_) device_.probe_remove(console_address_);  // LOCAL DIAGNOSTIC
         if (shadowed_) device_.remove_console_heap(console_address_);
         if (registered_cpu_views_) {
             std::lock_guard lock(device_.visible_heap_mutex);
@@ -10434,7 +9921,6 @@ public:
         return WriteToSubresource(subresource, nullptr, data, row, slice);
     }
 
-    bool replay_seen() const { return replay_seen_.load(std::memory_order_relaxed); }
     bool staged_title() const { return staged_title_; }
     bool upload_staged_title(const rt::xg_xs::Texture& layout, const std::uint8_t* tiled,
                              std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero) {
@@ -11095,7 +10581,6 @@ public:
         aspects_ = format.aspects;
         image_address_ = device_.next_image_address.fetch_add(256);
         device_.note_image_address(image_address_, this);
-        DeviceState::trace_image(image_address_, id(), "registered");
         binding_.image = image_;
         binding_.format = format_;
         binding_.aspects = aspects_;
@@ -11443,21 +10928,6 @@ public:
             image_backing_bytes_ = requirements.size;
         }
 
-        if (!deferred_stream_ && !deferred_attachment_ && origin != TitleImageOrigin::ordinary && leonida::mem_probe::interval_seconds()) {
-            char key[160];
-            std::snprintf(key, sizeof(key), "image-class slot=%u format=%u dim=%u samples=%u flags=0x%x usage=0x%x bits=0x%x",
-                          stream ? 70u : 133u, unsigned(info.format),
-                          unsigned(info.imageType), unsigned(info.samples), unsigned(info.flags),
-                          unsigned(info.usage), requirements.memoryTypeBits);
-            if (first_diagnostic(key, int(type))) {
-                VkImageCreateInfo staged = info;
-                staged.usage &= ~VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
-                VkMemoryRequirements without = requirements;
-                if (staged.usage != info.usage && !device_.memory_requirements(staged, without))
-                    without.memoryTypeBits = 0;
-                std::fprintf(stderr, "[rt] mem-probe: %s no-host-bits=0x%x type=%u\n", key, without.memoryTypeBits, type);
-            }
-        }
         leonida::ResourceBinding binding{};
         if (deferred_attachment_) {
             binding.residency_owner = this;
@@ -11517,10 +10987,7 @@ public:
             return committed_instead();
         }
         device_.note_image_address(image_address_, this);
-        DeviceState::trace_image(image_address_, id(), "registered");
         binding.deferred_memory = deferred_attachment_.get();
-        if (origin == TitleImageOrigin::placed && leonida::mem_probe::interval_seconds())
-            binding.replay_seen = &replay_seen_;
         binding_ = binding;
         if (shared_zero_) {
             // All direct GPU commands resolve this binding in prepare(), before the descriptor table flush.
@@ -11748,7 +11215,6 @@ public:
         device_.forget_image(va);  // an earlier texture placed at this address, still alive: its views are stale
         image_address_ = va;
         device_.note_image_address(image_address_, this);
-        DeviceState::trace_image(image_address_, id(), "registered");
     }
     // The title's own address for a texture Xbox slot 133 placed. The image is still the committed fallback, so its
     // pixels do not alias the title's pages yet; the address is what GetGPUVirtualAddress answers (XCL PR #168's
@@ -11828,45 +11294,10 @@ public:
     // the host runtime refuses a non-empty read range that ends past the buffer. A texture in a CPU-visible heap has
     // no pointer to give (its layout is the driver's), so D3D12 only lets it be mapped with a null pointer, before
     // WriteToSubresource/ReadFromSubresource.
-    // LEONIDA_LOG_TSHARP: CPU access to the glyph atlas's description (2048x2048 R8, retail 1.0.2.1), first 32 calls.
-    void log_atlas_access(const char* what, UINT subresource, const D3D12_BOX* box) const {
-        static const bool on = std::getenv("LEONIDA_LOG_TSHARP") != nullptr;
-        if (!on || !image_ || desc_.Width != 2048 || desc_.Height != 2048 || (desc_.Format != DXGI_FORMAT_R8_UNORM && desc_.Format != DXGI_FORMAT_A8_UNORM))
-            return;
-        static std::atomic<int> told{0};
-        if (told.fetch_add(1) >= 32) return;
-        std::fprintf(stderr, "[rt] d3d12: atlas %s sub %u box %s %u,%u-%u,%u, va %#llx, image address %#llx\n", what,
-                     subresource, box ? "yes" : "no", box ? box->left : 0, box ? box->top : 0, box ? box->right : 0,
-                     box ? box->bottom : 0, static_cast<unsigned long long>(va_),
-                     static_cast<unsigned long long>(image_address_));
-    }
-
     HRESULT STDMETHODCALLTYPE Map(UINT subresource, const D3D12_RANGE* read, void** data) override {
-        log_atlas_access(data ? "Map" : "Map(null)", subresource, nullptr);
         // merge: kept both. Upstream's answers for the images it places itself (place_at_title_address: slot-70 view
         // images) and for leased linear textures; ours for slot-133 textures on the title's pages (set_title_address)
         // and for textures off them (map_shadow_).
-        // LOCAL DIAGNOSTIC: LEONIDA_LOCK_TRACE=1 logs the first 256 texture Maps with a read range: the title's
-        // texture lock passes the subresource's byte range there, computed from its XG computer's
-        // layout, and adds the range's start to the pointer this answers.
-        static const bool lock_trace = [] {
-            char value[2]{};
-            return GetEnvironmentVariableA("LEONIDA_LOCK_TRACE", value, sizeof(value)) == 1 && value[0] == '1';
-        }();
-        if (lock_trace && read && image_) {
-            static std::atomic<int> logged{0};
-            if (logged.fetch_add(1, std::memory_order_relaxed) < 256) {
-                const auto caller = reinterpret_cast<std::uintptr_t>(_ReturnAddress());
-                std::fprintf(stderr,
-                             "[rt] d3d12: LOCAL DIAGNOSTIC: Map sub %u range 0x%llx..0x%llx of texture %llux%ux%u "
-                             "fmt %d flags 0x%x at 0x%llx, caller 0x%llx\n",
-                             subresource, static_cast<unsigned long long>(read->Begin),
-                             static_cast<unsigned long long>(read->End), static_cast<unsigned long long>(desc_.Width),
-                             desc_.Height, unsigned(desc_.DepthOrArraySize), int(desc_.Format), unsigned(desc_.Flags),
-                             static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(title_address_)),
-                             static_cast<unsigned long long>(caller));
-            }
-        }
         // A texture whose lease says its title memory is linear (title_linear_) and that also has a placement
         // address (slot 133; the video planes among them) has two answers. The placement address, with the title
         // texture registry filling the image, is the one the retail boot ran through the intro movie and the story
@@ -12048,7 +11479,6 @@ public:
     // the application to keep the GPU off the subresource meanwhile, so a blocking copy is the whole contract.
     HRESULT STDMETHODCALLTYPE WriteToSubresource(UINT subresource, const D3D12_BOX* box, const void* data,
                                                  UINT row_pitch, UINT depth_pitch) override {
-        log_atlas_access("WriteToSubresource", subresource, box);
         return cpu_copy(true, subresource, box, const_cast<void*>(data), row_pitch, depth_pitch);
     }
     HRESULT STDMETHODCALLTYPE ReadFromSubresource(void* data, UINT row_pitch, UINT depth_pitch, UINT subresource,
@@ -12349,8 +11779,6 @@ private:
             device_.release_resource(memory, !submitted);
             return hr;
         };
-        using copy_clock = std::chrono::steady_clock;
-        const auto copy_started = copy_clock::now();
         memory = device_.allocate_resource(VK_NULL_HANDLE, staging.buffer,
                                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                            write ? 0 : VK_MEMORY_PROPERTY_HOST_CACHED_BIT, nullptr, false, true);
@@ -12358,27 +11786,7 @@ private:
         if (!memory || !mapped ||
             vk.vkBindBufferMemory(dev, staging.buffer, memory.memory, memory.offset) != VK_SUCCESS)
             return release(E_OUTOFMEMORY);
-        const auto allocated = copy_clock::now();
         if (write) pack(static_cast<std::byte*>(mapped), pitch);
-        const auto packed = copy_clock::now();
-        // A slow staged copy, by phase (the title-texture sync held a submission for 47 s, 2026-11-25).
-        const struct CopyReport {
-            copy_clock::time_point start, allocated, packed;
-            VkDeviceSize bytes;
-            ~CopyReport() {
-                const auto ms = [](copy_clock::duration d) {
-                    return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
-                };
-                const auto end = copy_clock::now();
-                if (end - start < std::chrono::milliseconds(500)) return;
-                static std::atomic<int> told{0};
-                if (told.fetch_add(1, std::memory_order_relaxed) >= 100) return;
-                std::fprintf(stderr, "[rt] d3d12: slow staged copy %lld ms (%llu KiB): staging memory %lld, detile %lld, "
-                                     "staging submit %lld\n",
-                             ms(end - start), static_cast<unsigned long long>(bytes >> 10), ms(allocated - start),
-                             ms(packed - allocated), ms(end - packed));
-            }
-        } copy_report{copy_started, allocated, packed, staging.size};
 
         // Review D9: a VkQueue the game's direct queue is not on. CreateCommandQueue hands each family's VkQueues
         // out from the first, so the last one. A colour copy goes to the copy family, whose engine runs beside
@@ -12520,7 +11928,6 @@ private:
     bool console_d16s8_ = false;  // created from Xbox format 118 (even when pc_format made it D24S8)
     VkImage shared_zero_ = VK_NULL_HANDLE;  // owned by the device
     std::unique_ptr<leonida::DeferredImageBinding> deferred_attachment_;
-    std::atomic<bool> replay_seen_{false};
     bool staged_title_ = false;
     std::atomic<bool> deferred_stream_{false};  // keys stay unpublished until the whole first upload succeeds
     VkDeviceSize deferred_bytes_ = 0;
@@ -13763,7 +13170,6 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
 // A pipeline state, compute (create_compute) or graphics (create_graphics): each shader is found by the SHA-256 of
 // its FSSM program in the translator's index, and the FSSM blob is copied into the arena as the shader's code base.
 std::atomic<long> live_pipeline_state_count{0};  // live_pipeline_states()
-std::atomic<long> live_pipeline_state_views{0};  // LOCAL DIAGNOSTIC (mem probe): live PSOs that are views of a shared one
 
 // What the bindless set layout was made from, for a compute pipeline's journal name: a pipeline built against another
 // layout is another pipeline. Field by field, so padding never reaches the hash.
@@ -14093,9 +13499,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     if (journal.enabled() && device.info.pipeline_cache_control) trace.request_feedback(pipeline_info);
     const leonida::dev_status::Build dev_build(entry->name.c_str());
     const leonida::pipeline_profile::DriverCall profile("cs", trigger, entry->name.c_str());
-    // LOCAL DIAGNOSTIC (early device loss): a vkQueueSubmit was measured blocking 10 s and losing the device
-    // while another thread sat in this call. Name what is building (once past the gate: in the driver), and log
-    // the start of big ones.
+    // What is building, once past the gate (in the driver): the compile gate's wait reports name it.
     auto& compiling = leonida::driver_compile;
     VkResult created = VK_ERROR_UNKNOWN;
     bool from_shared = false, probe_compiled = false;
@@ -14117,9 +13521,6 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         compiling.trigger.store(trigger, std::memory_order_relaxed);
         compiling.since_ms.store(leonida::diagnostic_ms(), std::memory_order_relaxed);
         compiling.name.store(entry->name.c_str(), std::memory_order_release);
-        if (bytes >= 128 * 1024)
-            std::fprintf(stderr, "[rt] d3d12: compute pipeline %s (%zu B SPIR-V, %s) build starts at t=%.3f s\n",
-                         entry->name.c_str(), bytes, trigger, double(leonida::diagnostic_ms()) / 1000.0);
         if (ask_shared) {
             // VK_PIPELINE_COMPILE_REQUIRED (a success code, no pipeline) when the shared cache does not have it.
             pipeline_info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
@@ -14205,7 +13606,6 @@ public:
         for (VkShaderModule module : built_modules_) device_.shader_modules().release(module);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
         --live_pipeline_state_count;
-        if (native_owner_) --live_pipeline_state_views;
         delete compute;
         delete graphics;
     }
@@ -14250,7 +13650,6 @@ public:
     }
     // Upstream's native PSO sharing (slots 55/57): a view PSO answers with the compiled owner's pipeline.
     void share_native_graphics(std::shared_ptr<PipelineState> owner) {
-        if (!native_owner_ && owner) ++live_pipeline_state_views;
         native_owner_ = std::move(owner);
     }
     bool ensure_native_source(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc, D3D12_SHADER_BYTECODE mesh,
@@ -15183,34 +14582,11 @@ public:
             code_base_ = offset;
             gparts().graphics.code_base = offset;
         }
-        static const bool log_psos = std::getenv("LEONIDA_LOG_PSOS") != nullptr;
-        std::string names;
-        if (log_psos || dred_requested()) {
+        if (dred_requested()) {  // the shaders a DRED breadcrumb names for this pipeline
+            std::string names;
             for (const Stage& stage : stages)
                 if (stage.entry) names += std::string(" ") + stage.name + "=" + stage.entry->name;
-            if (log_psos) gparts().graphics.debug_name = names;
-            if (dred_requested()) leonida::note_breadcrumb_pso_name(id(), names);
-        }
-        if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC: what this pipeline is, for the fsdraw probe's draw lines
-            const auto& rt0 = desc.BlendState.RenderTarget[0];
-            char text[640];
-            std::snprintf(text, sizeof text,
-                          "vs %s (fssm %.16s) ps %s (fssm %.16s) rootsig %p rts %u fmt0 %d fmt1 %d dsv %d depth %d "
-                          "blend0 en %d src %d dst %d op %d srcA %d dstA %d opA %d logic %d wm 0x%x alpha2cov %d "
-                          "independent %d sample_mask 0x%x cull %d fill %d topo %d samples %u",
-                          stages[0].entry ? stages[0].entry->name.c_str() : "-",
-                          stages[0].entry ? stages[0].entry->fssm_sha256.c_str() : "-",
-                          stages[2].entry ? stages[2].entry->name.c_str() : "-",
-                          stages[2].entry ? stages[2].entry->fssm_sha256.c_str() : "-",
-                          static_cast<const void*>(desc.pRootSignature), desc.NumRenderTargets, int(desc.RTVFormats[0]),
-                          int(desc.RTVFormats[1]), int(desc.DSVFormat), int(desc.DepthStencilState.DepthEnable),
-                          int(rt0.BlendEnable), int(rt0.SrcBlend), int(rt0.DestBlend), int(rt0.BlendOp),
-                          int(rt0.SrcBlendAlpha), int(rt0.DestBlendAlpha), int(rt0.BlendOpAlpha), int(rt0.LogicOpEnable),
-                          unsigned(rt0.RenderTargetWriteMask), int(desc.BlendState.AlphaToCoverageEnable),
-                          int(desc.BlendState.IndependentBlendEnable), unsigned(desc.SampleMask),
-                          int(desc.RasterizerState.CullMode), int(desc.RasterizerState.FillMode),
-                          int(desc.PrimitiveTopologyType), desc.SampleDesc.Count);
-            leonida::fsdraw::note_pipeline(id(), text);
+            leonida::note_breadcrumb_pso_name(id(), names);
         }
         // Upstream's device-fault reports name the shaders of the pipeline a fault points at.
         if (device_.info.device_checkpoints) {
@@ -15220,29 +14596,6 @@ public:
             device_.context->add_graphics_pipeline(id(), gparts().graphics, &shaders);
         } else {
             device_.context->add_graphics_pipeline(id(), gparts().graphics);
-        }
-        if (log_psos) {
-            // Which shaders a PSO id stands for, so a draw named by its pipeline (record_draw's log, DRED) can be
-            // traced to its program.
-            char blend[96] = "no colour target";
-            if (!gparts().recipe.blends.empty()) {
-                const VkPipelineColorBlendAttachmentState& b = gparts().recipe.blends[0];
-                std::snprintf(blend, sizeof blend, "rt0 mask 0x%x blend %u (src %d dst %d op %d, a: %d %d %d), %zu rt",
-                              unsigned(b.colorWriteMask), unsigned(b.blendEnable), int(b.srcColorBlendFactor),
-                              int(b.dstColorBlendFactor), int(b.colorBlendOp), int(b.srcAlphaBlendFactor),
-                              int(b.dstAlphaBlendFactor), int(b.alphaBlendOp), gparts().recipe.blends.size());
-            }
-            std::fprintf(stderr, "[rt] d3d12: graphics PSO %llx:%s, %s\n", static_cast<unsigned long long>(id()),
-                         names.c_str(), blend);
-            // Text pipelines (glyph-cache letters hunt): the input layout, element by element.
-            if (names.find("Text_") != std::string::npos) {
-                for (UINT e = 0; e < desc.InputLayout.NumElements && desc.InputLayout.pInputElementDescs; ++e) {
-                    const D3D12_INPUT_ELEMENT_DESC& el = desc.InputLayout.pInputElementDescs[e];
-                    std::fprintf(stderr, "[rt]   input %u: %s%u format %d slot %u offset %u class %d step %u\n", e,
-                                 el.SemanticName ? el.SemanticName : "?", el.SemanticIndex, int(el.Format),
-                                 el.InputSlot, el.AlignedByteOffset, int(el.InputSlotClass), el.InstanceDataStepRate);
-                }
-            }
         }
         registered_ = true;
         is_graphics_ = true;
@@ -17430,14 +16783,7 @@ public:
             for (auto queue : info.compute_queues) state_.context->add_diagnostic_queue(queue);
             for (auto queue : info.copy_queues) state_.context->add_diagnostic_queue(queue);
         }
-        leonida::mem_probe::install(state_.context->vk);  // LOCAL DIAGNOSTIC: before anything allocates
-        if (info.device_fault_diagnostics && rt::compute_probe::enabled()) {
-            state_.context->set_input_probe([this](auto lists, auto sequence, auto queue) {
-                rt::compute_probe::inspect(state_, lists, sequence, queue);
-            });
-            if (auto* fault = state_.context->device_fault())
-                fault->set_lost_hook([this] { rt::compute_probe::recheck(state_); });
-        }
+        leonida::pipeline_counters::install(state_.context->vk);  // LEONIDA_TITLE_HUD: before any pipeline is made
         if (async_texture_refresh()) start_title_filler();
         state_.setup_console_heap_gpu(get_device);  // LEONIDA_CONSOLE_HEAP_GPU: the context's prelude
         state_.context->set_after_execute([this] { state_.geometry_execute_end(); });
@@ -17630,65 +16976,6 @@ public:
         if (info.buffer_device_address && state_.context->loaded() && !create_arena())
             std::fprintf(stderr, "[rt] d3d12: the GPU address arena could not be created\n");
         startup_mark("GPU address arena");
-        {  // LOCAL DIAGNOSTIC: mem probe (LEONIDA_MEM_PROBE=<seconds>)
-            leonida::mem_probe::DeviceFacts facts;
-            facts.memory = state_.memory;
-            facts.title_ranges = [] { return leonida::title_va_aliases().title_memory_ranges(); };
-            facts.describe = [this] {
-                state_.geometry.report();
-                DeviceState& d = state_;
-                // The driver serializes the whole cache to answer the size: only on request (LEONIDA_MEM_PROBE_CACHE=1).
-                std::size_t cache = 0;
-                static const bool ask_cache = [] {
-                    wchar_t value[2]{};
-                    return GetEnvironmentVariableW(L"LEONIDA_MEM_PROBE_CACHE", value, 2) == 1 && value[0] == L'1';
-                }();
-                const VkPipelineCache handle = d.pipeline_cache_handle;
-                if (ask_cache && handle && d.context->vk.vkGetPipelineCacheData)
-                    d.context->vk.vkGetPipelineCacheData(d.info.device, handle, &cache, nullptr);
-                std::uint64_t title = 0, title_ranges = 0;
-                for (const auto& [begin, end] : leonida::title_va_aliases().title_memory_ranges()) {
-                    title += end - begin;
-                    ++title_ranges;
-                }
-                std::uint64_t shadows = 0;
-                {
-                    std::lock_guard lock(d.shadow_mutex);
-                    shadows = d.shadows.size();
-                }
-                VkDeviceSize in_use = 0, peak = 0, use[4] = {};
-                {
-                    std::lock_guard lock(d.arena.mutex);
-                    in_use = d.arena.in_use;
-                    peak = d.arena.peak_end;
-                    for (int i = 0; i < 4; ++i) use[i] = d.arena.use_in_use[i];
-                }
-                char text[512];
-                std::snprintf(text, sizeof text,
-                              "pipeline cache %.0f MiB; arena %.0f MiB (type %u), in use %.0f MiB (buffer %.0f, "
-                              "descriptor heap %.0f, shader %.0f, heap %.0f), peak end %.0f MiB; title memory %llu "
-                              "ranges %.0f MiB reserved/committed VA; shadows %llu; fsdraw pipeline notes %zu",
-                              leonida::mem_probe::mib(cache), leonida::mem_probe::mib(d.arena.size),
-                              d.arena.memory_type, leonida::mem_probe::mib(in_use), leonida::mem_probe::mib(use[0]),
-                              leonida::mem_probe::mib(use[1]), leonida::mem_probe::mib(use[2]),
-                              leonida::mem_probe::mib(use[3]), leonida::mem_probe::mib(peak),
-                              (unsigned long long)title_ranges, leonida::mem_probe::mib(title),
-                              (unsigned long long)shadows, leonida::fsdraw::pipeline_count());
-                const auto streams = rt::d3d12_xs::pso_stream_stats();
-                const auto pool = d.title_image_pool.stats();
-                char more[512];
-                std::snprintf(more, sizeof more,
-                              "; PSOs live %ld (%ld views of a shared one); stream records %zu (%.1f MiB), %zu distinct "
-                              "streams (%.1f MiB); title image pool %zu pages in %zu classes %.0f MiB, %.0f MiB of "
-                              "slots in use",
-                              live_pipeline_state_count.load(), live_pipeline_state_views.load(), streams.records,
-                              leonida::mem_probe::mib(streams.bytes), streams.distinct,
-                              leonida::mem_probe::mib(streams.distinct_bytes), pool.pages, pool.classes,
-                              leonida::mem_probe::mib(pool.page_bytes), leonida::mem_probe::mib(pool.used_bytes));
-                return std::string(text) + more;
-            };
-            leonida::mem_probe::start(std::move(facts));
-        }
         if (info.conditional_rendering) {
             const auto properties = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                 info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties"));
@@ -18318,8 +17605,6 @@ public:
         length = 0;
         arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address, arena.size);
-        leonida::fsdraw::note_arena(arena.mapped, arena.size);  // LOCAL DIAGNOSTIC
-        leonida::fsdraw::backing_hook().store(&fsdraw_backing, std::memory_order_release);
         state_.context->set_zero_page(arena.buffer, 0, kZeroPage);
         state_.context->set_quad_indices(arena.buffer, kQuadIndexOffset, kQuadIndexCount);
         state_.context->set_title_buffer_lookup(
@@ -18333,31 +17618,14 @@ public:
         // A title address in a draw's or dispatch's root arguments: the MiB from its 64 KiB page gets page-table
         // entries (committed pages only) before the command runs.
         state_.context->set_title_mapper([state = &state_](std::uint64_t va) {
-            const bool mapped = state->map_title_memory(va & ~std::uint64_t(0xFFFF), 1ull << 20);
-            // The first title addresses seen in root arguments, with the words there (what the shader will read).
-            static std::mutex m;
-            static std::vector<std::uint64_t> shown;
-            std::lock_guard lock(m);
-            if (shown.size() >= 12 || std::find(shown.begin(), shown.end(), va) != shown.end()) return;
-            shown.push_back(va);
-            MEMORY_BASIC_INFORMATION info{};
-            const bool readable = VirtualQuery(reinterpret_cast<const void*>(va), &info, sizeof(info)) &&
-                                  info.State == MEM_COMMIT && !(info.Protect & (PAGE_NOACCESS | PAGE_GUARD));
-            char words[200] = "unreadable";
-            if (readable) {
-                const auto* w = reinterpret_cast<const std::uint32_t*>(va & ~std::uint64_t(3));
-                std::snprintf(words, sizeof words, "%08x %08x %08x %08x %08x %08x %08x %08x", w[0], w[1], w[2], w[3],
-                              w[4], w[5], w[6], w[7]);
-            }
-            std::fprintf(stderr, "[rt] title address in root arguments: %#llx (%s): %s\n",
-                         static_cast<unsigned long long>(va), mapped ? "mapped" : "not mapped", words);
+            state->map_title_memory(va & ~std::uint64_t(0xFFFF), 1ull << 20);
         });
         arena_pages_ = std::make_shared<DeviceArenaPages>(state_);
-        leonida::debug_targets::arena_mapped = arena.mapped;  // diagnostics read descriptors through it
-        leonida::debug_targets::arena_size = arena.size;
+        leonida::fault_memory::arena_mapped = arena.mapped;  // hang reports read descriptors through it
+        leonida::fault_memory::arena_size = arena.size;
         start_transient_watch(state_.context.get());
         // Hang reports follow V#s into the title's memory: committed, readable pages only (no fault in the report).
-        leonida::debug_targets::read_title = [](std::uint64_t va, void* out, std::size_t bytes) {
+        leonida::fault_memory::read_title = [](std::uint64_t va, void* out, std::size_t bytes) {
             for (std::uint64_t at = va; at < va + bytes;) {
                 MEMORY_BASIC_INFORMATION region{};
                 if (!VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region)) ||
@@ -18486,7 +17754,6 @@ public:
         state_.destroy_shared_layouts();  // every PSO, the only users, is gone
         state_.report_arena();
         if (state_.context && state_.arena.buffer) {
-            leonida::fsdraw::forget_arena(state_.arena.mapped);
             auto& vk = state_.context->vk;
             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
             if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
@@ -18620,14 +17887,6 @@ public:
 
     bool write_placed_buffer_view(bool unordered, const void* view, std::uint64_t address, std::uint64_t width,
                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) {
-        struct PlacedWrite {
-            DeviceState& state;
-            SIZE_T ptr;
-            bool unordered;
-            ~PlacedWrite() {
-                if (rt::compute_probe::enabled()) state.probe_api(ptr, 1, unordered ? "slot71" : "slot70");
-            }
-        } probe{state_, destination.ptr, unordered};
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         if (unordered) {
             D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
@@ -18659,19 +17918,9 @@ public:
             std::lock_guard lock(state_.title_texture_mutex);
             const InTitleTextures inside;
             TitleTextureStats& stats = title_stats_;
-            ++stats.views;
-            ++stats.asked[{d.format, d.layout, d.dimension, d.mips}];
             const std::uint64_t refusals = stats.refusals;
             written = place_title_view(d, words, srv, address, destination);
-            if (texture_probe())
-                std::fprintf(stderr, "[rt] texture-probe: SRV dest %llx va %llx %llux%ux%u fmt %u view %u mips %u ok %u\n",
-                             (unsigned long long)destination.ptr, (unsigned long long)address, (unsigned long long)d.width,
-                             d.height, unsigned(d.depth_or_array), d.format, unsigned(srv.Format), unsigned(d.mips), unsigned(written));
             if (!written && stats.refusals == refusals) refuse_title_view("no reason recorded", d, address);
-            if (!written) ++stats.null_views;
-            if ((leonida::fsdraw::enabled() || leonida::mem_probe::interval_seconds()) &&
-                (stats.views == 64 || !(stats.views % 2048)))
-                log_title_census("slot-70 texture views");
         }
         state_.drain_titles_gone();
         return written;
@@ -18771,7 +18020,6 @@ public:
             state_.mapped_title_textures.erase(address);
             state_.index_texture(*entry);
             slot = std::move(entry);
-            ++title_stats_.registered;
         }
     }
 
@@ -18837,14 +18085,12 @@ public:
                 return (filled && filled + span > fill_budget) || (fill_budget_ns && fill_pass_ns >= fill_budget_ns);
             };
             if (t.stale && !always && out_of_budget()) {
-                ++stats.deferred;
                 return;
             }
             std::uint64_t hash = 0;
             if (!title_texture_readable(t)) return;
             const bool full_mapped = async && always;
             checked += full_mapped ? span : hashed_bytes(span);
-            ++stats.checked;
             const auto* bytes = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(t.cpu));
             const auto timed_hash = [&](std::uint64_t& out, bool all = false) {
                 const auto start = clock::now();
@@ -18866,14 +18112,12 @@ public:
                 const auto it = state_.title_textures.find(address);
                 if (it == state_.title_textures.end() || it->second.get() != &t || !t.resource ||
                     !t.layout_known || t.layout->layout.size != span || t.fills != fills) return;
-                ++stats.mapped_checks;
                 if (!ok) {
                     t.memory.defer();
                     t.stale = true;
                     return;
                 }
                 if (t.hashed && t.full_hashed && t.full_hash == hash && !t.stale) return;
-                ++stats.mapped_changed;
             } else if (!timed_hash(hash)) {
                 t.memory.defer();
                 return;
@@ -18888,20 +18132,16 @@ public:
                 }
                 if (t.full_hashed && full == t.full_hash) return;
             }
-            ++stats.changed;
             if (!always && out_of_budget()) {
                 t.stale = true;
-                ++stats.deferred;
                 return;
             }
             const auto fill_start = clock::now();
             const auto uploaded = fill_title_texture(t, false);
             filled += uploaded;
-            if (full_mapped && uploaded) ++stats.mapped_fills;
             if (async && t.stale) queue_title_fill(t.address);  // generic staging needs an outer fill
             const std::uint64_t fill_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - fill_start).count();
-            stats.fill_ns += fill_ns;
             fill_pass_ns += fill_ns;
         };
         bool overflow = false;
@@ -18919,10 +18159,7 @@ public:
         if (now - title_retry_all_ >= kRetryAll) map_all = true;
         if (map_all) title_retry_all_ = now;
         leonida::merge_title_writes(title_map_changes_);
-        stats.map_ranges += title_map_changes_.size();
-        stats.map_all += map_all;
         if (!written.empty() || overflow || map_all || !title_map_changes_.empty()) {
-            stats.written_ranges += written.size();
             leonida::merge_title_writes(written);
             const auto invalidate = [&](TitleViewTexture& t, bool write) {
                 if (t.gpu_written || !t.layout_known) return;
@@ -18953,7 +18190,6 @@ public:
             }
         }
         const auto every_start = clock::now();
-        stats.written_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(every_start - now).count();
         // LEONIDA_TITLE_EVERY_BUDGET_US (0, the default: no limit, as before) limits the synchronous pass, the one that
         // runs before a submission on the title's submitting thread: the mapped and stale textures are visited for at
         // most this long a pass, in address order from where the last pass stopped, instead of all of them every pass
@@ -18968,27 +18204,23 @@ public:
                 if (!entry->resource) continue;
                 const auto it = state_.title_textures.find(address);
                 if (it == state_.title_textures.end() || it->second != entry) continue;
-                ++stats.every_pass_visits;
                 visit(*entry);
             }
             for (const auto& entry : entries)
                 if (!entry.second->mapped && entry.second->stale) {
                     const auto it = state_.title_textures.find(entry.first);
                     if (it == state_.title_textures.end() || it->second != entry.second) continue;
-                    ++stats.every_pass_visits;
                     visit(*entry.second);
                 }
         } else if (!every_budget_us) {
             for (const auto& entry : entries)
                 if (entry.second->mapped || entry.second->stale) {
-                    ++stats.every_pass_visits;
                     visit(*entry.second);
                 }
         } else {
             leonida::visit_marked_title_textures(
                 entries, title_every_cursor_,
                 [&](TitleViewTexture& t) {
-                    ++stats.every_pass_visits;
                     visit(t);
                 },
                 // A mapped texture never filled yet does not wait for its turn: the title has written it and the GPU
@@ -18996,7 +18228,6 @@ public:
                 [](const TitleViewTexture& t) { return t.mapped && !t.fills; },
                 [&] { return clock::now() - every_start >= std::chrono::microseconds(every_budget_us); });
         }
-        stats.every_pass_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - every_start).count();
         // The budget is the round robin's: mapped and stale textures above are checked every pass whatever it is
         // (unless LEONIDA_TITLE_EVERY_BUDGET_US limits them).
         const auto first_bytes = checked, first_hash_ns = stats.hash_ns;
@@ -19018,9 +18249,6 @@ public:
                 return std::uint64_t(elapsed.count()) >= sweep_budget_us;
             });
         }
-        stats.hashed += checked;
-        stats.filled_bytes += filled;
-        stats.max_pass_bytes = std::max(stats.max_pass_bytes, filled);
         std::vector<Resource*> release;
         std::erase_if(retired_title_textures_, [&](const auto& r) {
             if (now - r.first < std::chrono::seconds(3)) return false;  // descriptors may still be in flight
@@ -19029,20 +18257,6 @@ public:
             return true;
         });
         title_pass_ = false;
-        const std::uint64_t pass_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - now).count();
-        stats.refresh_ns += pass_ns;
-        stats.max_refresh_ns = std::max(stats.max_refresh_ns, pass_ns);
-        if (now - stats.last_log >= std::chrono::seconds(10)) {
-            stats.last_log = now;
-            if (async) {
-                std::fprintf(stderr, "[rt] async texture refresh: %llu mapped checks, %llu changed or stale, %llu uploaded in pass\n",
-                             static_cast<unsigned long long>(stats.mapped_checks),
-                             static_cast<unsigned long long>(stats.mapped_changed),
-                             static_cast<unsigned long long>(stats.mapped_fills));
-                stats.mapped_checks = stats.mapped_changed = stats.mapped_fills = 0;
-            }
-            if (leonida::fsdraw::enabled()) log_title_census("refresh");
-        }
         inside.reset();
         lock.unlock();
         state_.drain_titles_gone();
@@ -19051,26 +18265,10 @@ public:
 
 private:
     struct TitleTextureStats {
-        std::uint64_t mapped_checks = 0, mapped_changed = 0, mapped_fills = 0;
-        // (format, Layout word, dimension, mips) of the slot-70 texture views -> views
-        std::map<std::array<std::uint32_t, 4>, std::uint64_t> asked;
-        std::map<std::string, std::uint64_t> refused;  // why a view is a null view -> views
-        std::uint64_t views = 0, null_views = 0, of_slot133 = 0, of_cache = 0, made = 0, retired = 0, registered = 0,
-                      refusals = 0, written_ranges = 0, unmaps = 0, unreadable = 0, pending_views = 0;
-        std::uint64_t fills = 0, fill_bytes = 0, fill_failures = 0;
-        std::uint64_t staged_fills = 0, staged_ns = 0;
-        // refresh_title_textures, since the last log line
-        std::uint64_t passes = 0, checked = 0, hashed = 0, changed = 0, deferred = 0, filled_bytes = 0,
-                      max_pass_bytes = 0, hash_ns = 0, refresh_ns = 0, max_refresh_ns = 0;
-        // Split of refresh_ns: taking and matching the XG-written ranges, the mapped and stale textures visited every
-        // pass (and how many), and the fills inside both.
-        std::uint64_t written_ns = 0, every_pass_ns = 0, every_pass_visits = 0, fill_ns = 0;
-        std::uint64_t map_ranges = 0, map_all = 0;  // title memory map changes taken, passes that retried all
-        // Readability probes (texture_memory_readable) since the last log line: [0] in refresh passes, [1] elsewhere
-        // (slot-70 views, new images). A recheck is a probe of a texture whose memory was not readable at its last
-        // probe; readable_now counts the rechecks that found it readable.
-        std::array<std::uint64_t, 2> probes{}, probe_ns{}, rechecks{}, readable_now{};
-        std::chrono::steady_clock::time_point last_log{};
+        std::map<std::string, std::uint64_t> refused;  // why a view is a null view -> views (each reason logged once)
+        std::uint64_t refusals = 0;  // null views so far: a view that adds none without a reason gets one
+        std::uint64_t passes = 0;    // refresh_title_textures passes: every sixth hashes every byte of a texture
+        std::uint64_t hash_ns = 0;   // time spent hashing, for LEONIDA_TEXTURE_HASH_BUDGET_US
     };
     TitleTextureStats title_stats_;                                 // under title_texture_mutex
     bool title_pass_ = false;                                      // in refresh_title_textures, likewise
@@ -19243,14 +18441,10 @@ private:
                                          title_memory_write_combined(cpu));
         std::uint64_t hash = 0, full = 0;
         bool full_hashed = false, ok = false, nonzero = false;
-        std::uint64_t staged_ns = 0;
         if (copied) {
             hash_guarded(f.tiled.data(), f.tiled.size(), hash);
             full_hashed = every_byte && hash_guarded(f.tiled.data(), f.tiled.size(), full, true);
-            const auto start = std::chrono::steady_clock::now();
             ok = r.upload_staged_title(layout, f.tiled.data(), f.columns, false, nonzero);
-            staged_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
-                            .count();
         }
         std::lock_guard lock(state_.title_texture_mutex);
         const InTitleTextures inside;
@@ -19262,14 +18456,11 @@ private:
             t.stale = true;
             return false;
         }
-        title_stats_.staged_ns += staged_ns;
         if (!ok) {
             log_once("staged title texture upload failed, format", int(r.format()));
-            ++title_stats_.fill_failures;
             t.stale = true;
             return false;
         }
-        ++title_stats_.staged_fills;
         if (t.fills != fills) return true;  // another fill recorded itself in between: its hash is as good
         if (t.owned && !t.fills) r.publish_streamed_texture();
         t.hash = hash;
@@ -19277,8 +18468,6 @@ private:
         t.full_hash = full;
         t.full_hashed = full_hashed;
         ++t.fills;
-        ++title_stats_.fills;
-        title_stats_.fill_bytes += span;
         return true;
     }
 
@@ -19407,7 +18596,6 @@ private:
         if (!address) return refuse_title_view("no address", d, address);
         const auto write = [&](const TitleViewTexture& t) {
             const bool written = write_title_srv(*t.resource, srv, destination, d, address);
-            if (written && !t.gpu_written && t.memory.pending()) ++title_stats_.pending_views;
             return written;
         };
         auto& textures = state_.title_textures;
@@ -19416,12 +18604,10 @@ private:
         TitleViewTexture* t = it == textures.end() || !it->second->resource ? nullptr : it->second.get();
         if (!t || !TitleGpuPlacements<Resource>::matches(d, *t->resource)) {
             if (Resource* gpu = matching_gpu_placement(d, address)) {
-                ++title_stats_.of_slot133;
                 return write_title_srv(*gpu, srv, destination, d, address);
             }
         }
         if (t && !t->owned) {  // the title's slot-133 texture
-            ++title_stats_.of_slot133;
             if (!t->gpu_written && (t->layout_guessed || t->layout_from_xg || !t->layout_known || t->desc != words)) {
                 const char* why = nullptr;
                 rt::xg_xs::Texture layout;
@@ -19460,7 +18646,6 @@ private:
             textures.erase(address);
             t = make_title_texture(d, words, srv, address, same_shape ? formats : std::vector<DXGI_FORMAT>{});
         } else if (t) {
-            ++title_stats_.of_cache;
             refresh_title_texture(*t);
         } else {
             t = make_title_texture(d, words, srv, address, {});
@@ -19492,7 +18677,6 @@ private:
         // A streamed texture can have views before its pages arrive. Keep the descriptor stable across its first fill.
         entry->memory.check(0, check_pages_before_read(),
                             [&] { return probe_title_memory(entry->cpu, span, false); });
-        title_stats_.unreadable += entry->memory.pending();
         // The image takes the view's format too when the element is the same size (five-star-recomp does the same);
         // views in other formats of the same description add theirs (place_title_view).
         const auto add = [&](DXGI_FORMAT f) {
@@ -19554,7 +18738,6 @@ private:
         } else if (!entry->memory.pending()) {
             fill_title_texture(*entry, true);
         }
-        ++title_stats_.made;
         TitleViewTexture* t = entry.get();
         state_.index_texture(*entry);
         state_.title_textures[address] = std::move(entry);
@@ -19570,15 +18753,6 @@ private:
         retired_backing_ += t.resource->image_backing_bytes();
         retired_title_textures_.emplace_back(std::chrono::steady_clock::now(), t.resource);
         t.resource = nullptr;
-        ++title_stats_.retired;
-    }
-
-    static bool texture_probe() {
-        static const bool enabled = [] {
-            const char* v = std::getenv("LEONIDA_TEXTURE_PROBE");
-            return v && std::strcmp(v, "0");
-        }();
-        return enabled;
     }
 
     static bool check_pages_before_read() {
@@ -19597,19 +18771,9 @@ private:
         return enabled;
     }
 
-    // texture_memory_readable, timed and counted (TitleTextureStats::probes).
-    bool probe_title_memory(std::uint64_t cpu, std::uint64_t span, bool waited,
+    bool probe_title_memory(std::uint64_t cpu, std::uint64_t span, bool /*waited*/,
                             leonida::TexturePageCommitter commit = nullptr) {
-        const auto start = std::chrono::steady_clock::now();
-        const bool readable = leonida::texture_memory_readable(cpu, span, commit);
-        const std::size_t where = title_pass_ ? 0 : 1;
-        TitleTextureStats& s = title_stats_;
-        s.probe_ns[where] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - start).count();
-        ++s.probes[where];
-        s.rechecks[where] += waited;
-        s.readable_now[where] += waited && readable;
-        return readable;
+        return leonida::texture_memory_readable(cpu, span, commit);
     }
 
     // A mapped texture can lose its pages between views or between refreshes.
@@ -19700,11 +18864,7 @@ private:
         bool nonzero = false;
         bool ok = true;
         if (t.resource->staged_title()) {
-            const auto start = std::chrono::steady_clock::now();
             ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero);
-            title_stats_.staged_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - start).count();
-            if (ok) ++title_stats_.staged_fills;
             if (!ok) log_once("staged title texture upload failed, format", int(t.resource->format()));
         } else {
             for (std::uint32_t slice = 0; slice < slices && ok; ++slice) {
@@ -19728,7 +18888,6 @@ private:
             }
         }
         if (!ok) {
-            ++title_stats_.fill_failures;
             t.stale = true;
             return 0;
         }
@@ -19741,8 +18900,6 @@ private:
         t.hashed = true;
         t.stale = false;
         ++t.fills;
-        ++title_stats_.fills;
-        title_stats_.fill_bytes += span;
         return span;
     }
 
@@ -19780,134 +18937,6 @@ private:
                          static_cast<unsigned long long>(address), int(srv.Format), int(srv.ViewDimension),
                          unsigned(srv.Shader4ComponentMapping), int(r.desc().Format));
         return refuse_title_view("SRV refused for the texture", d, address);
-    }
-
-    // One line of what slot 70 was asked for, and one of what the refresh did since the last line (NOTES: step 4).
-    void log_title_census(const char* when) {
-        TitleTextureStats& s = title_stats_;
-        std::vector<std::pair<std::uint64_t, std::array<std::uint32_t, 4>>> asked;
-        for (const auto& [key, n] : s.asked) asked.emplace_back(n, key);
-        std::sort(asked.rbegin(), asked.rend());
-        std::string census;
-        for (std::size_t i = 0; i < asked.size() && i < 24; ++i) {
-            char text[64];
-            std::snprintf(text, sizeof(text), "%s%u/0x%x/%u/%u:%llu", i ? " " : "", asked[i].second[0],
-                          asked[i].second[1], asked[i].second[2], asked[i].second[3],
-                          static_cast<unsigned long long>(asked[i].first));
-            census += text;
-        }
-        std::string refused;
-        for (const auto& [why, n] : s.refused)
-            refused += (refused.empty() ? "" : "; ") + why + " " + std::to_string(n);
-        std::size_t owned = 0, slot133 = 0, mapped = 0, filled = 0;
-        VkDeviceSize owned_bytes = 0, placed_bytes = 0, host_heap_bytes = 0;
-        for (const auto& [address, t] : state_.title_textures) {
-            (t->owned ? owned : slot133) += 1;
-            if (!t->owned && t->resource && t->unbound_bytes) t->set_resource(t->resource);
-            mapped += t->mapped;
-            filled += t->fills > 0;
-            (t->owned ? owned_bytes : placed_bytes) += t->backing_bytes;
-            if (!t->device_local) host_heap_bytes += t->backing_bytes;
-        }
-        if (leonida::mem_probe::interval_seconds()) {
-            log_title_image_uses(state_.title_textures, retired_title_textures_.size(), retired_backing_, state_.zero_image_bytes.load());
-            const auto pool = state_.title_image_pool.stats();
-            std::fprintf(stderr, "[rt] mem-probe: title image pool: %zu pages in %zu size classes, %.1f MiB, %.1f MiB of "
-                                 "slots in use\n",
-                         pool.pages, pool.classes, double(pool.page_bytes) / 1048576.0,
-                         double(pool.used_bytes) / 1048576.0);
-        }
-        if (leonida::mem_probe::interval_seconds())
-            std::fprintf(stderr, "[rt] mem-probe: registered image backing: %.1f MiB from slot 70, %.1f MiB from slot "
-                                 "133, %.1f MiB total on non-device-local types; staged fills %llu, %.3f s, buffer %.1f MiB\n",
-                         double(owned_bytes) / 1048576.0, double(placed_bytes) / 1048576.0,
-                         double(host_heap_bytes) / 1048576.0, static_cast<unsigned long long>(s.staged_fills),
-                         double(s.staged_ns) / 1e9, double(state_.title_upload.capacity()) / 1048576.0);
-        std::fprintf(stderr,
-                     "[rt] d3d12: title textures (%s): %llu slot-70 texture views (%zu kinds), %llu of slot-133 textures, "
-                     "%llu of images made for them (%llu made, %llu over memory not readable yet, %llu retired), %llu "
-                     "null views; registry %zu images "
-                     "(%zu made, %zu slot 133 of %llu registered, %zu mapped, %zu filled); %llu fills %.1f MiB, %llu "
-                     "failed\n",
-                     when, static_cast<unsigned long long>(s.views), s.asked.size(),
-                     static_cast<unsigned long long>(s.of_slot133), static_cast<unsigned long long>(s.of_cache),
-                     static_cast<unsigned long long>(s.made), static_cast<unsigned long long>(s.unreadable),
-                     static_cast<unsigned long long>(s.retired),
-                     static_cast<unsigned long long>(s.null_views), state_.title_textures.size(), owned, slot133,
-                     static_cast<unsigned long long>(s.registered), mapped, filled,
-                     static_cast<unsigned long long>(s.fills), double(s.fill_bytes) / 1048576.0,
-                     static_cast<unsigned long long>(s.fill_failures));
-        const auto host = state_.context->host_texture_stats();
-        std::fprintf(stderr, "[rt] d3d12: ordered title host copies %llu, GPU waits %llu; "
-                             "slot-70 views awaiting readable memory: %llu\n",
-                     static_cast<unsigned long long>(host.copies), static_cast<unsigned long long>(host.waits),
-                     static_cast<unsigned long long>(s.pending_views));
-        std::fprintf(stderr, "[rt] d3d12: title textures census (format/Layout/dimension/mips:views): %s\n",
-                     census.c_str());
-        if (!refused.empty()) std::fprintf(stderr, "[rt] d3d12: title textures null views by reason: %s\n", refused.c_str());
-        std::string maps;
-        std::size_t listed = 0;
-        for (const auto& [address, t] : state_.title_textures) {
-            if (!t->mapped || !t->resource || listed++ >= 16) continue;
-            const D3D12_RESOURCE_DESC& rd = t->resource->desc();
-            char text[160];
-            std::snprintf(text, sizeof(text), "%s0x%llx %llux%u fmt %d layout %s mode %u, %u T#s, %llu fills", maps.empty() ? "" : "; ",
-                          static_cast<unsigned long long>(address), static_cast<unsigned long long>(rd.Width), rd.Height,
-                          int(rd.Format),
-                          t->layout_guessed ? "guessed" : t->layout_from_xg ? "XG" : t->layout_known ? "viewed" : "none",
-                          t->layout->mode, t->resource->shader_views(), static_cast<unsigned long long>(t->fills));
-            maps += text;
-        }
-        if (!maps.empty()) std::fprintf(stderr, "[rt] d3d12: title textures mapped: %s\n", maps.c_str());
-        if (s.passes) {
-            std::fprintf(stderr,
-                         "[rt] d3d12: title texture refresh: %llu passes, %llu XG-written ranges, %llu textures "
-                         "checked (%.1f MiB read for hashes), %llu changed, %llu deferred, %.1f MiB filled (%.2f MiB a "
-                         "pass on average, %.2f MiB at most)\n",
-                         static_cast<unsigned long long>(s.passes), static_cast<unsigned long long>(s.written_ranges),
-                         static_cast<unsigned long long>(s.checked),
-                         double(s.hashed) / 1048576.0, static_cast<unsigned long long>(s.changed),
-                         static_cast<unsigned long long>(s.deferred), double(s.filled_bytes) / 1048576.0,
-                         double(s.filled_bytes) / 1048576.0 / double(s.passes), double(s.max_pass_bytes) / 1048576.0);
-            const double ms_per_ns_per_pass = 1e-6 / double(s.passes);
-            std::fprintf(stderr, "[rt] title texture hash time %.3f ms/pass; refresh total %.3f ms/pass\n",
-                         double(s.hash_ns) * ms_per_ns_per_pass, double(s.refresh_ns) * ms_per_ns_per_pass);
-            // What the passes cost and why: the probes of memory (texture_memory_readable) and the textures that
-            // wait for readable memory, now.
-            std::size_t waiting = 0, waiting_stale = 0, waiting_mapped = 0, stale = 0;
-            for (const auto& [address, t] : state_.title_textures) {
-                if (t->gpu_written || !t->layout_known || !t->resource) continue;
-                stale += t->stale;
-                if (!t->memory.pending()) continue;
-                ++waiting;
-                waiting_stale += t->stale;
-                waiting_mapped += t->mapped;
-            }
-            const double per_pass = 1.0 / double(s.passes);
-            std::fprintf(stderr,
-                         "[rt] title texture rechecks: %.1f probes a pass (%.3f ms/pass), %.1f of waiting textures a "
-                         "pass (%llu found readable now); %zu textures wait for readable memory (%zu stale, %zu "
-                         "mapped), %zu stale in all; max pass %.3f ms; outside passes %llu probes (%.3f ms), %llu of "
-                         "waiting textures, %llu found readable\n",
-                         double(s.probes[0]) * per_pass, double(s.probe_ns[0]) * ms_per_ns_per_pass,
-                         double(s.rechecks[0]) * per_pass, static_cast<unsigned long long>(s.readable_now[0]), waiting,
-                         waiting_stale, waiting_mapped, stale, double(s.max_refresh_ns) * 1e-6,
-                         static_cast<unsigned long long>(s.probes[1]), double(s.probe_ns[1]) * 1e-6,
-                         static_cast<unsigned long long>(s.rechecks[1]),
-                         static_cast<unsigned long long>(s.readable_now[1]));
-            s.passes = s.checked = s.hashed = s.changed = s.deferred = s.filled_bytes = s.max_pass_bytes = 0;
-            std::fprintf(stderr,
-                         "[rt] title texture pass split: written ranges and map changes %.3f ms/pass (%.1f map ranges a "
-                         "pass, %llu passes probed all), mapped and stale textures %.3f ms/pass (%.1f visited a pass), "
-                         "fills %.3f ms/pass\n",
-                         double(s.written_ns) * ms_per_ns_per_pass, double(s.map_ranges) * per_pass,
-                         static_cast<unsigned long long>(s.map_all), double(s.every_pass_ns) * ms_per_ns_per_pass,
-                         double(s.every_pass_visits) * per_pass, double(s.fill_ns) * ms_per_ns_per_pass);
-            s.written_ns = s.every_pass_ns = s.every_pass_visits = s.fill_ns = s.map_ranges = s.map_all = 0;
-            s.hash_ns = s.refresh_ns = s.max_refresh_ns = 0;
-            s.written_ranges = 0;
-            s.probes = s.probe_ns = s.rechecks = s.readable_now = {};
-        }
     }
 
 public:
@@ -20991,36 +20020,10 @@ public:
         return kDescriptorSize;
     }
 
-    // Diagnostics: views that can write a 3840x2160 8-bit texture (the UI's gradient mask, which text and the loading
-    // screen's card multiply by, stays zero): the first 12, with the resource's flags and title address if placed.
-    static void note_mask_view(ID3D12Resource* resource, const char* kind) {
-        if (!resource) return;
-        const D3D12_RESOURCE_DESC d = resource->GetDesc();
-        if (d.Width != 3840 || d.Height != 2160 ||
-            (d.Format != DXGI_FORMAT_R8_UNORM && d.Format != DXGI_FORMAT_A8_UNORM && d.Format != DXGI_FORMAT_R8_TYPELESS))
-            return;
-        static std::atomic<int> told{0};
-        if (told.fetch_add(1, std::memory_order_relaxed) >= 12) return;
-        std::fprintf(stderr, "[rt] d3d12: %s view of a 3840x2160 8-bit texture %p (format %d, flags 0x%x, address %#llx)\n",
-                     kind, static_cast<void*>(resource), int(d.Format), unsigned(d.Flags),
-                     static_cast<unsigned long long>(resource->GetGPUVirtualAddress()));
-    }
-
     void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* resource, const D3D12_RENDER_TARGET_VIEW_DESC* desc,
                                                   D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateRenderTargetView");
         if (!destination.ptr) return;
-        note_mask_view(resource, "render target");
-        // LEONIDA_DUMP_TITLE_TEXTURE (glyph atlas hunt): a render target view of a 2048x2048 8-bit texture, the
-        // atlas's size: the GPU then draws into it, and a copy from the title's bytes would overwrite what it drew.
-        if (static const bool hunt = std::getenv("LEONIDA_DUMP_TITLE_TEXTURE") != nullptr; hunt && resource) {
-            const D3D12_RESOURCE_DESC d = resource->GetDesc();
-            static std::atomic<int> told{0};
-            if (d.Width == 2048 && d.Height == 2048 &&
-                (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM) && told.fetch_add(1) < 8)
-                std::fprintf(stderr, "[rt] d3d12: render target view of a 2048x2048 8-bit texture %p (view format %d)\n",
-                             static_cast<void*>(resource), desc ? int(desc->Format) : -1);
-        }
         leonida::TargetView view{};
         leonida::ResourceId rid = 0;
         D3D12_RESOURCE_DESC rd{};
@@ -21268,7 +20271,6 @@ public:
                 const std::uintptr_t from = sources[s].ptr + std::size_t(s_at++) * kDescriptorSize;
                 std::memmove(reinterpret_cast<void*>(to), reinterpret_cast<const void*>(from), kDescriptorSize);
                 if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) state_.copy_sampler_slots(to, from, 1);
-                state_.probe_api(to, 1);  // LOCAL DIAGNOSTIC
             }
         }
     }
@@ -21284,8 +20286,6 @@ public:
         std::memmove(reinterpret_cast<void*>(destination.ptr), reinterpret_cast<const void*>(source.ptr),
                      std::size_t(count) * kDescriptorSize);
         if (type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) state_.copy_sampler_slots(destination.ptr, source.ptr, count);
-        state_.probe_api(destination.ptr, count);  // LOCAL DIAGNOSTIC
-        state_.probe_view("CopyDescriptorsSimple", destination.ptr, count);
     }
 
     // A constant-buffer view is a 16-byte GFX10 raw buffer V# in the first half of the slot (zeros in the rest).
@@ -21304,7 +20304,6 @@ public:
                                     bool vector_rows) {
         d3d12_trace::record("ID3D12Device::CreateConstantBufferView");
         if (!destination.ptr) return;
-        ProbeApiWrite probe_note{state_, destination.ptr, 1, "CreateConstantBufferView"};  // LOCAL DIAGNOSTIC
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
         leonida::gfx10::Buffer buffer{};
@@ -21344,17 +20343,6 @@ public:
             words[3] = 0x0002403Cu;
         }
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
-        if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC: the CBVs the title makes, where they go and what V# they get
-            static std::atomic<std::uint64_t> made{0};
-            const std::uint64_t n = ++made;
-            if (n <= 8 || n % 600 == 0 || n % 600 == 1)
-                std::fprintf(stderr, "[rt] fsdraw: CBV #%llu dest 0x%llx location 0x%llx size %u -> V# base 0x%llx [%s]\n",
-                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(destination.ptr),
-                             static_cast<unsigned long long>(desc->BufferLocation), desc->SizeInBytes,
-                             static_cast<unsigned long long>(buffer.address),
-                             leonida::fsdraw::hex_words(words.data(), words.size()).c_str());
-        }
-        leonida::fsdraw::note_cbv(buffer.address, desc->BufferLocation, desc->SizeInBytes);  // LOCAL DIAGNOSTIC
     }
 
     // A buffer shader-resource view of the `width` bytes at console VA `base_va`: a 16-byte GFX10 V# in the first
@@ -21449,7 +20437,6 @@ public:
         d3d12_trace::record("ID3D12Device::CreateShaderResourceView");
         using leonida::gfx10::ImageType;
         if (!destination.ptr) return;
-        ProbeApiWrite probe_note{state_, destination.ptr, 1, "CreateShaderResourceView"};  // LOCAL DIAGNOSTIC
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         const Resource* r = Resource::from<Resource>(resource);
         if (!r) {
@@ -21549,19 +20536,6 @@ public:
             }
         }
         write_image_descriptor(*r, view, destination, ImageViewUse::sampled);
-        if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC: the texture SRVs the title makes, where they go and the T# they get
-            static std::atomic<std::uint64_t> made{0};
-            const std::uint64_t n = ++made;
-            if (n <= 8 || n % 600 == 0 || n % 600 == 1) {
-                std::uint32_t w[8];
-                std::memcpy(w, reinterpret_cast<const void*>(destination.ptr), sizeof w);
-                std::fprintf(stderr, "[rt] fsdraw: SRV #%llu dest 0x%llx resource 0x%llx format %d dim %d -> [%s] bindless %s\n",
-                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(destination.ptr),
-                             static_cast<unsigned long long>(r->id()), desc ? int(desc->Format) : -1,
-                             desc ? int(desc->ViewDimension) : -1, leonida::fsdraw::hex_words(w, 8).c_str(),
-                             leonida::fsdraw::has_tsharp(w) ? "yes" : "NO");
-            }
-        }
     }
 
     // An unordered-access view of a buffer is a V# in the slot (docs section 3.4): the shader loads those four dwords
@@ -21680,8 +20654,6 @@ public:
                                                      D3D12_CPU_DESCRIPTOR_HANDLE destination) override {
         d3d12_trace::record("ID3D12Device::CreateUnorderedAccessView");
         if (!destination.ptr) return;
-        note_mask_view(resource, "unordered-access");
-        ProbeApiWrite probe_note{state_, destination.ptr, 1, "CreateUnorderedAccessView"};  // LOCAL DIAGNOSTIC
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         const Resource* r = Resource::from<Resource>(resource);
         if (!r || !r->belongs_to(state_)) {
@@ -22289,25 +21261,6 @@ public:
     HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,
                                    void** out, const D3D12_CLEAR_VALUE* clear) {
         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
-        // A slow creation (100 ms or more): the title rebuilds objects between a release and a create (its output
-        // object's settings reset, 0x14290B2A0), and another thread read the half-made one at 0x1428EF557 (runs 10,
-        // 14); a creation stuck behind the runtime's locks widens that window from microseconds to the wait.
-        const struct SlowCreate {
-            std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-            const D3D12_RESOURCE_DESC& desc;
-            ~SlowCreate() {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-                                                                                      start).count();
-                if (ms < 100) return;
-                static std::atomic<int> told{0};
-                if (told.fetch_add(1, std::memory_order_relaxed) < 100)
-                    std::fprintf(stderr, "[rt] d3d12: slow slot-133 creation %lld ms (dimension %d, %llux%u, format %d, "
-                                         "flags %#x)\n",
-                                 static_cast<long long>(ms), int(desc.Dimension),
-                                 static_cast<unsigned long long>(desc.Width), desc.Height, int(desc.Format),
-                                 unsigned(desc.Flags));
-            }
-        } slow_create{std::chrono::steady_clock::now(), desc};
         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
             // A texture cannot be placed on the title's pages (the PC GPU does not sample the console layout): it gets
             // a committed texture of the same description, so the title has its resource instead of asserting (found
@@ -22318,11 +21271,6 @@ public:
             log_once("a title-placed texture (device slot 133) is a committed texture whose GPU VA is the title "
                      "address, fed from the title's pages at each submission; dimension",
                      int(desc.Dimension));
-            if (const char* v = std::getenv("LEONIDA_LOG_TSHARP");
-                v && std::strtoull(v, nullptr, 16) == reinterpret_cast<std::uint64_t>(address))
-                std::fprintf(stderr, "[rt] d3d12: title-placed texture at %p: %llux%u, %u mips, format %d, flags %#x, "
-                                     "layout %u\n", address, static_cast<unsigned long long>(desc.Width), desc.Height,
-                             desc.MipLevels, int(desc.Format), unsigned(desc.Flags), layout);
             // The title's barrier layout (slot 133's third argument, measured by @dracbat) is checked against the
             // description as CreateCommittedResource checks a state; one it refuses (or UNDEFINED) gives COMMON, so
             // the title still gets its texture. The image itself starts undefined either way: the first command that
@@ -23867,13 +22815,6 @@ private:
                 min_lod_floor = static_cast<float>(std::min(last, pages->first_mip(resource.id())));
             }
         }
-        if (const char* v = std::getenv("LEONIDA_LOG_TSHARP"); v && std::strtoull(v, nullptr, 16) == image.address) {
-            const D3D12_RESOURCE_DESC& d = resource.desc();
-            std::fprintf(stderr, "[rt] d3d12: view of %#llx: %llux%u fmt %d flags %#x layout %d, memory flags %#x, "
-                                 "storage %d\n", static_cast<unsigned long long>(image.address),
-                         static_cast<unsigned long long>(d.Width), d.Height, int(d.Format), unsigned(d.Flags),
-                         int(d.Layout), unsigned(resource.memory_flags()), int(storage));
-        }
         const VkFormat channels_format = resource.rgba4_render_backing() ? VK_FORMAT_A4R4G4B4_UNORM_PACK16 :
             (resource.rgb96() ? rgb96_named_format(view_format) : view_format);
         if (new_uav && !state_.info.robust_image_access) {
@@ -24858,19 +23799,6 @@ void start_transient_watch(leonida::VulkanContext* context) {
 
 // Where a slow sync_title_textures spent its time (over 400 ms: logged at its end). It held the submission for 47 s in
 // the first loading screen (2026-11-25), with every other submitting thread waiting behind it.
-struct SyncStats {
-    long long ready_ns = 0, hash_ns = 0, copy_ns = 0, longest_ns = 0;
-    long long lock_ns = 0, marks_ns = 0, pages_ns = 0, flush_ns = 0;  // the mutex, the dirty marks, page state, flush
-    std::size_t copies = 0, copy_bytes = 0;
-    std::uint32_t longest_width = 0, longest_height = 0, longest_format = 0;
-};
-struct SyncTimer {
-    long long& into;
-    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-    explicit SyncTimer(long long& target) : into(target) {}
-    ~SyncTimer() { into += (std::chrono::steady_clock::now() - start).count(); }
-};
-
 void note_title_textures_copied(const std::vector<std::uintptr_t>& ids) {
     if (ids.empty() || !g_title_texture_count.load(std::memory_order_acquire)) return;
     std::lock_guard lock(title_texture_mutex());
@@ -24880,15 +23808,6 @@ void note_title_textures_copied(const std::vector<std::uintptr_t>& ids) {
         const Resource* r = static_cast<const Resource*>(reinterpret_cast<const ID3D12Resource*>(id));
         for (auto [it, end] = by_resource.equal_range(r); it != end; ++it) {
             TitleTexture* const t = it->second;
-            if (!t->gpu_written) {
-                static std::atomic<std::uint64_t> told{0};
-                const std::uint64_t n = ++told;
-                if ((n & (n - 1)) == 0)
-                    std::fprintf(stderr, "[rt] d3d12: %llu title textures copied into by the GPU, not refreshed from "
-                                         "their memory any more (last %ux%u format %u, %s)\n",
-                                 static_cast<unsigned long long>(n), t->width, t->height, t->format,
-                                 t->resource->paged() ? "paged" : "committed");
-            }
             t->gpu_written = true;
         }
     }
@@ -24897,24 +23816,6 @@ void note_title_textures_copied(const std::vector<std::uintptr_t>& ids) {
 void sync_title_textures() {
     if (!g_title_texture_count.load(std::memory_order_acquire)) return;  // one load when nothing is registered
     const auto now = std::chrono::steady_clock::now();
-    SyncStats sync_stats;
-    const struct SyncReport {
-        SyncStats& s;
-        std::chrono::steady_clock::time_point start;
-        ~SyncReport() {
-            const auto ms = [](long long ns) { return ns / 1000000; };
-            const long long total = (std::chrono::steady_clock::now() - start).count();
-            if (total < 150000000LL) return;  // 150 ms: each one holds every submitting thread behind its queue lock
-            static std::atomic<int> told{0};
-            if (told.fetch_add(1, std::memory_order_relaxed) >= 200) return;
-            std::fprintf(stderr, "[rt] d3d12: slow title texture sync %lld ms: lock %lld, marks %lld, page state %lld, "
-                                 "readability %lld, hashes %lld, %zu copies (%zu MiB) %lld, flush %lld, longest copy %lld "
-                                 "ms (%ux%u format %u)\n",
-                         ms(total), ms(s.lock_ns), ms(s.marks_ns), ms(s.pages_ns), ms(s.ready_ns), ms(s.hash_ns),
-                         s.copies, s.copy_bytes >> 20, ms(s.copy_ns), ms(s.flush_ns), ms(s.longest_ns),
-                         s.longest_width, s.longest_height, s.longest_format);
-        }
-    } sync_report{sync_stats, now};
     // Coalesced: what the title wrote before this call is covered by any sync that began after the call did (each
     // flushes its copies, and publishes them to every queue's next submission, before it lets go of the mutex). The
     // title's submitting threads each ran a whole sync, one after another, holding their queue locks (0.5-1.2 s waits
@@ -24923,10 +23824,7 @@ void sync_title_textures() {
     static std::uint64_t last_finished_begin = 0;  // under title_texture_mutex: the begin number of the last one done
     const std::uint64_t arrived_after = syncs_begun.load(std::memory_order_acquire);
     std::unique_lock lock(title_texture_mutex(), std::defer_lock);
-    {
-        const SyncTimer lock_timer(sync_stats.lock_ns);
-        lock.lock();
-    }
+    lock.lock();
     if (last_finished_begin > arrived_after) return;  // a sync that began after this call arrived is done
     const std::uint64_t my_begin = syncs_begun.fetch_add(1, std::memory_order_acq_rel) + 1;
     // Set when this sync is done, after its batch is flushed (BatchScope, declared after this, is destroyed first).
@@ -24950,8 +23848,7 @@ void sync_title_textures() {
     const struct BatchScope {
         DeviceState* device;
         DeviceState::StagedBatch& batch;
-        long long& flush_ns;
-        BatchScope(DeviceState* d, DeviceState::StagedBatch& b, long long& f) : device(d), batch(b), flush_ns(f) {
+        BatchScope(DeviceState* d, DeviceState::StagedBatch& b) : device(d), batch(b) {
             static const bool off = [] {
                 const char* v = std::getenv("LEONIDA_SYNC_BATCH");  // 0: one submission per copy, as before
                 return v && v[0] == '0';
@@ -24965,15 +23862,12 @@ void sync_title_textures() {
             if (!device) return;
             device->staged_batch.store(nullptr, std::memory_order_release);
             device->staged_batch_owner.store(std::thread::id{}, std::memory_order_release);
-            const SyncTimer flush_timer(flush_ns);
             device->flush_staged_batch(batch);
         }
-    } batch_scope{count ? const_cast<DeviceState*>(&textures.front()->resource->device_state()) : nullptr, staged,
-                  sync_stats.flush_ns};
+    } batch_scope{count ? const_cast<DeviceState*>(&textures.front()->resource->device_state()) : nullptr, staged};
     // Streamed textures on the title's pages (vulkan_title_pages.h) with more mips bound since the last submission (a
     // view asked for them): those pages are fresh, so their bytes are copied again.
     leonida::TitlePages* const pages = count ? textures.front()->resource->device_state().context->title_pages() : nullptr;
-    std::optional<SyncTimer> marks_timer(std::in_place, sync_stats.marks_ns);
     if (pages) {
         const std::vector<std::uintptr_t> grown = pages->take_remapped();
         auto& by_resource = title_textures_by_resource();
@@ -25007,7 +23901,6 @@ void sync_title_textures() {
                 for_title_textures_overlapping(begin, end, [](TitleTexture* t) { t->dirty = true; });
         }
     }
-    marks_timer.reset();
     for (std::size_t n = 0; n < count; ++n) {
         const auto& t = textures[(cursor + n) % count];
         // Nothing due on this submission (dirty, mapped, or a watched one whose next check has come; see the checks
@@ -25020,7 +23913,6 @@ void sync_title_textures() {
         const bool paged = pages && t->resource->paged();
         std::uint32_t first_mip = 0;
         if (paged) {
-            const SyncTimer pages_timer(sync_stats.pages_ns);
             if (!pages->ready(t->resource->id())) continue;
             // A streamed texture with only its smaller mips bound reads, hashes and copies just their bytes: the rest
             // of its range is its neighbours' memory (resident_prefix).
@@ -25030,33 +23922,6 @@ void sync_title_textures() {
         // not commit (a guarded read faulted there, and the texture was never copied: d3d12_mapped_plane_async).
         const std::size_t span = t->console ? resident_prefix(t->console.get(), t->bytes, first_mip)
                                             : std::min(t->bytes, static_cast<std::size_t>(rt::xg::texel_extent(*t->layout)));
-        // LEONIDA_DUMP_TARGETS with LEONIDA_DUMP_TITLE_TEXTURE: the glyph atlas's image is dumped with the targets.
-        static const bool note_atlas =
-            leonida::debug_targets::dump_at() && std::getenv("LEONIDA_DUMP_TITLE_TEXTURE") != nullptr;
-        if (note_atlas) {
-            const D3D12_RESOURCE_DESC& d = t->resource->desc();
-            // The glyph atlas and the 4K 8-bit masks the text's gradient-mask pipelines sample.
-            if (((d.Width == 2048 && d.Height == 2048) || (d.Width == 3840 && d.Height == 2160)) &&
-                (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM)) {
-                leonida::debug_targets::note(t->resource->id());
-                // A 4K 8-bit texture (the gradient mask): its flags and how many of its title bytes are set, every
-                // 5 s, whether or not it is copied (render targets are not watched).
-                if (d.Width == 3840) {
-                    static std::map<const void*, std::chrono::steady_clock::time_point> next;
-                    auto& when = next[t->title];
-                    if (now >= when && title_range_readable(t->title, t->bytes)) {
-                        when = now + std::chrono::seconds(5);
-                        std::size_t set = 0;
-                        for (std::size_t i = 0; i < t->bytes; i += 64) set += t->title[i] != 0;
-                        std::fprintf(stderr, "[rt] d3d12: 4K 8-bit title texture %p (image %#llx): flags 0x%x watch %d "
-                                             "mapped %d copied %d, %zu of %zu sampled bytes set\n",
-                                     static_cast<const void*>(t->title),
-                                     static_cast<unsigned long long>(t->resource->image_address()), unsigned(d.Flags),
-                                     int(t->watch), int(t->mapped), int(t->copied), set, t->bytes / 64);
-                    }
-                }
-            }
-        }
         // What to look at (see "Title-placed textures"): every check but the dirty one is a sampled hash (probe_hash,
         // 1/64 of the bytes), never a full one per submission. Full hashes of every watched texture on every
         // submission, and of the video planes every 15 ms, ran the game at 0.1 fps once the mirrored window gave the
@@ -25111,7 +23976,6 @@ void sync_title_textures() {
         // would land in unbound pages, and its submission would wait on the host until the bind is made. Left as it is
         // (dirty stays), so a later submission copies it.
         if (paged) {
-            const SyncTimer pages_timer(sync_stats.pages_ns);
             if (t->resource->device_state().context->title_bind_pending(t->resource->id())) continue;
         }
         // A render target or UAV texture (not watched) the title placed but never wrote by CPU: its pages are not in the
@@ -25151,13 +24015,10 @@ void sync_title_textures() {
         const auto faulted = [&] {
             t->readable = false;
             t->readable_until = t->mapped ? now : now + std::chrono::seconds(1);
-            const SyncTimer ready_timer(sync_stats.ready_ns);
             if (t->mapped)
                 if (const auto commit = rt::xmem::g_commit_range.load(std::memory_order_acquire)) commit(t->title, span);
         };
-        const auto hash_start = std::chrono::steady_clock::now();
         const bool probed = guarded_probe_hash(t->title, span, probe);
-        sync_stats.hash_ns += (std::chrono::steady_clock::now() - hash_start).count();
         if (!probed) {
             faulted();
             continue;
@@ -25166,9 +24027,7 @@ void sync_title_textures() {
             if (probe == t->probe) continue;
             hash = 0;  // changed: copied below without a full hash
         } else if (check == Check::full) {
-            const auto full_start = std::chrono::steady_clock::now();
             const bool hashed = guarded_title_hash(t->title, span, hash);
-            sync_stats.hash_ns += (std::chrono::steady_clock::now() - full_start).count();
             if (!hashed) {
                 faulted();
                 continue;
@@ -25180,20 +24039,7 @@ void sync_title_textures() {
             }
         }
         t->dirty = false;
-        const auto copy_start = std::chrono::steady_clock::now();
         const bool copied_now = guarded_copy_from_title(t->resource, t->title, *t->layout, t->console.get(), first_mip);
-        {
-            const auto ns = (std::chrono::steady_clock::now() - copy_start).count();
-            sync_stats.copy_ns += ns;
-            ++sync_stats.copies;
-            sync_stats.copy_bytes += span;
-            if (ns > sync_stats.longest_ns) {
-                sync_stats.longest_ns = ns;
-                sync_stats.longest_width = t->width;
-                sync_stats.longest_height = t->height;
-                sync_stats.longest_format = t->format;
-            }
-        }
         if (!copied_now) {
             faulted();
             log_once("a title-placed texture could not be copied from the title's pages; it keeps its texels; "
@@ -25206,50 +24052,6 @@ void sync_title_textures() {
         t->probe = probe;  // as sampled before the copy
         t->first_watch_until = now + kTitleTextureFirstWatch;
         t->watch_until = now + title_texture_watch();
-        if (t->mapped) {  // the video planes: the first 40 copies of mapped textures, and every 100th after
-            static int copies = 0;
-            if (copies < 40 || copies % 100 == 0)
-                std::fprintf(stderr, "[rt] d3d12: mapped title texture %p copied again (copy %d, hash %016llx)\n",
-                             static_cast<const void*>(t->title), copies, static_cast<unsigned long long>(hash));
-            ++copies;
-        }
-        // LEONIDA_DUMP_TITLE_TEXTURE=<dir>: the title bytes of each copied 2048x2048 A8/R8 texture (the glyph atlas),
-        // as <dir>/<title address>_<copy n>.bin, the first 24 copies.
-        if (static const char* dir = std::getenv("LEONIDA_DUMP_TITLE_TEXTURE"); dir && *dir) {
-            const D3D12_RESOURCE_DESC& d = t->resource->desc();
-            static int dumped = 0;
-            static int atlas_copies = 0;
-            const bool atlas = d.Width == 2048 && d.Height == 2048 &&
-                               (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM);
-            bool dump_now = false;
-            if (atlas) {
-                // Every copy of the glyph atlas: how many of its title bytes are set (glyphs written by the CPU make
-                // this grow), its flags and layout once; its bytes every 20th copy.
-                std::size_t set = 0;
-                for (std::size_t i = 0; i < t->bytes; ++i) set += t->title[i] != 0;
-                const int n = atlas_copies++;
-                if (n == 0)
-                    std::fprintf(stderr, "[rt] d3d12: atlas %p: flags 0x%x layout %d mapped %d, %zu bytes\n",
-                                 static_cast<const void*>(t->title), unsigned(d.Flags), int(d.Layout), int(t->mapped),
-                                 t->bytes);
-                if (n < 400)
-                    std::fprintf(stderr, "[rt] d3d12: atlas copy %d: %zu bytes set\n", n, set);
-                dump_now = n % 20 == 0;
-            }
-            if ((atlas ? dump_now : (d.Width == 256 && d.Height == 128 &&
-                                     (d.Format == DXGI_FORMAT_A8_UNORM || d.Format == DXGI_FORMAT_R8_UNORM))) &&
-                dumped < 24) {
-                char path[512];
-                std::snprintf(path, sizeof path, "%s\\%p_%02d.bin", dir, static_cast<const void*>(t->title), dumped++);
-                CreateDirectoryA(dir, nullptr);
-                if (FILE* f = std::fopen(path, "wb")) {
-                    std::fwrite(t->title, 1, t->bytes, f);
-                    std::fclose(f);
-                }
-                std::fprintf(stderr, "[rt] d3d12: title texture %p copied (%zu bytes) -> %s\n",
-                             static_cast<const void*>(t->title), t->bytes, path);
-            }
-        }
     }
 }
 

@@ -2683,72 +2683,9 @@ public:
 
     uint64_t STDMETHODCALLTYPE GetCurrentTimestamp() override { return now_us(); }
 
-    // LEONIDA_INPUT_STATS=1 (diagnostic): every 10 s, how the title asked for readings (by method and device
-    // argument) and what it got (by the reading's device, and whether a gamepad button was down in it).
-    static void note_reading(int method, IGameInputDevice* asked, HRESULT hr, IGameInputReading* got) {
-        static const bool on = env("LEONIDA_INPUT_STATS") == "1";
-        if (!on) return;
-        struct Stats {
-            std::mutex mu;
-            uint64_t calls[3][3] = {};  // method x (null, aggregate, a device)
-            uint64_t found[3] = {}, pressed[3] = {};
-            std::map<std::string, std::pair<uint64_t, uint64_t>> by_device;  // name -> (readings, with buttons)
-            uint64_t since = 0;
-        };
-        static Stats st;
-        std::string name;
-        bool buttons = false;
-        if (SUCCEEDED(hr) && got) {
-            IGameInputDevice* d = nullptr;
-            got->GetDevice(&d);
-            if (d) {
-                name = as_device(d)->name;
-                d->Release();
-            }
-            GameInputGamepadState g{};
-            if (got->GetGamepadState(&g)) buttons = g.buttons != 0;
-        }
-        const int arg = !asked ? 0 : as_device(asked)->info.deviceFamily == GameInputFamilyAggregate ? 1 : 2;
-        std::lock_guard lock(st.mu);
-        ++st.calls[method][arg];
-        if (SUCCEEDED(hr) && got) {
-            ++st.found[method];
-            st.pressed[method] += buttons;
-            auto& e = st.by_device[name];
-            ++e.first;
-            e.second += buttons;
-        }
-        const uint64_t now = now_us();
-        if (!st.since) st.since = now;
-        if (now - st.since < 10'000'000) return;
-        static const char* methods[] = {"GetCurrentReading", "GetNextReading", "GetPreviousReading"};
-        std::string line;
-        for (int m = 0; m < 3; ++m) {
-            char t[200];
-            std::snprintf(t, sizeof(t), " %s %llu/%llu/%llu found %llu pressed %llu;", methods[m],
-                          (unsigned long long)st.calls[m][0], (unsigned long long)st.calls[m][1],
-                          (unsigned long long)st.calls[m][2], (unsigned long long)st.found[m],
-                          (unsigned long long)st.pressed[m]);
-            line += t;
-        }
-        for (const auto& [n, c] : st.by_device) {
-            char t[160];
-            std::snprintf(t, sizeof(t), " [%s: %llu readings, %llu with buttons]", n.c_str(), (unsigned long long)c.first,
-                          (unsigned long long)c.second);
-            line += t;
-        }
-        std::fprintf(stderr, "[rt] gameinput stats (calls null/aggregate/device): %s\n", line.c_str());
-        std::memset(st.calls, 0, sizeof(st.calls));
-        std::memset(st.found, 0, sizeof(st.found));
-        std::memset(st.pressed, 0, sizeof(st.pressed));
-        st.by_device.clear();
-        st.since = now;
-    }
-
     HRESULT STDMETHODCALLTYPE GetCurrentReading(uint32_t kind, IGameInputDevice* device, IGameInputReading** out) override {
         g_reading_calls.fetch_add(1, std::memory_order_relaxed);
         const HRESULT hr = current_reading(kind, device, out);
-        note_reading(0, device, hr, out ? *out : nullptr);
         return hr;
     }
     HRESULT current_reading(uint32_t kind, IGameInputDevice* device, IGameInputReading** out) {
@@ -2799,13 +2736,11 @@ public:
     HRESULT STDMETHODCALLTYPE GetNextReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
                                              IGameInputReading** out) override {
         const HRESULT hr = find_reading(ref, kind, device, out, true);
-        note_reading(1, device, hr, out ? *out : nullptr);
         return hr;
     }
     HRESULT STDMETHODCALLTYPE GetPreviousReading(IGameInputReading* ref, uint32_t kind, IGameInputDevice* device,
                                                  IGameInputReading** out) override {
         const HRESULT hr = find_reading(ref, kind, device, out, false);
-        note_reading(2, device, hr, out ? *out : nullptr);
         return hr;
     }
     // E_NOTIMPL is GameInput v0's own answer: Microsoft's reference page says the method "was never implemented in

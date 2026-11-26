@@ -151,31 +151,11 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
     return d3d12_trace::result("XboxPresentation::PresentX", present_x(plane_count, planes, params));
 }
 
-// LOCAL DIAGNOSTIC (LEONIDA_LOCAL_DIAGNOSTICS=1): which check refuses PresentX, with its HRESULT.
-static HRESULT present_diag(int line, HRESULT hr) {
-    static std::atomic<int> logged{0};
-    if (FAILED(hr) && leonida::local_diagnostics() && logged.fetch_add(1) < 40)
-        std::fprintf(stderr, "[rt] PresentX diag: refused at line %d hr 0x%08lx\n", line, static_cast<unsigned long>(hr));
-    return hr;
-}
-
 HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlaneParameters* planes,
                                     const XboxPresentParameters* params) {
     std::lock_guard serialise(present_mutex_);
-    if (leonida::local_diagnostics()) {
-        static std::atomic<int> dumped{0};
-        if (dumped.fetch_add(1) < 6) {
-            std::fprintf(stderr, "[rt] PresentX diag: planes %u params %p suspended %d registered %d\n", plane_count,
-                         static_cast<const void*>(params), int(pacer_.suspended()), int(pacer_.registered()));
-            for (UINT i = 0; planes && i < plane_count && i < 2; ++i)
-                std::fprintf(stderr, "[rt] PresentX diag:  plane %u token 0x%llx count %u res %p res0 %p\n", i,
-                             static_cast<unsigned long long>(planes[i].Token), planes[i].ResourceCount,
-                             static_cast<const void*>(planes[i].ppResources),
-                             planes[i].ppResources ? static_cast<const void*>(planes[i].ppResources[0]) : nullptr);
-        }
-    }
-    if (plane_count > 2 || (plane_count && !planes)) return present_diag(117, E_INVALIDARG);
-    if (pacer_.suspended()) return present_diag(118, from_pacer(hr::invalid_state));
+    if (plane_count > 2 || (plane_count && !planes)) return E_INVALIDARG;
+    if (pacer_.suspended()) return from_pacer(hr::invalid_state);
     // A zero, negative or NaN threshold never tears; an uncapped frame is never late for anything either.
     const float threshold = params ? params->ImmediateThresholdPercent : 0.0f;
     const bool wants_tear = threshold > 0.0f && !pacer_.uncapped();
@@ -194,7 +174,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
             pacer_.note_untokened_present();
             ++presents_;
         }
-        return present_diag(__LINE__, result);
+        return result;
     }
 
     // All planes carry the token of one frame.
@@ -202,20 +182,20 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     for (UINT i = 0; i < plane_count; ++i) {
         const XboxPresentPlaneParameters& plane = planes[i];
         if (plane.Token != token || plane.ResourceCount == 0 || !plane.ppResources || !plane.ppResources[0])
-            return present_diag(145, E_INVALIDARG);
+            return E_INVALIDARG;
         // Both paths read ppResources[0] only: a plane with several resources would silently lose the others and could show
         // the wrong frame, so it is refused (before anything is presented) until it is modelled. What the console does
         // with ResourceCount above 1 (views? stereo?) is unmeasured.
         if (plane.ResourceCount != 1) {
             log_once(logged_resource_count_, "PresentX plane with ResourceCount other than 1: not implemented, refused");
-            return present_diag(__LINE__, DXGI_ERROR_UNSUPPORTED);
+            return DXGI_ERROR_UNSUPPORTED;
         }
     }
     // Only a token that was never handed out is refused. Null, stale and repeated tokens are presented anyway (what the
     // console does with them is unmeasured, and a title that does it must not freeze); each kind is logged once.
     FramePacer::TokenIssue issue{};
     if (const std::int32_t checked = pacer_.check_present_token(token, &issue); checked != hr::ok)
-        return present_diag(158, from_pacer(checked));
+        return from_pacer(checked);
     switch (issue) {
     case FramePacer::TokenIssue::null_token:
         log_once(logged_null_token_, "PresentX with the null token: presented anyway (real behaviour unmeasured)");
@@ -328,12 +308,12 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
             const XboxPresentPlaneParameters& p = i == 0 ? shown : planes[i];
             ID3D12Resource* source = p.ppResources[0];
             const D3D12_RESOURCE_DESC source_desc = source->GetDesc();
-            if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return present_diag(222, E_INVALIDARG);
+            if (source_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
             const D3D12_RECT* source_rect = p.pSrcViewRects;
             if (source_rect && (source_rect->left < 0 || source_rect->top < 0 || source_rect->left >= source_rect->right ||
                                 source_rect->top >= source_rect->bottom || UINT64(source_rect->right) > source_desc.Width ||
                                 UINT(source_rect->bottom) > source_desc.Height))
-                return present_diag(227, E_INVALIDARG);
+                return E_INVALIDARG;
             const XboxViewRect* place = placement(p);
             leonida::PresentPlane& out = composed.plane[i];
             out.source = resource_id(source);
@@ -357,7 +337,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
             tear = leonida::decide_present_sync(timing.late_us, timing.period_us, threshold) == leonida::PresentSync::immediate;
         }
         const HRESULT result = presenter_->present_planes(composed, sync_interval, tear);
-        if (FAILED(result)) return present_diag(251, pacer_.suspended() ? from_pacer(hr::invalid_state) : result);
+        if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
         pacer_.commit_present_token(token, plane_count,
                                     tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
                                                                             : leonida::PresentSync::vblank);
@@ -368,7 +348,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     const XboxPresentPlaneParameters& plane = shown;
     ID3D12Resource* resource = plane.ppResources[0];
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return present_diag(262, E_INVALIDARG);
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D) return E_INVALIDARG;
     D3D12_HEAP_PROPERTIES heap{};
     D3D12_HEAP_FLAGS heap_flags = D3D12_HEAP_FLAG_NONE;
     if (SUCCEEDED(resource->GetHeapProperties(&heap, &heap_flags)) && !(heap_flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY))
@@ -377,7 +357,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
     const D3D12_RECT* rect = plane.pSrcViewRects;
     if (rect && (rect->left < 0 || rect->top < 0 || rect->left >= rect->right || rect->top >= rect->bottom ||
                  UINT64(rect->right) > desc.Width || UINT(rect->bottom) > desc.Height))
-        return present_diag(271, E_INVALIDARG);
+        return E_INVALIDARG;
 
     // How late the frame is, now that everything that can refuse it has: past the vblank it was due at, by what part of
     // the interval the scan has moved on. The presenter says whether it really queued it as a tear.
@@ -388,7 +368,7 @@ HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlanePara
         tear = leonida::decide_present_sync(timing.late_us, timing.period_us, threshold) == leonida::PresentSync::immediate;
     }
     const HRESULT result = presenter_->present(resource, sync_interval, rect, tear);
-    if (FAILED(result)) return present_diag(282, pacer_.suspended() ? from_pacer(hr::invalid_state) : result);
+    if (FAILED(result)) return pacer_.suspended() ? from_pacer(hr::invalid_state) : result;
     pacer_.commit_present_token(token, plane_count,
                                 tear && presenter_->last_present_tore() ? leonida::PresentSync::immediate
                                                                         : leonida::PresentSync::vblank);

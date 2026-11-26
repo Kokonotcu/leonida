@@ -155,25 +155,6 @@ public:
         return out;
     }
 
-    // The free block that holds `offset` (if one does) and the offset of the next block after it: what the compute
-    // input probe reads to tell a free range from a live one without walking the map itself
-    // (d3d12_compute_input_probe.h backing()).
-    bool free_at(std::uint64_t offset, std::uint64_t& block_offset, std::uint64_t& block_size,
-                 std::uint64_t& next_offset) const {
-        auto it = blocks_.upper_bound(offset);
-        bool inside = false;
-        if (it != blocks_.begin()) {
-            const auto previous = std::prev(it);
-            if (offset >= previous->first && offset < previous->first + previous->second) {
-                inside = true;
-                block_offset = previous->first;
-                block_size = previous->second;
-            }
-        }
-        next_offset = it == blocks_.end() ? size_ : it->first;
-        return inside;
-    }
-
     // The largest free block, for the high-water report (D3D-55).
     Block largest() const {
         Block best{0, 0};

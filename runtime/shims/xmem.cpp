@@ -1248,7 +1248,6 @@ bool map_view(uintptr_t address, const View& view, uint64_t* done = nullptr) {
                                          MEM_REPLACE_PLACEHOLDER, view.protect, nullptr, 0)) {
             return false;
         }
-        rt::xmem::g_view_maps.fetch_add(1, std::memory_order_relaxed);  // the address-space lock rate report
         rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
         leonida::title_memory_map::changed(target, size);
         View part = view;
@@ -1298,7 +1297,6 @@ bool unmap_range_locked(uintptr_t start, uintptr_t end) {
                                            MEM_PRESERVE_PLACEHOLDER)) {
             return false;
         }
-        rt::xmem::g_view_unmaps.fetch_add(1, std::memory_order_relaxed);  // the address-space lock rate report
         rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
         leonida::title_memory_map::changed(base, view_end);
         leonida::geometry_writes::notify(base, view_end, leonida::geometry_writes::Event::replaced);
@@ -1488,7 +1486,6 @@ PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& prot
     }
     void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset + within;
     if (!VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return PageCommit::failed;
-    rt::xmem::g_commits_on_touch.fetch_add(1, std::memory_order_relaxed);  // the address-space lock rate report
     leonida::geometry_writes::notify(address, address + kPhysicalPageSize, leonida::geometry_writes::Event::mapping);
     leonida::title_memory_map::changed(address, address + kPhysicalPageSize);
     return PageCommit::committed_now;

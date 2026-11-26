@@ -105,14 +105,6 @@ inline std::atomic<ProtectWatchedFn> g_protect_watched{nullptr};
 // VirtualQuery again (one call per 64 KiB view) until it changes.
 inline std::atomic<std::uint64_t> g_map_generation{0};
 
-// Calls that take the process's address-space lock exclusively, counted for the rate report (d3d12_xs sync): every
-// VirtualQuery in the process (ours, the driver's in each host import: 15-30 ms per call in the game, 0.001-0.05 ms
-// alone) waits behind them.
-inline std::atomic<std::uint64_t> g_commits_on_touch{0};  // physical_page_fault: VirtualAlloc(MEM_COMMIT) of a page
-inline std::atomic<std::uint64_t> g_view_maps{0};         // MapViewOfFile3 of physical pages
-inline std::atomic<std::uint64_t> g_view_unmaps{0};       // UnmapViewOfFile2
-inline std::atomic<std::uint64_t> g_placeholder_splits{0};  // VirtualFree(MEM_PRESERVE/COALESCE_PLACEHOLDER)
-
 // The GPU's view of physical pages (the D3D12 layer's title page table). A page's own memory is its 64 KiB in the
 // whole-section view of the section behind it (`section`, `section_bytes`), which stays at one address while the
 // section lives, whatever window the page is mapped into. The page table points each window address at that memory,

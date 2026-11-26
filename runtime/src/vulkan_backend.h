@@ -61,19 +61,6 @@
 
 namespace leonida {
 
-// This thread's time in the device's title-memory mapping (DeviceState::map_title_memory, host imports), in ns: a
-// recording that maps title memory holds resource_mutex_ shared meanwhile (ExecuteTiming::title_map_ms). A plain
-// integer: no thread_local with a destructor in gta6rt.
-inline thread_local std::uint64_t g_title_map_ns = 0;
-// Which check of the queue's replay refused a batch ("ExecuteCommandLists failed: unsupported"), by source line,
-// the first time each one does. The batch is then not submitted at all.
-inline ReplayResult queue_unsupported(int line) {
-    static std::atomic<bool> seen[4096];
-    if (line < 0 || line >= 4096 || !seen[line].exchange(true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[rt] d3d12: queue replay refused a batch at vulkan_backend.h:%d\n", line);
-    return ReplayResult::unsupported;
-}
-
 // A CPU-written Vulkan-address instance pointer array, kept until the submission that builds with it completes.
 // Completed stages are pooled per queue and reused, so a per-frame TLAS build does not allocate memory each frame.
 // The same stages carry the title-memory translation table of an XDXR TLAS build (VulkanQueue::stage_xdxr_table).
@@ -626,114 +613,6 @@ inline bool set_device_lost(std::atomic<bool>& flag, const char* where) noexcept
                  where);
     return true;
 }
-// LEONIDA_GPU_LATENCY=1 (diagnostic): for each queue kind, how long the GPU took from a submission's vkQueueSubmit to
-// the dispatcher seeing it done, and how much of the wall time the queue had work (in-order queue: a submission is
-// busy from the later of its submit and the previous one's completion to its own). One line per kind every 10 s.
-namespace gpu_latency {
-inline bool enabled() {
-    static const bool on = [] {
-        const char* v = std::getenv("LEONIDA_GPU_LATENCY");
-        return v && std::strcmp(v, "1") == 0;
-    }();
-    return on;
-}
-struct Stats {
-    std::mutex mutex;
-    std::uint64_t count = 0;
-    double sum_ms = 0, max_ms = 0, busy_ms = 0;
-    std::chrono::steady_clock::time_point last_done{}, since = std::chrono::steady_clock::now();
-};
-inline Stats& stats(int kind) {
-    static Stats s[3];
-    return s[kind < 0 || kind > 2 ? 0 : kind];
-}
-inline void held_tick(int kind);  // below: the held-operations line, due on the same 10 s
-
-inline void done(int kind, std::chrono::steady_clock::time_point submitted) {
-    using clock = std::chrono::steady_clock;
-    const auto now = clock::now();
-    const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
-    Stats& s = stats(kind);
-    std::lock_guard lock(s.mutex);
-    const double latency = ms(now - submitted);
-    ++s.count;
-    s.sum_ms += latency;
-    s.max_ms = (std::max)(s.max_ms, latency);
-    s.busy_ms += ms(now - (std::max)(submitted, s.last_done));
-    s.last_done = now;
-    if (now - s.since >= std::chrono::seconds(10)) {
-        const double wall = ms(now - s.since);
-        std::fprintf(stderr, "[rt] gpu latency (%s): %llu submissions in %.0f s, submit to done %.2f ms on average, "
-                             "%.1f ms the longest; the queue had work %.1f%% of the time\n",
-                     kind == 0 ? "direct" : kind == 1 ? "compute" : "copy",
-                     static_cast<unsigned long long>(s.count), wall / 1000.0, s.sum_ms / double(s.count), s.max_ms,
-                     100.0 * s.busy_ms / wall);
-        s.count = 0;
-        s.sum_ms = s.max_ms = s.busy_ms = 0;
-        s.since = now;
-    }
-    held_tick(kind);
-}
-// A held queue operation (Wait before Signal), released: how long it waited on the CPU before it could run.
-// A held queue operation (Wait before Signal), released: how long it waited on the CPU before it could run, and for
-// the longest one of the window the fence (semaphore handle) and value it waited for, so the slow signaller can be
-// named. The line is due every 10 s: held() prints it, and so does done() (held_tick), so a window with nothing
-// released still reports.
-struct HeldStats {
-    std::mutex mutex;
-    std::uint64_t count[3] = {};
-    double sum_ms = 0, max_ms = 0;
-    std::uint64_t max_fence = 0, max_value = 0;
-    int max_op = 0;
-    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
-};
-inline HeldStats& held_stats(int kind) {
-    static HeldStats h[3];
-    return h[kind < 0 || kind > 2 ? 0 : kind];
-}
-// held_stats(kind).mutex held.
-inline void held_report_locked(int kind, HeldStats& s, std::chrono::steady_clock::time_point now) {
-    if (now - s.since < std::chrono::seconds(10)) return;
-    const std::uint64_t all = s.count[0] + s.count[1] + s.count[2];
-    std::fprintf(stderr, "[rt] gpu latency (%s): %llu held operations released in %.0f s (%llu batches, %llu "
-                         "signals, %llu markers), held %.2f ms on average, %.1f ms the longest",
-                 kind == 0 ? "direct" : kind == 1 ? "compute" : "copy", static_cast<unsigned long long>(all),
-                 std::chrono::duration<double>(now - s.since).count(), static_cast<unsigned long long>(s.count[0]),
-                 static_cast<unsigned long long>(s.count[1]), static_cast<unsigned long long>(s.count[2]),
-                 all ? s.sum_ms / double(all) : 0.0, s.max_ms);
-    if (all && s.max_fence)
-        std::fprintf(stderr, " (a %s waiting for fence 0x%llx value %llu)",
-                     s.max_op == 0 ? "batch" : s.max_op == 1 ? "Signal" : "marker",
-                     static_cast<unsigned long long>(s.max_fence), static_cast<unsigned long long>(s.max_value));
-    std::fputc('\n', stderr);
-    s.count[0] = s.count[1] = s.count[2] = 0;
-    s.sum_ms = s.max_ms = 0;
-    s.max_fence = s.max_value = 0;
-    s.since = now;
-}
-inline void held(int kind, int op, std::chrono::steady_clock::time_point at, std::uint64_t fence = 0,
-                 std::uint64_t value = 0) {
-    using clock = std::chrono::steady_clock;
-    HeldStats& s = held_stats(kind);
-    const auto now = clock::now();
-    const double ms = std::chrono::duration<double, std::milli>(now - at).count();
-    std::lock_guard lock(s.mutex);
-    ++s.count[op < 0 || op > 2 ? 0 : op];
-    s.sum_ms += ms;
-    if (ms > s.max_ms) {
-        s.max_ms = ms;
-        s.max_fence = fence;
-        s.max_value = value;
-        s.max_op = op;
-    }
-    held_report_locked(kind, s, now);
-}
-inline void held_tick(int kind) {
-    HeldStats& s = held_stats(kind);
-    std::lock_guard lock(s.mutex);
-    held_report_locked(kind, s, std::chrono::steady_clock::now());
-}
-}  // namespace gpu_latency
 
 // Centralized single-thread fence dispatcher using Vulkan 1.2 vkWaitSemaphores(VK_SEMAPHORE_WAIT_ANY_BIT).
 // Eliminates per-fence OS threads and 10ms polling: a synthetic timeline semaphore (wakeup_sem_) at index 0
@@ -1281,19 +1160,6 @@ public:
         replay_.write_timestamp = vk.vkCmdWriteTimestamp;
         replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
         replay_.bind_pipeline = vk.vkCmdBindPipeline;
-        {
-            // D3D-324: LEONIDA_DRAW_SCOPES=0 gives every draw its own rendering scope again (to compare). Read here,
-            // once per context, not through a function-local static on a title thread.
-#ifdef _WIN32
-            char value[4] = {};
-            std::size_t length = 0;
-            replay_.merge_draw_scopes =
-                !(getenv_s(&length, value, sizeof(value), "LEONIDA_DRAW_SCOPES") == 0 && length == 2 && value[0] == '0');
-#else
-            const char* value = std::getenv("LEONIDA_DRAW_SCOPES");
-            replay_.merge_draw_scopes = !(value && value[0] == '0' && value[1] == '\0');
-#endif
-        }
         replay_.push_constants = vk.vkCmdPushConstants;
         replay_.bind_descriptor_sets = vk.vkCmdBindDescriptorSets;
         replay_.dispatch = vk.vkCmdDispatch;
@@ -2154,25 +2020,6 @@ public:
     // `before` is called at the start of every submission of command lists (a held batch: when it is released),
     // before any lock here is taken: the device re-copies its slot-133 shadow buffers from the title's pages there.
     // Set once, before the first queue exists.
-    using InputProbe = std::function<void(std::span<const CommandList* const>, std::uint64_t, const char*)>;
-    void set_input_probe(InputProbe probe) { input_probe_ = std::move(probe); }
-    bool diagnostic_buffer(std::uint64_t va, std::uint64_t& host, std::uint64_t& room) {
-        std::shared_lock lock(resource_mutex_);
-        BufferVaIndex<ResourceId>::Hit hit{};
-        if (!buffer_vas_.find(va, hit)) return false;
-        const auto* b = resolve(hit.id);
-        if (!b || va - b->va >= b->size) return false;
-        const auto offset = va - b->va;
-        host = b->host ? reinterpret_cast<std::uint64_t>(b->host + offset) : 0;
-        room = b->size - offset;
-        return true;
-    }
-    const char* diagnostic_compute_name(std::uintptr_t id) {
-        std::shared_lock lock(pipeline_mutex_);
-        if (!device_fault_) return nullptr;
-        const auto it = device_fault_->pipeline_names.find(id);
-        return it == device_fault_->pipeline_names.end() ? nullptr : it->second[0];
-    }
     void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
     // Called at the end of every ExecuteCommandLists replay that called before_execute_, however it returns: by then
     // the submissions it made are recorded, so submitted_retire_ticket() covers them.
@@ -2767,8 +2614,6 @@ private:
         if (auto* memory = binding.deferred_memory; memory && !memory->ensure()) return nullptr;
         // The caller holds resource_mutex_, so the registered owner's lifetime includes this bind.
         if (binding.ensure_residency && !binding.ensure_residency(binding.residency_owner)) return nullptr;
-        if (auto* seen = binding.replay_seen; seen && !seen->load(std::memory_order_relaxed))
-            seen->store(true, std::memory_order_relaxed);
         return found;
     }
 
@@ -2849,15 +2694,12 @@ private:
         std::uint64_t retired = 0;
         std::int64_t reported_hold = -1;
         std::int64_t busy_since = -1;
-        SubmitMutex::GateStats gate_logged;
-        unsigned tick = 0;
         std::mutex timer_mutex;
         std::condition_variable_any timer;
         std::unique_lock timer_lock(timer_mutex);
-        // LOCAL DIAGNOSTIC (post-load GPU hangs): with the device-fault report on, sample every 250 ms, so a loss the
+        // With the device-fault report on, sample every 250 ms, so a loss the
         // driver has already reset is seen (and its checkpoints read) before a watchdog outside kills the process.
         const auto period = device_fault_ ? std::chrono::milliseconds(250) : std::chrono::milliseconds(1000);
-        const unsigned per_10s = unsigned(std::chrono::seconds(10) / period);
         while (!stop.stop_requested()) {
             timer.wait_for(timer_lock, stop, period, [] { return false; });
             if (stop.stop_requested() || is_device_lost()) break;
@@ -2880,7 +2722,7 @@ private:
                     state = retired < submitted ? Watch::State::pending : Watch::State::idle;
                 }
             }
-            // LOCAL DIAGNOSTIC (early device loss): a submission unfinished for 4 s dumps the recent submissions with
+            // A submission unfinished for 4 s dumps the recent submissions with
             // their semaphore counters (unreadable once the device is lost); a hold of the submit lock of 3 s names
             // its thread and prints its call chain, once per hold.
             // A vkQueueSubmit stuck in the driver (measured: 10 s, then VK_ERROR_DEVICE_LOST) also blocks
@@ -2909,20 +2751,6 @@ private:
             }
             // A failed counter query does not measure GPU progress.
             if (result != VK_SUCCESS) state = Watch::State::idle;
-            // Every 10 s while it changes: what the compile gate has cost so far (SubmitMutex::CompileTurn).
-            if (++tick % per_10s == 0) {
-                const SubmitMutex::GateStats gate = submit_mutex_.gate_stats();
-                if (gate.submits != gate_logged.submits || gate.creates != gate_logged.creates) {
-                    gate_logged = gate;
-                    std::fprintf(stderr, "[rt] compile-gate: t=%.0f s: %llu submissions waited for pipeline creates "
-                                         "(%lld ms in all, longest %lld ms); %llu creates waited behind a submission "
-                                         "(%lld ms in all, longest %lld ms)\n",
-                                 double(diagnostic_ms()) / 1000.0, static_cast<unsigned long long>(gate.submits),
-                                 static_cast<long long>(gate.submit_ms), static_cast<long long>(gate.submit_max_ms),
-                                 static_cast<unsigned long long>(gate.creates), static_cast<long long>(gate.create_ms),
-                                 static_cast<long long>(gate.create_max_ms));
-                }
-            }
             // LEONIDA_HANG_EXIT_S=<s> (for boots): work pending and retirement still for s seconds is a GPU hang
             // the driver may recover from without Vulkan ever reporting the device lost (Xid 109: the title then
             // waits forever, the window frozen). The stall is reported (with the checkpoints under
@@ -3057,7 +2885,6 @@ private:
     std::map<std::tuple<VkImage, VkImage, VkImageView, VkImageView, VkRenderPass>, VkFramebuffer> resolve_framebuffers_;
     std::function<void()> before_execute_;
     std::function<void()> after_execute_;
-    InputProbe input_probe_;
     TableScanner table_scanner_;
     GeometryProvider geometry_provider_;
     std::function<bool(std::uint64_t,std::uint32_t)> sample_table_resolver_;
@@ -3153,14 +2980,6 @@ private:
     static constexpr std::size_t kBindChunkImages = 16;
 
     void bind_title_pages(BindJob& job) {
-        std::size_t image_binds = 0, opaque_binds = 0, image_info_count = 0, opaque_info_count = 0;
-        for (const auto& op : job.ops) {
-            image_binds += op.image_binds.size();
-            opaque_binds += op.opaque_binds.size();
-            image_info_count += !op.image_binds.empty();
-            opaque_info_count += !op.opaque_binds.empty();
-        }
-        const auto t_wait = std::chrono::steady_clock::now();
         VkResult result = is_device_lost() ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
         // The job's waits (every queue's work submitted before it) are met here, on the host, before any bind call:
         // passed to vkQueueBindSparse, NVIDIA met them inside the call, with the device-wide lock held, so every
@@ -3184,8 +3003,6 @@ private:
                 }
             }
         }
-        const auto t0 = std::chrono::steady_clock::now();
-        const long long wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t0 - t_wait).count();
         // The chunks run in order through the binder's own chain timeline: the first waits for the job's waits (unless
         // met on the host above), each later one for the one before, and the last signals the job's ticket.
         const std::size_t chunks = std::max<std::size_t>(1, (job.ops.size() + kBindChunkImages - 1) / kBindChunkImages);
@@ -3231,9 +3048,6 @@ private:
             std::lock_guard heavy(driver_heavy_mutex_);  // never beside a host import (driver_heavy_mutex)
             result = vk.vkQueueBindSparse(binder_.queue, 1, &info, VK_NULL_HANDLE);
         }
-        const std::size_t image_infos_size = image_info_count, opaque_infos_size = opaque_info_count;
-        const long long ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         if (result == VK_ERROR_DEVICE_LOST) mark_device_lost();
         if (result != VK_SUCCESS) {
             static std::atomic<bool> told{false};
@@ -3256,16 +3070,6 @@ private:
             return;
         }
         finish_bind_job(job);  // published only now: what is submitted from here on waits for a bind already made
-        if (ms + wait_ms >= 300) {
-            static std::atomic<int> told{0};
-            if (told.fetch_add(1, std::memory_order_relaxed) < 200)
-                std::fprintf(stderr,
-                             "[rt] title pages: slow bind %lld ms on the bind queue (after %lld ms waiting on the host "
-                             "for the GPU): %zu images, %zu image binds in %zu infos, %zu opaque binds in %zu infos, %zu "
-                             "calls (ticket %llu)\n",
-                             ms, wait_ms, job.ops.size(), image_binds, image_infos_size, opaque_binds, opaque_infos_size,
-                             chunks, static_cast<unsigned long long>(job.ticket));
-        }
     }
 
     void stop_binder() {
@@ -3333,7 +3137,7 @@ public:
     }
     ~VulkanFence() {
         if (!semaphore_) return;
-        // LOCAL DIAGNOSTIC (early device loss): a fence released while a Signal the GPU has not run yet names it.
+        // A fence released while a Signal the GPU has not run yet names it.
         if (!context_.is_device_lost()) {
             const std::uint64_t submitted = context_.holds().submitted_value(semaphore_);
             std::uint64_t reached = 0;
@@ -3661,7 +3465,7 @@ public:
             if (!must_hold()) {
                 result = execute_now(lists, execute_call);
             } else if (context_.is_device_lost()) {
-                result = queue_unsupported(__LINE__);
+                result = ReplayResult::unsupported;
             } else {
                 Deferred op;
                 op.kind = Deferred::Kind::batch;
@@ -3842,15 +3646,6 @@ public:
     // Waits on the CPU until what this queue has submitted so far is done: its own timeline, without the device's
     // submit lock, so other queues keep submitting, and without waiting for anything submitted after (review D9;
     // idle() waits for the whole VkQueue, which D3D12 queues may share, and blocks every submission meanwhile).
-    // Where the last execute_lists spent its time (the device's slow-submission log): waiting for room in the ring,
-    // for compiling compute pipelines, preparing the lists, recording them (acquire through vkEndCommandBuffer), and
-    // submitting.
-    struct ExecuteTiming {
-        std::uint32_t room_ms = 0, compute_wait_ms = 0, prepare_ms = 0, record_ms = 0, submit_ms = 0;
-        std::uint32_t title_map_ms = 0;  // of record: mapping title memory into the page table (g_title_map_ns)
-    };
-    ExecuteTiming last_timing() const { return last_timing_; }
-    ExecuteTiming last_timing_{};
 
     // This queue's timeline and the value of its latest submission (VulkanContext::note_upload).
     VkSemaphore progress_semaphore() const { return progress_; }
@@ -4081,11 +3876,11 @@ private:
             !funcs.vkAllocateMemory || !funcs.vkFreeMemory || !funcs.vkBindBufferMemory || !funcs.vkMapMemory ||
             !funcs.vkUnmapMemory || !funcs.vkGetBufferDeviceAddress || !vk.host_at || !vk.buffer_at ||
             !build.instance_count)
-            return queue_unsupported(__LINE__);
+            return ReplayResult::unsupported;
         const std::uint64_t bytes = 8ull * build.instance_count;
         const std::uint8_t* guest = nullptr;
         const HostReadStatus status = vk.host_at(build.instances_va, bytes, guest);
-        if (status == HostReadStatus::not_cpu_written) return queue_unsupported(__LINE__);
+        if (status == HostReadStatus::not_cpu_written) return ReplayResult::unsupported;
         if (status != HostReadStatus::ok) return ReplayResult::invalid_copy;
 
         KhrInstanceStage stage{};
@@ -4094,12 +3889,12 @@ private:
                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
                                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
                            stage))
-            return queue_unsupported(__LINE__);
+            return ReplayResult::unsupported;
 
         void* mapped = nullptr;
         if (funcs.vkMapMemory(context_.device(), stage.memory, 0, bytes, 0, &mapped) != VK_SUCCESS) {
             discard();
-            return queue_unsupported(__LINE__);
+            return ReplayResult::unsupported;
         }
         // Validate and translate in one pass straight into the staging buffer; no second vector of addresses.
         for (std::uint32_t i = 0; i < build.instance_count; ++i) {
@@ -4124,7 +3919,7 @@ private:
         stage.address = funcs.vkGetBufferDeviceAddress(context_.device(), &device_address);
         if (!stage.address) {
             discard();
-            return queue_unsupported(__LINE__);
+            return ReplayResult::unsupported;
         }
         stages.push_back(std::move(stage));
         address = stages.back().address;
@@ -4238,15 +4033,9 @@ private:
     ReplayResult execute_lists(std::span<const CommandList* const> lists, std::uint64_t execute_call,
                                std::span<const CommandList* const> identity,
                                std::span<const BreadcrumbRing::Names> held_names) {
-        using phase_clock = std::chrono::steady_clock;
-        const auto phase_start = phase_clock::now();
-        last_timing_ = {};
-        const auto phase_ms = [](phase_clock::time_point a, phase_clock::time_point b) {
-            return static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count());
-        };
         {
             const submit_phases::Scope waited(submit_phases::wait_room);
-            if (context_.is_device_lost() || !wait_for_room()) return queue_unsupported(__LINE__);
+            if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
         }
         if (context_.before_execute_) context_.before_execute_();
         struct AfterExecute {
@@ -4263,21 +4052,14 @@ private:
                 submit_phases::submitted();
             }
         } replayed;
-        if (context_.input_probe_)
-            context_.input_probe_(lists, execute_call, kind_ == QueueKind::direct ? "direct" :
-                                                      kind_ == QueueKind::compute ? "compute" : "copy");
-        const auto room = phase_clock::now();
         wait_for_pending_compute(lists);
-        last_timing_.room_ms = phase_ms(phase_start, room);
-        last_timing_.compute_wait_ms = phase_ms(room, phase_clock::now());
-        const auto prepare_start = phase_clock::now();
         context_.wait_title_binds(lists);  // copies into streamed textures whose bind is not made yet (in "prepare")
         if (kind_ != QueueKind::direct)
             for (const auto* list : lists)
                 for (const auto& command : list->commands())
                     if (std::holds_alternative<ClearRenderTarget>(command) ||
                         std::holds_alternative<ClearDepthStencil>(command))
-                        return queue_unsupported(__LINE__);
+                        return ReplayResult::unsupported;
         VkCommandBuffer command_buffer = VK_NULL_HANDLE;
         struct KhrGuard {
             VulkanQueue* queue;
@@ -4417,12 +4199,12 @@ private:
         std::unique_ptr<IndirectArgumentClamp::Batch> clamp_batch;
         if (captures) {
             if (kind_ == QueueKind::copy || !context_.predicate_reducer_ || family_ != context_.predicate_family_)
-                return queue_unsupported(__LINE__);
+                return ReplayResult::unsupported;
             // The helper's lazy pipeline is shared by queues. Serialize preparation with the tracker lock,
             // retaining main's resource -> tracker -> submit lock order through emit and submission.
             if (!tracker_lock.owns_lock()) tracker_lock.lock();
             batch = context_.predicate_reducer_->batch(captures);
-            if (!batch) return queue_unsupported(__LINE__);
+            if (!batch) return ReplayResult::unsupported;
             replay.prepare_predicate = [&](VkBuffer buffer, VkDeviceSize offset, PredicateCapture& out) {
                 return batch->prepare(buffer, offset, out);
             };
@@ -4571,7 +4353,7 @@ private:
             if (prepared[i].segment_count > UINT32_MAX - segments ||
                 prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments) {
                 failure_.reason = "query segment count overflow";
-                prepare_result = queue_unsupported(__LINE__);
+                prepare_result = ReplayResult::unsupported;
                 break;
             }
             segments += prepared[i].segment_count;
@@ -4624,7 +4406,7 @@ private:
                 info.pipelineStatistics = kMeshStatisticsFlags;
                 if (context_.vk.vkCreateQueryPool(statistics->device, &info, nullptr, &statistics->mesh_pool) !=
                     VK_SUCCESS)
-                    return queue_unsupported(__LINE__);
+                    return ReplayResult::unsupported;
                 // The mesh-primitives count of a mesh segment (D3D-MESH-CLIPPING-COUNTER): a query of its own type,
                 // which the pipeline-statistics pool cannot hold. The device needs the meshShaderQueries feature,
                 // or the clipping field of a mesh segment stays 0.
@@ -4634,7 +4416,7 @@ private:
                     primitives.queryCount = statistics_segments;
                     if (context_.vk.vkCreateQueryPool(statistics->device, &primitives, nullptr,
                                                       &statistics->primitives_pool) != VK_SUCCESS)
-                        return queue_unsupported(__LINE__);
+                        return ReplayResult::unsupported;
                 }
             }
         }
@@ -4671,9 +4453,6 @@ private:
             }
         }
 
-        last_timing_.prepare_ms = phase_ms(prepare_start, phase_clock::now());
-        const auto record_start = phase_clock::now();
-        const std::uint64_t title_map_before = g_title_map_ns;
         CommandSlot* slot = acquire();
         if (!slot) {
             failure_.reason = "no command slot";
@@ -4712,7 +4491,7 @@ private:
                                     "vkBeginCommandBuffer") != VK_SUCCESS) {
             discard();
             failure_.reason = "vkBeginCommandBuffer";
-            return queue_unsupported(__LINE__);
+            return ReplayResult::unsupported;
         }
         // D3D12 ends every ExecuteCommandLists with all its work done and its writes visible to the next one on the
         // queue (implicit state decay relies on it), and a list may then touch the same memory without a barrier:
@@ -4757,7 +4536,7 @@ private:
             if (bindless_commit) bindless_commit(submitted);
             tracker_lock.unlock();
             failure_.reason = "bindless table flush";
-            return queue_unsupported(__LINE__);
+            return ReplayResult::unsupported;
         }
         replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
         const bool bindless_uploaded = std::exchange(context_.bindless_upload_pending_, false);
@@ -4937,16 +4716,6 @@ private:
         }
         const bool ended = context_.observe_result(context_.vk.vkEndCommandBuffer(command_buffer),
                                                   "vkEndCommandBuffer") == VK_SUCCESS;
-        last_timing_.record_ms = phase_ms(record_start, phase_clock::now());
-        last_timing_.title_map_ms = static_cast<std::uint32_t>((g_title_map_ns - title_map_before) / 1000000);
-        const struct SubmitTimer {
-            VulkanQueue& q;
-            phase_clock::time_point start = phase_clock::now();
-            ~SubmitTimer() {
-                q.last_timing_.submit_ms = static_cast<std::uint32_t>(
-                    std::chrono::duration_cast<std::chrono::milliseconds>(phase_clock::now() - start).count());
-            }
-        } submit_timer{*this};
         resource_lock.unlock();  // release resource_mutex_ and pipeline_mutex_ before vkQueueSubmit while keeping tracker_lock held
         pipeline_lock.unlock();
         const bool wait_previous = ordered_timestamps && submitted_;
@@ -5027,7 +4796,7 @@ private:
         // the queue (it keeps a single upload obligation).
         if (bindless_commit) bindless_commit(submitted);
         tracker_lock.unlock();
-        return submitted ? ReplayResult::success : queue_unsupported(__LINE__);
+        return submitted ? ReplayResult::success : ReplayResult::unsupported;
     }
 
     void marker_now(DebugMarker::Kind kind, const char* label) {
@@ -5070,7 +4839,6 @@ private:
         // signatures of the lists (the application may release them right after the call).
         std::vector<std::shared_ptr<void>> pins;
         std::vector<std::shared_ptr<void>> wait_pins;  // the fences of `waits`
-        std::chrono::steady_clock::time_point held_at{};  // LEONIDA_GPU_LATENCY: when it was held
     };
 
     bool waits_pending(const std::vector<VkSemaphore>& semaphores, const std::vector<std::uint64_t>& values) const {
@@ -5149,7 +4917,6 @@ private:
                                                         : static_cast<unsigned long long>(oldest.wait_values.front()));
             }
         }
-        if (gpu_latency::enabled()) op.held_at = std::chrono::steady_clock::now();
         held_.push_back(std::move(op));
         held_front_seq_.store(held_.front().seq, std::memory_order_release);
         context_.holds().held_changed(1);
@@ -5221,16 +4988,6 @@ private:
                 Deferred op = std::move(held_.front());
                 held_.pop_front();
                 context_.holds().held_changed(-1);
-                if (gpu_latency::enabled()) {
-                    // The wait that was pending when it was held: the fence whose Signal let it go.
-                    std::uint64_t fence = 0, value = 0;
-                    for (std::size_t i = 0; i < op.waits.size(); ++i)
-                        if (op.wait_values[i] > value) {
-                            fence = std::uint64_t(reinterpret_cast<std::uintptr_t>(op.waits[i]));
-                            value = op.wait_values[i];
-                        }
-                    gpu_latency::held(int(kind_), int(op.kind), op.held_at, fence, value);
-                }
                 if (!context_.is_device_lost()) run(op);
                 // Only now: until it has run, the operation still counts as the oldest held one.
                 held_front_seq_.store(held_.empty() ? 0 : held_.front().seq, std::memory_order_release);
@@ -5381,21 +5138,15 @@ private:
             waits_ = std::move(saved_waits);
             wait_values_ = std::move(saved_values);
         };
-        // A slow flush (over 300 ms, on the submitting thread) says where it went: the first-bind layout
-        // initialisation or the bind call, and how many images and binds it carried.
-        const auto t0 = std::chrono::steady_clock::now();
-        std::size_t first_count = 0;
         {
             std::vector<ResourceId> first;
             for (const auto& op : ops)
                 if (op.first) first.push_back(op.id);
-            first_count = first.size();
             if (!first.empty() && !initialize_title_images(first)) {
                 restore();
                 return false;
             }
         }
-        const auto t1 = std::chrono::steady_clock::now();
         if (context_.title_pages_async()) {
             // The bind worker makes them (VulkanContext::set_title_pages_queue): after every queue's work submitted so
             // far, this queue's included; this queue's next submission waits for them like every other queue's
@@ -5455,29 +5206,10 @@ private:
             info.pImageOpaqueBinds = opaque_infos.data();
             info.signalSemaphoreCount = 1;
             info.pSignalSemaphores = &progress_;
-            const auto t2 = std::chrono::steady_clock::now();
             const VkResult result = vk.vkQueueBindSparse(queue_, 1, &info, VK_NULL_HANDLE);
             if (result == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
             ok = result == VK_SUCCESS;
             if (ok) context_.record_submit_locked(progress_, ticket);
-            const auto t3 = std::chrono::steady_clock::now();
-            const auto ms = [](auto a, auto b) {
-                return static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count());
-            };
-            if (ms(t0, t3) >= 300) {
-                static std::atomic<int> told{0};
-                if (told.fetch_add(1, std::memory_order_relaxed) < 200) {
-                    std::size_t image_binds = 0, opaque_binds = 0;
-                    for (const auto& i : image_infos) image_binds += i.bindCount;
-                    for (const auto& o : opaque_infos) opaque_binds += o.bindCount;
-                    std::fprintf(stderr,
-                                 "[rt] title pages: slow flush %lld ms: %zu images (%zu first), %zu image binds in %zu "
-                                 "infos, %zu opaque binds in %zu infos; first-bind init %lld ms, submit lock %lld ms, "
-                                 "vkQueueBindSparse %lld ms\n",
-                                 ms(t0, t3), ops.size(), first_count, image_binds, image_infos.size(), opaque_binds,
-                                 opaque_infos.size(), ms(t0, t1), ms(t1, t2), ms(t2, t3));
-                }
-            }
         }
         restore();
         if (!ok) {
@@ -5750,41 +5482,6 @@ private:
         return event;
     }
 
-    static void pass_trace(const CheckpointSubmission& d) {
-        static const std::uint64_t every = [] {
-            const char* v = std::getenv("LEONIDA_PASS_TRACE");
-            return v && *v ? std::strtoull(v, nullptr, 10) : 0ull;
-        }();
-        if (!every) return;
-        const std::uint64_t present = submit_phases::totals().present_serial.load(std::memory_order_relaxed);
-        if (present % every != 1 % every) return;
-        std::string line;
-        const char* last = nullptr;
-        unsigned run = 0;
-        const auto flush = [&] {
-            if (!last) return;
-            char text[96];
-            std::snprintf(text, sizeof(text), run > 1 ? " %s x%u" : " %s", last, run);
-            line += text;
-        };
-        for (const auto& x : d.dispatches) {
-            const char* name = x.shader ? x.shader : "-";
-            if (const char* slash = std::strrchr(name, '/')) name = slash + 1;
-            if (last && std::strcmp(last, name) == 0) {
-                ++run;
-                continue;
-            }
-            flush();
-            last = name;
-            run = 1;
-        }
-        flush();
-        std::fprintf(stderr, "[rt] passes: present %llu execute %llu (%s) %zu dispatches%s:%s\n",
-                     static_cast<unsigned long long>(present), static_cast<unsigned long long>(d.execute_call),
-                     d.queue_kind ? d.queue_kind : "?", d.dispatch_count,
-                     d.dispatch_count > d.dispatches.size() ? " (last 64)" : "", line.empty() ? " none" : line.c_str());
-    }
-
     bool submit(VkCommandBuffer command_buffer, VkSemaphore fence, std::uint64_t value,
                 CheckpointSubmission* diagnostics = nullptr) {
         if (context_.is_device_lost()) return false;
@@ -5834,9 +5531,6 @@ private:
             submit.pCommandBuffers = &command_buffer;
             submit.signalSemaphoreCount = signal_count;
             submit.pSignalSemaphores = signals;
-            // LEONIDA_PASS_TRACE=<n> (with LEONIDA_DEVICE_FAULT=1): in the frame after every n-th present, each
-            // submission logs its compute programs in order (repeats folded), for the frame's pass order.
-            if (diagnostics) pass_trace(*diagnostics);
             // Publish before the driver can execute a marker or a concurrent fence wait can see the loss.
             if (diagnostics) context_.device_fault()->publish(std::move(*diagnostics));
             DeviceFaultDiagnostics* const ring = context_.device_fault();
@@ -5880,12 +5574,6 @@ private:
             return false;
         }
         const bool ok = (res == VK_SUCCESS);
-        if (ok && gpu_latency::enabled()) {
-            // LEONIDA_GPU_LATENCY=1: when the GPU finished this submission, measured from the submit.
-            const auto kind = int(kind_);
-            const auto at = std::chrono::steady_clock::now();
-            context_.enqueue_fence_callback(progress_, ticket, [kind, at] { gpu_latency::done(kind, at); });
-        }
         if (ok) {
             submitted_ = ticket;
             clear_waits(ticket);
@@ -5951,13 +5639,6 @@ private:
         VkSemaphore fence = VK_NULL_HANDLE;
         DebugMarker::Kind marker_kind = DebugMarker::Kind::set;
         std::string label;
-        std::chrono::steady_clock::time_point queued_at{};
-    };
-
-    struct AsyncStats {  // under inbox_mutex_, since the last line
-        std::uint64_t calls = 0, batches = 0, room_waits = 0, room_wait_ns = 0, run_ns = 0, lag_ns = 0, lag_max_ns = 0;
-        std::size_t depth_max = 0;
-        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
     };
 
     void enqueue(Call&& call) {
@@ -5973,23 +5654,11 @@ private:
             return async_stop_ ||
                    ((!batch || inbox_batches_ < async_depth()) && inbox_.size() < 4 * std::size_t(async_depth()));
         };
-        if (!room()) {
-            const auto start = std::chrono::steady_clock::now();
-            room_cv_.wait(lock, room);
-            ++async_stats_.room_waits;
-            async_stats_.room_wait_ns += std::uint64_t(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-        }
-        if (batch) {
-            ++inbox_batches_;
-            ++async_stats_.batches;
-        }
-        ++async_stats_.calls;
+        if (!room()) room_cv_.wait(lock, room);
+        if (batch) ++inbox_batches_;
         call.seq = context_.holds().next_seq();
-        call.queued_at = std::chrono::steady_clock::now();
         context_.holds().held_changed(1);
         inbox_.push_back(std::move(call));
-        async_stats_.depth_max = std::max(async_stats_.depth_max, inbox_.size());
         lock.unlock();
         inbox_cv_.notify_one();
     }
@@ -6014,19 +5683,7 @@ private:
                 worker_busy_ = true;
             }
             if (release) release_held();
-            std::uint64_t ran_ns = 0;
-            if (have) {
-                const auto start = std::chrono::steady_clock::now();
-                run_call(call);
-                const auto end = std::chrono::steady_clock::now();
-                ran_ns = std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count());
-                const auto lag = std::uint64_t(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(start - call.queued_at).count());
-                std::lock_guard lock(inbox_mutex_);
-                async_stats_.run_ns += ran_ns;
-                async_stats_.lag_ns += lag;
-                async_stats_.lag_max_ns = std::max(async_stats_.lag_max_ns, lag);
-            }
+            if (have) run_call(call);
             {
                 std::lock_guard lock(inbox_mutex_);
                 running_seq_ = 0;
@@ -6034,7 +5691,6 @@ private:
                 if (have && call.kind == Call::Kind::execute) --inbox_batches_;
                 if (have) room_cv_.notify_all();
                 idle_cv_.notify_all();
-                report_async_locked();
             }
             if (have) context_.holds().held_changed(-1);
             call = Call{};  // the copies and pins go before the pump, outside the lock
@@ -6105,24 +5761,6 @@ private:
         }
     }
 
-    // Every 10 s, per queue: what the worker did. Called with inbox_mutex_ held.
-    void report_async_locked() {
-        const auto now = std::chrono::steady_clock::now();
-        const double s = std::chrono::duration<double>(now - async_stats_.since).count();
-        if (s < 10.0) return;
-        static constexpr const char* kinds[] = {"direct", "compute", "copy"};
-        const AsyncStats& a = async_stats_;
-        std::fprintf(stderr,
-                     "[rt] submit-async: %s queue %p: %.1f calls/s (%.1f batches/s), queued now %zu (max %zu), "
-                     "worker busy %.0f%%, call waited for the worker avg %.2f ms max %.2f ms, caller waited for "
-                     "room %llu times %.1f ms\n",
-                     kinds[int(kind_) < 3 ? int(kind_) : 0], static_cast<const void*>(this), double(a.calls) / s,
-                     double(a.batches) / s, inbox_.size(), a.depth_max, 100.0 * double(a.run_ns) / (s * 1e9),
-                     a.calls ? double(a.lag_ns) / double(a.calls) / 1e6 : 0.0, double(a.lag_max_ns) / 1e6,
-                     static_cast<unsigned long long>(a.room_waits), double(a.room_wait_ns) / 1e6);
-        async_stats_ = AsyncStats{};
-    }
-
     // What was queued before this call has run (held work may stay held, as without the worker). A worker that does
     // not come back (a GPU hang inside wait_for_room, say) is reported every 10 s, and after 60 s the caller goes on
     // without it: false.
@@ -6166,7 +5804,6 @@ private:
     std::size_t inbox_batches_ = 0;
     std::uint64_t running_seq_ = 0;  // the call the worker runs now
     bool worker_busy_ = false, release_requested_ = false, async_stop_ = false;
-    AsyncStats async_stats_;
     std::atomic<bool> async_started_{false};
     bool synchronous_ = false;  // make_synchronous()
     std::thread worker_;

@@ -95,8 +95,6 @@ std::string module_name(std::string path) {
     return path;
 }
 
-bool crt_heap_ok() { return HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr) != FALSE; }
-
 std::string host_module_name(HMODULE module) {
     // No lazy static map: GetProcAddress on a host module is reached during the title's CRT
     // initialisation, and a first-use magic static there depends on TLS/epoch state that is not
@@ -216,13 +214,6 @@ HMODULE WINAPI get_module_handle_a(LPCSTR name) {
 }
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
-    if (getenv("LEONIDA_HEAP_PROBE")) {
-        std::fprintf(stderr, "[rt] heap-probe: GetModuleHandleW entry tid=%lu\n", GetCurrentThreadId());
-        std::fflush(stderr);
-        const BOOL ok = HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr);
-        std::fprintf(stderr, "[rt] heap-probe: GetModuleHandleW entry ok=%d\n", ok);
-        std::fflush(stderr);
-    }
     if (!name) {
         // The process's own image: the mapped exe, not gta6rt.
         if (void* h = bundled_main_module()) return reinterpret_cast<HMODULE>(h);
@@ -332,10 +323,6 @@ DWORD WINAPI get_module_file_name_a(HMODULE module, LPSTR buffer, DWORD size) {
 }
 
 FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
-    const bool heap_probe = getenv("LEONIDA_HEAP_PROBE") != nullptr;
-    if (heap_probe)
-        std::fprintf(stderr, "[rt] heap-probe: GetProcAddress entry tid=%lu module=%p ok=%d\n",
-                     GetCurrentThreadId(), module, crt_heap_ok());
     if (const Pseudo* p = pseudo(module)) {
         if (!name) {
             SetLastError(ERROR_PROC_NOT_FOUND);
@@ -365,10 +352,8 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
     }
 
     const std::string what = IS_INTRESOURCE(name) ? "#" + std::to_string(reinterpret_cast<uintptr_t>(name)) : name;
-    if (heap_probe) std::fprintf(stderr, "[rt] heap-probe: after name ok=%d name=%s\n", crt_heap_ok(), what.c_str());
     bool owns_handle = false;
     void* fn = get_bundled_proc_address(module, what, owns_handle);
-    if (heap_probe) std::fprintf(stderr, "[rt] heap-probe: after bundled ok=%d owns=%d\n", crt_heap_ok(), owns_handle);
     if (owns_handle) {
         if (fn) return reinterpret_cast<FARPROC>(fn);
         SetLastError(ERROR_PROC_NOT_FOUND);
