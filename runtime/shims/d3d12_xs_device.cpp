@@ -4270,8 +4270,33 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                 // CopyResourceX(dst, src, flags): CopyResource with a trailing flags word, which is dropped.
                 if (layout == kConsoleLayoutNewer && a1 && a2) {
                     self->part_has_work = true;
-                    self->real->CopyResource(reinterpret_cast<ID3D12Resource*>(unwrap_object(a1)),
-                                             reinterpret_cast<ID3D12Resource*>(unwrap_object(a2)));
+                    auto* const dst = reinterpret_cast<ID3D12Resource*>(unwrap_object(a1));
+                    auto* const src = reinterpret_cast<ID3D12Resource*>(unwrap_object(a2));
+                    const D3D12_RESOURCE_DESC dd = dst->GetDesc(), sd = src->GetDesc();
+                    // A buffer into a texture (the game's upload ring into a texture, 0x1404F4210): on the console a
+                    // copy of the bytes into the texture's memory, which D3D12's CopyResource refuses (the replay
+                    // took it as an invalid copy). A texture the title placed answers its title address
+                    // (Resource::GetGPUVirtualAddress), and its image follows its title bytes (the layer's title
+                    // texture sync): the bytes move there, as many as the buffer holds and the texture takes.
+                    if (dd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && sd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+                        const std::uint64_t to = dst->GetGPUVirtualAddress(), from = src->GetGPUVirtualAddress();
+                        const D3D12_RESOURCE_ALLOCATION_INFO info = self->device->real->GetResourceAllocationInfo(0, 1, &dd);
+                        const std::uint64_t bytes = std::min<std::uint64_t>(sd.Width, info.SizeInBytes);
+                        if (to && from && bytes && info.SizeInBytes != UINT64_MAX &&
+                            leonida::kernel_writes::write(reinterpret_cast<void*>(to), reinterpret_cast<const void*>(from),
+                                                          static_cast<std::size_t>(bytes))) {
+                            rt::xmem::note_title_written(reinterpret_cast<const void*>(to), static_cast<std::size_t>(bytes));
+                            static std::atomic<std::uint64_t> told{0};
+                            const std::uint64_t n = told.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if ((n & (n - 1)) == 0)
+                                std::fprintf(stderr, "[rt] d3d12_xs: list slot 86 CopyResourceX: %llu buffer-to-texture "
+                                                     "copies into title memory (last %llux%u format %d, %llu bytes)\n",
+                                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(dd.Width),
+                                             dd.Height, int(dd.Format), static_cast<unsigned long long>(bytes));
+                            return 0;
+                        }
+                    }
+                    self->real->CopyResource(dst, src);
                     return 0;
                 }
             }
