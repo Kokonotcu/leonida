@@ -177,6 +177,19 @@ inline bool linear_layout(const D3D12_RESOURCE_DESC& d, ResourceLayout& out) {
     return true;
 }
 
+// Where the texels of `layout` end: the last subresource's end, before size_bytes rounds the resource up to 64 KiB.
+// What a copy of the texels reads; the padding after it need not be committed (a 256x8 R8 plane is 2 KiB of a 64 KiB
+// size, and a title that commits only those 2 KiB still has its texels copied).
+inline std::uint64_t texel_extent(const ResourceLayout& layout) {
+    std::uint64_t end = 0;
+    for (std::uint32_t p = 0; p < layout.planes && p < 4; ++p) {
+        const PlaneLayout& plane = layout.plane[p];
+        for (std::uint32_t m = 0; m < layout.mip_levels && m < kMaxMips; ++m)
+            end = std::max(end, plane.base_offset_bytes + plane.mip[m].offset_bytes + plane.mip[m].size_bytes);
+    }
+    return end ? std::min(end, layout.size_bytes) : layout.size_bytes;
+}
+
 // Subresource `subresource` (mip + slice * mips, D3D12's numbering) of `layout` as a D3D12 placed footprint, the
 // offset from the resource's start. False past the last subresource.
 inline bool footprint(const D3D12_RESOURCE_DESC& d, const ResourceLayout& layout, std::uint32_t subresource,

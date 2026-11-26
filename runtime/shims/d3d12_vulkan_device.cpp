@@ -9734,7 +9734,8 @@ std::uint64_t probe_hash(const std::uint8_t* p, std::size_t bytes) {
 // contents and the intro video showed grey, then all green (YUV zeros). Such textures are hashed for life, at most
 // every kMappedRecheck (one check a frame at 60 Hz), outside the byte budget: there are few (12 in the intro video).
 // five-star-recomp found the same (ThatRecompDev, docs/gpu-resources.md, "CPU-mapped textures").
-void mark_title_texture_mapped(const Resource* resource);
+void mark_title_texture_mapped(const Resource* resource, const D3D12_RESOURCE_DESC& desc, bool title_placed = true);
+std::shared_ptr<const leonida::xg_console::Layout> console_layout_of(const D3D12_RESOURCE_DESC& desc, std::uint32_t word);
 bool register_title_texture(Resource* texture, const void* address, const D3D12_RESOURCE_DESC& desc);
 
 // Set around the creation of a title-placed texture (create_at_host_address): where in the title's memory it lies, so
@@ -9831,12 +9832,38 @@ bool overlaps_mapped_range(const std::uint8_t* title, std::size_t bytes) {
     return false;
 }
 
-void mark_title_texture_mapped(const Resource* resource) {
+void mark_title_texture_mapped(const Resource* resource, const D3D12_RESOURCE_DESC& d, bool title_placed) {
     if (!g_title_texture_count.load(std::memory_order_acquire)) return;
     std::lock_guard lock(title_texture_mutex());
-    const TitleTexture* mapped = nullptr;
+    TitleTexture* mapped = nullptr;
     for (auto [it, end] = title_textures_by_resource().equal_range(resource); it != end; ++it)
         if (!mapped || it->second->serial > mapped->serial) mapped = it->second;  // the last registered, as before
+    // Slot 133 gave no layout word (0): the title laid out what it writes through this Map as the XG computer it made
+    // for the texture's shape right before it says (title_xg_layouts, as upstream's DeviceState::title_texture_mapped
+    // takes it). A tiled one is detiled from now on; a linear one (the glyph caches, 0x100) stays as it is.
+    // Copied before the Map as linear: copied again in the computer's layout.
+    if (TitleTexture* t = mapped; t && title_placed && !t->console_layout) {
+        std::uint32_t word = 0;
+        if (leonida::title_xg_layouts::find({std::uint32_t(d.Dimension), std::uint32_t(d.Format), d.Height,
+                                             std::uint32_t(d.DepthOrArraySize), std::uint32_t(d.MipLevels), d.Width},
+                                            word)) {
+            // The computer's word as the swizzle mode it lays out (rt::xg_xs::select_mode, as build_texture reads it:
+            // 1 linear, 0x100 + mode that mode, 0 XG's default for the shape, 4KB_S for a 2D texture), as a console
+            // layout word (0x100 + mode).
+            rt::xg_xs::ResourceDesc x{};
+            x.dimension = std::uint32_t(d.Dimension);
+            x.layout = word;
+            const std::uint32_t console_word = rt::xg_xs::kSwizzled | rt::xg_xs::select_mode(x);
+            if (auto l = console_layout_of(d, console_word)) {
+                t->console_layout = console_word;
+                t->console = std::move(l);
+                t->bytes = static_cast<std::size_t>(t->console->size);
+                g_title_texture_max_bytes = std::max(g_title_texture_max_bytes, t->bytes);
+                t->dirty = true;
+                t->copied = false;
+            }
+        }
+    }
     if (!mapped || overlaps_mapped_range(mapped->title, mapped->bytes)) return;
     const auto begin = reinterpret_cast<std::uintptr_t>(mapped->title);
     mapped_title_ranges().emplace_back(begin, begin + mapped->bytes);
@@ -11547,7 +11574,7 @@ public:
                 return E_INVALIDARG;
             }
             *data = reinterpret_cast<std::uint8_t*>(static_cast<std::uintptr_t>(va_)) + f.Offset;
-            mark_title_texture_mapped(this);  // CPU writes through this pointer reach the image (sync_title_textures)
+            mark_title_texture_mapped(this, desc_);  // CPU writes through this pointer reach the image (sync_title_textures)
             return S_OK;
         }
         if (title_linear_ && data && image_) {  // a leased linear texture with no placement address
@@ -11584,7 +11611,7 @@ public:
                                  static_cast<unsigned long long>(desc_.Width), desc_.Height, int(desc_.Format));
             }
             *data = map_shadow_ + f.Offset;
-            mark_title_texture_mapped(this);
+            mark_title_texture_mapped(this, desc_, false);
             return S_OK;
         }
         if (image_) {
@@ -12241,6 +12268,28 @@ std::vector<std::uint64_t> title_resident_ends(const D3D12_RESOURCE_DESC& desc, 
     return ends;
 }
 
+// The console's tiled layout of `desc` under the layout word `word` (0x100 + swizzle mode), or null: not tiled (a
+// linear word, or 0), or not computable. Null means the title's bytes follow the texture computer's linear layout.
+std::shared_ptr<const leonida::xg_console::Layout> console_layout_of(const D3D12_RESOURCE_DESC& desc, std::uint32_t word) {
+    namespace xc = leonida::xg_console;
+    static const bool detile = [] {
+        const char* v = std::getenv("LEONIDA_CONSOLE_DETILE");  // =0: the title's bytes are read as linear, as before
+        return !(v && v[0] == '0');
+    }();
+    if (!detile || !xc::is_console_tiled(word) || xc::swizzle_mode(word) == xc::mode_linear) return nullptr;
+    xc::Desc x;
+    x.dimension = static_cast<std::uint32_t>(desc.Dimension);
+    x.width = desc.Width;
+    x.height = desc.Height;
+    x.depth_or_array_size = desc.DepthOrArraySize;
+    x.mip_levels = desc.MipLevels;
+    x.format = static_cast<std::uint32_t>(desc.Format);
+    x.sample_count = std::max<std::uint32_t>(desc.SampleDesc.Count, 1);
+    x.layout = word;
+    if (auto l = xc::compute_layout(x)) return std::make_shared<const xc::Layout>(*l);
+    return nullptr;
+}
+
 bool register_title_texture(Resource* texture, const void* address, const D3D12_RESOURCE_DESC& desc) {
     if (!texture || !address || desc.SampleDesc.Count > 1 || (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
         return false;
@@ -12251,25 +12300,9 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
     t->title = static_cast<const std::uint8_t*>(address);
     t->bytes = static_cast<std::size_t>(t->layout->size_bytes);
     t->console_layout = rt::d3d12_xs::g_placed_console_layout;
-    namespace xc = leonida::xg_console;
-    static const bool detile = [] {
-        const char* v = std::getenv("LEONIDA_CONSOLE_DETILE");  // =0: the title's bytes are read as linear, as before
-        return !(v && v[0] == '0');
-    }();
-    if (detile && xc::is_console_tiled(t->console_layout) && xc::swizzle_mode(t->console_layout) != xc::mode_linear) {
-        xc::Desc x;
-        x.dimension = static_cast<std::uint32_t>(desc.Dimension);
-        x.width = desc.Width;
-        x.height = desc.Height;
-        x.depth_or_array_size = desc.DepthOrArraySize;
-        x.mip_levels = desc.MipLevels;
-        x.format = static_cast<std::uint32_t>(desc.Format);
-        x.sample_count = std::max<std::uint32_t>(desc.SampleDesc.Count, 1);
-        x.layout = t->console_layout;
-        if (auto l = xc::compute_layout(x)) {
-            t->console = std::make_shared<const xc::Layout>(*l);
-            t->bytes = static_cast<std::size_t>(l->size);  // what is hashed and read: the console layout's span
-        }
+    if (auto l = console_layout_of(desc, t->console_layout)) {
+        t->console = std::move(l);
+        t->bytes = static_cast<std::size_t>(t->console->size);  // what is hashed and read: the console layout's span
     }
     {
         // The layout words the title's textures come with (the first of each, with a texture that has it).
@@ -24157,7 +24190,10 @@ bool guarded_copy_from_title(Resource* resource, const std::uint8_t* title, cons
     // and the title's threads then hung at their start under the runtime's own loader (0.8 s into the boot).
     if (!bytes) return false;
     std::vector<std::uint8_t> copy(bytes);
-    if (!guarded_title_read(copy.data(), title, resident_prefix(console, bytes, first_mip))) return false;
+    // A linear layout reads its texels only, not the 64 KiB padding after them (rt::xg::texel_extent).
+    const std::size_t read = console ? resident_prefix(console, bytes, first_mip)
+                                     : static_cast<std::size_t>(rt::xg::texel_extent(layout));
+    if (!guarded_title_read(copy.data(), title, read)) return false;
     return console ? resource->copy_from_console(copy.data(), *console, first_mip)
                    : resource->copy_from_title(copy.data(), layout, first_mip);
 }
@@ -24429,7 +24465,10 @@ void sync_title_textures() {
             // of its range is its neighbours' memory (resident_prefix).
             first_mip = pages->first_mip(t->resource->id());
         }
-        const std::size_t span = resident_prefix(t->console.get(), t->bytes, first_mip);
+        // What is hashed and read: a linear texture's texels, not the padding to its 64 KiB size, which the title need
+        // not commit (a guarded read faulted there, and the texture was never copied: d3d12_mapped_plane_async).
+        const std::size_t span = t->console ? resident_prefix(t->console.get(), t->bytes, first_mip)
+                                            : std::min(t->bytes, static_cast<std::size_t>(rt::xg::texel_extent(*t->layout)));
         // LEONIDA_DUMP_TARGETS with LEONIDA_DUMP_TITLE_TEXTURE: the glyph atlas's image is dumped with the targets.
         static const bool note_atlas =
             leonida::debug_targets::dump_at() && std::getenv("LEONIDA_DUMP_TITLE_TEXTURE") != nullptr;
@@ -24545,9 +24584,12 @@ void sync_title_textures() {
         // A read that faulted (reserved or unmapped pages): unreadable for a second, not retried at every submission.
         // A mapped texture's pages are committed then (xmem commits on first touch; the title writes them through
         // another view, the mirrored window), so the next try sees what it wrote.
+        // A mapped texture is tried again at the next submission: the title writes it through its mapping and draws it
+        // in the next frame (a plane whose pages were committed after its Map kept its old texels for a second:
+        // d3d12_existing_heap's persistent slot-133 plane). Mapped textures are few (video planes, the glyph atlas).
         const auto faulted = [&] {
             t->readable = false;
-            t->readable_until = now + std::chrono::seconds(1);
+            t->readable_until = t->mapped ? now : now + std::chrono::seconds(1);
             const SyncTimer ready_timer(sync_stats.ready_ns);
             if (t->mapped)
                 if (const auto commit = rt::xmem::g_commit_range.load(std::memory_order_acquire)) commit(t->title, span);
