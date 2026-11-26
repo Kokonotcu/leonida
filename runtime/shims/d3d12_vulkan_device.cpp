@@ -19350,12 +19350,23 @@ private:
     // The console layout of a description, as XG lays it out; false with the reason when this XG model lacks it.
     static bool title_layout(const rt::xg_xs::ResourceDesc& d, rt::xg_xs::Texture& out, const char*& why) {
         namespace xg = rt::xg_xs;
-        const std::uint32_t mode = xg::select_mode(d);
+        std::uint32_t mode = xg::select_mode(d);
         if (d.samples > 1) return why = "multisampled", false;
+        xg::ResourceDesc plain = d;
+        // ADDR_SW_4KB_R_X (23) and ADDR_SW_64KB_R_X (27), the modes XGSuggestSwizzleMode answers for 2D textures: the
+        // shipped textures' block patterns for them (src/xg_console_layout.h, measured) are, element size by element
+        // size, this model's 4KB_S and 64KB_D patterns (1-byte texels: xxxxyyyyyxyx and xxxyyyxyyxyxyxyx), so they are
+        // laid out as those. Without it the UI's views in mode 23 were null views: Scaleform's 1x1 RGBA8 white
+        // texture read zero, and white text and the solid UI shapes drew black or not at all (account picker).
+        // A single texel (the 1x1x1 RGBA8 the UI also makes as a 3D texture) sits at offset 0 in any mode.
+        const bool one_texel = d.width == 1 && d.height == 1 && d.depth_or_array == 1 && d.mips == 1;
+        if ((d.dimension == xg::kTexture2D || one_texel) && (mode == 23 || mode == xg::k64kbRX)) {
+            mode = mode == 23 ? xg::k4kbS : xg::k64kbD;
+            plain.layout = xg::kSwizzled | mode;
+        }
         if (mode != xg::kLinear && mode != xg::k4kbS && mode != xg::k64kbS && mode != xg::k64kbD)
             return why = "swizzle mode the XG model lacks", false;
         if (!xg::format_info(d.format).bytes) return why = "format the XG model lacks", false;
-        xg::ResourceDesc plain = d;
         plain.flags &= ~(xg::kRenderTarget | xg::kDepthStencil);
         if (!xg::build_texture(plain, out)) return why = "description the XG model refuses", false;
         return true;
@@ -26437,6 +26448,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                                             VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                                             VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
         info.a8_render_target = maintenance5.maintenance5 == VK_TRUE && (a8.optimalTilingFeatures & needed) == needed;
+        // Ours (RGBA8 A8 render targets, kA8TargetFormat) unless LEONIDA_A8_NATIVE=1: with upstream's
+        // VK_FORMAT_A8_UNORM_KHR images on NVIDIA the UI's 3840x2160 A8 gradient mask stayed all zero through every
+        // draw into it (dumps, 2026-11-26), so the text multiplied by it drew black and the loading screen's card was
+        // missing, as before the RGBA8 images (kA8TargetFormat's note).
+        if (const char* v = std::getenv("LEONIDA_A8_NATIVE"); !(v && v[0] == '1')) info.a8_render_target = false;
     }
     std::fprintf(stderr, "[rt] d3d12: A8_UNORM textures are %s\n",
                  info.a8_render_target ? "VK_FORMAT_A8_UNORM_KHR images (render targets too)"
