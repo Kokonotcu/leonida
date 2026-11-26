@@ -12163,7 +12163,7 @@ private:
     bool previously_pinned_ = false;
     std::uint64_t title_linear_limit_ = 0;
     std::atomic<bool> gpu_referenced_{false};
-    std::mutex title_map_mutex_;
+    std::shared_mutex title_map_mutex_;  // an SRW lock: 8 bytes, not std::mutex's 80, in each of ~40,000 resources
     std::map<UINT,TitleMap> title_maps_;
     // One subresource region in copy units: rows of texels, or of 4x4 blocks for block-compressed formats.
     struct Region {
@@ -13744,6 +13744,7 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
 // A pipeline state, compute (create_compute) or graphics (create_graphics): each shader is found by the SHA-256 of
 // its FSSM program in the translator's index, and the FSSM blob is copied into the arena as the shader's code base.
 std::atomic<long> live_pipeline_state_count{0};  // live_pipeline_states()
+std::atomic<long> live_pipeline_state_views{0};  // LOCAL DIAGNOSTIC (mem probe): live PSOs that are views of a shared one
 
 // What the bindless set layout was made from, for a compute pipeline's journal name: a pipeline built against another
 // layout is another pipeline. Field by field, so padding never reaches the hash.
@@ -14166,22 +14167,28 @@ public:
         auto& vk = device_.context->vk;
         const VkDevice dev = device_.info.device;
         if (registered_) device_.context->remove_pipeline(id());
-        if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
-        // pipeline_.layout and graphics_.layout are the device's shared layouts (DeviceState::shared_layout).
+        leonida::ComputePipeline* const compute = compute_parts_.load(std::memory_order_acquire);
+        GraphicsParts* const graphics = graphics_parts_.load(std::memory_order_acquire);
+        if (compute && compute->pipeline) vk.vkDestroyPipeline(dev, compute->pipeline, nullptr);
+        // The compute and graphics layouts are the device's shared layouts (DeviceState::shared_layout).
         if (module_) device_.shader_modules().release(module_);
         if (gpl_upgrade_) {
             // Waits for a running optimised link; one not started yet finds itself cancelled.
             std::lock_guard lock(gpl_upgrade_->mutex);
             gpl_upgrade_->cancelled = true;
             if (gpl_upgrade_->optimized) vk.vkDestroyPipeline(dev, gpl_upgrade_->optimized, nullptr);
-            if (gpl_upgrade_->retired_fast) graphics_.pipeline = VK_NULL_HANDLE;  // the deletion queue destroys it
+            if (gpl_upgrade_->retired_fast && graphics)
+                graphics->graphics.pipeline = VK_NULL_HANDLE;  // the deletion queue destroys it
         }
-        if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
+        if (graphics && graphics->graphics.pipeline) vk.vkDestroyPipeline(dev, graphics->graphics.pipeline, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         for (VkShaderModule module : modules_) device_.shader_modules().release(module);
         for (VkShaderModule module : built_modules_) device_.shader_modules().release(module);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
         --live_pipeline_state_count;
+        if (native_owner_) --live_pipeline_state_views;
+        delete compute;
+        delete graphics;
     }
 
     // Pipeline layouts declare the whole 144-byte block as one push-constant range. A device whose
@@ -14223,7 +14230,10 @@ public:
         return native_owner_ ? native_owner_->id() : reinterpret_cast<std::uintptr_t>(static_cast<const ID3D12PipelineState*>(this));
     }
     // Upstream's native PSO sharing (slots 55/57): a view PSO answers with the compiled owner's pipeline.
-    void share_native_graphics(std::shared_ptr<PipelineState> owner) { native_owner_ = std::move(owner); }
+    void share_native_graphics(std::shared_ptr<PipelineState> owner) {
+        if (!native_owner_ && owner) ++live_pipeline_state_views;
+        native_owner_ = std::move(owner);
+    }
     bool ensure_native_source(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& pc, D3D12_SHADER_BYTECODE mesh,
                               std::span<const rt::d3d12_xs::PsoStreamRecord::ShaderData> containers) {
         std::call_once(native_source_once_,[&]{
@@ -14321,9 +14331,9 @@ public:
         auto& vk = device_.context->vk;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
         if (stub_pipelines_enabled()) {
-            graphics_.pending = true;
-            graphics_.mesh = mesh;
-            device_.context->add_graphics_pipeline(id(), graphics_);
+            gparts().graphics.pending = true;
+            gparts().graphics.mesh = mesh;
+            device_.context->add_graphics_pipeline(id(), gparts().graphics);
             registered_ = true;
             is_graphics_ = true;
             return S_OK;
@@ -14412,7 +14422,7 @@ public:
             [](auto& g) {
                 if constexpr (requires { g.rectangle_variant_topology; })
                     g.rectangle_variant_topology = leonida::topology_rect_list;
-            }(graphics_);
+            }(gparts().graphics);
         if (geometry && topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
             log_once("a translated geometry shader takes triangles; topology type", int(topology_type));
             return E_INVALIDARG;
@@ -14453,7 +14463,7 @@ public:
                            {"gs", VK_SHADER_STAGE_GEOMETRY_BIT, desc.GS},
                            {"ps", VK_SHADER_STAGE_FRAGMENT_BIT, desc.PS}};
         // stage_infos.size() indexes the recipe's per-stage required-size structs: one for every table entry.
-        static_assert(std::size(stages) <= std::size(decltype(recipe_.required_sizes){}),
+        static_assert(std::size(stages) <= std::size(decltype(gparts().recipe.required_sizes){}),
                       "Recipe::required_sizes needs an entry per graphics stage");
         // B4G4R4A4 targets stored as RGBA8 (no 4444 format renders on the device): the pixel shader's output is
         // quantised to 4 bits (rewrite_fragment); blending such a target is refused.
@@ -14484,7 +14494,7 @@ public:
         bool uses_bindless = false;  // a stage declares set-0 bindings: the layout holds the device's set 0
         std::vector<VkPipelineShaderStageCreateInfo> stage_infos;
         // Chained from stage_infos, which the recipe keeps for variants built at draw time: so they live in the recipe.
-        auto& required_sizes = recipe_.required_sizes;
+        auto& required_sizes = gparts().recipe.required_sizes;
         const Stage* code_stage = nullptr;
         // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU): the pixel stage writes the depth D24
         // would hold, biased in D24 units and quantised (src/depth24_fragment.h, D3D-309), and the rasterizer's own
@@ -14542,9 +14552,9 @@ public:
                 if (missing_shader_stub_enabled()) {
                     // A graphics PSO without that shader: registered pending, so its draws are skipped
                     // (GraphicsPipeline::pending), instead of a failure the title reads through as null.
-                    graphics_.pending = true;
-                    graphics_.mesh = ms != nullptr && ms->pShaderBytecode != nullptr;
-                    device_.context->add_graphics_pipeline(id(), graphics_);
+                    gparts().graphics.pending = true;
+                    gparts().graphics.mesh = ms != nullptr && ms->pShaderBytecode != nullptr;
+                    device_.context->add_graphics_pipeline(id(), gparts().graphics);
                     registered_ = true;
                     is_graphics_ = true;
                     return S_OK;
@@ -14732,7 +14742,7 @@ public:
             attributes.push_back({input->register_index, element.InputSlot, format, offset});
             const bool instance = element.InputSlotClass == D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA;
             // Step rate 0: every instance reads element 0, which a stride of 0 gives (set at each draw).
-            if (instance && element.InstanceDataStepRate == 0) graphics_.zero_step_slots |= 1u << element.InputSlot;
+            if (instance && element.InstanceDataStepRate == 0) gparts().graphics.zero_step_slots |= 1u << element.InputSlot;
             if (instance && element.InstanceDataStepRate > 1) {
                 if (!device_.info.vertex_attribute_divisor) {
                     log_once("instance step rates above 1 need vertexAttributeInstanceRateDivisor; rate",
@@ -14745,11 +14755,11 @@ public:
                     // Upstream's flag, where vulkan_replay.h has it: an actual divisor, not a zero-stride emulation.
                     [](auto& g) {
                         if constexpr (requires { g.nonunit_vertex_divisor; }) g.nonunit_vertex_divisor = true;
-                    }(graphics_);
+                    }(gparts().graphics);
                 }
             }
-            if (!(graphics_.vertex_slots & (1u << element.InputSlot))) {
-                graphics_.vertex_slots |= 1u << element.InputSlot;
+            if (!(gparts().graphics.vertex_slots & (1u << element.InputSlot))) {
+                gparts().graphics.vertex_slots |= 1u << element.InputSlot;
                 bindings.push_back({element.InputSlot, 0,  // stride: dynamic, from IASetVertexBuffers
                                     instance ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX});
             }
@@ -14781,7 +14791,7 @@ public:
                 log_once("index-buffer strip cut value not supported:", desc.IBStripCutValue);
                 return E_INVALIDARG;
             }
-            graphics_.strip_cut = desc.IBStripCutValue;
+            gparts().graphics.strip_cut = desc.IBStripCutValue;
         }
 
         const D3D12_RASTERIZER_DESC& r = desc.RasterizerState;
@@ -14917,26 +14927,26 @@ public:
 
         // With multiViewport, VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT let a draw bind 1..16 viewports and scissors
         // (pso::Recipe::viewport_with_count; shader objects always set the counts, one without the feature).
-        graphics_.viewport_with_count = features.multiViewport && device_.context->vk.vkCmdSetViewportWithCount &&
+        gparts().graphics.viewport_with_count = features.multiViewport && device_.context->vk.vkCmdSetViewportWithCount &&
                                         device_.context->vk.vkCmdSetScissorWithCount;
 
-        graphics_.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
+        gparts().graphics.color_formats.assign(desc.NumRenderTargets, VK_FORMAT_UNDEFINED);
         for (UINT i = 0; i < desc.NumRenderTargets; ++i) {
             if (desc.RTVFormats[i] == DXGI_FORMAT_UNKNOWN) continue;
-            graphics_.color_formats[i] = vulkan_format(desc.RTVFormats[i], false).format;
+            gparts().graphics.color_formats[i] = vulkan_format(desc.RTVFormats[i], false).format;
             // B4G4R4A4 targets are RGBA8 images where no 4444 format renders (DeviceState's texture format choice).
-            if (graphics_.color_formats[i] == VK_FORMAT_A4R4G4B4_UNORM_PACK16 &&
+            if (gparts().graphics.color_formats[i] == VK_FORMAT_A4R4G4B4_UNORM_PACK16 &&
                 !device_.color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16))
-                graphics_.color_formats[i] = VK_FORMAT_R8G8B8A8_UNORM;
+                gparts().graphics.color_formats[i] = VK_FORMAT_R8G8B8A8_UNORM;
             // A8 render targets are VK_FORMAT_A8_UNORM_KHR images where the device has them (upstream), else RGBA8
             // (kA8TargetFormat, ours): either way the pixel shader's alpha lands in alpha, and the alpha blend factors
             // and write mask apply to it as on the console (texture_format makes the images).
             if (desc.RTVFormats[i] == DXGI_FORMAT_A8_UNORM)
-                graphics_.color_formats[i] = device_.info.a8_render_target ? kA8UnormFormat : kA8TargetFormat;
+                gparts().graphics.color_formats[i] = device_.info.a8_render_target ? kA8UnormFormat : kA8TargetFormat;
             // Upstream: an R9G9B9E5 target the GPU cannot render is a B10G11R11 image (r9g9b9e5_target_stand_in).
             if (desc.RTVFormats[i] == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && device_.r9g9b9e5_target_stand_in)
-                graphics_.color_formats[i] = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
-            if (graphics_.color_formats[i] == VK_FORMAT_UNDEFINED) {
+                gparts().graphics.color_formats[i] = VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+            if (gparts().graphics.color_formats[i] == VK_FORMAT_UNDEFINED) {
                 log_once("render-target format not supported yet:", desc.RTVFormats[i]);
                 return E_INVALIDARG;
             }
@@ -14945,14 +14955,14 @@ public:
             Format f = vulkan_format(desc.DSVFormat, true);
             if (f.format == VK_FORMAT_D24_UNORM_S8_UINT && !device_.depth_usable(f.format))
                 f.format = VK_FORMAT_D32_SFLOAT_S8_UINT;  // as CreateCommittedResource does
-            graphics_.depth_format = device_.depth_backing(f.format);  // upstream: D16S8 where the GPU lacks it
-            graphics_.depth_aspects = f.aspects;
+            gparts().graphics.depth_format = device_.depth_backing(f.format);  // upstream: D16S8 where the GPU lacks it
+            gparts().graphics.depth_aspects = f.aspects;
         }
         if (samples > 1) {
             const auto& dinfo = device_.info;
-            const bool has_color = std::any_of(graphics_.color_formats.begin(), graphics_.color_formats.end(),
+            const bool has_color = std::any_of(gparts().graphics.color_formats.begin(), gparts().graphics.color_formats.end(),
                                                [](VkFormat f) { return f != VK_FORMAT_UNDEFINED; });
-            const bool has_depth = graphics_.depth_format != VK_FORMAT_UNDEFINED;
+            const bool has_depth = gparts().graphics.depth_format != VK_FORMAT_UNDEFINED;
             if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
                     dinfo.get_instance_proc ? dinfo.get_instance_proc(dinfo.instance, "vkGetPhysicalDeviceProperties")
                                             : nullptr)) {
@@ -14960,9 +14970,9 @@ public:
                 get_props(dinfo.physical, &props);
                 VkSampleCountFlags supported = ~VkSampleCountFlags(0);
                 if (has_color) supported &= props.limits.framebufferColorSampleCounts;
-                if (has_depth && (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
+                if (has_depth && (gparts().graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
                     supported &= props.limits.framebufferDepthSampleCounts;
-                if (has_depth && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
+                if (has_depth && (gparts().graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
                     supported &= props.limits.framebufferStencilSampleCounts;
                 if (!has_color && !has_depth) supported &= props.limits.framebufferNoAttachmentsSampleCounts;
                 if (!(supported & samples)) {
@@ -14974,7 +14984,7 @@ public:
                 log_once("cannot query per-format multisample support; samples", int(samples));
                 return E_INVALIDARG;
             }
-            for (const VkFormat fmt : graphics_.color_formats) {
+            for (const VkFormat fmt : gparts().graphics.color_formats) {
                 if (fmt == VK_FORMAT_UNDEFINED) continue;
                 VkImageFormatProperties img_props{};
                 if (device_.image_format_properties(dinfo.physical, fmt, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL,
@@ -14986,7 +14996,7 @@ public:
             }
             if (has_depth) {
                 VkImageFormatProperties img_props{};
-                if (device_.image_format_properties(dinfo.physical, graphics_.depth_format, VK_IMAGE_TYPE_2D,
+                if (device_.image_format_properties(dinfo.physical, gparts().graphics.depth_format, VK_IMAGE_TYPE_2D,
                                                     VK_IMAGE_TILING_OPTIMAL,
                                                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
                                                     &img_props) != VK_SUCCESS ||
@@ -15002,7 +15012,7 @@ public:
         // (The geometry bit only where the device has the stage: a range may not name a stage it cannot run.)
         for (const Stage& stage : stages)
             if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
-                graphics_.push_stages |= stage.bit;
+                gparts().graphics.push_stages |= stage.bit;
         // Shader objects (docs/aot_pipelines.md step 2) unless a stage is the built-in depth24 shader, which has no
         // index entry to store a binary under: that PSO keeps the pipeline path.
         bool builtin_stage = false;
@@ -15015,44 +15025,44 @@ public:
         // objects it is the shared one every shader object is made with (one push range over all graphics stages);
         // with pipeline libraries the one the shared parts are made with (the same push range, set 0 when the device
         // has it, so a part fits every PSO whatever its other stage declares).
-        layout_push_stages_ = graphics_.push_stages;
+        layout_push_stages_ = gparts().graphics.push_stages;
         layout_push_size_ = sizeof(leonida::ShaderUserData);
         layout_bindless_ = uses_bindless;
         if (shader_objects) {
             const leonida::shader_objects::Layout so_layout = device_.so_graphics_layout();
             layout_push_stages_ = so_layout.push.stageFlags;
-            graphics_.push_stages = layout_push_stages_;
+            gparts().graphics.push_stages = layout_push_stages_;
             layout_bindless_ = so_layout.set0 != VK_NULL_HANDLE;
             uses_bindless = layout_bindless_;
         } else if (gpl_) {
             layout_push_stages_ = device_.gpl_push_stages();
-            graphics_.push_stages = layout_push_stages_;
+            gparts().graphics.push_stages = layout_push_stages_;
             layout_bindless_ = device_.bindless != nullptr;
             uses_bindless = layout_bindless_;
         }
         // The device's layout for this push range and set 0 (DeviceState::shared_layout), not one of the PSO's own.
-        graphics_.uses_set0 = uses_bindless;  // the set itself is read at submit, under the descriptor lock
-        graphics_.layout = device_.shared_layout(layout_push_stages_, layout_push_size_,
+        gparts().graphics.uses_set0 = uses_bindless;  // the set itself is read at submit, under the descriptor lock
+        gparts().graphics.layout = device_.shared_layout(layout_push_stages_, layout_push_size_,
                                                  uses_bindless ? device_.bindless->layout() : VK_NULL_HANDLE);
-        if (!graphics_.layout) return E_FAIL;
+        if (!gparts().graphics.layout) return E_FAIL;
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
-        graphics_.mesh = mesh;
-        graphics_.depth_bounds = depth_bounds;
-        recipe_.mesh = mesh;
-        recipe_.stages = std::move(stage_infos);
-        recipe_.attributes = std::move(attributes);
-        recipe_.bindings = std::move(bindings);
-        recipe_.divisors = std::move(divisors);
-        recipe_.assembly = assembly;
-        recipe_.raster = raster;
-        recipe_.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
-        recipe_.multisample = multisample;
-        graphics_.samples = samples;
-        recipe_.sample_mask = sample_mask;
-        recipe_.depth = depth;
-        recipe_.blends = std::move(blends);
-        recipe_.blend = blend;
+        gparts().graphics.mesh = mesh;
+        gparts().graphics.depth_bounds = depth_bounds;
+        gparts().recipe.mesh = mesh;
+        gparts().recipe.stages = std::move(stage_infos);
+        gparts().recipe.attributes = std::move(attributes);
+        gparts().recipe.bindings = std::move(bindings);
+        gparts().recipe.divisors = std::move(divisors);
+        gparts().recipe.assembly = assembly;
+        gparts().recipe.raster = raster;
+        gparts().recipe.conservative = r.ConservativeRaster == D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON;
+        gparts().recipe.multisample = multisample;
+        gparts().graphics.samples = samples;
+        gparts().recipe.sample_mask = sample_mask;
+        gparts().recipe.depth = depth;
+        gparts().recipe.blends = std::move(blends);
+        gparts().recipe.blend = blend;
         if (shader_objects) {
             leonida::shader_objects::GraphicsShaders shaders;
             for (const leonida::pso::Stage& m : stage_meta_) {
@@ -15085,9 +15095,9 @@ public:
             device_stages.mesh = device_.info.mesh_shader;
             const leonida::shader_objects::Functions* fn = &device_.so_fn;
             const bool conservative = device_.info.conservative_rasterization;
-            graphics_.pipeline = VK_NULL_HANDLE;
-            graphics_.shader_objects = {shaders.vertex, shaders.geometry, shaders.fragment, shaders.mesh};
-            graphics_.bind_shaders = [fn, shaders, recipe, device_stages, conservative](
+            gparts().graphics.pipeline = VK_NULL_HANDLE;
+            gparts().graphics.shader_objects = {shaders.vertex, shaders.geometry, shaders.fragment, shaders.mesh};
+            gparts().graphics.bind_shaders = [fn, shaders, recipe, device_stages, conservative](
                                          VkCommandBuffer cb, const VkViewport* viewports, const VkRect2D* scissors,
                                          std::uint32_t viewport_count, const VkDeviceSize* strides,
                                          std::uint32_t stride_count) {
@@ -15099,14 +15109,17 @@ public:
         } else {
             if (gpl_) {
                 // The pixel shader part carries the multisample state only when the shader runs per sample.
-                gpl_per_sample_ = recipe_.multisample.sampleShadingEnable == VK_TRUE;
+                gpl_per_sample_ = gparts().recipe.multisample.sampleShadingEnable == VK_TRUE;
                 for (const Stage& s : stages)
                     if (s.entry && s.bit == VK_SHADER_STAGE_FRAGMENT_BIT)
                         gpl_per_sample_ = gpl_per_sample_ || leonida::pso::spirv_runs_per_sample(s.words);
                 // What the linked pipeline takes at the draw that the whole one bakes in.
-                const leonida::pso::LibraryState state(to_recipe(0));
+                // Held through a shared pointer: the closure then fits std::function's own storage, so this PSO's
+                // copy and the context's copy (and every copy replay makes) share one state instead of each
+                // allocating its own (~62,000 graphics PSOs live in a story load).
+                const auto state = std::make_shared<const leonida::pso::LibraryState>(to_recipe(0));
                 const leonida::pso::LibraryState::Functions* fn = &device_.gpl_fn;
-                graphics_.set_state = [fn, state](VkCommandBuffer cb) { state.emit(*fn, cb); };
+                gparts().graphics.set_state = [fn, state](VkCommandBuffer cb) { state->emit(*fn, cb); };
             }
             // LEONIDA_DEFER_GRAPHICS=1: nothing is built here; the first draw builds its configuration through
             // variant() (vulkan_replay.h, GraphicsPipeline::deferred).
@@ -15114,17 +15127,17 @@ public:
                 const char* v = std::getenv("LEONIDA_DEFER_GRAPHICS");
                 return v && v[0] == '1';
             }();
-            graphics_.deferred = defer;
+            gparts().graphics.deferred = defer;
             if (!defer) {
-                graphics_.pipeline = build(0);
-                if (!graphics_.pipeline) return E_FAIL;
+                gparts().graphics.pipeline = build(0);
+                if (!gparts().graphics.pipeline) return E_FAIL;
             }
-            graphics_.variant = [this](std::uint32_t unbound) { return variant(unbound); };
+            gparts().graphics.variant = [this](std::uint32_t unbound) { return variant(unbound); };
             if (defer && async_pso_enabled()) {
                 // The base configuration builds on the compile workers at the first draw that needs it; draws are
                 // left out until then (GraphicsPipeline::ready / request).
-                graphics_.ready = [this] { return base_built_.load(std::memory_order_acquire); };
-                graphics_.request = [this] {
+                gparts().graphics.ready = [this] { return base_built_.load(std::memory_order_acquire); };
+                gparts().graphics.request = [this] {
                     if (base_requested_.exchange(true, std::memory_order_acq_rel)) return;
                     AddRef();
                     device_.compile_enqueue([this] {
@@ -15135,7 +15148,7 @@ public:
                 // The other configurations (slots a draw leaves unbound, rect lists) the same way: built inline they
                 // held the submitting thread in NVIDIA's compiler, with its queue's lock, past the title's 30 s
                 // watchdog (an uncached pipeline in the first loading screen).
-                graphics_.variant_ready = [this](std::uint32_t unbound) { return variant_ready_or_request(unbound); };
+                gparts().graphics.variant_ready = [this](std::uint32_t unbound) { return variant_ready_or_request(unbound); };
             }
         }
 
@@ -15149,14 +15162,14 @@ public:
             std::memcpy(device_.arena.mapped + offset, fssm.data(), fssm.size());
             code_bytes_ = fssm.size();
             code_base_ = offset;
-            graphics_.code_base = offset;
+            gparts().graphics.code_base = offset;
         }
         static const bool log_psos = std::getenv("LEONIDA_LOG_PSOS") != nullptr;
         std::string names;
         if (log_psos || dred_requested()) {
             for (const Stage& stage : stages)
                 if (stage.entry) names += std::string(" ") + stage.name + "=" + stage.entry->name;
-            if (log_psos) graphics_.debug_name = names;
+            if (log_psos) gparts().graphics.debug_name = names;
             if (dred_requested()) leonida::note_breadcrumb_pso_name(id(), names);
         }
         if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC: what this pipeline is, for the fsdraw probe's draw lines
@@ -15185,20 +15198,20 @@ public:
             leonida::CheckpointShaders shaders{};
             for (std::size_t i = 0; i < std::size(stages); ++i)
                 if (stages[i].entry) shaders[i] = stages[i].entry->name.c_str();
-            device_.context->add_graphics_pipeline(id(), graphics_, &shaders);
+            device_.context->add_graphics_pipeline(id(), gparts().graphics, &shaders);
         } else {
-            device_.context->add_graphics_pipeline(id(), graphics_);
+            device_.context->add_graphics_pipeline(id(), gparts().graphics);
         }
         if (log_psos) {
             // Which shaders a PSO id stands for, so a draw named by its pipeline (record_draw's log, DRED) can be
             // traced to its program.
             char blend[96] = "no colour target";
-            if (!recipe_.blends.empty()) {
-                const VkPipelineColorBlendAttachmentState& b = recipe_.blends[0];
+            if (!gparts().recipe.blends.empty()) {
+                const VkPipelineColorBlendAttachmentState& b = gparts().recipe.blends[0];
                 std::snprintf(blend, sizeof blend, "rt0 mask 0x%x blend %u (src %d dst %d op %d, a: %d %d %d), %zu rt",
                               unsigned(b.colorWriteMask), unsigned(b.blendEnable), int(b.srcColorBlendFactor),
                               int(b.dstColorBlendFactor), int(b.colorBlendOp), int(b.srcAlphaBlendFactor),
-                              int(b.dstAlphaBlendFactor), int(b.alphaBlendOp), recipe_.blends.size());
+                              int(b.dstAlphaBlendFactor), int(b.alphaBlendOp), gparts().recipe.blends.size());
             }
             std::fprintf(stderr, "[rt] d3d12: graphics PSO %llx:%s, %s\n", static_cast<unsigned long long>(id()),
                          names.c_str(), blend);
@@ -15220,8 +15233,8 @@ public:
     // A graphics pipeline state that draws nothing (LEONIDA_MISSING_SHADER_STUB): registered pending, so replay skips
     // its draws. For the title's native PSOs (device slot 57) until their description is implemented.
     HRESULT make_stub() {
-        graphics_.pending = true;
-        device_.context->add_graphics_pipeline(id(), graphics_);
+        gparts().graphics.pending = true;
+        device_.context->add_graphics_pipeline(id(), gparts().graphics);
         registered_ = true;
         is_graphics_ = true;
         return S_OK;
@@ -15234,9 +15247,9 @@ public:
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
         if (stub_pipelines_enabled()) {
-            pipeline_.pending = true;
-            pipeline_.stub = true;
-            device_.context->add_pipeline(id(), pipeline_);
+            cpipe().pending = true;
+            cpipe().stub = true;
+            device_.context->add_pipeline(id(), cpipe());
             registered_ = true;
             return S_OK;
         }
@@ -15275,9 +15288,9 @@ public:
             if (missing_shader_stub_enabled()) {
                 // A PSO that never gets a pipeline: registered pending, so its dispatches are skipped, and the title
                 // keeps an object rather than a failure it would read through (retail boot 5 died on such a null).
-                pipeline_.pending = true;
-                pipeline_.stub = true;
-                device_.context->add_pipeline(id(), pipeline_);
+                cpipe().pending = true;
+                cpipe().stub = true;
+                device_.context->add_pipeline(id(), cpipe());
                 registered_ = true;
                 return S_OK;
             }
@@ -15296,9 +15309,9 @@ public:
                 at = comma + 1;
                 if (part.empty() || source.find(part) == std::string::npos) continue;
                 std::fprintf(stderr, "[rt] d3d12: %s left out (LEONIDA_SKIP_PSO %s)\n", source.c_str(), part.c_str());
-                pipeline_.pending = true;
-                pipeline_.stub = true;
-                device_.context->add_pipeline(id(), pipeline_);
+                cpipe().pending = true;
+                cpipe().stub = true;
+                device_.context->add_pipeline(id(), cpipe());
                 registered_ = true;
                 return S_OK;
             }
@@ -15360,11 +15373,11 @@ public:
         VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
         if (entry->binding_count) {
             set0_layout = device_.bindless->layout();
-            pipeline_.uses_set0 = true;  // the set itself is read at submit, under the descriptor lock
+            cpipe().uses_set0 = true;  // the set itself is read at submit, under the descriptor lock
         }
-        pipeline_.layout =
+        cpipe().layout =
             device_.shared_layout(VK_SHADER_STAGE_COMPUTE_BIT, sizeof(leonida::ShaderUserData), set0_layout);
-        if (!pipeline_.layout) return E_FAIL;
+        if (!cpipe().layout) return E_FAIL;
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -15372,7 +15385,7 @@ public:
         pipeline_info.stage.pName = "main";
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfo required_size{};
         subgroup_size_for(*entry, required_size, pipeline_info.stage);
-        pipeline_info.layout = pipeline_.layout;
+        pipeline_info.layout = cpipe().layout;
         if (shader_object) {
             leonida::shader_objects::ShaderSource so;
             so.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -15385,8 +15398,8 @@ public:
                 device_.shader_object(so, device_.so_compute_layout(entry->binding_count != 0));
             if (!shader) return E_FAIL;
             const leonida::shader_objects::Functions* fn = &device_.so_fn;
-            pipeline_.shader_object = shader;
-            pipeline_.bind_shader = [fn, shader](VkCommandBuffer cb) {
+            cpipe().shader_object = shader;
+            cpipe().bind_shader = [fn, shader](VkCommandBuffer cb) {
                 const VkShaderStageFlagBits stage = VK_SHADER_STAGE_COMPUTE_BIT;
                 fn->vkCmdBindShadersEXT(cb, 1, &stage, &shader);
             };
@@ -15398,7 +15411,7 @@ public:
             async_compute_->required = required_size;
             async_compute_->has_required = pipeline_info.stage.pNext != nullptr;
             async_compute_->info.stage.pNext = nullptr;
-            pipeline_.pending = true;
+            cpipe().pending = true;
             // LEONIDA_LAZY_COMPUTE=1: nothing compiles until a dispatch meets the pending entry (request_compute in
             // vulkan_replay.h). The title keeps the PSO alive while lists that use it execute, so `this` is valid there.
             static const bool lazy = [] {
@@ -15406,15 +15419,15 @@ public:
                 return v && v[0] == '1';
             }();
             if (lazy) {
-                pipeline_.requested = std::make_shared<std::atomic<bool>>(false);
-                pipeline_.request = [this] { start_async_compile(); };
+                cpipe().requested = std::make_shared<std::atomic<bool>>(false);
+                cpipe().request = [this] { start_async_compile(); };
             }
         } else {
             if (device_.create_pipeline(
                     [&](VkPipelineCache cache, const VkComputePipelineCreateInfo& create) {
                         const DriverTurn turn(device_.context->submit_mutex(), "create", "vkCreateComputePipelines", true,
                                               entry->name.c_str());  // upstream's compile gate, as below
-                        return vk.vkCreateComputePipelines(dev, cache, 1, &create, nullptr, &pipeline_.pipeline);
+                        return vk.vkCreateComputePipelines(dev, cache, 1, &create, nullptr, &cpipe().pipeline);
                     },
                     pipeline_info) != VK_SUCCESS) {
                 device_.shader_modules().release(module_);
@@ -15434,13 +15447,13 @@ public:
         std::memcpy(device_.arena.mapped + offset, code.data(), code.size());
         code_bytes_ = code.size();
         code_base_ = offset;
-        pipeline_.code_base = offset;
-        device_.context->add_pipeline(id(), pipeline_,
+        cpipe().code_base = offset;
+        device_.context->add_pipeline(id(), cpipe(),
                                       device_.info.device_fault_diagnostics ? entry->name.c_str() : nullptr);
         registered_ = true;
         // After the pending entry is registered, so the compiled one the job registers is the one that stays. Lazily
         // compiled pipelines start at their first dispatch instead (ComputePipeline::request).
-        if (async_compute_ && !pipeline_.request) start_async_compile();
+        if (async_compute_ && !cpipe().request) start_async_compile();
         return S_OK;
     }
 
@@ -15488,10 +15501,10 @@ public:
                                  heavy ? ", heavy slot" : "");
                 if (module) device_.shader_modules().release(module);
                 if (r == VK_SUCCESS) {
-                    leonida::ComputePipeline ready = pipeline_;
+                    leonida::ComputePipeline ready = cpipe();
                     ready.pipeline = made;
                     ready.pending = false;
-                    pipeline_ = ready;  // only this job writes pipeline_ while the PSO is compiling
+                    cpipe() = ready;  // only this job writes cpipe() while the PSO is compiling
                     device_.context->add_pipeline(id(), ready);
                     device_.pipeline_created();
                 } else {
@@ -15526,7 +15539,7 @@ private:
     // This PSO's pipeline for a draw that leaves the `unbound` slots (leonida::GraphicsPipeline::variant) unbound, as
     // pso_recipe.h data: what build() creates and what pso_recipes.jsonl records for --prebuild-pipelines.
     leonida::pso::Recipe to_recipe(std::uint32_t unbound) const {
-        const Recipe& r = recipe_;
+        const Recipe& r = gparts().recipe;
         leonida::pso::Recipe out;
         out.stages = stage_meta_;
         out.mesh = r.mesh;
@@ -15565,18 +15578,18 @@ private:
         out.logic_op = std::uint32_t(r.blend.logicOp);
         std::memcpy(out.blend_constants, r.blend.blendConstants, sizeof(out.blend_constants));
         out.blends = r.blends;
-        for (std::size_t slot = 0; slot < graphics_.color_formats.size(); ++slot)
+        for (std::size_t slot = 0; slot < gparts().graphics.color_formats.size(); ++slot)
             out.colors.push_back((unbound & (1u << slot)) ? std::uint32_t(VK_FORMAT_UNDEFINED)
-                                                          : std::uint32_t(graphics_.color_formats[slot]));
+                                                          : std::uint32_t(gparts().graphics.color_formats[slot]));
         const bool depth_bound = !(unbound & leonida::GraphicsPipeline::unbound_depth);
-        if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
-            out.depth_format = std::uint32_t(graphics_.depth_format);
-        if (depth_bound && (graphics_.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
-            out.stencil_format = std::uint32_t(graphics_.depth_format);
+        if (depth_bound && (gparts().graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT))
+            out.depth_format = std::uint32_t(gparts().graphics.depth_format);
+        if (depth_bound && (gparts().graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT))
+            out.stencil_format = std::uint32_t(gparts().graphics.depth_format);
         out.push_stages = layout_push_stages_;
         out.push_size = layout_push_size_;
         out.bindless = layout_bindless_;
-        out.viewport_with_count = graphics_.viewport_with_count;
+        out.viewport_with_count = gparts().graphics.viewport_with_count;
         return out;
     }
 
@@ -15599,7 +15612,7 @@ private:
         built_modules_.clear();
         if (module_sources_.empty()) return;
         for (const DeferredModule& d : module_sources_)
-            if (d.stage_index < recipe_.stages.size()) recipe_.stages[d.stage_index].module = VK_NULL_HANDLE;
+            if (d.stage_index < gparts().recipe.stages.size()) gparts().recipe.stages[d.stage_index].module = VK_NULL_HANDLE;
         deferred_modules_ = module_sources_;
     }
 
@@ -15612,8 +15625,8 @@ private:
             for (const DeferredModule& d : deferred_modules_) {
                 std::vector<std::uint32_t> words;
                 if (d.edited) {
-                    const auto bit = d.stage_index < recipe_.stages.size()
-                                         ? recipe_.stages[d.stage_index].stage
+                    const auto bit = d.stage_index < gparts().recipe.stages.size()
+                                         ? gparts().recipe.stages[d.stage_index].stage
                                          : VK_SHADER_STAGE_ALL;
                     words = edited_words(bit, d.entry);
                     // Made again exactly as create() made them, or not used at all.
@@ -15627,18 +15640,18 @@ private:
                     words = library->spirv(*d.entry);
                 }
                 const VkShaderModule module = words.empty() ? VK_NULL_HANDLE : device_.shader_modules().acquire(words);
-                if (!module || d.stage_index >= recipe_.stages.size()) {
+                if (!module || d.stage_index >= gparts().recipe.stages.size()) {
                     log_once("a deferred shader module could not be made; stage index", int(d.stage_index));
                     return VK_NULL_HANDLE;
                 }
-                recipe_.stages[d.stage_index].module = module;
+                gparts().recipe.stages[d.stage_index].module = module;
                 built_modules_.push_back(module);
             }
             deferred_modules_.clear();
         }
         leonida::pso::Recipe recipe = to_recipe(unbound);
         std::vector<VkShaderModule> modules;
-        for (const VkPipelineShaderStageCreateInfo& s : recipe_.stages) modules.push_back(s.module);
+        for (const VkPipelineShaderStageCreateInfo& s : gparts().recipe.stages) modules.push_back(s.module);
         if (unbound & leonida::GraphicsPipeline::rect_list) {
             // Rect lists: the geometry shader that adds each rectangle's fourth corner, made for this VS's outputs.
             if (has_geometry_ || recipe.mesh || !device_.info.features.geometryShader) {
@@ -15669,7 +15682,7 @@ private:
             report_slow("libraries");
             return linked;
         }
-        const leonida::pso::GraphicsCreateInfo create(recipe, modules, graphics_.layout);
+        const leonida::pso::GraphicsCreateInfo create(recipe, modules, gparts().graphics.layout);
         VkPipeline pipeline = VK_NULL_HANDLE;
         const VkResult made = device_.create_pipeline(
             [&](VkPipelineCache cache, const VkGraphicsPipelineCreateInfo& info) {
@@ -15710,7 +15723,7 @@ private:
         if (leonida::pso::Recorder* recorder = device_.pso_recorder()) recorder->record(recipe);
         if (base && leonida::pso::gpl_optimize() && device_.info.pipeline_creation_cache_control &&
             device_.gpl_cached_link) {
-            const leonida::pso::LinkCreateInfo cached_create(parts, graphics_.layout, Link::cached);
+            const leonida::pso::LinkCreateInfo cached_create(parts, gparts().graphics.layout, Link::cached);
             VkResult result = VK_SUCCESS;
             if (const VkPipeline optimized = device_.gpl_create(cached_create.info, cached, &result)) {
                 ++device_.gpl_links;
@@ -15721,7 +15734,7 @@ private:
             }
             if (result != VK_PIPELINE_COMPILE_REQUIRED) log_once("a cache-only optimised link failed; VkResult", int(result));
         }
-        const leonida::pso::LinkCreateInfo create(parts, graphics_.layout);
+        const leonida::pso::LinkCreateInfo create(parts, gparts().graphics.layout);
         const VkPipeline pipeline = device_.gpl_create(create.info, cached);
         if (!pipeline) return VK_NULL_HANDLE;
         ++device_.gpl_links;
@@ -15746,13 +15759,13 @@ private:
     // deferred deletion queue (VulkanContext::replace_graphics_pipeline).
     void start_upgrade(const std::array<VkPipeline, 4>& parts, VkPipeline fast) {
         gpl_upgrade_ = std::make_shared<GplUpgrade>();
-        graphics_.upgrade = std::make_shared<leonida::GraphicsPipeline::Upgrade>();
+        gparts().graphics.upgrade = std::make_shared<leonida::GraphicsPipeline::Upgrade>();
         DeviceState* device = &device_;
         const std::shared_ptr<GplUpgrade> state = gpl_upgrade_;
         // The slot lives while the PSO does, and the job checks `cancelled` (set by the destructor) before using it.
-        leonida::GraphicsPipeline::Upgrade* slot = graphics_.upgrade.get();
-        const VkPipelineLayout layout = graphics_.layout;
-        graphics_.upgrade->request = [device, state, slot, parts, layout, fast] {
+        leonida::GraphicsPipeline::Upgrade* slot = gparts().graphics.upgrade.get();
+        const VkPipelineLayout layout = gparts().graphics.layout;
+        gparts().graphics.upgrade->request = [device, state, slot, parts, layout, fast] {
             device->gpl_enqueue([device, state, slot, parts, layout, fast] {
                 std::lock_guard lock(state->mutex);
                 if (state->cancelled) return;
@@ -15825,16 +15838,40 @@ private:
     }
 
     DeviceState& device_;
-    leonida::ComputePipeline pipeline_;
-    leonida::GraphicsPipeline graphics_;
-    Recipe recipe_;
-    // What to_recipe() needs beyond recipe_: each stage's index name, flags, subgroup request and SPIR-V hash (in
-    // recipe_.stages order), and the layout's push range and set 0.
+    // A compute PSO's pipeline, and a graphics PSO's pipeline and recipe, made the first time they are written: a
+    // PSO is one or the other, and a view of a shared native PSO (share_native_graphics) is neither. Held inline, the
+    // three took 1,424 of the object's 2,048 bytes in each of ~109,000 live PSOs of a story load (25,000 of them
+    // views, which use none). Installed with a compare-exchange, so two threads that both make one keep one.
+    struct GraphicsParts {
+        leonida::GraphicsPipeline graphics;
+        Recipe recipe;
+    };
+    template<class T>
+    static T& made(std::atomic<T*>& slot) {
+        if (T* existing = slot.load(std::memory_order_acquire)) return *existing;
+        T* fresh = new T();
+        T* expected = nullptr;
+        if (slot.compare_exchange_strong(expected, fresh, std::memory_order_acq_rel)) return *fresh;
+        delete fresh;
+        return *expected;
+    }
+    leonida::ComputePipeline& cpipe() { return made(compute_parts_); }
+    GraphicsParts& gparts() { return made(graphics_parts_); }
+    // Read-only callers see the default-constructed parts when none were made, as they saw the inline members.
+    const GraphicsParts& gparts() const {
+        static const GraphicsParts none{};
+        const GraphicsParts* parts = graphics_parts_.load(std::memory_order_acquire);
+        return parts ? *parts : none;
+    }
+    std::atomic<leonida::ComputePipeline*> compute_parts_{nullptr};
+    std::atomic<GraphicsParts*> graphics_parts_{nullptr};
+    // What to_recipe() needs beyond the recipe: each stage's index name, flags, subgroup request and SPIR-V hash (in
+    // the recipe's stages order), and the layout's push range and set 0.
     std::vector<leonida::pso::Stage> stage_meta_;
     VkShaderStageFlags layout_push_stages_ = 0;
     std::uint32_t layout_push_size_ = 0;
     bool layout_bindless_ = false;
-    std::mutex variants_mutex_;
+    std::shared_mutex variants_mutex_;  // 8 bytes, not std::mutex's 80: one per PSO (~85k live)
     std::map<std::uint32_t, VkPipeline> variants_;
     std::set<std::uint32_t> variants_requested_;  // queued by variant_ready_or_request (under variants_mutex_)
     std::atomic<bool> base_built_{false};      // variant 0 exists (GraphicsPipeline::ready)
@@ -16402,11 +16439,56 @@ private:
 // (render targets, depth, unordered access) are never filled from memory. The approach is five-star-recomp's
 // (docs/gpu-resources.md "Textures", GpuTextures.cs / GpuTextureUploader.cs, GPL-3.0-or-later): a registry by
 // address, refreshed at every slot-70 view and once a frame for textures the title maps.
+//
+// A texture's console layout (2 KiB: per-mip offsets and pitches for up to 15 mips) is held as one shared copy per
+// distinct content: the retail title registers tens of thousands of textures (23,000 100 s into a boot, 47 MiB of
+// layouts held inline) in far fewer shapes. Assigning a layout interns it; reading goes through * and ->. Contents
+// are compared whole (the hash only picks the bucket), so a shared copy is byte for byte the assigned one.
+class SharedTextureLayout {
+public:
+    SharedTextureLayout() : layout_(empty()) {}
+    SharedTextureLayout& operator=(const rt::xg_xs::Texture& value) {
+        layout_ = intern(value);
+        return *this;
+    }
+    const rt::xg_xs::Texture& operator*() const { return *layout_; }
+    const rt::xg_xs::Texture* operator->() const { return layout_.get(); }
+
+private:
+    using Shared = std::shared_ptr<const rt::xg_xs::Texture>;
+    static const Shared& empty() {
+        static const Shared none = std::make_shared<const rt::xg_xs::Texture>();
+        return none;
+    }
+    static Shared intern(const rt::xg_xs::Texture& value) {
+        struct Pool {
+            std::mutex mutex;
+            std::unordered_multimap<std::uint64_t, std::weak_ptr<const rt::xg_xs::Texture>> layouts;
+            std::uint64_t inserted = 0;
+        };
+        static auto* pool = new Pool;  // never destroyed: textures may outlive static destruction order
+        const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
+        std::uint64_t hash = 14695981039346656037ull;  // FNV-1a
+        for (std::size_t i = 0; i < sizeof(value); ++i) hash = (hash ^ bytes[i]) * 1099511628211ull;
+        std::lock_guard lock(pool->mutex);
+        const auto [first, last] = pool->layouts.equal_range(hash);
+        for (auto it = first; it != last; ++it)
+            if (auto live = it->second.lock(); live && std::memcmp(live.get(), &value, sizeof(value)) == 0) return live;
+        auto made = std::make_shared<const rt::xg_xs::Texture>(value);
+        // Forget the expired entries now and then, so the table does not grow with every layout ever made.
+        if (++pool->inserted % 4096 == 0)
+            std::erase_if(pool->layouts, [](const auto& entry) { return entry.second.expired(); });
+        pool->layouts.emplace(hash, made);
+        return made;
+    }
+    Shared layout_;
+};
+
 struct TitleViewTexture {
     std::uint64_t address = 0;              // the GPU address the title names it by
     std::uint64_t cpu = 0;                  // where the CPU reads its bytes (title_gpu_views::to_cpu)
     std::array<std::uint32_t, 14> desc{};   // the console resource words the layout was built from
-    rt::xg_xs::Texture layout{};            // valid when layout_known
+    SharedTextureLayout layout;             // valid when layout_known
     bool layout_known = false;
     bool layout_guessed = false;            // a slot-133 texture's own description (Layout 0), no slot-70 view yet
     bool layout_from_xg = false;            // the title's XG computer of its shape (title_xg_layout)
@@ -16435,7 +16517,7 @@ struct TitleViewTexture {
     // misses. Video planes, rewritten whole every frame, are caught by the sampled one first.
     std::uint64_t full_hash = 0;
     bool full_hashed = false;
-    bool every_byte() const { return mapped && (async_texture_refresh() || layout.layout.size <= (4u << 20)); }
+    bool every_byte() const { return mapped && (async_texture_refresh() || layout->layout.size <= (4u << 20)); }
     std::uint64_t fills = 0;
 };
 
@@ -16465,10 +16547,17 @@ bool title_xg_layout(const Resource& r, rt::xg_xs::Texture& out, std::array<std:
     std::memcpy(words.data(), &x, sizeof(x));
     return true;
 }
+// The same into a texture's shared layout (written only when it answers true, as above).
+bool title_xg_layout(const Resource& r, SharedTextureLayout& out, std::array<std::uint32_t, 14>& words) {
+    rt::xg_xs::Texture made;
+    if (!title_xg_layout(r, made, words)) return false;
+    out = made;
+    return true;
+}
 
 void DeviceState::index_texture(const TitleViewTexture& t) {
     if (async_texture_refresh())
-        texture_ranges.set(t.address, t.cpu, t.layout_known && !t.gpu_written ? t.layout.layout.size : 0);
+        texture_ranges.set(t.address, t.cpu, t.layout_known && !t.gpu_written ? t.layout->layout.size : 0);
 }
 
 void DeviceState::title_texture_mapped(const void* resource, std::uint64_t address) {
@@ -16501,7 +16590,7 @@ void DeviceState::title_texture_mapped(const void* resource, std::uint64_t addre
                      t.gpu_written     ? "none (GPU-written)"
                      : !t.layout_known ? "unknown"
                      : t.layout_guessed ? "guessed (no slot-70 view, no XG computer of its shape)"
-                     : t.layout_from_xg ? (t.layout.mode == rt::xg_xs::kLinear ? "the title's XG computer's (linear)"
+                     : t.layout_from_xg ? (t.layout->mode == rt::xg_xs::kLinear ? "the title's XG computer's (linear)"
                                                                               : "the title's XG computer's (swizzled)")
                                         : "from a slot-70 view",
                      t.fills ? "filled before" : "not filled yet");
@@ -17556,7 +17645,18 @@ public:
                               leonida::mem_probe::mib(use[3]), leonida::mem_probe::mib(peak),
                               (unsigned long long)title_ranges, leonida::mem_probe::mib(title),
                               (unsigned long long)shadows, leonida::fsdraw::pipeline_count());
-                return std::string(text);
+                const auto streams = rt::d3d12_xs::pso_stream_stats();
+                const auto pool = d.title_image_pool.stats();
+                char more[512];
+                std::snprintf(more, sizeof more,
+                              "; PSOs live %ld (%ld views of a shared one); stream records %zu (%.1f MiB), %zu distinct "
+                              "streams (%.1f MiB); title image pool %zu pages in %zu classes %.0f MiB, %.0f MiB of "
+                              "slots in use",
+                              live_pipeline_state_count.load(), live_pipeline_state_views.load(), streams.records,
+                              leonida::mem_probe::mib(streams.bytes), streams.distinct,
+                              leonida::mem_probe::mib(streams.distinct_bytes), pool.pages, pool.classes,
+                              leonida::mem_probe::mib(pool.page_bytes), leonida::mem_probe::mib(pool.used_bytes));
+                return std::string(text) + more;
             };
             leonida::mem_probe::start(std::move(facts));
         }
@@ -18540,7 +18640,8 @@ public:
                              d.height, unsigned(d.depth_or_array), d.format, unsigned(srv.Format), unsigned(d.mips), unsigned(written));
             if (!written && stats.refusals == refusals) refuse_title_view("no reason recorded", d, address);
             if (!written) ++stats.null_views;
-            if (leonida::fsdraw::enabled() && (stats.views == 64 || !(stats.views % 2048)))
+            if ((leonida::fsdraw::enabled() || leonida::mem_probe::interval_seconds()) &&
+                (stats.views == 64 || !(stats.views % 2048)))
                 log_title_census("slot-70 texture views");
         }
         state_.drain_titles_gone();
@@ -18625,7 +18726,7 @@ public:
                 entry->layout_known = entry->layout_from_xg = true;
             } else {
                 entry->layout_known = entry->layout_guessed = title_layout(d, entry->layout, why) &&
-                                                              title_layout_fits(entry->layout, d, *texture, why);
+                                                              title_layout_fits(*entry->layout, d, *texture, why);
                 std::memcpy(entry->desc.data(), &d, sizeof(d));
             }
         }
@@ -18698,7 +18799,7 @@ public:
             if (t.gpu_written || !t.layout_known || !t.resource ||
                 ((t.layout_guessed || t.layout_from_xg) && !t.mapped && !t.stale))
                 return;
-            const std::uint64_t span = t.layout.layout.size;
+            const std::uint64_t span = t.layout->layout.size;
             const bool always = t.mapped && refresh_mapped_pages();
             // Out of this pass's fill budget (bytes or time): a texture known to need a fill (stale) waits for the
             // next pass unprobed and unhashed; hashing it now would only find it changed again (measured: 10,000
@@ -18735,7 +18836,7 @@ public:
                 stats.hash_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(clock::now() - start).count();
                 const auto it = state_.title_textures.find(address);
                 if (it == state_.title_textures.end() || it->second.get() != &t || !t.resource ||
-                    !t.layout_known || t.layout.layout.size != span || t.fills != fills) return;
+                    !t.layout_known || t.layout->layout.size != span || t.fills != fills) return;
                 ++stats.mapped_checks;
                 if (!ok) {
                     t.memory.defer();
@@ -18804,7 +18905,7 @@ public:
                 // No fills or callbacks during invalidation; registry iterators stay valid.
                 for (const auto& [key, ptr] : state_.title_textures) {
                     auto& t = *ptr;
-                    const auto end = t.cpu + t.layout.layout.size;
+                    const auto end = t.cpu + t.layout->layout.size;
                     const bool write = leonida::title_write_overlaps(written, t.cpu, end);
                     if (write || map_all || overflow || leonida::title_write_overlaps(title_map_changes_, t.cpu, end))
                         invalidate(t, write);
@@ -19070,7 +19171,7 @@ private:
                         if (t.resource->staged_title() && !t.unbound_bytes) {
                             r = t.resource;
                             r->AddRef();
-                            layout = t.layout;
+                            layout = *t.layout;
                             cpu = t.cpu;
                             fills = t.fills;
                             every_byte = t.every_byte();
@@ -19230,6 +19331,13 @@ private:
         if (!xg::build_texture(plain, out)) return why = "description the XG model refuses", false;
         return true;
     }
+    // The same into a texture's shared layout: whatever the call leaves in its output is kept, as above.
+    static bool title_layout(const rt::xg_xs::ResourceDesc& d, SharedTextureLayout& out, const char*& why) {
+        rt::xg_xs::Texture made = *out;
+        const bool ok = title_layout(d, made, why);
+        out = made;
+        return ok;
+    }
 
     // The image a layout fills: the same extent, mips, layers and element (texel or 4x4 block) size.
     static bool title_layout_fits(const rt::xg_xs::Texture& layout, const rt::xg_xs::ResourceDesc& d,
@@ -19339,7 +19447,7 @@ private:
         auto entry = std::make_shared<TitleViewTexture>();
         const char* why = nullptr;
         if (!title_layout(d, entry->layout, why)) return refuse_title_view(why, d, address), nullptr;
-        const std::uint64_t span = entry->layout.layout.size;
+        const std::uint64_t span = entry->layout->layout.size;
         entry->cpu = leonida::title_gpu_views::to_cpu(address);
         // A streamed texture can have views before its pages arrive. Keep the descriptor stable across its first fill.
         entry->memory.check(0, check_pages_before_read(),
@@ -19363,7 +19471,7 @@ private:
         pc.Width = d.width;
         pc.Height = d.height;
         pc.DepthOrArraySize = d.depth_or_array;
-        pc.MipLevels = UINT16(entry->layout.layout.mips);
+        pc.MipLevels = UINT16(entry->layout->layout.mips);
         pc.Format = formats.front();
         pc.SampleDesc = {1, 0};
         pc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -19390,7 +19498,7 @@ private:
             log_once("an image for a slot-70 texture view could not be made; HRESULT", int(hr));
             return refuse_title_view("image not created", d, address), nullptr;
         }
-        if (!title_layout_fits(entry->layout, d, *r, why)) {
+        if (!title_layout_fits(*entry->layout, d, *r, why)) {
             r->Release();
             return refuse_title_view(why, d, address), nullptr;
         }
@@ -19474,7 +19582,7 @@ private:
         // The answer is kept (generation 0) until a map change over the texture, a write into it or the periodic
         // retry of refresh_title_textures asks again.
         return t.memory.check(0, guard && !mapped,
-                              [&] { return probe_title_memory(t.cpu, t.layout.layout.size, waited, commit); },
+                              [&] { return probe_title_memory(t.cpu, t.layout->layout.size, waited, commit); },
                               guard && !mapped);
     }
 
@@ -19501,7 +19609,7 @@ private:
         std::uint64_t hash = 0;
         if (!title_texture_readable(t)) return;
         if (!hash_guarded(reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(t.cpu)),
-                          std::size_t(t.layout.layout.size), hash)) {
+                          std::size_t(t.layout->layout.size), hash)) {
             t.memory.defer();
             return;
         }
@@ -19511,7 +19619,8 @@ private:
     // Snapshot the whole footprint before uploading any subresource. A concurrent unmap defers the fill.
     // Private title staging bypasses the D3D12 submit callbacks. Generic staged copies require an outer fill.
     std::uint64_t fill_title_texture(TitleViewTexture& t, bool staged) {
-        const rt::xg_xs::Texture& layout = t.layout;
+        const SharedTextureLayout held = t.layout;  // keeps this layout alive while it is read
+        const rt::xg_xs::Texture& layout = *held;
         const std::uint32_t mips = layout.layout.mips, slices = layout.array;
         if (!staged && !t.unbound_bytes && !t.resource->staged_title())
             for (UINT sub = 0; sub < mips * slices; ++sub)
@@ -19660,8 +19769,14 @@ private:
             (t->owned ? owned_bytes : placed_bytes) += t->backing_bytes;
             if (!t->device_local) host_heap_bytes += t->backing_bytes;
         }
-        if (leonida::mem_probe::interval_seconds())
+        if (leonida::mem_probe::interval_seconds()) {
             log_title_image_uses(state_.title_textures, retired_title_textures_.size(), retired_backing_, state_.zero_image_bytes.load());
+            const auto pool = state_.title_image_pool.stats();
+            std::fprintf(stderr, "[rt] mem-probe: title image pool: %zu pages in %zu size classes, %.1f MiB, %.1f MiB of "
+                                 "slots in use\n",
+                         pool.pages, pool.classes, double(pool.page_bytes) / 1048576.0,
+                         double(pool.used_bytes) / 1048576.0);
+        }
         if (leonida::mem_probe::interval_seconds())
             std::fprintf(stderr, "[rt] mem-probe: registered image backing: %.1f MiB from slot 70, %.1f MiB from slot "
                                  "133, %.1f MiB total on non-device-local types; staged fills %llu, %.3f s, buffer %.1f MiB\n",
@@ -19700,7 +19815,7 @@ private:
                           static_cast<unsigned long long>(address), static_cast<unsigned long long>(rd.Width), rd.Height,
                           int(rd.Format),
                           t->layout_guessed ? "guessed" : t->layout_from_xg ? "XG" : t->layout_known ? "viewed" : "none",
-                          t->layout.mode, t->resource->shader_views(), static_cast<unsigned long long>(t->fills));
+                          t->layout->mode, t->resource->shader_views(), static_cast<unsigned long long>(t->fills));
             maps += text;
         }
         if (!maps.empty()) std::fprintf(stderr, "[rt] d3d12: title textures mapped: %s\n", maps.c_str());

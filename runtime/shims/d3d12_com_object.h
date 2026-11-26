@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cwchar>
 #include <mutex>
+#include <shared_mutex>
 #include <utility>
 #include <vector>
 
@@ -193,7 +194,7 @@ private:
     }
 
     std::atomic<ULONG> refs_{1};
-    std::mutex data_mutex_;
+    std::shared_mutex data_mutex_;  // SRW lock, 8 bytes: std::mutex is 80 in every COM object (~150k live)
     std::vector<PrivateData> data_;
 };
 
