@@ -886,23 +886,6 @@ void note_open_failure(const char* api, LPCWSTR name, DWORD error, const void* c
             rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
 }
 
-// LOCAL DIAGNOSTIC: gta6rt --trace FILE also records the first 600 successful opens ("file_open": path, access,
-// caller), so the startup trace shows which file the title was working on when it stopped making progress.
-void note_open(const char* api, LPCWSTR name, DWORD access, const void* caller) {
-    if (!rt::startup_trace::enabled()) return;
-    static std::atomic<int> left{600};
-    if (left.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
-    std::string utf8;
-    if (const int n = WideCharToMultiByte(CP_UTF8, 0, name, -1, nullptr, 0, nullptr, nullptr); n > 1) {
-        utf8.resize(static_cast<size_t>(n) - 1);
-        WideCharToMultiByte(CP_UTF8, 0, name, -1, utf8.data(), n, nullptr, nullptr);
-    }
-    rt::startup_trace::event(
-        "file_open",
-        std::string("\"api\":\"") + api + "\",\"path\":" + rt::startup_trace::quote(utf8) + ",\"access\":" +
-            std::to_string(access) + ",\"caller\":" +
-            rt::startup_trace::quote(rt::startup_trace::where(reinterpret_cast<uint64_t>(caller))));
-}
 
 // Reads one byte of every 4 KiB page of [buffer, buffer + size) from user mode, so that pages committed on first
 // touch (xmem's physical-page views: a reserve-only section committed by its vectored handler) are committed before
@@ -941,8 +924,6 @@ HANDLE WINAPI create_file_w(LPCWSTR name, DWORD access, DWORD share, LPSECURITY_
         const DWORD error = GetLastError();
         note_open_failure("CreateFileW", name, error, _ReturnAddress());
         SetLastError(error);
-    } else {
-        note_open("CreateFileW", name, access, _ReturnAddress());
     }
     return h;
 }
@@ -974,8 +955,6 @@ HANDLE WINAPI create_file2(LPCWSTR name, DWORD access, DWORD share, DWORD dispos
         const DWORD error = GetLastError();
         note_open_failure("CreateFile2", name, error, _ReturnAddress());
         SetLastError(error);
-    } else {
-        note_open("CreateFile2", name, access, _ReturnAddress());
     }
     return h;
 }

@@ -90,8 +90,7 @@ int run(vktest::Device& d, HWND window) {
         EXPECT(queue.execute({&input,1})==ReplayResult::success);
     }
     EXPECT(queue.idle());
-    EXPECT(!_putenv_s("LEONIDA_CAPTURE_EVERY","3") && !_putenv_s("LEONIDA_CAPTURE_LIMIT","2") &&
-           !_putenv_s("LEONIDA_CAPTURE_SOURCE","0"));
+    EXPECT(!_putenv_s("LEONIDA_CAPTURE_EVERY","3") && !_putenv_s("LEONIDA_CAPTURE_LIMIT","2"));
     enum class Phase { sparse, final_pending, continuous, splash, composed };
     for (Phase p : {Phase::sparse,Phase::final_pending,Phase::continuous,Phase::splash,Phase::composed}) {
         Folder folder;

@@ -263,8 +263,6 @@ private:
     std::vector<HostArea> areas_;
     std::vector<Slot> free_slots_;
     Counters counters_{};
-    std::uint64_t next_report_frame_ = 0;
-    std::chrono::steady_clock::time_point next_mesh_report_{};
 };
 
 namespace detail {
@@ -435,7 +433,6 @@ inline void IndirectArgumentClamp::release_one(Slot slot) {
 // Called when the submission's timeline ticket has been reached, so the GPU is past the copies.
 inline void IndirectArgumentClamp::release(std::vector<Slot>& slots, bool read) {
     Counters delta{};
-    const std::size_t calls = slots.size();
     {
         std::lock_guard lock(mutex_);
         for (const Slot& slot : slots) {
@@ -465,23 +462,6 @@ inline void IndirectArgumentClamp::release(std::vector<Slot>& slots, bool read) 
         counters_.mesh_yz_records += delta.mesh_yz_records;
         counters_.mesh_max_y = std::max(counters_.mesh_max_y, delta.mesh_max_y);
         counters_.mesh_max_z = std::max(counters_.mesh_max_z, delta.mesh_max_z);
-        // One line every 10 s while mesh records are clamped: does the console's mesh dispatch use y or z?
-        const auto now = std::chrono::steady_clock::now();
-        if (read && counters_.mesh_records && now >= next_mesh_report_) {
-            next_mesh_report_ = now + std::chrono::seconds(10);
-            std::fprintf(stderr, "[rt] indirect clamp mesh: %llu records, %llu with y > 1 or z > 1 (forced to 1), "
-                                 "max y %u, max z %u\n",
-                         static_cast<unsigned long long>(counters_.mesh_records),
-                         static_cast<unsigned long long>(counters_.mesh_yz_records), counters_.mesh_max_y,
-                         counters_.mesh_max_z);
-        }
-        const auto frame = submit_phases::totals().present_serial.load(std::memory_order_relaxed);
-        if (read && calls && frame >= next_report_frame_) {
-            next_report_frame_ = frame + 60;
-            std::fprintf(stderr, "[rt] indirect clamp: frame %llu, observed %llu records clamped, %llu zeroed, %llu over list budget\n",
-                         static_cast<unsigned long long>(frame), static_cast<unsigned long long>(counters_.records_clamped),
-                         static_cast<unsigned long long>(counters_.zeroed), static_cast<unsigned long long>(counters_.over_budget));
-        }
     }
     slots.clear();
 }

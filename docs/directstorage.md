@@ -176,11 +176,7 @@ The first boot with the executable settles most of this: the dry-run report show
   Inflate expands LZ matches in bulk and batches Adler-32 reductions. `LEONIDA_DSTORAGE_FAST_INFLATE=0`
   selects the original bytewise path. BCPack indexes the entropy model by the high slot byte.
   `LEONIDA_DSTORAGE_FAST_BCPACK=0` selects the scalar bucket search.
-- With `LEONIDA_DSTORAGE_TRACE=1`, `tools/dstorage_census.py <trace>` totals retirements, errors and bytes
-  by shape, plus microseconds spent reading, inflating, decoding BC blocks, unshuffling, publishing and
-  notifying. `--from-file story000` starts the measurement at the first story archive request and counts
-  every subsequent retirement across queues. Stage times can overlap. Each failure reports its process-wide count
-  for that HRESULT even with request tracing disabled.
+- Each failure reports its process-wide count for that HRESULT.
 - The worker inflates zlib to `IntermediateSize` when BCPack follows, rebuilds standard BC blocks, then
   applies the optional DirectStorage macro-unshuffle. Each stage validates its entire output before a destination
   write. Typed zlib errors propagate through the combined path.
@@ -225,11 +221,9 @@ The first boot with the executable settles most of this: the dry-run report show
   memory go through the shared kernel-write helper, which pins each kernel write, commits first-touch pages
   on an access error and retries once. The superseded `LEONIDA_DSTORAGE_PIN_FILE_READS` switch is retired.
 - `LEONIDA_DSTORAGE_EXTENDED=0` restores the old refusal for page lists, BCPack and nonzero swizzle.
-  `LEONIDA_DSTORAGE_TRACE=1` logs each retired request, worker timestamp, options, source file/range, sizes, destination,
-  cancellation and HRESULT. Queue pointers connect those lines to status slots, fences and events.
-  Failures always log the full request. An access violation also records the CPU mapping and protection.
-  With startup tracing enabled, `dstorage_failure` events share its clock with title exceptions.
-  Pool fill lines report whether a successful texture upload used any nonzero detiled bytes.
+  A failure logs the full request (options, source file/range, sizes, destination, cancellation and HRESULT); an
+  access violation also records the CPU mapping and protection. With startup tracing enabled, `dstorage_failure`
+  events share its clock with title exceptions.
 
 ## Tests
 

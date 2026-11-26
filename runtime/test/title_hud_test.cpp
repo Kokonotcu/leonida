@@ -115,7 +115,7 @@ int main() {
         CHECK(text.find(L"RAM ") != std::wstring::npos && text.find(L"VRAM ") != std::wstring::npos);
         // The private bytes are read under Wine as well ("VRAM n/a" may show: no device behind this HUD).
         CHECK(text.find(L"| RAM n/a") == std::wstring::npos);
-        CHECK(text.find(L"PSO -") != std::wstring::npos);  // no LEONIDA_MEM_PROBE: no pipeline counters
+        CHECK(text.find(L"PSO -") != std::wstring::npos);  // no device: no pipeline counters
         const int fps = _wtoi(text.c_str() + 10);
         CHECK(fps >= 10 && fps <= 120);  // a loose band: Sleep(16) on a loaded machine is not 60 Hz
 

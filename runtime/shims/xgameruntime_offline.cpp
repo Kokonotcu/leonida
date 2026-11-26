@@ -7,8 +7,7 @@
 // class's first method is slot 3. Signatures follow Microsoft's public GDK reference (learn.microsoft.com/gaming/gdk).
 // No GDK header or library code is used.
 //
-//   XGameEventImpl      XGameEventWrite (telemetry) succeeds and is dropped; the first event's name is logged, and
-//                       LEONIDA_LOG_GAME_EVENTS=1 logs every one.
+//   XGameEventImpl      XGameEventWrite (telemetry) succeeds and is dropped; the first event's name is logged.
 //   XGameUiImpl         a message dialog or error dialog has no screen: its title and text go to the log and it
 //                       completes at once with the dialog's default button (error dialogs: dismissed). Every other UI
 //                       (profile cards, pickers, text entry, web authentication, invites) fails before starting.
@@ -121,21 +120,13 @@ bool env_is_one(const char* name, std::atomic<int>& cached) {
     return on != 0;
 }
 
-std::atomic<int> g_log_every_event{-1};
-bool log_every_event() { return env_is_one("LEONIDA_LOG_GAME_EVENTS", g_log_every_event); }
-
 // 3: HRESULT XGameEventWrite(XUserHandle user, const char* serviceConfigId, const char* playSessionId,
 //                            const char* eventName, const char* dimensionsJson, const char* measurementsJson)
-HRESULT STDMETHODCALLTYPE event_write(void*, XUserHandle, const char*, const char*, const char* name,
-                                      const char* dimensions, const char* measurements) {
+HRESULT STDMETHODCALLTYPE event_write(void*, XUserHandle, const char*, const char*, const char* name, const char*,
+                                      const char*) {
     if (!name) return E_INVALIDARG;
-    const long n = g_events.fetch_add(1);
-    if (log_every_event())
-        std::fprintf(stderr, "[rt] game event %s dimensions=%s measurements=%s\n", name, dimensions ? dimensions : "",
-                     measurements ? measurements : "");
-    else if (n == 0)
-        std::fprintf(stderr, "[rt] xgameruntime: game events are dropped offline (first: %s; "
-                             "LEONIDA_LOG_GAME_EVENTS=1 logs them)\n", name);
+    if (g_events.fetch_add(1) == 0)
+        std::fprintf(stderr, "[rt] xgameruntime: game events are dropped offline (first: %s)\n", name);
     return S_OK;
 }
 

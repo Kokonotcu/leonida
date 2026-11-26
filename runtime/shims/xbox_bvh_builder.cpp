@@ -187,44 +187,10 @@ DXGI_FORMAT index_format(DXGI_FORMAT f) {
     return f;
 }
 
-// What each build writes, [dest, dest + our layout) (the first few logged), and any build whose range reaches another
-// structure's start: ours larger than what the title gave it, as the rehydrated ones were (2026-11-26). Measured on the
-// retail boot after the rehydrate fix: 146 BLAS, 245 rehydrated and 5 TLAS builds, none overlapping.
-std::mutex g_range_mutex;
-std::map<UINT64, UINT64> g_written;  // dest -> bytes, under g_range_mutex
-void note_written_range(const char* what, UINT64 dest, UINT64 bytes, UINT flags) {
-    if (!dest || !bytes) return;
-    static std::atomic<unsigned> s_told{0}, s_overlaps{0};
-    if (s_told.fetch_add(1, std::memory_order_relaxed) < 16)
-        std::fprintf(stderr, "[rt] bvh-write: %s %#llx..%#llx (%llu bytes, flags %#x)\n", what,
-                     static_cast<unsigned long long>(dest), static_cast<unsigned long long>(dest + bytes),
-                     static_cast<unsigned long long>(bytes), flags);
-    std::lock_guard<std::mutex> lock(g_range_mutex);
-    if (g_written.size() >= (1u << 16)) g_written.clear();
-    // Another structure starting inside ours, or ours starting inside an earlier one.
-    auto next = g_written.upper_bound(dest);
-    UINT64 other = 0, other_bytes = 0;
-    if (next != g_written.end() && next->first < dest + bytes) {
-        other = next->first;
-        other_bytes = next->second;
-    } else if (next != g_written.begin()) {
-        auto prev = std::prev(next);
-        if (prev->first != dest && prev->first + prev->second > dest) {
-            other = prev->first;
-            other_bytes = prev->second;
-        }
-    }
-    if (other && s_overlaps.fetch_add(1, std::memory_order_relaxed) < 30)
-        std::fprintf(stderr, "[rt] bvh-overlap: %s %#llx + %llu reaches the structure at %#llx + %llu\n", what,
-                     static_cast<unsigned long long>(dest), static_cast<unsigned long long>(bytes),
-                     static_cast<unsigned long long>(other), static_cast<unsigned long long>(other_bytes));
-    g_written[dest] = bytes;
-}
-
 // One build on the PC list, with the title's typeless index formats made plain and unreadable bottom levels left out.
 void build_one(ID3D12GraphicsCommandList4* list, D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC desc,
                UINT postbuild_count, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* postbuild,
-               ID3D12Device5* device = nullptr) {
+               ID3D12Device5* = nullptr) {
     std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geometries;  // the inputs with plain index formats, as an array
     if (desc.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL) {
         bool typeless = false;
@@ -245,16 +211,15 @@ void build_one(ID3D12GraphicsCommandList4* list, D3D12_BUILD_RAYTRACING_ACCELERA
             desc.Inputs.pGeometryDescs = geometries.data();
         }
     }
-    if (!readable(desc.Inputs)) {
+    // LEONIDA_BVH_BUILDS=0: no build is recorded (destinations keep what they had): a bisect switch for the
+    // acceleration-structure path, as a whole.
+    static const bool builds_off = [] {
+        char v[2]{};
+        return GetEnvironmentVariableA("LEONIDA_BVH_BUILDS", v, sizeof v) == 1 && v[0] == '0';
+    }();
+    if (builds_off || !readable(desc.Inputs)) {
         note(g_skipped, "builds left out");
         return;
-    }
-    if (device) {
-        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild{};
-        device->GetRaytracingAccelerationStructurePrebuildInfo(&desc.Inputs, &prebuild);
-        note_written_range(desc.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL ? "tlas" : "blas",
-                           desc.DestAccelerationStructureData, prebuild.ResultDataMaxSizeInBytes,
-                           static_cast<UINT>(desc.Inputs.Flags));
     }
     list->BuildRaytracingAccelerationStructure(&desc, postbuild_count, postbuild);
     if (desc.Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL)
@@ -573,31 +538,10 @@ HRESULT builder_rehydrate_batched2x(void* self, void* list, UINT count,
         build.SourceAccelerationStructureData = 0;
         UINT64 region = kNoRegion;
         if (has_geometry(build.Inputs)) {
-            if (!room && s_no_room.fetch_add(1, std::memory_order_relaxed) < 8) {
-                // No readable stream (none given, or one the CPU cannot read here): built in place as before, the
-                // destination taken to be as large as our layout (what the prebuild info told the title).
-                MEMORY_BASIC_INFORMATION region{};
-                VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(src + 0x104)), &region,
-                             sizeof(region));
-                std::fprintf(stderr, "[rt] XboxBvhBuilder shim: a rehydrated structure's console size could not be "
-                                     "read from its stream at %#llx (state %#lx protect %#lx type %#lx; window pages "
-                                     "%s); built in place at %#llx\n",
-                             static_cast<unsigned long long>(src), region.State, region.Protect, region.Type,
-                             rt::xmem::g_window_pages.load() ? "known" : "none",
-                             static_cast<unsigned long long>(build.DestAccelerationStructureData));
-            }
+            if (!room) s_no_room.fetch_add(1, std::memory_order_relaxed);  // built in place, our layout's size
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild{};
             if (device) device->GetRaytracingAccelerationStructurePrebuildInfo(&build.Inputs, &prebuild);
             if (room && prebuild.ResultDataMaxSizeInBytes > room) {
-                {
-                    static std::atomic<unsigned> s_rooms_told{0};
-                    if (s_rooms_told.fetch_add(1, std::memory_order_relaxed) < 4)
-                        std::fprintf(stderr, "[rt] XboxBvhBuilder shim: rehydrate at %#llx (stream flags %#x): console "
-                                             "size %llu bytes, ours %llu: built from its first triangle only\n",
-                                     static_cast<unsigned long long>(build.DestAccelerationStructureData),
-                                     stream_flags, static_cast<unsigned long long>(room),
-                                     static_cast<unsigned long long>(prebuild.ResultDataMaxSizeInBytes));
-                }
                 // The first triangle of the first geometry that has one, as a geometry of its own.
                 const D3D12_RAYTRACING_GEOMETRY_DESC* first = nullptr;
                 for (UINT g = 0; g < build.Inputs.NumDescs && !first; ++g) {
@@ -663,12 +607,6 @@ HRESULT builder_rehydrate_batched2x(void* self, void* list, UINT count,
             if (rooms[i])
                 rt::d3d12::note_acceleration_structure_room(device, build.DestAccelerationStructureData, rooms[i]);
 #endif
-            if (device) {
-                D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO written{};
-                device->GetRaytracingAccelerationStructurePrebuildInfo(&build.Inputs, &written);
-                note_written_range("rehydrated blas", build.DestAccelerationStructureData,
-                                   written.ResultDataMaxSizeInBytes, static_cast<UINT>(build.Inputs.Flags));
-            }
             list4->BuildRaytracingAccelerationStructure(&build, 0, nullptr);
         } else {
             static std::atomic<bool> s_empty_logged{false};

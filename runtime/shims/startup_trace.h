@@ -266,53 +266,9 @@ inline void log_watchdog_table(std::uint64_t fault_address) {
     }
 }
 
-// LOCAL DIAGNOSTIC for one of the title's asserts (docs/re/answers.md, "transient pool"): at that assert's int3
-// the title has just computed the peak of a list of resources with lifetimes against a fixed pool. The int3's
-// location is measured locally and not kept here: LEONIDA_POOL_DIAG_AT names it as the trace prints it
-// (`<module>+0x<offset>`), and the dump is off without it.
-// rdi = the list (24-byte records: entry pointer, u32 size rounded to 64 KiB), r13 = the count, rax = the peak,
-// rcx = the pool size. An entry is {record pointer, ..., u32 first pass at +16, u32 last pass at +20}; a record has
-// its usage word at +14, kind word at +16 and, for a texture, width/height/depth words at +56/+58/+60, the dimension
-// and DXGI format bytes at +62/+63 and the mip count at +66. Printed once, to stderr; every read is checked.
-inline void dump_transient_pool(const CONTEXT& c) {
-    static std::atomic<bool> done{false};
-    if (done.exchange(true)) return;
-    const auto read = [](uint64_t at, void* out, size_t n) {
-        SIZE_T got = 0;
-        return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(at), out, n, &got) && got == n;
-    };
-    std::fprintf(stderr, "[rt] pool-diag: peak %llu B, pool %llu B, %llu entries (i size first last usage kind fmt WxHxD mips)\n",
-                 static_cast<unsigned long long>(c.Rax), static_cast<unsigned long long>(c.Rcx),
-                 static_cast<unsigned long long>(c.R13));
-    for (uint64_t i = 0; i < c.R13 && i < 4096; ++i) {
-        uint64_t entry = 0, record = 0;
-        uint32_t size = 0, passes[2]{};
-        uint8_t desc[16]{};
-        uint16_t words[2]{};
-        if (!read(c.Rdi + i * 24, &entry, 8) || !read(c.Rdi + i * 24 + 8, &size, 4) || !read(entry, &record, 8) ||
-            !read(entry + 16, passes, 8) || !read(record + 14, words, 4) || !read(record + 56, desc, 16))
-            break;
-        uint16_t w, h, d;
-        std::memcpy(&w, desc, 2);
-        std::memcpy(&h, desc + 2, 2);
-        std::memcpy(&d, desc + 4, 2);
-        std::fprintf(stderr, "[rt] pool-diag: %llu %u %u %u 0x%x 0x%x %u %ux%ux%u %u\n",
-                     static_cast<unsigned long long>(i), size, passes[0], passes[1], words[0], words[1],
-                     unsigned(desc[7]), unsigned(w), unsigned(h), unsigned(d), unsigned(desc[10]));
-    }
-}
-
 inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
-        static const std::string pool_diag_at = [] {
-            char at[128]{};
-            const DWORD n = GetEnvironmentVariableA("LEONIDA_POOL_DIAG_AT", at, sizeof(at));
-            return n && n < sizeof(at) ? std::string(at, n) : std::string();
-        }();
-        if (r.ExceptionCode == EXCEPTION_BREAKPOINT && info.ContextRecord && !pool_diag_at.empty() &&
-            where(reinterpret_cast<uint64_t>(r.ExceptionAddress)).ends_with(pool_diag_at))
-            dump_transient_pool(*info.ContextRecord);
         if (r.ExceptionCode == kDbgPrint || r.ExceptionCode == kDbgPrintWide) {
             const ULONG_PTR fallback = wide_fallback;
             const bool wide = r.ExceptionCode == kDbgPrintWide;

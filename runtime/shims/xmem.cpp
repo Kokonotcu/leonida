@@ -45,7 +45,6 @@
 #include "title_memory.h"
 #include "xmem.h"
 #include "placed_image_map_note.h"
-#include "../src/dstorage_trace.h"
 #include "../src/gpu_label_memory.h"
 #include "../src/title_page_watch.h"
 #include "../src/title_geometry_watch.h"
@@ -1248,7 +1247,6 @@ bool map_view(uintptr_t address, const View& view, uint64_t* done = nullptr) {
                                          MEM_REPLACE_PLACEHOLDER, view.protect, nullptr, 0)) {
             return false;
         }
-        rt::xmem::g_view_maps.fetch_add(1, std::memory_order_relaxed);  // the address-space lock rate report
         rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
         leonida::title_memory_map::changed(target, size);
         View part = view;
@@ -1356,7 +1354,6 @@ bool unmap_range_locked(uintptr_t start, uintptr_t end) {
                                            MEM_PRESERVE_PLACEHOLDER)) {
             return false;
         }
-        rt::xmem::g_view_unmaps.fetch_add(1, std::memory_order_relaxed);  // the address-space lock rate report
         rt::xmem::g_map_generation.fetch_add(1, std::memory_order_release);
         leonida::title_memory_map::changed(base, view_end);
         leonida::geometry_writes::notify(base, view_end, leonida::geometry_writes::Event::replaced);
@@ -1547,7 +1544,6 @@ PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& prot
     }
     void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset + within;
     if (!VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return PageCommit::failed;
-    rt::xmem::g_commits_on_touch.fetch_add(1, std::memory_order_relaxed);  // the address-space lock rate report
     leonida::geometry_writes::notify(address, address + kPhysicalPageSize, leonida::geometry_writes::Event::mapping);
     leonida::title_memory_map::changed(address, address + kPhysicalPageSize);
     return PageCommit::committed_now;
@@ -3288,10 +3284,6 @@ bool transfer_physical(std::span<const uint64_t> pages, uint16_t offset, std::sp
                     // The D3D12 layer's title-texture watch (merge: ours beside upstream's texel-write notes).
                     if (const auto told = g_title_written.load(std::memory_order_acquire))
                         told(reinterpret_cast<void*>(address + offset), bytes);
-                    if (leonida::dstorage::trace_enabled())
-                        std::fprintf(stderr, "[rt] ds-scatter cpu=%llx bytes=%zu page=%llu\n",
-                                     static_cast<unsigned long long>(address + offset), bytes,
-                                     static_cast<unsigned long long>(page));
                 }
             }
         } else {

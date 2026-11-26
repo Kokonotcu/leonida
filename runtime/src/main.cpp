@@ -42,9 +42,6 @@
 #include <cstring>
 #include <mutex>
 
-namespace rt::write_watch {
-void start_from_environment();
-}
 #include <cstring>
 
 namespace {
@@ -115,78 +112,9 @@ void keep_title_watchdog_kicked(std::uint8_t* base) {
     }
 }
 
-// LEONIDA_PEEK="<rva>:3,<rva>,<rva>" (diagnostic): a thread prints the 8-byte values at these RVAs of the
-// title's image (":n" = n consecutive values, at most 32; "RVA>OFF" reads through the pointer stored at the RVA, at
-// pointer + OFF, both hex) every LEONIDA_PEEK_SECONDS (default 10). For answering "what does this
-// global hold at run time" without a debugger: the reverse-engineering notes (docs/re/requests.md) ask for exactly
-// that. Reads are checked; nothing is written.
-void start_title_peek(std::uint8_t* base) {
-    static char spec[1024];
-    const DWORD n = GetEnvironmentVariableA("LEONIDA_PEEK", spec, sizeof(spec));
-    if (!n || n >= sizeof(spec)) return;
-    static std::uint8_t* image = base;
-    const HANDLE thread = CreateThread(
-        nullptr, 0,
-        [](LPVOID) -> DWORD {
-            char seconds[16]{};
-            DWORD period = 10;
-            if (GetEnvironmentVariableA("LEONIDA_PEEK_SECONDS", seconds, sizeof(seconds)) > 0)
-                period = std::max<DWORD>(1, static_cast<DWORD>(std::strtoul(seconds, nullptr, 10)));
-            for (unsigned tick = 0;; ++tick) {
-                std::string line = "[rt] peek t=" + std::to_string(tick * period) + "s:";
-                for (const char* at = spec; *at;) {
-                    char* end = nullptr;
-                    const std::uint64_t rva = std::strtoull(at, &end, 16);
-                    if (end == at) break;
-                    // "RVA>OFF": the 8-byte pointer at the RVA, then the values at pointer + OFF (both hex).
-                    bool deref = false;
-                    std::uint64_t offset = 0;
-                    if (*end == '>') {
-                        deref = true;
-                        offset = std::strtoull(end + 1, &end, 16);
-                    }
-                    unsigned count = 1;
-                    if (*end == ':') count = static_cast<unsigned>(std::strtoul(end + 1, &end, 10));
-                    char text[48];
-                    if (deref)
-                        std::snprintf(text, sizeof(text), " 0x%llx>%llx=", static_cast<unsigned long long>(rva),
-                                      static_cast<unsigned long long>(offset));
-                    else
-                        std::snprintf(text, sizeof(text), " 0x%llx=", static_cast<unsigned long long>(rva));
-                    line += text;
-                    const std::uint8_t* from = image + rva;
-                    if (deref) {
-                        std::uint64_t pointer = 0;
-                        SIZE_T got = 0;
-                        if (!ReadProcessMemory(GetCurrentProcess(), from, &pointer, sizeof(pointer), &got) ||
-                            got != sizeof(pointer) || !pointer)
-                            count = 0, line += "?";
-                        from = reinterpret_cast<const std::uint8_t*>(pointer + offset);
-                    }
-                    for (unsigned i = 0; i < count && i < 32; ++i) {
-                        std::uint64_t value = 0;
-                        SIZE_T got = 0;
-                        const bool ok = ReadProcessMemory(GetCurrentProcess(), from + 8ull * i, &value,
-                                                          sizeof(value), &got) && got == sizeof(value);
-                        std::snprintf(text, sizeof(text), ok ? "%s%llx" : "%s?", i ? "," : "",
-                                      static_cast<unsigned long long>(value));
-                        line += text;
-                    }
-                    at = *end == ',' ? end + 1 : end;
-                    if (at == end && *end) break;
-                }
-                std::fprintf(stderr, "%s\n", line.c_str());
-                Sleep(period * 1000);
-            }
-        },
-        nullptr, 0, nullptr);
-    if (thread) CloseHandle(thread);
-}
-
 }  // namespace
 
 #include "base_reservation.h"
-#include "big_alloc_log.h"
 #include "code_hooks.h"
 #include "cpu_emulation.h"
 #include "host_cpu.h"
@@ -194,7 +122,6 @@ void start_title_peek(std::uint8_t* base) {
 #include "pe_loader.h"
 #include "thread_stacks.h"
 #include "dev_overlay.h"
-#include "thread_sampler.h"
 #include "title_page_watch.h"
 #include "title_geometry_watch.h"
 #include "../shims/d3d12_trace.h"
@@ -403,24 +330,6 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
                      reinterpret_cast<void*>(c.R11), reinterpret_cast<void*>(c.R12),
                      reinterpret_cast<void*>(c.R13), reinterpret_cast<void*>(c.R14),
                      reinterpret_cast<void*>(c.R15));
-        if (c.Rip == 0) {
-            __try {
-                const auto object = static_cast<std::uint64_t>(c.Rax);
-                const auto vtable = *reinterpret_cast<const std::uint64_t*>(object);
-                const auto slot146 = *reinterpret_cast<const std::uint64_t*>(vtable + 0x490);
-                char where[MAX_PATH] = {};
-                HMODULE holder = nullptr;
-                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   reinterpret_cast<LPCSTR>(vtable), &holder);
-                if (holder) GetModuleFileNameA(holder, where, MAX_PATH);
-                std::fprintf(stderr, "[rt] nullcall: rax=%p vtable=%p slot146=%p module=%s\n",
-                             reinterpret_cast<void*>(object), reinterpret_cast<void*>(vtable),
-                             reinterpret_cast<void*>(slot146), where[0] ? where : "?");
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                std::fprintf(stderr, "[rt] nullcall: unreadable\n");
-            }
-        }
         __try {
             const auto* stack = reinterpret_cast<const std::uint64_t*>(c.Rsp);
             std::fprintf(stderr, "[rt] crash-stack-raw:");
@@ -429,76 +338,6 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             std::fprintf(stderr, "[rt] crash-stack-raw: unreadable\n");
         }
-        // Diagnostic: the memory around each general register that points at readable memory, with its region, so a
-        // corrupted object can be told apart from an overrun leading into it (retail boot 15: an object whose vtable
-        // word read 0x3F8000003F800000, two floats of 1.0).
-        const struct {
-            const char* name;
-            DWORD64 value;
-        } regs[] = {{"rax", c.Rax}, {"rbx", c.Rbx}, {"rcx", c.Rcx}, {"rdx", c.Rdx}, {"rsi", c.Rsi}, {"rdi", c.Rdi},
-                    {"r8", c.R8},   {"r9", c.R9},   {"r12", c.R12}, {"r13", c.R13}, {"r14", c.R14}, {"r15", c.R15}};
-        for (const auto& reg : regs) {
-            MEMORY_BASIC_INFORMATION info{};
-            if (reg.value < 0x10000 ||
-                VirtualQuery(reinterpret_cast<void*>(reg.value), &info, sizeof(info)) != sizeof(info) ||
-                info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
-                continue;
-            const auto region_begin = reinterpret_cast<DWORD64>(info.BaseAddress);
-            const DWORD64 region_end = region_begin + info.RegionSize;
-            const DWORD64 at_reg = reg.value & ~DWORD64(7);
-            const DWORD64 from = at_reg - region_begin >= 0x80 ? at_reg - 0x80 : region_begin;
-            const DWORD64 to = region_end - at_reg >= 0x80 ? at_reg + 0x80 : region_end;
-            std::fprintf(stderr, "[rt] crash-mem %s=%p region base=%p size=0x%llx alloc=%p type=0x%lx", reg.name,
-                         reinterpret_cast<void*>(reg.value), info.BaseAddress,
-                         static_cast<unsigned long long>(info.RegionSize), info.AllocationBase, info.Type);
-            __try {
-                for (DWORD64 at = from; at < to; at += 8) {
-                    if (((at - from) & 0x3f) == 0)
-                        std::fprintf(stderr, "\n[rt] crash-mem   %+05lld:",
-                                     static_cast<long long>(at) - static_cast<long long>(at_reg));
-                    std::fprintf(stderr, " %016llx", *reinterpret_cast<const unsigned long long*>(at));
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                std::fprintf(stderr, " (unreadable)");
-            }
-            std::fprintf(stderr, "\n");
-        }
-        // LOCAL DIAGNOSTIC (2026-11-26): a recent host write (a file read, a DirectStorage copy) into the title's
-        // memory that covers what a register points at: a title object found holding a stream's bytes was either
-        // read over (this names the write) or written by the GPU (nothing here).
-        for (const auto& reg : regs)
-            if (reg.value >= 0x10000) leonida::kernel_writes::report_recent_writes(reg.value, reg.name);
-    }
-    // Diagnostic: the retail frame path reads through 0x100000000 (the synthetic-VA base). Commit one guard page
-    // there so a read of that address is a value, not a fault, while the caller is being identified.
-    __try {
-        void* probe = VirtualAlloc(reinterpret_cast<void*>(0x100000000ull), 0x10000,
-                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        std::fprintf(stderr, "[rt] crash-pad: 0x100000000 -> %p\n", probe);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        std::fprintf(stderr, "[rt] crash-pad: failed\n");
-    }
-    // Diagnostic: the faulting thread's TEB TLS slots (the console main image reads slot 0 directly).
-    __try {
-        auto** tls = reinterpret_cast<void**>(__readgsqword(0x58));
-        std::fprintf(stderr, "[rt] crash-tls: slots=%p slot0=%p slot1=%p slot2=%p slot3=%p\n",
-                     static_cast<void*>(tls), tls ? tls[0] : nullptr, tls ? tls[1] : nullptr,
-                     tls ? tls[2] : nullptr, tls ? tls[3] : nullptr);
-        if (tls && tls[0]) {
-            MEMORY_BASIC_INFORMATION info{};
-            if (VirtualQuery(tls[0], &info, sizeof(info)) == sizeof(info))
-                std::fprintf(stderr, "[rt] crash-tls: slot0 region base=%p size=0x%llx state=0x%lx protect=0x%lx\n",
-                             info.BaseAddress, static_cast<unsigned long long>(info.RegionSize), info.State,
-                             info.Protect);
-            else
-                std::fprintf(stderr, "[rt] crash-tls: slot0 not mapped\n");
-            auto* base = static_cast<unsigned char*>(tls[0]);
-            std::fprintf(stderr, "[rt] crash-tls: tls+0x12a8=%p tls+0x12a0=%p tls+0x12b0=%p\n",
-                         *reinterpret_cast<void**>(base + 0x12a8), *reinterpret_cast<void**>(base + 0x12a0),
-                         *reinterpret_cast<void**>(base + 0x12b0));
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        std::fprintf(stderr, "[rt] crash-tls: unreadable\n");
     }
     void* frames[32] = {};
     const USHORT count = CaptureStackBackTrace(0, 32, frames, nullptr);
@@ -516,59 +355,12 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
                                 : 0ull);
     }
     std::fflush(stderr);
-    // The retail frame path reads the per-thread context pointer at 0x100000000 (4 GiB): its TLS block is laid out
-    // so the pointer field lands exactly at 4 GiB. This thread's own TLS block already holds that pointer at
-    // +0x12a8, so put it in the slot the title reads, then let the faulting instruction run again against it.
-    // Diagnostic: the A8 render-target format assert (title RVA 0xCC2936). The format is supported by the layer but
-    // the title's own info switch still traps; step over the int3 so the next real stop is visible.
+    // The A8 render-target format assert (title RVA 0xCC2936; with LEONIDA_ASSERTS=stop too): the format is supported
+    // by the layer, but the title's own info switch still traps. Its int3 is stepped over.
     if (r.ExceptionCode == 0x80000003 && info->ContextRecord &&
         info->ContextRecord->Rip == 0x140CC2936ull) {
         static std::atomic<int> skipped_format{0};
         if (skipped_format.fetch_add(1) < 64) {
-            std::fprintf(stderr, "[rt] format-int3: rbp=%p r10=%p r13=%p r14=%p rsi=%p rdi=%p\n",
-                         reinterpret_cast<void*>(info->ContextRecord->Rbp),
-                         reinterpret_cast<void*>(info->ContextRecord->R10),
-                         reinterpret_cast<void*>(info->ContextRecord->R13),
-                         reinterpret_cast<void*>(info->ContextRecord->R14),
-                         reinterpret_cast<void*>(info->ContextRecord->Rsi),
-                         reinterpret_cast<void*>(info->ContextRecord->Rdi));
-            __try {
-                const auto rsp = static_cast<std::uint64_t>(info->ContextRecord->Rsp);
-                const auto caller_rsi = *reinterpret_cast<const std::uint64_t*>(rsp + 0x48);
-                const auto holder = caller_rsi ? *reinterpret_cast<const std::uint64_t*>(caller_rsi + 0x60) : 0;
-                const auto holder_vt = holder ? *reinterpret_cast<const std::uint64_t*>(holder) : 0;
-                std::fprintf(stderr, "[rt] format-object: caller_rsi=%p holder=%p holder_vtable=%p\n",
-                             reinterpret_cast<void*>(caller_rsi), reinterpret_cast<void*>(holder),
-                             reinterpret_cast<void*>(holder_vt));
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                std::fprintf(stderr, "[rt] format-object: unreadable\n");
-            }
-            __try {
-                const auto* st = reinterpret_cast<const std::uint64_t*>(info->ContextRecord->Rsp);
-                std::fprintf(stderr, "[rt] format-stack-raw:");
-                for (int i = 0; i < 10; ++i) std::fprintf(stderr, " %016llx", static_cast<unsigned long long>(st[i]));
-                std::fprintf(stderr, "\n");
-                for (int i = 0; i < 14; ++i) {
-                    const std::uint64_t a = st[i];
-                    if (a < 0x10000) continue;
-                    HMODULE holder = nullptr;
-                    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                           reinterpret_cast<LPCSTR>(a), &holder) &&
-                        holder) {
-                        char name[MAX_PATH] = {};
-                        GetModuleFileNameA(holder, name, MAX_PATH);
-                        const char* slash = std::strrchr(name, '\\');
-                        std::fprintf(stderr, "[rt] format-frame %d: %s+0x%llx\n", i, slash ? slash + 1 : name,
-                                     static_cast<unsigned long long>(a - reinterpret_cast<std::uint64_t>(holder)));
-                    } else if (a >= 0x140000000ull && a < 0x150000000ull) {
-                        std::fprintf(stderr, "[rt] format-frame %d: game+0x%llx\n", i,
-                                     static_cast<unsigned long long>(a - 0x140000000ull));
-                    }
-                }
-            } __except (EXCEPTION_EXECUTE_HANDLER) {
-                std::fprintf(stderr, "[rt] format-stack-raw: unreadable\n");
-            }
             info->ContextRecord->Rip += 1;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -589,9 +381,14 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
+    // The retail frame path reads the per-thread context pointer at 0x100000000 (4 GiB): its TLS block is laid out
+    // so the pointer field lands exactly at 4 GiB. This thread's own TLS block already holds that pointer at
+    // +0x12a8, so put it in the slot the title reads, then let the faulting instruction run again against it.
     if (r.ExceptionCode == 0xC0000005 && access == reinterpret_cast<void*>(0x100000000ull)) {
         __try {
-            VirtualAlloc(reinterpret_cast<void*>(0x100000000ull), 0x1000, MEM_COMMIT, PAGE_READWRITE);
+            void* const page = reinterpret_cast<void*>(0x100000000ull);
+            if (!VirtualAlloc(page, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+                VirtualAlloc(page, 0x1000, MEM_COMMIT, PAGE_READWRITE);  // reserved by an earlier fault
             auto** tls = reinterpret_cast<void**>(__readgsqword(0x58));
             void* context = nullptr;
             if (tls && tls[0]) context = *reinterpret_cast<void**>(static_cast<unsigned char*>(tls[0]) + 0x12a8);
@@ -722,7 +519,6 @@ static BOOL WINAPI show_package_window(HWND window, int command) {
 #endif
 
 int wmain(int argc, wchar_t** argv) {
-    leonida::big_alloc_log::install();  // LEONIDA_LOG_BIG_ALLOCS=1 (src/big_alloc_log.h)
 #ifdef LEONIDA_VULKAN_DEVICE
     if (argc > 1 && std::wstring(argv[1]) == L"--precompile-pipelines") return precompile_main(argc, argv);
     if (argc > 1 && std::wstring(argv[1]) == L"--compile-server") return compile_server_main(argc, argv);
@@ -898,7 +694,6 @@ int wmain(int argc, wchar_t** argv) {
                          ok ? 0ul : GetLastError());
         }
     }
-    rt::write_watch::start_from_environment();  // LEONIDA_WATCH_WRITE (src/write_watch.cpp), added after: runs first
     // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
     if (rt::xmem::slot31_runs() && rt::xmem::queue_page_mappings_enabled())
@@ -1000,13 +795,6 @@ int wmain(int argc, wchar_t** argv) {
             std::fflush(stdout);
             std::rethrow_exception(init_failure);
         }
-        if (std::getenv("LEONIDA_HEAP_PROBE")) {
-            std::fprintf(stderr, "[rt] heap-probe: after mapping\n");
-            std::fflush(stderr);
-            const BOOL ok = HeapValidate(reinterpret_cast<HANDLE>(_get_heap_handle()), 0, nullptr);
-            std::fprintf(stderr, "[rt] heap-probe: after mapping ok=%d\n", ok);
-            std::fflush(stderr);
-        }
         if (!run) {
             rt::startup_trace::event("exit", "\"code\":0");
             return 0;
@@ -1038,9 +826,7 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         keep_title_watchdog_kicked(main_module.base);
-        start_title_peek(main_module.base);
         leonida::dev_overlay::start();  // LEONIDA_DEV_OVERLAY=1
-        leonida::thread_sampler::start(main_module.base, main_module.size);  // LEONIDA_SAMPLE_MS (diagnostic)
 #ifdef LEONIDA_VULKAN_DEVICE
         SetConsoleCtrlHandler(&stop_compiles_on_console_exit, TRUE);
         previous_fatal_filter = SetUnhandledExceptionFilter(&save_caches_on_fatal_exception);
@@ -1049,10 +835,7 @@ int wmain(int argc, wchar_t** argv) {
 #ifdef LEONIDA_VULKAN_DEVICE
         leonida::thread_stack_hook.store(&rt::print_thread_stacks_now, std::memory_order_release);
 #endif
-        {
-            auto stacks = rt::start_thread_stacks();
-            code = rt::process::run_entry(main_module.base + main_module.entry_rva);
-        }
+        code = rt::process::run_entry(main_module.base + main_module.entry_rva);
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);
         rt::shims::report_called_unimplemented();

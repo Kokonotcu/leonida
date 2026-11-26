@@ -206,19 +206,6 @@ int bad_releases() {
     return 0;
 }
 
-// The diagnostic reader in d3d12_compute_input_probe.h: is an address inside a free block, and where does the next
-// one start.
-int reader() {
-    Blocks b;
-    b.reset(kReserved, kSize);
-    std::uint64_t a = 0, c = 0, offset = 0, size = 0, next = 0;
-    EXPECT(b.allocate(0x1000, kAlign, no_keep_out, a));
-    EXPECT(b.allocate(0x1000, kAlign, no_keep_out, c));
-    EXPECT(!b.free_at(a, offset, size, next) && next == c + 0x1000);
-    EXPECT(b.free_at(c + 0x1000, offset, size, next) && offset == c + 0x1000 && next == kSize);
-    return 0;
-}
-
 // Many threads, one lock -- the device's shape: every call to the block map under one mutex, no call re-entering it.
 int threads() {
     Blocks b;
@@ -303,7 +290,6 @@ int main() {
     if (int r = taken_under_the_walk()) return r;
     if (int r = walk_interrupted()) return r;
     if (int r = bad_releases()) return r;
-    if (int r = reader()) return r;
     if (int r = threads()) return r;
     if (int r = overflow_and_bounds()) return r;
     std::fprintf(stderr, "arena_blocks: ok\n");

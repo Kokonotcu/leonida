@@ -229,117 +229,7 @@ const Subobject* find_subobject(const std::vector<Subobject>& subs, const Target
     return nullptr;
 }
 
-D3D12_SHADER_BYTECODE bytecode(const unsigned char* src, const Subobject& sub) {
-    D3D12_SHADER_BYTECODE code{};
-    std::memcpy(&code, src + sub.payload, sizeof(code));
-    return code;
-}
-
-int dxil_kind(std::span<const std::uint8_t> code) {
-    const auto dxil = leonida::dxbc_part(code, "DXIL");
-    return dxil.size() >= 4 ? dxil[2] | (dxil[3] << 8) : -1;
-}
-
 }  // namespace
-
-void audit_pso_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, HRESULT hr, bool normalized) {
-    const auto* src = static_cast<const unsigned char*>(desc.pPipelineStateSubobjectStream);
-    std::vector<Subobject> subs;
-    if (!src || !desc.SizeInBytes || desc.SizeInBytes > kMaxStreamBytes ||
-        !walk(src, desc.SizeInBytes, subs, normalized)) {
-        std::fprintf(stderr, "[rt] pso-stream call=%llu normalized=%d hr=%08lx types=unwalked reason=%s\n",
-                     d3d12_trace::last_sequence, int(normalized), static_cast<unsigned long>(hr),
-                     d3d12_trace::stream_refusal ? d3d12_trace::stream_refusal : "-");
-        return;
-    }
-    bool depth_bounds = false;
-    std::string types, shaders;
-    for (const auto& sub : subs) {
-        unsigned raw;
-        std::memcpy(&raw, src + sub.tag_offset, sizeof(raw));
-        if (!types.empty()) types += ',';
-        types += std::to_string(raw);
-        if (sub.type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1 ||
-            sub.type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2) {
-            BOOL enabled;
-            const auto offset = sub.type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1
-                ? offsetof(D3D12_DEPTH_STENCIL_DESC1, DepthBoundsTestEnable)
-                : offsetof(D3D12_DEPTH_STENCIL_DESC2, DepthBoundsTestEnable);
-            std::memcpy(&enabled, src + sub.payload + offset, sizeof(enabled));
-            depth_bounds |= enabled != FALSE;
-        }
-        if (!(sub.type >= 1 && sub.type <= 6) && sub.type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS &&
-            sub.type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) continue;
-        const auto code = bytecode(src, sub);
-        if (!code.pShaderBytecode || !code.BytecodeLength) continue;
-        const std::span bytes{static_cast<const std::uint8_t*>(code.pShaderBytecode), code.BytecodeLength};
-        const auto program = leonida::compute_program(bytes);
-        shaders += " " + std::to_string(raw) + "/" + std::to_string(dxil_kind(bytes)) + "=" +
-                   (program.bytes.empty() ? "unknown" : leonida::sha256_hex(program.bytes));
-        if (FAILED(hr) && hr != E_NOTIMPL)
-            shaders += " container=" + leonida::sha256_hex(bytes) + " bytes=" + std::to_string(bytes.size());
-    }
-    std::fprintf(stderr, "[rt] pso-stream call=%llu normalized=%d hr=%08lx bounds=%d types=%s%s reason=%s\n",
-                 d3d12_trace::last_sequence, int(normalized), static_cast<unsigned long>(hr), int(depth_bounds),
-                 types.c_str(), shaders.c_str(), d3d12_trace::stream_refusal ? d3d12_trace::stream_refusal : "-");
-}
-
-namespace {
-// LOCAL DIAGNOSTIC (mem probe): live records by stream content hash, with that content's size.
-bool probe_records() {
-    static const bool on = [] {
-        const char* v = std::getenv("LEONIDA_MEM_PROBE");
-        return v && v[0] && v[0] != '0';
-    }();
-    return on;
-}
-struct ProbeRecords {
-    std::mutex mutex;
-    std::unordered_map<std::uint64_t, std::pair<std::size_t, std::size_t>> by_hash;  // count, bytes
-    std::size_t records = 0;
-    std::uint64_t bytes = 0;
-};
-ProbeRecords& probe_state() {
-    static auto* s = new ProbeRecords;
-    return *s;
-}
-}  // namespace
-
-void PsoStreamRecord::note_made() {
-    if (!probe_records()) return;
-    std::uint64_t hash = 14695981039346656037ull;
-    for (const unsigned char c : bytes_) hash = (hash ^ c) * 1099511628211ull;
-    probe_hash_ = hash ^ bytes_.size() ^ 1;  // never 0 in practice
-    ProbeRecords& s = probe_state();
-    std::lock_guard lock(s.mutex);
-    auto& entry = s.by_hash[probe_hash_];
-    ++entry.first;
-    entry.second = bytes_.size();
-    ++s.records;
-    s.bytes += bytes_.size();
-}
-
-PsoStreamRecord::~PsoStreamRecord() {
-    if (!probe_hash_) return;
-    ProbeRecords& s = probe_state();
-    std::lock_guard lock(s.mutex);
-    const auto it = s.by_hash.find(probe_hash_);
-    if (it != s.by_hash.end() && !--it->second.first) s.by_hash.erase(it);
-    --s.records;
-    s.bytes -= bytes_.size();
-}
-
-PsoStreamStats pso_stream_stats() {
-    PsoStreamStats out;
-    if (!probe_records()) return out;
-    ProbeRecords& s = probe_state();
-    std::lock_guard lock(s.mutex);
-    out.records = s.records;
-    out.bytes = s.bytes;
-    out.distinct = s.by_hash.size();
-    for (const auto& [hash, entry] : s.by_hash) out.distinct_bytes += entry.second;
-    return out;
-}
 
 PsoStreamRecord::Payloads::~Payloads() {
     for (ID3D12RootSignature* root : roots)
@@ -366,7 +256,6 @@ std::unique_ptr<PsoStreamRecord> PsoStreamRecord::capture(const D3D12_PIPELINE_S
         if (console) std::memcpy(record->bytes_.data() + sub.tag_offset, &sub.type, sizeof(sub.type));
         if (!record->copy_pointed_data(sub.type, sub.payload)) return nullptr;
     }
-    record->note_made();
     return record;
 }
 
@@ -376,7 +265,6 @@ std::unique_ptr<PsoStreamRecord> PsoStreamRecord::derived(const PsoStreamRecord&
     std::unique_ptr<PsoStreamRecord> record(new PsoStreamRecord());
     record->bytes_ = std::move(stream);
     record->payloads_ = base.payloads_;
-    record->note_made();
     return record;
 }
 

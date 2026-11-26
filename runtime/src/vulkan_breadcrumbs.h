@@ -27,7 +27,7 @@
 #include <vulkan/vulkan.h>
 
 #include "command_list.h"
-#include "debug_targets.h"  // arena_mapped: the stuck dispatch's descriptors in a hang report
+#include "fault_memory.h"  // the stuck dispatch's descriptors in a hang report
 #include "vulkan_memory.h"
 
 #include <algorithm>
@@ -373,12 +373,12 @@ public:
                     pso = d->pipeline;
                     detail = {d->x, d->y, d->z, d->user_data[0], d->user_data[1], d->user_data[2], d->user_data[3],
                               d->user_data[4], d->user_data[5], d->user_data[6], d->user_data[7]};
-                    if (debug_targets::arena_mapped) {
+                    if (fault_memory::arena_mapped) {
                         std::array<std::uint32_t, 32> words{};
                         bool any = false;
                         for (int w = 0; w < 8; ++w)
                             if (arena_word(d->user_data[w])) {
-                                const auto* v = reinterpret_cast<const std::uint32_t*>(debug_targets::arena_mapped +
+                                const auto* v = reinterpret_cast<const std::uint32_t*>(fault_memory::arena_mapped +
                                                                                        d->user_data[w]);
                                 for (int k = 0; k < 4; ++k) words[w * 4 + k] = v[k];
                                 any = true;
@@ -512,7 +512,7 @@ public:
                 for (int w = 3; w < 11 && shown < limit; ++w) {
                     if (!arena_word(d[w])) continue;
                     std::uint32_t t[32];
-                    if (!debug_targets::read_gpu_va(d[w], t, sizeof(t))) continue;
+                    if (!fault_memory::read_gpu_va(d[w], t, sizeof(t))) continue;
                     for (int q = 0; q < 8; ++q) {
                         const std::uint32_t* v = t + 4 * q;
                         const std::uint64_t base = v[0] | (std::uint64_t(v[1] & 0xFFFF) << 32);
@@ -688,20 +688,20 @@ private:
                                  d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10]);
                     // The descriptors a word names when it is an address in the GPU address arena (the V# a shader
                     // loads through it): 4 dwords each, for the stuck operation.
-                    if (k == at && debug_targets::arena_mapped) {
+                    if (k == at && fault_memory::arena_mapped) {
                         const std::array<std::uint32_t, 32>* then = nullptr;
                         for (const auto& s : e.submitted_words)
                             if (s.first == k) then = &s.second;
                         for (int w = 3; w < 11; ++w)
                             if (arena_word(d[w])) {
-                                const auto* v = reinterpret_cast<const std::uint32_t*>(debug_targets::arena_mapped + d[w]);
+                                const auto* v = reinterpret_cast<const std::uint32_t*>(fault_memory::arena_mapped + d[w]);
                                 std::fprintf(out, "\n[rt] d3d12 DRED:          at user data %d (%#x): %08x %08x %08x %08x",
                                              w - 3, d[w], v[0], v[1], v[2], v[3]);
                                 if (then) {
                                     const std::uint32_t* s = then->data() + (w - 3) * 4;
                                     std::fprintf(out, " (at submission %08x %08x %08x %08x)", s[0], s[1], s[2], s[3]);
                                 }
-                                debug_targets::log_table(out, w - 3, d[w]);
+                                fault_memory::log_table(out, w - 3, d[w]);
                             }
                     }
                 }
@@ -713,7 +713,7 @@ private:
     }
     // A user-data word that is a 4-aligned address of 16 bytes in the GPU address arena, past its zero page.
     static bool arena_word(std::uint32_t w) {
-        return w >= 0x10000 && w % 4 == 0 && std::uint64_t(w) + 16 <= debug_targets::arena_size;
+        return w >= 0x10000 && w % 4 == 0 && std::uint64_t(w) + 16 <= fault_memory::arena_size;
     }
     static std::size_t count_incomplete(const std::vector<Entry>& entries) {
         std::size_t n = 0;

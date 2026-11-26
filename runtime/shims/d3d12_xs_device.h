@@ -369,6 +369,12 @@ void set_device_presentation_window(void* device, std::uint64_t window);
 using TextureByVaProvider = ID3D12Resource* (*)(ID3D12Device* real, std::uint64_t va, const D3D12_RESOURCE_DESC* desc);
 bool set_device_texture_provider(void* device, TextureByVaProvider provider);
 
+// The bytes a texture the title placed takes in its memory (its console layout's span), 0 when unknown: the Vulkan
+// layer's rt::d3d12::title_texture_footprint, installed by it; null where the proxy runs without that layer (tests).
+// List slot 86's buffer-to-texture copy is bounded by it, and not made without it.
+using TitleTextureFootprint = std::uint64_t (*)(ID3D12Resource* resource);
+inline std::atomic<TitleTextureFootprint> g_title_texture_footprint{nullptr};
+
 // The console layout word (D3D12_RESOURCE_DESC::Layout as the title wrote it) of the texture the device is asked to
 // place on this thread right now (slot 133's handler, slot 70's texture provider), 0 otherwise (bd6529b5b).
 inline thread_local std::uint32_t g_placed_console_layout = 0;

@@ -612,6 +612,9 @@ TitleImage test_bind_title_image(ID3D12Device* device, const std::array<std::uin
 
 // Returns the internal image address registered for a resource in the device's image table.
 std::uint64_t resource_image_address(ID3D12Resource* resource);
+// The bytes a texture the title placed in its own memory takes there (its console layout's span, as registered),
+// or 0 when it is not such a texture.
+std::uint64_t title_texture_footprint(ID3D12Resource* resource);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be

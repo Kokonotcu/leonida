@@ -19,14 +19,6 @@
 #include <vector>
 
 namespace rt::d3d12 {
-inline bool trace_pipeline_compile() {
-    static const bool on = [] {
-        wchar_t v[2]{};
-        return GetEnvironmentVariableW(L"LEONIDA_TRACE_PIPELINE_COMPILE", v, 2) == 1 && v[0] == L'1';
-    }();
-    return on;
-}
-
 inline bool async_replay_compile() {
     static const bool on = [] {
         wchar_t v[2]{};
@@ -59,48 +51,15 @@ inline VkPipelineCreateFlags fast_pipeline_flags(bool compute) {
     return (mask & (compute ? 2u : 1u)) ? VkPipelineCreateFlags(VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) : 0;
 }
 
-// Absolute monotonic timestamps let trace readers distinguish time in the ICD from time queued for the worker.
-using CompileClock = std::chrono::steady_clock;
-inline long long compile_us() {
-    return std::chrono::duration_cast<std::chrono::microseconds>(CompileClock::now().time_since_epoch()).count();
-}
-
-inline long long compile_wall_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-template<class Build> VkPipeline replay_pipeline(const char* trigger, Build&& get) {
-    if (!trace_pipeline_compile()) return get();
-    const auto start = compile_us();
-    auto handle = get();
-    auto elapsed = compile_us() - start;
-    if (elapsed >= 1000)
-        std::fprintf(stderr, "[rt] pipeline-use trigger=%s tid=%lu us=%lld ready=%d end_ms=%lld\n",
-                     trigger, GetCurrentThreadId(), elapsed, int(handle != VK_NULL_HANDLE), compile_wall_ms());
-    return handle;
-}
-
+// Whether a pipeline came out of the application's VkPipelineCache, from VkPipelineCreationFeedback (the pipeline
+// journal asks on a Vulkan 1.3 device, where feedback is core).
 struct CompileTrace {
     VkPipelineCreationFeedback feedback{};
     VkPipelineCreationFeedbackCreateInfo chain{VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
                                                nullptr, &feedback, 0, nullptr};
-    long long started = 0;
-    const char* key = "-";
     bool linked = false;  // chain is in a create info's pNext chain
 
-    template<class Info> void begin(Info& info, bool supported, const char* trigger, const char* shaders,
-                                    std::uint32_t variant, std::size_t bytes, const std::string& description_key) {
-        if (!trace_pipeline_compile()) return;
-        if (!description_key.empty()) key = description_key.c_str();
-        if (supported) request_feedback(info);
-        std::fprintf(stderr, "[rt] pipeline-compile-begin trigger=%s tid=%lu bytes=%zu variant=%u begin_ms=%lld key=%s shaders=%s\n",
-                     trigger, GetCurrentThreadId(), bytes, variant, compile_wall_ms(), key, shaders);
-        started = compile_us();
-    }
-
-    // Chains the feedback struct ahead of info.pNext, once. begin() does when tracing; the pipeline journal does on a
-    // Vulkan 1.3 device (feedback is core there) to learn whether a pipeline came out of its cache.
+    // Chains the feedback struct ahead of info.pNext, once.
     template<class Info> void request_feedback(Info& info) {
         if (linked) return;
         chain.pNext = info.pNext;
@@ -115,14 +74,6 @@ struct CompileTrace {
                int((feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0);
     }
 
-    void end(const char* trigger, const char* shaders, std::uint32_t variant, std::size_t bytes, VkResult result) const {
-        if (!started) return;
-        const auto ended = compile_us();
-        const int hit = this->hit();
-        std::fprintf(stderr, "[rt] pipeline-compile trigger=%s tid=%lu start_us=%lld us=%lld hit=%d bytes=%zu "
-                             "variant=%u result=%d end_ms=%lld key=%s shaders=%s\n", trigger, GetCurrentThreadId(), started,
-                             ended - started, hit, bytes, variant, int(result), compile_wall_ms(), key, shaders);
-    }
 };
 
 // The triggers of builds on the compile worker (PipelineCompiler): "warmup", "dispatch-worker", "draw-worker".

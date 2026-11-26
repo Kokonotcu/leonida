@@ -277,7 +277,7 @@ inline void run_device_lost_hook() noexcept {
     if (const auto hook = device_lost_hook.load(std::memory_order_acquire)) hook();
 }
 
-// LOCAL DIAGNOSTIC (early device loss): what the submit lock, the recent submissions and the other threads were
+// For the device-loss and stall reports: what the submit lock, the recent submissions and the other threads were
 // doing when a submission stalled or the device was lost.
 inline std::int64_t diagnostic_ms() {
     static const auto start = std::chrono::steady_clock::now();
@@ -924,16 +924,6 @@ private:
         }
     }
 
-public:
-    // LOCAL DIAGNOSTIC: run once after a loss is reported (the compute input probe rechecks the descriptors it saw).
-    void set_lost_hook(std::function<void()> hook) {
-        std::lock_guard lock(mutex_);
-        lost_hook_ = std::move(hook);
-    }
-
-private:
-    std::function<void()> lost_hook_;
-
     void report(const char* operation) noexcept {
         if (reported_.exchange(true, std::memory_order_relaxed)) return;
         std::fprintf(stderr, "[rt] device-fault: VK_ERROR_DEVICE_LOST from %s\n", operation);
@@ -948,15 +938,6 @@ private:
         } catch (...) {
         }
         dump_dispatches(report_markers(true));
-        try {
-            std::function<void()> hook;
-            {
-                std::lock_guard lock(mutex_);
-                hook = lost_hook_;
-            }
-            if (hook) hook();
-        } catch (...) {
-        }
         try {
             if (vkGetDeviceFaultInfoEXT) report_fault();
         } catch (...) {
@@ -1048,7 +1029,7 @@ private:
                              pipeline.shaders[2] ? pipeline.shaders[2] : "-");
             }
         }
-        // LOCAL DIAGNOSTIC (post-load GPU faults): the work in flight is between the bottom-of-pipe checkpoint (last
+        // The work in flight is between the bottom-of-pipe checkpoint (last
         // command finished) and the top-of-pipe one (last command started) of the same list. Every pipeline bound in
         // that window, so the faulting program is among them; the dispatch ring above only keeps the last 64
         // dispatches of all queues, and those were from another queue in the fault this was added for.

@@ -32,7 +32,6 @@
 #endif
 #include "d3d12_xs_placed_depth.h"
 #include "d3d12_trace.h"
-#include "../src/fsdraw_probe.h"  // LEONIDA_FSDRAW_PROBE gates the fsdraw lines here
 #include "../src/native_pso.h"
 #include "xmem.h"  // rt::xmem::copy_page_mappings_fn for queue slot 31
 #include "d3d12_xs_alloc_size.h"
@@ -41,11 +40,10 @@
 #include "d3d12_xs_list_values.h"
 #include "xmem.h"  // PageBatch, PageRange (queue slot 31)
 #include "../src/frame_pacer.h"
-#include "../src/local_diagnostics.h"
 #include "d3d12_xs_pso_stream.h"
 #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
 #include "../src/title_page_watch.h"  // leonida::kernel_writes for slot 14
-#include "../src/debug_targets.h"     // ours: title_heap_of, hang reports look at the title's bytes behind a table
+#include "../src/fault_memory.h"  // title_heap_of: hang reports look at the title's bytes behind a table
 #include "presentx_capture.h"  // ours: the windowless PresentX capture (LEONIDA_CAPTURE), in every build of this file
 
 #ifdef LEONIDA_VULKAN_DEVICE
@@ -505,9 +503,6 @@ struct DirtyWatch {
     SRWLOCK lock = SRWLOCK_INIT;
 };
 DirtyWatch g_dirty_watches[16];
-// Address-space lock users of the dirty watch, for the rate report (sync_title_heaps): pages opened by a write fault,
-// and pages protected again by a sync. Each is a VirtualProtect, which takes the address-space lock exclusively.
-std::atomic<std::uint64_t> g_heap_faults{0}, g_heap_reprotects{0};
 
 LONG CALLBACK title_heap_write_fault(EXCEPTION_POINTERS* info) {
     const EXCEPTION_RECORD* r = info ? info->ExceptionRecord : nullptr;
@@ -519,7 +514,6 @@ LONG CALLBACK title_heap_write_fault(EXCEPTION_POINTERS* info) {
         if (!begin || at < begin || at >= w.end.load(std::memory_order_acquire)) continue;
         const std::size_t page = (at - begin) / kTitleDirtyPage;
         AcquireSRWLockExclusive(&w.lock);  // against the sync's clear + re-protect (DirtyWatch::lock)
-        g_heap_faults.fetch_add(1, std::memory_order_relaxed);
         w.dirty[page].store(1, std::memory_order_release);  // before the page opens (see above)
         DWORD old = 0;
         const bool opened =
@@ -626,7 +620,7 @@ std::atomic<std::size_t> g_title_sync_count{0};
 std::atomic<TitleSamplerSlotsFn> g_title_sampler_slots{nullptr};
 TitleHeapSyncStats g_title_sync_stats;  // title_sync_mutex()
 
-// debug_targets::title_heap_of: a hang report's look at the title's bytes behind a table (no lock: the reporter may run
+// fault_memory::title_heap_of: a hang report's look at the title's bytes behind a table (no lock: the reporter may run
 // while a sync holds it; heaps are immortal enough for a report, and the reads are of plain memory).
 bool title_heap_bytes_of(const void* real, void* now, void* copied) {
     const auto* p = static_cast<const std::uint8_t*>(real);
@@ -642,7 +636,7 @@ bool title_heap_bytes_of(const void* real, void* now, void* copied) {
 
 bool register_title_sync(const HeapProxy* heap, ID3D12Device* real_device, SIZE_T title, SIZE_T bytes, SIZE_T real,
                          std::size_t increment, bool sampler) {
-    leonida::debug_targets::title_heap_of = &title_heap_bytes_of;
+    leonida::fault_memory::title_heap_of = &title_heap_bytes_of;
     auto sync = std::unique_ptr<TitleHeapSync>(new (std::nothrow) TitleHeapSync{
         heap, real_device, reinterpret_cast<std::uint8_t*>(title), reinterpret_cast<std::uint8_t*>(real), bytes,
         increment, sampler, std::unique_ptr<std::uint8_t[]>(new (std::nothrow) std::uint8_t[bytes]())});
@@ -702,7 +696,6 @@ void sync_title_heap(TitleHeapSync& s, TitleSamplerSlotsFn sampler_slots, TitleH
             AcquireSRWLockExclusive(&watch->lock);  // a fault's mark + open cannot land between these two
             const bool was_dirty = watch->dirty[page].exchange(0) != 0;
             if (was_dirty) {
-                g_heap_reprotects.fetch_add(1, std::memory_order_relaxed);
                 DWORD old = 0;
                 VirtualProtect(reinterpret_cast<void*>(watch_begin + page * kTitleDirtyPage), kTitleDirtyPage,
                                watch->readonly, &old);
@@ -1655,22 +1648,14 @@ void reset_child_stats() {
 //
 // The descriptor's code pointer is not called: the measured run goes on without it, and its contract (when it runs,
 // on which thread, with what) is not known. The first call is logged with its arguments.
-// LEONIDA_MIRROR_LAG=1: how late the mirror shows a value the GPU has reached. Each mirror also has the device's
-// fence-wait thread call back the moment the timeline reaches the next value (it only notes when); the refresh that
-// then writes that value adds now - that moment to the stats. LEONIDA_MIRROR_EXACT=1: that callback writes the
-// mirror itself and asks for the next value, so the title sees a completion as soon as our dispatcher does (the
-// thread-pool wait stays as the backstop for rewinds).
+// LEONIDA_MIRROR_EXACT=1: each mirror also has the device's fence-wait thread call back the moment the timeline reaches
+// the next value; that callback writes the mirror itself and asks for the next value, so the title sees a completion
+// as soon as our dispatcher does (the thread-pool wait stays as the backstop for rewinds).
 struct FenceMirror;
 struct MirrorLink {  // shared with the fence-wait callbacks; destroy_child clears `mirror` before the fence goes
     SRWLOCK lock = SRWLOCK_INIT;
     FenceMirror* mirror = nullptr;            // under lock
-    std::atomic<std::uint64_t> reached_value{0};  // the value the callback saw, 0: none outstanding
-    std::atomic<std::int64_t> reached_at{0};      // QueryPerformanceCounter when it saw it
 };
-bool mirror_lag_enabled() {
-    static const bool on = [] { const char* v = std::getenv("LEONIDA_MIRROR_LAG"); return v && *v == '1'; }();
-    return on;
-}
 bool mirror_exact_enabled() {
     static const bool on = [] { const char* v = std::getenv("LEONIDA_MIRROR_EXACT"); return v && *v == '1'; }();
     return on;
@@ -1678,7 +1663,7 @@ bool mirror_exact_enabled() {
 
 struct FenceMirror {
     alignas(8) volatile std::uint64_t completed = 0;  // what the title reads through slot 12's pointer
-    std::shared_ptr<MirrorLink> link;  // LEONIDA_MIRROR_LAG / LEONIDA_MIRROR_EXACT only
+    std::shared_ptr<MirrorLink> link;  // LEONIDA_MIRROR_EXACT only
     ID3D12Fence* fence = nullptr;  // the real fence; the proxy holds the reference
     SRWLOCK lock = SRWLOCK_INIT;   // orders refreshes
     HANDLE event = nullptr;        // auto-reset; the real fence sets it at the armed value
@@ -1687,51 +1672,13 @@ struct FenceMirror {
     std::atomic<bool> arm_failed{false};
 };
 
-void note_mirror_lag(std::int64_t ticks, bool exact);
-
-std::uint64_t refresh_mirror(FenceMirror* m, bool exact = false) {
+std::uint64_t refresh_mirror(FenceMirror* m) {
     AcquireSRWLockExclusive(&m->lock);
     const std::uint64_t value = m->fence->GetCompletedValue();
     const bool advanced = m->completed != value;
     if (advanced) m->completed = value;
     ReleaseSRWLockExclusive(&m->lock);
-    if (advanced && m->link && value != ~std::uint64_t{0}) {
-        std::uint64_t reached = m->link->reached_value.load(std::memory_order_acquire);
-        if (reached && reached <= value && m->link->reached_value.compare_exchange_strong(reached, 0)) {
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            note_mirror_lag(now.QuadPart - m->link->reached_at.load(std::memory_order_acquire), exact);
-        }
-    }
     return value;
-}
-
-// Every 10 s with LEONIDA_MIRROR_LAG: from our dispatcher seeing a fence reach a value to the mirror showing it.
-void note_mirror_lag(std::int64_t ticks, bool exact) {
-    static LARGE_INTEGER frequency = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
-    static std::atomic<std::uint64_t> count{0}, total_us{0}, max_us{0}, over_1ms{0}, exact_count{0};
-    static std::atomic<ULONGLONG> last{0};
-    const std::uint64_t us = ticks > 0 ? std::uint64_t(ticks) * 1000000 / std::uint64_t(frequency.QuadPart) : 0;
-    count.fetch_add(1, std::memory_order_relaxed);
-    exact_count.fetch_add(exact, std::memory_order_relaxed);
-    total_us.fetch_add(us, std::memory_order_relaxed);
-    over_1ms.fetch_add(us > 1000, std::memory_order_relaxed);
-    for (std::uint64_t m = max_us.load(); us > m && !max_us.compare_exchange_weak(m, us);) {
-    }
-    const ULONGLONG now = GetTickCount64();
-    ULONGLONG was = last.load(std::memory_order_relaxed);
-    if (!was) {
-        last.compare_exchange_strong(was, now);
-        return;
-    }
-    if (now - was < 10000 || !last.compare_exchange_strong(was, now)) return;
-    const std::uint64_t n = count.exchange(0);
-    std::fprintf(stderr, "[rt] d3d12_xs: fence slot 12 mirror lag (dispatcher saw the value -> mirror shows it): %llu "
-                         "updates in %.0f s (%llu written by the exact callback), avg %.0f us, max %llu us, %llu over 1 ms\n",
-                 static_cast<unsigned long long>(n), double(now - was) / 1000.0,
-                 static_cast<unsigned long long>(exact_count.exchange(0)),
-                 n ? double(total_us.exchange(0)) / double(n) : 0.0,
-                 static_cast<unsigned long long>(max_us.exchange(0)), static_cast<unsigned long long>(over_1ms.exchange(0)));
 }
 
 // Asks the fence-wait thread for a callback when the fence reaches `value`. Once per call chain: the dispatcher runs a
@@ -1747,20 +1694,12 @@ void arm_mirror_callback(const std::shared_ptr<MirrorLink>& link, ID3D12Fence* f
     rt::d3d12::fence_callback_at(fence, value, [link] {
         // Run at once inside the arming call (dispatcher stopping): this thread may hold link->lock already.
         if (t_mirror_arming) return;
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
         AcquireSRWLockExclusive(&link->lock);
         FenceMirror* m = link->mirror;
         if (m) {
             const std::uint64_t seen = m->fence->GetCompletedValue();
             if (seen != ~std::uint64_t{0}) {
-                // Only a value the mirror does not show yet: one another path (slot 12, a CPU Signal) already wrote
-                // would otherwise stay outstanding until the next advance and count that wait as lag.
-                if (!link->reached_value.load(std::memory_order_acquire) && m->completed < seen) {
-                    link->reached_at.store(now.QuadPart, std::memory_order_release);
-                    link->reached_value.store(seen, std::memory_order_release);
-                }
-                if (mirror_exact_enabled()) refresh_mirror(m, true);
+                refresh_mirror(m);
                 arm_mirror_callback(link, m->fence, seen + 1);
             }
         }
@@ -1778,31 +1717,8 @@ void wait_for_fence_progress(FenceMirror* mirror) {
     SetThreadpoolWait(mirror->wait, mirror->event, &timeout);
 }
 
-// Every 10 s: how many fence mirrors are live and how often their thread-pool waits ran (on a completion event or on
-// the 10 ms timeout). Each run is a wake of Wine's wait-queue thread and a callback on a pool worker.
-std::atomic<std::uint64_t> g_mirrors_live{0}, g_mirror_signals{0}, g_mirror_timeouts{0};
-std::atomic<ULONGLONG> g_mirror_report{0};
-
-void note_mirror_run(TP_WAIT_RESULT result) {
-    (result == WAIT_OBJECT_0 ? g_mirror_signals : g_mirror_timeouts).fetch_add(1, std::memory_order_relaxed);
-    const ULONGLONG now = GetTickCount64();
-    ULONGLONG last = g_mirror_report.load(std::memory_order_relaxed);
-    if (!last) {
-        g_mirror_report.compare_exchange_strong(last, now, std::memory_order_relaxed);
-        return;
-    }
-    if (now - last < 10000 || !g_mirror_report.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
-    std::fprintf(stderr, "[rt] d3d12_xs: fence slot 12 mirrors: %llu live; in %.0f s %llu waits ended on an event, "
-                         "%llu on the 10 ms timeout\n",
-                 static_cast<unsigned long long>(g_mirrors_live.load(std::memory_order_relaxed)),
-                 double(now - last) / 1000.0,
-                 static_cast<unsigned long long>(g_mirror_signals.exchange(0, std::memory_order_relaxed)),
-                 static_cast<unsigned long long>(g_mirror_timeouts.exchange(0, std::memory_order_relaxed)));
-}
-
 VOID CALLBACK on_fence_progress(PTP_CALLBACK_INSTANCE, PVOID context, PTP_WAIT, TP_WAIT_RESULT result) {
     auto* mirror = static_cast<FenceMirror*>(context);
-    note_mirror_run(result);
     const std::uint64_t value = refresh_mirror(mirror);
     if (value == ~std::uint64_t{0}) return;
     if (result == WAIT_OBJECT_0) {
@@ -1826,7 +1742,7 @@ FenceMirror* fence_mirror(ChildProxy* self) {
     if (!m && (m = new (std::nothrow) FenceMirror)) {
         m->fence = reinterpret_cast<ID3D12Fence*>(self->real);
         refresh_mirror(m);
-        if (mirror_lag_enabled() || mirror_exact_enabled()) {
+        if (mirror_exact_enabled()) {
             m->link = std::make_shared<MirrorLink>();
             m->link->mirror = m;
             arm_mirror_callback(m->link, m->fence, m->completed + 1);
@@ -1834,7 +1750,6 @@ FenceMirror* fence_mirror(ChildProxy* self) {
         m->event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (m->event) m->wait = CreateThreadpoolWait(on_fence_progress, m, nullptr);
         if (m->wait) {
-            g_mirrors_live.fetch_add(1, std::memory_order_relaxed);
             wait_for_fence_progress(m);
             SetEvent(m->event);  // the callback makes the first SetEventOnCompletion
         } else {
@@ -1886,7 +1801,6 @@ void destroy_child(ChildProxy* self) {
         ReleaseSRWLockExclusive(&mirror->lock);
         WaitForThreadpoolWaitCallbacks(mirror->wait, TRUE);
         CloseThreadpoolWait(mirror->wait);
-        g_mirrors_live.fetch_sub(1, std::memory_order_relaxed);
     }
     if (mirror && mirror->link) {  // a fence-wait callback still pending (or running) no longer reaches the mirror
         AcquireSRWLockExclusive(&mirror->link->lock);
@@ -2472,11 +2386,6 @@ void queue_closed_list(DeviceProxy* device, ID3D12CommandList* list) {
     if (queue) {
         queue->ExecuteCommandLists(1, &list);
         queue->Release();
-        static std::atomic<std::uint64_t> runs{0};
-        const std::uint64_t n = runs.fetch_add(1, std::memory_order_relaxed) + 1;
-        if ((n & (n - 1)) == 0)
-            std::fprintf(stderr, "[rt] d3d12_xs: %llu console list(s) run at their Close\n",
-                         static_cast<unsigned long long>(n));
         return;
     }
     list->AddRef();
@@ -2559,13 +2468,6 @@ std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_
                 if (std::find(chained.begin(), chained.end(), named[i]) == chained.end()) combined.push_back(named[i]);
             count_word = combined.size();
             lists_word = reinterpret_cast<std::uint64_t>(combined.data());
-            static std::atomic<std::uint64_t> runs{0}, lists{0};
-            lists.fetch_add(chained.size(), std::memory_order_relaxed);
-            const std::uint64_t n = runs.fetch_add(1, std::memory_order_relaxed) + 1;
-            if ((n & (n - 1)) == 0)
-                std::fprintf(stderr, "[rt] d3d12_xs: chained submission %llu: %llu closed lists so far (this one %zu)\n",
-                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(lists.load()),
-                             chained.size());
         }
     }
     // Pass zero-extended UINT in 64-bit RDX so both 32-bit PC implementations and 64-bit mock thunks see clean count.
@@ -2718,12 +2620,9 @@ struct AsyncMapper {
     std::condition_variable wake;
     std::deque<AsyncMapping> jobs;
     bool started = false;
-    std::uint64_t done = 0, failed = 0;
-    std::chrono::steady_clock::duration wait{}, map{};
-    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    std::uint64_t failed = 0;
 
     void run() {
-        using clock = std::chrono::steady_clock;
         for (;;) {
             AsyncMapping job;
             {
@@ -2732,31 +2631,15 @@ struct AsyncMapper {
                 job = std::move(jobs.front());
                 jobs.pop_front();
             }
-            const auto t0 = clock::now();
             HRESULT hr = job.fence->SetEventOnCompletion(job.value, nullptr);
             job.fence->Release();  // the reference the call took for this job: the queue may be gone by now
-            const auto t1 = clock::now();
             bool ok = SUCCEEDED(hr) &&
                       job.map(std::uint32_t(job.batches.size()), job.batches.data(), job.pool, job.pages, job.flags);
-            const auto t2 = clock::now();
             std::lock_guard lock(mutex);
-            ++done;
             failed += !ok;
-            wait += t1 - t0;
-            map += t2 - t1;
             if (!ok && failed <= 8)
                 std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31 (async): a batch could not be mapped (hr 0x%08x, "
                                      "error %lu)\n", unsigned(hr), GetLastError());
-            if (t2 - since >= std::chrono::seconds(10)) {
-                const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
-                std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31 (async worker): %llu calls mapped in %.0f s "
-                                     "(%llu failed): %.1f ms waiting for the queue, %.1f ms mapping; %zu queued\n",
-                             static_cast<unsigned long long>(done), std::chrono::duration<double>(t2 - since).count(),
-                             static_cast<unsigned long long>(failed), ms(wait), ms(map), jobs.size());
-                done = failed = 0;
-                wait = map = {};
-                since = t2;
-            }
         }
     }
 
@@ -2987,37 +2870,9 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
         if (SUCCEEDED(hr)) hr = fence->SetEventOnCompletion(value, nullptr);
         if (SUCCEEDED(hr) && fence->GetCompletedValue() == UINT64_MAX) hr = DXGI_ERROR_DEVICE_REMOVED;
     }
-    const auto t1 = clock::now();
     if (SUCCEEDED(hr) && !deferred && !map(count, batches, pool, pages, flags)) {
         const DWORD error = GetLastError();
         hr = error ? HRESULT_FROM_WIN32(error) : E_FAIL;
-    }
-    const auto t2 = clock::now();
-    // Every 10 s: how long the calls of slot 31 kept the caller (the title's render thread) waiting for the queue's
-    // earlier work, and then mapping.
-    static std::mutex stats_mutex;
-    static struct {
-        std::uint64_t calls = 0, ranges = 0;
-        clock::duration wait{}, map{}, max{};
-        clock::time_point since = clock::now();
-    } stats;
-    {
-        std::lock_guard lock(stats_mutex);
-        ++stats.calls;
-        stats.ranges += count;
-        stats.wait += t1 - t0;
-        stats.map += t2 - t1;
-        stats.max = (std::max)(stats.max, t2 - t0);
-        if (t2 - stats.since >= std::chrono::seconds(10)) {
-            const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
-            std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31: %llu calls (%llu batches) in %.0f s: %.1f ms waiting "
-                                 "for the queue, %.1f ms mapping, %.1f ms the longest call\n",
-                         static_cast<unsigned long long>(stats.calls), static_cast<unsigned long long>(stats.ranges),
-                         std::chrono::duration<double>(t2 - stats.since).count(), ms(stats.wait), ms(stats.map),
-                         ms(stats.max));
-            stats = {};
-            stats.since = t2;
-        }
     }
     return hr;
 }
@@ -4339,22 +4194,31 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                     // copy of the bytes into the texture's memory, which D3D12's CopyResource refuses (the replay
                     // took it as an invalid copy). A texture the title placed answers its title address
                     // (Resource::GetGPUVirtualAddress), and its image follows its title bytes (the layer's title
-                    // texture sync): the bytes move there, as many as the buffer holds and the texture takes.
+                    // texture sync): the bytes move there, as many as the buffer holds and the texture takes there.
+                    // "Takes there" is the span its console layout covers, as the layer registered it when the title
+                    // placed it: the PC's GetResourceAllocationInfo for the PC description sized this copy before
+                    // and is larger for many shapes, so the copy ran past the texture into what the title keeps after
+                    // it (its pointer arrays read back as half floats, -inf and +-65504, and the title faulted on
+                    // them: runs of 2026-11-26). A texture the layer knows no span for is not copied at all.
                     if (dd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && sd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
                         const std::uint64_t to = dst->GetGPUVirtualAddress(), from = src->GetGPUVirtualAddress();
-                        const D3D12_RESOURCE_ALLOCATION_INFO info = self->device->real->GetResourceAllocationInfo(0, 1, &dd);
-                        const std::uint64_t bytes = std::min<std::uint64_t>(sd.Width, info.SizeInBytes);
-                        if (to && from && bytes && info.SizeInBytes != UINT64_MAX &&
+                        const TitleTextureFootprint footprint = g_title_texture_footprint.load(std::memory_order_acquire);
+                        const std::uint64_t span = footprint ? footprint(dst) : 0;
+                        const std::uint64_t bytes = std::min<std::uint64_t>(sd.Width, span);
+                        static std::atomic<std::uint64_t> copies{0}, unknown{0};
+                        if (!span) {
+                            const std::uint64_t n = unknown.fetch_add(1, std::memory_order_relaxed) + 1;
+                            if ((n & (n - 1)) == 0)
+                                std::fprintf(stderr, "[rt] d3d12_xs: list slot 86: %llu buffer-to-texture copies into a "
+                                                     "texture with no known title span, not made\n",
+                                             static_cast<unsigned long long>(n));
+                            return 0;
+                        }
+                        if (to && from && bytes &&
                             leonida::kernel_writes::write(reinterpret_cast<void*>(to), reinterpret_cast<const void*>(from),
                                                           static_cast<std::size_t>(bytes))) {
                             rt::xmem::note_title_written(reinterpret_cast<const void*>(to), static_cast<std::size_t>(bytes));
-                            static std::atomic<std::uint64_t> told{0};
-                            const std::uint64_t n = told.fetch_add(1, std::memory_order_relaxed) + 1;
-                            if ((n & (n - 1)) == 0)
-                                std::fprintf(stderr, "[rt] d3d12_xs: list slot 86 CopyResourceX: %llu buffer-to-texture "
-                                                     "copies into title memory (last %llux%u format %d, %llu bytes)\n",
-                                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(dd.Width),
-                                             dd.Height, int(dd.Format), static_cast<unsigned long long>(bytes));
+                            copies.fetch_add(1, std::memory_order_relaxed);
                             return 0;
                         }
                     }
@@ -5545,18 +5409,6 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::memcpy(&address, tail, sizeof(address));
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
             const auto stride = self->real->GetDescriptorHandleIncrementSize(desc->Type);
-            // LOCAL DIAGNOSTIC: what the title passes on slot 14, and whether the console path takes it
-            if (leonida::local_diagnostics()) {
-                static std::atomic<int> logged{0};
-                if (logged.fetch_add(1) < 32)
-                    std::fprintf(stderr, "[rt] heap-probe: slot 14 type %d num %u flags 0x%x console va 0x%llx size %llu "
-                                         "(num*stride %llu, our stride %u, size/num %.2f) writable %d\n",
-                                 int(desc->Type), desc->NumDescriptors, unsigned(desc->Flags),
-                                 static_cast<unsigned long long>(address), static_cast<unsigned long long>(size),
-                                 static_cast<unsigned long long>(std::uint64_t(desc->NumDescriptors) * stride), stride,
-                                 desc->NumDescriptors ? double(size) / desc->NumDescriptors : 0.0,
-                                 address && size ? int(accessible_range(reinterpret_cast<const void*>(address), size, true)) : -1);
-            }
             // A non-zero word is not evidence of that layout - the bytes after a PC desc are whatever the caller holds
             // next, and they are almost always readable and non-zero. The size has to agree with the descriptor count
             // (32 bytes each, the console's and this layer's stride), and the range has to be the title's writable
@@ -5616,12 +5468,6 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             }
         }
     }
-    if (leonida::local_diagnostics()) {  // LOCAL DIAGNOSTIC
-        static std::atomic<int> logged{0};
-        if (logged.fetch_add(1) < 32)
-            std::fprintf(stderr, "[rt] heap-probe: slot 14 -> %s heap, hr 0x%08lx\n", console_extended ? "CONSOLE" : "pc",
-                         static_cast<unsigned long>(hr));
-    }
     if (FAILED(hr) || !created) return FAILED(hr) ? hr : E_FAIL;
 
     ID3D12DescriptorHeap* heap = static_cast<ID3D12DescriptorHeap*>(created);
@@ -5656,7 +5502,7 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
                     // makes views there through the API and then moves the 32-byte records into its shader-visible
                     // heap with its own memcpy (no CopyDescriptors call), so the records must be in the memory its
                     // handles name. Without this the device wrote its own heap and the title copied the untouched
-                    // backing (zeros or stale bytes; found by the fsdraw forensics on the console path).
+                    // backing (zeros or stale bytes).
                     if (!console_extended && !(desc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) &&
                         rt::d3d12::vulkan_device_info(self->real)) {
                         void* in_backing = nullptr;
@@ -5692,19 +5538,6 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             real_cpu_start ? real_cpu_start : raw_heap_get_cpu_handle(heap, *reinterpret_cast<void***>(heap)).ptr;
         if (inc && desc->NumDescriptors <= (std::numeric_limits<SIZE_T>::max)() / inc)
             proxy->rtv_real_bytes = static_cast<SIZE_T>(desc->NumDescriptors) * inc;
-    }
-    if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC (fsdraw): which CPU start the title gets for this heap
-        static std::atomic<int> logged{0};
-        if (logged.fetch_add(1) < 32)
-            std::fprintf(stderr, "[rt] fsdraw: heap type %d num %u flags 0x%x console %d: title CPU start 0x%llx (custom "
-                                 "backing %s), real CPU start 0x%llx, hr 0x%08lx\n",
-                         desc ? int(desc->Type) : -1, desc ? desc->NumDescriptors : 0u, desc ? unsigned(desc->Flags) : 0u,
-                         int(console_extended),
-                         static_cast<unsigned long long>(custom_cpu_start ? custom_cpu_start
-                                                                          : raw_heap_get_cpu_handle(heap, *reinterpret_cast<void***>(heap)).ptr),
-                         custom_cpu_start ? "yes" : "no",
-                         static_cast<unsigned long long>(raw_heap_get_cpu_handle(heap, *reinterpret_cast<void***>(heap)).ptr),
-                         static_cast<unsigned long>(hr));
     }
     if (FAILED(hr)) {
         heap->Release();
@@ -5812,21 +5645,6 @@ void proxy_copy_descriptors_simple(DeviceProxy* self, UINT num_descriptors, D3D1
     self->real->CopyDescriptorsSimple(num_descriptors, dest, src, type);
     local_write_through(self, dest_start, num_descriptors);
     copy_null_rtv_marks(self, 1, &dest, &num_descriptors, 1, &src, &num_descriptors, type);
-    if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC (fsdraw): where the title copies its descriptors, and what lands there
-        static std::atomic<std::uint64_t> copies{0};
-        const std::uint64_t n = ++copies;
-        if (n <= 24 || n % 600 == 0 || n % 600 == 1) {
-            std::uint32_t w[8]{};
-            if (dest.ptr && num_descriptors && accessible_range(reinterpret_cast<const void*>(dest.ptr), sizeof w, false))
-                std::memcpy(w, reinterpret_cast<const void*>(dest.ptr), sizeof w);  // a handle need not be CPU memory (mocks)
-            std::fprintf(stderr, "[rt] fsdraw: CopyDescriptorsSimple #%llu n %u type %d dest 0x%llx -> 0x%llx src 0x%llx -> "
-                                 "0x%llx first slot now [%08x %08x %08x %08x %08x %08x %08x %08x]\n",
-                         static_cast<unsigned long long>(n), num_descriptors, int(type),
-                         static_cast<unsigned long long>(dest_start.ptr), static_cast<unsigned long long>(dest.ptr),
-                         static_cast<unsigned long long>(src_start.ptr), static_cast<unsigned long long>(src.ptr), w[0],
-                         w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
-        }
-    }
 }
 
 // The Xbox slot 62 takes two more words between the description and the IID: (desc, w2, w3, riid, out). Measured
@@ -7014,15 +6832,6 @@ HRESULT create_pso_from_stream(DeviceProxy* self, const D3D12_PIPELINE_STATE_STR
     used_console_stream = false;
     d3d12_trace::stream_refusal = nullptr;
     const HRESULT hr = reinterpret_cast<Fn>(self->real_vtable[47])(self->real, desc, riid, out);
-    static const bool audit = [] {
-        char value[2]{};
-        return GetEnvironmentVariableA("LEONIDA_PSO_STREAM_AUDIT", value, sizeof(value)) == 1 && value[0] == '1';
-    }();
-    if (audit && desc && (hr == E_NOTIMPL || hr == E_FAIL)) {
-        try {
-            audit_pso_stream(*desc, hr, used_console_stream);
-        } catch (const std::bad_alloc&) {}
-    }
     if (SUCCEEDED(hr) && out && *out && desc) keep_pso_stream(static_cast<IUnknown*>(*out), *desc);
     return hr;
 }
@@ -7584,29 +7393,11 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t 
                          static_cast<unsigned>(d.Flags), static_cast<unsigned>(title_descs[i].Flags));
         }
     }
-    const UINT64 pc_size = info.SizeInBytes;
     // The console tile sizes are the title's: a call in the console form gets them. A PC-form caller (the runtime's
     // own code and tests, which compare with the PC device) gets the PC device's answer unchanged.
     if (call.console_abi)
         apply_console_placement(descs, desc_count, info, nullptr,
                                 [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25, title_descs);
-    // LEONIDA_LOG_ALLOCINFO=1: every call, with the calling thread (the title sums a batch of these against a fixed
-    // pool and asserts when the batch does not fit).
-    static const bool log_all = [] {
-        wchar_t value[2]{};
-        return GetEnvironmentVariableW(L"LEONIDA_LOG_ALLOCINFO", value, 2) == 1 && value[0] == L'1';
-    }();
-    if (log_all && descs && desc_count)
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: slot 25 tid %lx n %u: dim %d fmt %d %llux%ux%u mips %u samples %u flags 0x%x -> %llu B "
-                     "(pc %llu) align %llu\n",
-                     static_cast<unsigned long>(GetCurrentThreadId()), static_cast<unsigned>(desc_count),
-                     static_cast<int>(descs[0].Dimension), static_cast<int>(descs[0].Format),
-                     static_cast<unsigned long long>(descs[0].Width), static_cast<unsigned>(descs[0].Height),
-                     static_cast<unsigned>(descs[0].DepthOrArraySize), static_cast<unsigned>(descs[0].MipLevels),
-                     static_cast<unsigned>(descs[0].SampleDesc.Count), static_cast<unsigned>(descs[0].Flags),
-                     static_cast<unsigned long long>(info.SizeInBytes), static_cast<unsigned long long>(pc_size),
-                     static_cast<unsigned long long>(info.Alignment));
     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
     return call.ret;
 }
@@ -7887,55 +7678,6 @@ void sync_title_heaps() {
     if (title_syncs().empty()) return;
     ++g_title_sync_stats.syncs;
     for (const auto& sync : title_syncs()) sync_title_heap(*sync, sampler_slots, g_title_sync_stats);
-    {
-        // Every 10 s: the calls per second that take the process's address-space lock exclusively (rt::xmem's counters
-        // and the dirty watch's), and how long one VirtualQuery takes now. A host import's driver calls took 15-30 ms
-        // each in the game against 0.001-0.05 ms alone (D:\GTA6\analysis\tools\heapimport).
-        static auto last = std::chrono::steady_clock::now();
-        static std::uint64_t prev[6] = {};
-        const auto now = std::chrono::steady_clock::now();
-        const double seconds = std::chrono::duration<double>(now - last).count();
-        if (seconds >= 10.0) {
-            const std::uint64_t cur[6] = {g_heap_faults.load(), g_heap_reprotects.load(),
-                                          rt::xmem::g_commits_on_touch.load(), rt::xmem::g_view_maps.load(),
-                                          rt::xmem::g_view_unmaps.load(), rt::xmem::g_placeholder_splits.load()};
-            MEMORY_BASIC_INFORMATION info{};
-            const auto q0 = std::chrono::steady_clock::now();
-            VirtualQuery(reinterpret_cast<void*>(&last), &info, sizeof(info));
-            const double query_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - q0).count();
-            std::fprintf(stderr, "[rt] address-space lock users per second: heap write faults %.0f, heap re-protects %.0f, "
-                                 "commits on touch %.0f, view maps %.0f, unmaps %.0f, placeholder splits %.0f; one "
-                                 "VirtualQuery %.2f ms\n",
-                         (cur[0] - prev[0]) / seconds, (cur[1] - prev[1]) / seconds, (cur[2] - prev[2]) / seconds,
-                         (cur[3] - prev[3]) / seconds, (cur[4] - prev[4]) / seconds, (cur[5] - prev[5]) / seconds,
-                         query_ms);
-            std::copy(std::begin(cur), std::end(cur), std::begin(prev));
-            last = now;
-        }
-    }
-    // LEONIDA_SCAN_HEAP_TSHARP=<word 2 hex>: every 2000 syncs, the descriptors of the shader-visible heaps whose word 2
-    // (a T#'s extent) is that value: how many, and the first indices with their word 0.
-    static const std::uint32_t scan = [] {
-        char v[16] = {};
-        return GetEnvironmentVariableA("LEONIDA_SCAN_HEAP_TSHARP", v, sizeof v) ? std::uint32_t(std::strtoul(v, nullptr, 16))
-                                                                                 : 0u;
-    }();
-    if (scan && g_title_sync_stats.syncs % 2000 == 0) {
-        for (const auto& sync : title_syncs()) {
-            if (sync->sampler || sync->increment != 32) continue;
-            std::size_t found = 0;
-            char first[512] = {};
-            std::size_t used = 0;
-            for (std::size_t at = 0; at + 32 <= sync->bytes; at += 32) {
-                const auto* w = reinterpret_cast<const std::uint32_t*>(sync->title + at);
-                if (w[2] != scan || (w[3] >> 28) < 8) continue;
-                if (found++ < 12 && used < sizeof(first) - 40)
-                    used += std::snprintf(first + used, sizeof(first) - used, " %zu:%08x", at / 32, w[0]);
-            }
-            std::fprintf(stderr, "[rt] d3d12_xs: heap scan (sync %llu): %zu T#s of extent %08x;%s\n",
-                         static_cast<unsigned long long>(g_title_sync_stats.syncs), found, scan, first);
-        }
-    }
 }
 
 TitleHeapSyncStats title_heap_sync_stats() {

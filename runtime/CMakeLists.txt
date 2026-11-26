@@ -235,7 +235,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   add_executable(gta6rt
     src/main.cpp
-    src/write_watch.cpp
     src/host_cpu.cpp
     src/pe_loader.cpp
     src/thread_stacks.cpp
@@ -679,7 +678,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(bcrypt_rng_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(bcrypt_rng_test PRIVATE /OPT:NOREF)
 
-  # LEONIDA_STACKS's sampler (src/thread_stacks.cpp): call chains of helper threads, no game data.
+  # The thread-stack sampler of the fault reports (src/thread_stacks.cpp): call chains of helper threads, no game data.
   add_executable(thread_stacks_test
     test/thread_stacks_test.cpp
     src/thread_stacks.cpp
@@ -3054,7 +3053,7 @@ if(TARGET Vulkan::Headers)
 
     # XDXR acceleration structures through BuildRaytracingAccelerationStructure (docs/d3d12_vulkan.md 4.8): the
     # device builds them, tools/xdxr_bvh.py checks them.
-    add_executable(d3d12_xdxr_rt_test test/d3d12_xdxr_rt_test.cpp test/xmem_geometry_aliases_stub.cpp)
+    add_executable(d3d12_xdxr_rt_test test/d3d12_xdxr_rt_test.cpp)
     target_link_libraries(d3d12_xdxr_rt_test PRIVATE gta6rt_d3d12_com)
     target_compile_definitions(d3d12_xdxr_rt_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_xdxr_rt_test PRIVATE /W4 /permissive- /utf-8)
@@ -3128,7 +3127,7 @@ if(TARGET Vulkan::Headers)
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
 
     # DXR acceleration-structure prebuild and command-list recording validation parity test.
-    add_executable(d3d12_dxr_validation_test test/d3d12_dxr_validation_test.cpp test/xmem_geometry_aliases_stub.cpp)
+    add_executable(d3d12_dxr_validation_test test/d3d12_dxr_validation_test.cpp)
     target_link_libraries(d3d12_dxr_validation_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_dxr_validation_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(d3d12_dxr_validation_test PRIVATE /W4 /permissive- /utf-8)
@@ -4678,7 +4677,7 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_compile_teardown PROPERTIES DISABLED TRUE)
       # A buffer at the title's own VA (device slot 133) read by the same shader through a root view and a V#.
       add_executable(d3d12_title_va_test test/d3d12_title_va_test.cpp shims/d3d12_xs_device.cpp
-                     test/xmem_geometry_aliases_stub.cpp ${LEONIDA_TEST_CS})
+                     ${LEONIDA_TEST_CS})
       target_link_libraries(d3d12_title_va_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_title_va_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
                                  LEONIDA_TEST_CS_SPV="${LEONIDA_TEST_CS}")

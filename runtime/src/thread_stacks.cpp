@@ -18,7 +18,6 @@
 namespace rt {
 namespace {
 
-using Clock = std::chrono::steady_clock;
 using GetDescription = HRESULT(WINAPI*)(HANDLE, PWSTR*);
 using QueryThread = LONG(NTAPI*)(HANDLE, int, void*, ULONG, ULONG*);
 
@@ -189,26 +188,6 @@ std::size_t StackSampler::sample(void* thread, std::uint64_t* frames) {
     return walk_copy(context, stack, frames);
 }
 
-bool parse_stack_times(std::string_view text, std::vector<unsigned>& seconds) {
-    seconds.clear();
-    for (;;) {
-        const auto comma = text.find(',');
-        const auto token = text.substr(0, comma);
-        unsigned value = 0;
-        const auto [end, error] = std::from_chars(token.data(), token.data() + token.size(), value);
-        if (token.empty() || error != std::errc{} || end != token.data() + token.size()) {
-            seconds.clear();
-            return false;
-        }
-        seconds.push_back(value);
-        if (comma == std::string_view::npos) break;
-        text.remove_prefix(comma + 1);
-    }
-    std::sort(seconds.begin(), seconds.end());
-    seconds.erase(std::unique(seconds.begin(), seconds.end()), seconds.end());
-    return true;
-}
-
 void print_thread_stacks_now(std::uint32_t tid, const char* why) noexcept {
     static std::mutex mutex;
     try {
@@ -221,33 +200,6 @@ void print_thread_stacks_now(std::uint32_t tid, const char* why) noexcept {
         snapshot_threads(why ? why : "now", sampler, describe, query, tid);
     } catch (...) {
     }
-}
-
-std::jthread start_thread_stacks() {
-    const auto start = Clock::now();
-    char spec[1024];
-    const DWORD length = GetEnvironmentVariableA("LEONIDA_STACKS", spec, sizeof(spec));
-    if (!length) return {};
-    std::vector<unsigned> times;
-    if (length >= sizeof(spec) || !parse_stack_times(std::string_view(spec, length), times)) {
-        std::fprintf(stderr, "[rt] LEONIDA_STACKS: expected comma-separated whole seconds\n");
-        return {};
-    }
-    return std::jthread([start, times = std::move(times)](std::stop_token stop) {
-        const auto describe = reinterpret_cast<GetDescription>(reinterpret_cast<void*>(
-            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetThreadDescription")));
-        const auto query = reinterpret_cast<QueryThread>(reinterpret_cast<void*>(
-            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")));
-        StackSampler sampler;
-        std::condition_variable_any wake;
-        std::mutex mutex;
-        std::unique_lock lock(mutex);
-        for (const unsigned at : times) {
-            wake.wait_until(lock, stop, start + std::chrono::seconds(at), [] { return false; });
-            if (stop.stop_requested()) break;
-            snapshot_threads("t=" + std::to_string(at), sampler, describe, query);
-        }
-    });
 }
 
 }  // namespace rt

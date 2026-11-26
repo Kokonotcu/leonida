@@ -209,9 +209,7 @@ compression metadata planes, and addressing or copies for the pipe/bank XOR mode
 it cannot lay out still gets a computer in the out pointer with `E_INVALIDARG`, because two of the four callers ignore
 the HRESULT and call through the object at once; that object answers every slot with `E_NOTIMPL` and writes nothing.
 `xg_xs_test` covers the model (hand-checked addresses, mip tails, a bijection and round trip over every element) and the
-shim's slots.
-Set `LEONIDA_XG_TRACE=1` to log the first 1024 calls per entry point; the source notes are in
-[xg_xs_THIRD_PARTY.md](../runtime/shims/xg_xs_THIRD_PARTY.md).
+shim's slots. The source notes are in [xg_xs_THIRD_PARTY.md](../runtime/shims/xg_xs_THIRD_PARTY.md).
 
 Only two of these DLLs have a shim in the repository (`xmem.dll` and `d3d12_xs.dll`), and they are not complete:
 they hold 8 of the 30 unimplemented imports. The other 22 are in five DLLs (`xg_xs.dll`, `XCRDAPI.dll`, `chad.dll`,
@@ -619,8 +617,7 @@ on the executable, the rest is not:
 
 `XGameEventImpl`, `XGameUiImpl`, `XGameStreamingImpl`, `XDisplayImpl`, `XUserDeviceImpl`, `XAccessibilityImpl` and
 `XLauncherImpl` (`runtime/shims/xgameruntime_offline.cpp`), from the same layout, also **not measured**:
-- **`XGameEventWrite`** succeeds; the events are dropped. The first one's name is logged, and
-  `LEONIDA_LOG_GAME_EVENTS=1` logs each with its dimensions and measurements.
+- **`XGameEventWrite`** succeeds; the events are dropped. The first one's name is logged.
 - **Dialogs:** a message dialog's title, text and buttons go to the log (`[rt] game dialog:`), and it completes at
   once with its default button; an error dialog's HRESULT and context are logged and it is dismissed. So an error
   the game would show on screen at boot is readable in the log. Every other UI (profile cards, pickers, text entry,

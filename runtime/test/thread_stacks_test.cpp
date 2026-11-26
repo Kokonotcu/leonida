@@ -1,5 +1,5 @@
-// rt::StackSampler (runtime/src/thread_stacks.cpp, LEONIDA_STACKS): the call chain of a thread blocked in a known
-// function, and of a thread whose stack keeps changing while it is sampled. No game data.
+// rt::StackSampler (runtime/src/thread_stacks.cpp, the thread stacks of the fault reports): the call chain of a
+// thread blocked in a known function, and of a thread whose stack keeps changing while it is sampled. No game data.
 #include <windows.h>
 #include <intrin.h>
 
@@ -147,20 +147,9 @@ void moving_thread() {
     check(reached + deep == sampled, "every chain of a moving stack unwinds to its thread function");
 }
 
-void parse() {
-    std::vector<unsigned> t;
-    check(rt::parse_stack_times("90,180", t) && t == std::vector<unsigned>{90, 180}, "parse 90,180");
-    check(rt::parse_stack_times("180,90,90", t) && t == std::vector<unsigned>{90, 180}, "parse sorts and dedupes");
-    check(!rt::parse_stack_times("", t) && t.empty(), "empty text refused");
-    check(!rt::parse_stack_times("1,,2", t) && !rt::parse_stack_times("1,", t) && !rt::parse_stack_times("x", t) &&
-              !rt::parse_stack_times("-5", t) && !rt::parse_stack_times("1.5", t),
-          "bad tokens refused");
-}
-
 }  // namespace
 
 int main() {
-    parse();
     blocked_thread();
     moving_thread();
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

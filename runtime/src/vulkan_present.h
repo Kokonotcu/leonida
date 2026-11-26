@@ -26,12 +26,9 @@
 // tear mode or FIFO, vulkan_present_mode.h), since a chained mode also holds for the presents after it. Without the
 // extension, or without either mode, a request is ignored and the frame waits for the vblank.
 
-#include "debug_targets.h"
 #include "vulkan_backend.h"
 #include "vulkan_present_compose.h"
 #include "vulkan_present_mode.h"
-#include "fsdraw_probe.h"  // LOCAL DIAGNOSTIC
-#include "local_diagnostics.h"
 #include "present_dump.h"
 
 // Use the original EXT spellings. They are aliases of the promoted KHR types and are available in older headers.
@@ -222,11 +219,6 @@ public:
             if (const char* limit = std::getenv("LEONIDA_CAPTURE_LIMIT")) capture_limit_ = std::max(1, std::atoi(limit));
             std::fprintf(stderr, "[rt] present: capture on: every %d presented frame(s), at most %d, into %s\n",
                          capture_every_, capture_limit_, capture_dir_.c_str());
-            // LOCAL DIAGNOSTIC: LEONIDA_CAPTURE_SOURCE=1 also reads back the presented source texture itself.
-            if (const char* source = std::getenv("LEONIDA_CAPTURE_SOURCE"); source && *source && *source != '0') {
-                probe_source_ = true;
-                std::fprintf(stderr, "[rt] present-probe: source capture on\n");
-            }
         }
         ok_ = recreate(true, false);
         if (!ok_ && capture_to_disk_) {
@@ -262,7 +254,6 @@ public:
             if (frame.done) vkDestroyFence_(device, frame.done, nullptr);
             if (frame.acquired) vk.vkDestroySemaphore(device, frame.acquired, nullptr);
         }
-        if (probe_fence_) vkDestroyFence_(device, probe_fence_, nullptr);  // LOCAL DIAGNOSTIC
         if (pool_) vk.vkDestroyCommandPool(device, pool_, nullptr);
         if (surface_ && vkDestroySurfaceKHR_) vkDestroySurfaceKHR_(instance_, surface_, nullptr);
     }
@@ -338,9 +329,6 @@ public:
         if (!(planes.hdr_peak_nits > 0.0f) || !std::isfinite(planes.hdr_peak_nits)) return VK_ERROR_UNKNOWN;
         for (std::uint32_t i = 0; i < planes.count; ++i) {
             const PresentPlane& plane = planes.plane[i];
-            // The planes go into a dump too (LEONIDA_DUMP_TARGETS): plane 0 can be written by compute (the console FSR
-            // upscaler's output), which no draw notes.
-            debug_targets::note(plane.source);
             ResourceBinding binding;
             {
                 std::shared_lock lock(context_.resource_mutex_);
@@ -447,9 +435,6 @@ public:
             std::fprintf(stderr, "[rt] d3d12: a Present is queued behind held work (a Wait whose Signal is not "
                                  "submitted yet) and is shown once that work is released; logged once\n");
         }
-        if (const std::uint64_t n = ++probe_deferred_; local_diagnostics() && (n <= 8 || n % 600 == 0))
-            std::fprintf(stderr, "[rt] present-probe: present #%llu queued behind held work (%zu queued)\n",
-                         static_cast<unsigned long long>(n), deferred_.size());
         last_tore_ = false;
         context_.holds().after_held(this, [this] { run_deferred(); });
         return VK_SUCCESS;
@@ -527,7 +512,6 @@ private:
     VkResult submit_now(const ResourceBinding* binding, ResourceId source, bool vsync, const PresentRect* source_rect,
                         bool srgb, bool tear = false, const PresentPlanes* planes = nullptr) {
         last_tore_ = false;
-        probe_path(binding, source, planes);  // LOCAL DIAGNOSTIC
         if (!ok_) return VK_ERROR_INITIALIZATION_FAILED;
         if (surface_lost_) {  // the window's display went away under a presented swapchain
             // Try to make a new surface for the same window (the hwnd is retained by the factory's callback).
@@ -757,8 +741,6 @@ private:
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
             const auto shown = ++presented_;
             renderdoc::after_present(shown);  // LEONIDA_RENDERDOC: the next present is captured when listed
-            if (debug_targets::dump_at() && debug_targets::dump_now(presented_)) dump_targets();
-            submit_phases::totals().presents.fetch_add(1, std::memory_order_relaxed);  // frames a second, phase line
             submit_phases::totals().present_serial.fetch_add(1, std::memory_order_relaxed);
             if (dump_.due(shown - 1)) {
                 // Presentation is already queued and the queue/tracker locks are released. A sampled frame
@@ -798,312 +780,6 @@ private:
     }
 
 private:
-    // ---- LOCAL DIAGNOSTIC (not for upstream): which path each present takes, and the source texture's contents ----
-    bool probe_source_ = false;
-    std::uint64_t probe_calls_ = 0, probe_blit_ = 0, probe_compose_ = 0, probe_blank_ = 0, probe_unresolved_ = 0;
-    std::atomic<std::uint64_t> probe_deferred_{0};
-    int probe_written_ = 0;
-    VkCommandBuffer probe_commands_ = VK_NULL_HANDLE;
-    VkFence probe_fence_ = VK_NULL_HANDLE;
-
-    static float probe_half(std::uint16_t h) {
-        const std::uint32_t sign = (h >> 15) & 1, exponent = (h >> 10) & 0x1f, mantissa = h & 0x3ff;
-        float v;
-        if (exponent == 0) v = std::ldexp(float(mantissa), -24);
-        else if (exponent == 31) v = mantissa ? 0.0f : 65504.0f;  // NaN reads as 0, inf as the largest half
-        else v = std::ldexp(float(mantissa | 0x400), int(exponent) - 25);
-        return sign ? -v : v;
-    }
-    static float probe_uf11(std::uint32_t bits, int mantissa_bits) {  // B10G11R11 channels (5-bit exponent)
-        const std::uint32_t exponent = (bits >> mantissa_bits) & 0x1f, mantissa = bits & ((1u << mantissa_bits) - 1);
-        if (exponent == 0) return std::ldexp(float(mantissa), -14 - mantissa_bits);
-        if (exponent == 31) return 65504.0f;
-        return std::ldexp(float(mantissa | (1u << mantissa_bits)), int(exponent) - 15 - mantissa_bits);
-    }
-    // RGB in 0..1 (float formats unclamped) of one texel; false for a format this probe does not decode.
-    static bool probe_decode(VkFormat format, const std::uint8_t* t, float rgb[3]) {
-        switch (format) {
-        case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
-            rgb[0] = t[2] / 255.0f; rgb[1] = t[1] / 255.0f; rgb[2] = t[0] / 255.0f; return true;
-        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
-            rgb[0] = t[0] / 255.0f; rgb[1] = t[1] / 255.0f; rgb[2] = t[2] / 255.0f; return true;
-        case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: {
-            std::uint32_t w; std::memcpy(&w, t, 4);
-            const float lo = (w & 0x3ff) / 1023.0f, mid = ((w >> 10) & 0x3ff) / 1023.0f, hi = ((w >> 20) & 0x3ff) / 1023.0f;
-            const bool bgra = format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
-            rgb[0] = bgra ? hi : lo; rgb[1] = mid; rgb[2] = bgra ? lo : hi; return true;
-        }
-        case VK_FORMAT_R16G16B16A16_SFLOAT: {
-            std::uint16_t h[3]; std::memcpy(h, t, 6);
-            for (int i = 0; i < 3; ++i) rgb[i] = probe_half(h[i]);
-            return true;
-        }
-        case VK_FORMAT_R16G16B16A16_UNORM: {
-            std::uint16_t h[3]; std::memcpy(h, t, 6);
-            for (int i = 0; i < 3; ++i) rgb[i] = h[i] / 65535.0f;
-            return true;
-        }
-        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: {
-            std::uint32_t w; std::memcpy(&w, t, 4);
-            rgb[0] = probe_uf11(w & 0x7ff, 6); rgb[1] = probe_uf11((w >> 11) & 0x7ff, 6); rgb[2] = probe_uf11(w >> 22, 5);
-            return true;
-        }
-        case VK_FORMAT_R32G32B32A32_SFLOAT:
-            std::memcpy(rgb, t, 12); return true;
-        default:
-            return false;
-        }
-    }
-
-    // Called at the top of submit_now(), so after any held work it was queued behind.
-    void probe_path(const ResourceBinding* binding, ResourceId source, const PresentPlanes* planes) {
-        const std::uint64_t n = ++probe_calls_;
-        const char* path = planes ? "present_planes(compose)" : binding ? "present(blit)" : "present_blank";
-        (planes ? probe_compose_ : binding ? probe_blit_ : probe_blank_)++;
-        const ResourceId id = planes ? planes->plane[0].source : binding ? source : ResourceId{};
-        ResourceBinding found{};
-        bool resolved = false;
-        if (id) {
-            std::shared_lock lock(context_.resource_mutex_);
-            if (const ResourceBinding* b = context_.resolve(id)) {
-                found = *b;
-                resolved = true;
-            }
-        }
-        if (id && !resolved) ++probe_unresolved_;
-        if (local_diagnostics() && (n <= 6 || n % 600 == 0))
-            std::fprintf(stderr,
-                         "[rt] present-probe: submit #%llu path %s source 0x%llx resolved %d image %p format %d %ux%u "
-                         "mips %u layers %u samples %u sampled %d (blit %llu compose %llu blank %llu unresolved %llu)\n",
-                         static_cast<unsigned long long>(n), path, static_cast<unsigned long long>(id), int(resolved),
-                         reinterpret_cast<void*>(found.image), int(found.format), found.width, found.height,
-                         found.mip_levels, found.array_layers, found.samples, int(found.sampled),
-                         static_cast<unsigned long long>(probe_blit_), static_cast<unsigned long long>(probe_compose_),
-                         static_cast<unsigned long long>(probe_blank_), static_cast<unsigned long long>(probe_unresolved_));
-        // The same frames the swapchain capture takes: the one presented_ becomes when this present is shown.
-        if (probe_source_ && resolved && found.image && probe_written_ < capture_limit_ &&
-            presented_ % std::uint64_t(capture_every_) == 0)
-        {
-            probe_read_source(id, presented_ + 1, path);
-            // Plane 1 too (the title's front end draws its UI, prompts and loading screen there: shims/xbox_present.cpp).
-            if (planes && planes->count == 2 && planes->plane[1].source && planes->plane[1].source != id)
-                probe_read_source(planes->plane[1].source, presented_ + 1, "plane 1", "plane1");
-            // LOCAL DIAGNOSTIC (fsdraw): the render targets of the frame's fullscreen draws, read back with it.
-            for (const std::uint64_t target : fsdraw::targets())
-                if (target != id) probe_read_source(target, presented_ + 1, "fullscreen-draw target", "target");
-        }
-    }
-
-    // Copies mip 0, layer 0 of `id` to host memory on the presenter's queue (waited for), logs and writes it.
-    void probe_read_source(ResourceId id, std::uint64_t number, const char* path, const char* prefix = "source") {
-        const bool is_source = std::strcmp(prefix, "source") == 0;
-        auto& vk = context_.vk;
-        const VkDevice device = context_.device();
-        const ReplayFunctions& fn = context_.replay_;
-        if (!probe_commands_) {
-            VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-            allocate.commandPool = pool_;
-            allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocate.commandBufferCount = 1;
-            VkFenceCreateInfo fence{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-            if (vk.vkAllocateCommandBuffers(device, &allocate, &probe_commands_) != VK_SUCCESS ||
-                vkCreateFence_(device, &fence, nullptr, &probe_fence_) != VK_SUCCESS) {
-                std::fprintf(stderr, "[rt] present-probe: cannot make the readback command buffer\n");
-                probe_source_ = false;
-                return;
-            }
-        }
-        std::shared_lock resource_lock(context_.resource_mutex_);
-        const ResourceBinding* found = context_.resolve(id);
-        if (!found || !found->image) return;
-        const ResourceBinding binding = *found;
-        const BlockFormat bf = block_format(binding.format, VK_IMAGE_ASPECT_COLOR_BIT);
-        // Held only while the copy is recorded (fsdraw: holding them through the wait, the slow host reads and the
-        // file write stalled every resource creation and the boot ran out of memory).
-        std::unique_lock tracker_lock(context_.tracker_mutex_);
-        const bool tracked = context_.tracker_.tracked(id);
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        const VkImageLayout common = image_layout(binding, VK_IMAGE_LAYOUT_GENERAL);
-        LayoutPieces pieces = detail::current(&context_.tracker_, id, range, common);
-        const VkImageLayout layout = pieces.empty() ? VK_IMAGE_LAYOUT_UNDEFINED : pieces[0].layout;
-        std::fprintf(stderr,
-                     "[rt] present-probe: %s frame %llu via %s: id 0x%llx format %d %ux%u mips %u layers %u samples %u "
-                     "texel bytes %u tracked %d layout %d\n",
-                     prefix, static_cast<unsigned long long>(number), path, static_cast<unsigned long long>(id),
-                     int(binding.format), binding.width, binding.height, binding.mip_levels, binding.array_layers,
-                     binding.samples, bf.bytes, int(tracked), int(layout));
-        if (layout == VK_IMAGE_LAYOUT_UNDEFINED) {
-            std::fprintf(stderr, "[rt] present-probe: %s frame %llu is UNDEFINED in the tracker: no tracked GPU "
-                                 "operation ever wrote it (the present zero-fills it)\n",
-                         prefix, static_cast<unsigned long long>(number));
-            if (is_source) ++probe_written_;
-            return;
-        }
-        if (binding.samples > 1 || bf.block != 1 || !bf.bytes) {
-            std::fprintf(stderr, "[rt] present-probe: %s format %d not read back\n", prefix, int(binding.format));
-            return;
-        }
-        const VkDeviceSize size = VkDeviceSize(binding.width) * binding.height * bf.bytes;
-        VkBuffer buffer = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        void* mapped = nullptr;
-        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        info.size = size;
-        info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-        if (vk.vkCreateBuffer(device, &info, nullptr, &buffer) != VK_SUCCESS) return;
-        VkMemoryRequirements requirements{};
-        vk.vkGetBufferMemoryRequirements(device, buffer, &requirements);
-        VkPhysicalDeviceMemoryProperties props{};
-        vkGetPhysicalDeviceMemoryProperties_(physical_, &props);
-        constexpr VkMemoryPropertyFlags wanted = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-        std::uint32_t type = UINT32_MAX;
-        // Host-cached system memory first (fsdraw): a resizable-BAR type is uncached for host reads.
-        for (int pass = 0; pass < 2 && type == UINT32_MAX; ++pass)
-            for (std::uint32_t i = 0; i < props.memoryTypeCount; ++i) {
-                const VkMemoryPropertyFlags f = props.memoryTypes[i].propertyFlags;
-                const bool cached = (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-                if ((requirements.memoryTypeBits & (1u << i)) && (f & wanted) == wanted && (pass || cached)) {
-                    type = i;
-                    break;
-                }
-            }
-        VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-        allocate.allocationSize = requirements.size;
-        allocate.memoryTypeIndex = type;
-        const auto cleanup = [&] {
-            if (memory) vk.vkFreeMemory(device, memory, nullptr);
-            if (buffer) vk.vkDestroyBuffer(device, buffer, nullptr);
-        };
-        if (type == UINT32_MAX || vk.vkAllocateMemory(device, &allocate, nullptr, &memory) != VK_SUCCESS ||
-            vk.vkBindBufferMemory(device, buffer, memory, 0) != VK_SUCCESS ||
-            vk.vkMapMemory(device, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
-            cleanup();
-            return;
-        }
-        VkCommandBuffer commands = probe_commands_;
-        vk.vkResetCommandBuffer(commands, 0);
-        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vk.vkBeginCommandBuffer(commands, &begin);
-        constexpr VkAccessFlags any = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
-        for (const auto& piece : pieces)
-            detail::image_barrier(fn, commands, binding, piece.range, piece.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                  any, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                                  VK_PIPELINE_STAGE_TRANSFER_BIT);
-        VkBufferImageCopy copy{};
-        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        copy.imageExtent = {binding.width, binding.height, 1};
-        fn.copy_image_to_buffer(commands, binding.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
-        for (const auto& piece : pieces)
-            detail::image_barrier(fn, commands, binding, piece.range, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, piece.layout,
-                                  VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, any,
-                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        VkBufferMemoryBarrier to_host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
-        to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-        to_host.srcQueueFamilyIndex = to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        to_host.buffer = buffer;
-        to_host.size = VK_WHOLE_SIZE;
-        fn.pipeline_barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1,
-                            &to_host, 0, nullptr);
-        vk.vkEndCommandBuffer(commands);
-        tracker_lock.unlock();
-        resource_lock.unlock();
-        vkResetFences_(device, 1, &probe_fence_);
-        VkSubmitInfo submit_info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        submit_info.commandBufferCount = 1;
-        submit_info.pCommandBuffers = &commands;
-        VkResult submitted;
-        {
-            std::lock_guard lock(context_.submit_mutex());
-            submitted = context_.observe_result(context_.queue_submit(queue_, 1, &submit_info, probe_fence_),
-                                                "vkQueueSubmit (present probe)");
-            if (submitted == VK_SUCCESS) context_.note_image_work_locked();
-        }
-        if (submitted != VK_SUCCESS ||
-            context_.observe_result(vkWaitForFences_(device, 1, &probe_fence_, VK_TRUE, 5'000'000'000ull),
-                                    "vkWaitForFences (present probe)") != VK_SUCCESS) {
-            std::fprintf(stderr, "[rt] present-probe: readback submit/wait failed (%d)\n", int(submitted));
-            cleanup();
-            return;
-        }
-        const std::size_t texels = std::size_t(binding.width) * binding.height;
-        const auto* bytes = static_cast<const std::uint8_t*>(mapped);
-        std::vector<std::uint8_t> rgb(texels * 3);
-        double sum[3] = {0, 0, 0};
-        float peak = 0.0f;
-        std::size_t nonzero = 0;
-        bool decoded = true;
-        for (std::size_t i = 0; i < texels && decoded; ++i) {
-            float c[3];
-            if (!probe_decode(binding.format, bytes + i * bf.bytes, c)) {
-                decoded = false;
-                break;
-            }
-            bool any_set = false;
-            for (int k = 0; k < 3; ++k) {
-                sum[k] += c[k];
-                peak = std::max(peak, c[k]);
-                if (c[k] != 0.0f) any_set = true;
-                rgb[i * 3 + k] = std::uint8_t(std::clamp(c[k], 0.0f, 1.0f) * 255.0f + 0.5f);
-            }
-            nonzero += any_set;
-        }
-        // Raw bytes too: a format the probe cannot decode still says whether anything was written.
-        std::size_t raw_nonzero = 0;
-        std::size_t first_nonzero = SIZE_MAX;
-        for (std::size_t i = 0; i < std::size_t(size); ++i)
-            if (bytes[i]) {
-                if (first_nonzero == SIZE_MAX) first_nonzero = i;
-                ++raw_nonzero;
-            }
-        {  // LOCAL DIAGNOSTIC (fsdraw): raw texels at the centre and at the first non-zero byte
-            const std::size_t centre = (std::size_t(binding.height / 2) * binding.width + binding.width / 2) * bf.bytes;
-            std::string c, f;
-            char b[8];
-            for (std::uint32_t k = 0; k < bf.bytes && k < 16; ++k) {
-                std::snprintf(b, sizeof b, "%02x", bytes[centre + k]);
-                c += b;
-            }
-            if (first_nonzero != SIZE_MAX) {
-                const std::size_t t = first_nonzero / bf.bytes * bf.bytes;
-                for (std::uint32_t k = 0; k < bf.bytes && k < 16; ++k) {
-                    std::snprintf(b, sizeof b, "%02x", bytes[t + k]);
-                    f += b;
-                }
-            }
-            std::fprintf(stderr, "[rt] present-probe: %s frame %llu raw centre texel %s first non-zero texel %lld (%s)\n",
-                         prefix, static_cast<unsigned long long>(number), c.c_str(),
-                         first_nonzero == SIZE_MAX ? -1ll : static_cast<long long>(first_nonzero / bf.bytes), f.c_str());
-        }
-        cleanup();
-        const double scale = 255.0 / double(texels);
-        std::fprintf(stderr,
-                     "[rt] present-probe: %s frame %llu mean rgb %.2f %.2f %.2f (0..255 scale) peak %.3f nonzero "
-                     "texels %zu of %zu, nonzero bytes %zu of %llu%s\n",
-                     prefix, static_cast<unsigned long long>(number), sum[0] * scale, sum[1] * scale, sum[2] * scale, peak,
-                     nonzero, texels, raw_nonzero, static_cast<unsigned long long>(size),
-                     decoded ? "" : " (format not decoded)");
-        std::string dir = capture_dir_;
-        if (dir.back() != '/' && dir.back() != '\\') dir += '/';
-        if (decoded && (is_source || nonzero)) {
-            char name[64];
-            std::snprintf(name, sizeof name, "%s_%05llu.ppm", prefix, static_cast<unsigned long long>(number));
-            std::ofstream file(dir + name, std::ios::binary | std::ios::trunc);
-            if (file) {
-                file << "P6\n" << binding.width << ' ' << binding.height << "\n255\n";
-                file.write(reinterpret_cast<const char*>(rgb.data()), std::streamsize(rgb.size()));
-            }
-        }
-        std::ofstream index(dir + "source_index.txt", std::ios::app);
-        if (index)
-            index << prefix << " frame " << number << " id 0x" << std::hex << id << std::dec << " path " << path << " format " << int(binding.format) << " extent "
-                  << binding.width << 'x' << binding.height << " layout " << int(layout) << " mean rgb " << std::fixed
-                  << std::setprecision(2) << sum[0] * scale << ' ' << sum[1] * scale << ' ' << sum[2] * scale
-                  << " nonzero texels " << nonzero << " nonzero bytes " << raw_nonzero << '\n';
-        if (is_source) ++probe_written_;
-    }
-    // ---- end LOCAL DIAGNOSTIC ----
 
     struct Frame {
         VkCommandBuffer commands = VK_NULL_HANDLE;
@@ -1515,207 +1191,6 @@ private:
         captured_ = false;
     }
 
-    // LEONIDA_DUMP_TARGETS (src/debug_targets.h): every colour target the title drew into, mip 0 / layer 0, copied
-    // to host memory and written as <capture dir>/target_<id>_<w>x<h>_f<format>.ppm with its mean RGBA logged.
-    // Synchronous (it waits for the copy): a diagnostic for one present, not for every frame.
-    static bool texel_rgba(VkFormat f, const std::uint8_t* p, float out[4]) {
-        const auto half = [](std::uint16_t h) {
-            const std::uint32_t s = h >> 15, e = (h >> 10) & 31, m = h & 1023;
-            float v = e == 0 ? std::ldexp(float(m), -24) : e == 31 ? 65504.0f : std::ldexp(float(m | 1024), int(e) - 25);
-            return s ? -v : v;
-        };
-        const auto small_float = [](std::uint32_t bits, int mantissa) {  // unsigned 5-bit exponent floats
-            const std::uint32_t e = bits >> mantissa, m = bits & ((1u << mantissa) - 1);
-            if (e == 0) return std::ldexp(float(m), -14 - mantissa);
-            if (e == 31) return 65504.0f;
-            return std::ldexp(float(m | (1u << mantissa)), int(e) - 15 - mantissa);
-        };
-        std::uint32_t w;
-        switch (f) {
-        case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
-            for (int i = 0; i < 4; ++i) out[i] = p[i] / 255.0f;
-            return true;
-        case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
-            out[0] = p[2] / 255.0f, out[1] = p[1] / 255.0f, out[2] = p[0] / 255.0f, out[3] = p[3] / 255.0f;
-            return true;
-        case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
-            std::memcpy(&w, p, 4);
-            out[0] = (w & 1023) / 1023.0f, out[1] = ((w >> 10) & 1023) / 1023.0f, out[2] = ((w >> 20) & 1023) / 1023.0f;
-            out[3] = (w >> 30) / 3.0f;
-            return true;
-        case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
-            std::memcpy(&w, p, 4);
-            out[0] = small_float(w & 2047, 6), out[1] = small_float((w >> 11) & 2047, 6),
-            out[2] = small_float(w >> 22, 5), out[3] = 1.0f;
-            return true;
-        case VK_FORMAT_R16G16B16A16_SFLOAT:
-            for (int i = 0; i < 4; ++i) {
-                std::uint16_t h;
-                std::memcpy(&h, p + 2 * i, 2);
-                out[i] = half(h);
-            }
-            return true;
-        case VK_FORMAT_R8_UNORM: out[0] = out[1] = out[2] = p[0] / 255.0f, out[3] = 1.0f; return true;
-#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
-        case VK_FORMAT_A8_UNORM_KHR: out[0] = out[1] = out[2] = p[0] / 255.0f, out[3] = 1.0f; return true;  // coverage
-#endif
-        case VK_FORMAT_R16_UINT:          // the R16_UINT backing of a B5G5R5A1 UAV texture (uint_backed): A1R5G5B5
-        case VK_FORMAT_A1R5G5B5_UNORM_PACK16: {
-            std::uint16_t v;
-            std::memcpy(&v, p, 2);
-            out[0] = ((v >> 10) & 31) / 31.0f, out[1] = ((v >> 5) & 31) / 31.0f, out[2] = (v & 31) / 31.0f;
-            out[3] = float(v >> 15);
-            return true;
-        }
-        case VK_FORMAT_R16_SFLOAT: {
-            std::uint16_t h;
-            std::memcpy(&h, p, 2);
-            out[0] = out[1] = out[2] = half(h), out[3] = 1.0f;
-            return true;
-        }
-        case VK_FORMAT_R32_SFLOAT: std::memcpy(&out[0], p, 4); out[1] = out[2] = out[0], out[3] = 1.0f; return true;
-        default: return false;
-        }
-    }
-    static std::uint32_t texel_bytes(VkFormat f) {
-        switch (f) {
-        case VK_FORMAT_R8_UNORM: return 1;
-#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
-        case VK_FORMAT_A8_UNORM_KHR: return 1;
-#endif
-        case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UINT: case VK_FORMAT_A1R5G5B5_UNORM_PACK16: return 2;
-        case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
-        default: return 4;
-        }
-    }
-    void dump_targets() {
-        auto& vk = context_.vk;
-        const ReplayFunctions& fn = context_.replay_;
-        const VkDevice device = context_.device();
-        std::vector<ResourceId> ids = debug_targets::snapshot();
-        std::fprintf(stderr, "[rt] dump: %zu render target(s) at present %llu\n", ids.size(),
-                     static_cast<unsigned long long>(presented_));
-        VkPhysicalDeviceMemoryProperties memory{};
-        vkGetPhysicalDeviceMemoryProperties_(physical_, &memory);
-        for (const ResourceId id : ids) {
-            ResourceBinding b;
-            {
-                std::shared_lock lock(context_.resource_mutex_);
-                const ResourceBinding* found = context_.resolve(id);
-                if (!found || !found->image || found->aspects != VK_IMAGE_ASPECT_COLOR_BIT || found->samples > 1) {
-                    std::fprintf(stderr, "[rt] dump: target %llx skipped: %s\n", static_cast<unsigned long long>(id),
-                                 !found ? "unknown" : !found->image ? "no image" : found->samples > 1 ? "multisampled"
-                                                                                                    : "not colour");
-                    if (found && found->samples > 1)
-                        std::fprintf(stderr, "[rt] dump:   %ux%u format %d, %u samples\n", found->width, found->height,
-                                     int(found->format), found->samples);
-                    continue;
-                }
-                b = *found;
-            }
-            float probe[4];
-            const std::uint8_t zeros[8] = {};
-            if (!texel_rgba(b.format, zeros, probe)) {
-                std::fprintf(stderr, "[rt] dump: target %llx %ux%u format %d not dumped (format)\n",
-                             static_cast<unsigned long long>(id), b.width, b.height, int(b.format));
-                continue;
-            }
-            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-            const VkImageLayout common = image_layout(b, VK_IMAGE_LAYOUT_GENERAL);
-            auto pieces = detail::current(&context_.tracker_, id, range, common);
-            bool undefined = false;
-            for (const auto& piece : pieces) undefined |= piece.layout == VK_IMAGE_LAYOUT_UNDEFINED;
-            if (undefined) {
-                std::fprintf(stderr, "[rt] dump: target %llx never written (UNDEFINED)\n", static_cast<unsigned long long>(id));
-                continue;
-            }
-            const VkDeviceSize bytes = VkDeviceSize(b.width) * b.height * texel_bytes(b.format);
-            VkBuffer buffer = VK_NULL_HANDLE;
-            VkDeviceMemory mem = VK_NULL_HANDLE;
-            VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-            info.size = bytes;
-            info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            if (vk.vkCreateBuffer(device, &info, nullptr, &buffer) != VK_SUCCESS) continue;
-            VkMemoryRequirements req{};
-            vk.vkGetBufferMemoryRequirements(device, buffer, &req);
-            std::uint32_t type = UINT32_MAX;
-            for (std::uint32_t i = 0; i < memory.memoryTypeCount && type == UINT32_MAX; ++i)
-                if ((req.memoryTypeBits & (1u << i)) &&
-                    (memory.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
-                        (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
-                    type = i;
-            VkMemoryAllocateInfo allocate{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-            allocate.allocationSize = req.size;
-            allocate.memoryTypeIndex = type;
-            void* mapped = nullptr;
-            VkCommandBuffer cmd = VK_NULL_HANDLE;
-            VkFence fence = VK_NULL_HANDLE;
-            VkCommandBufferAllocateInfo cba{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-            cba.commandPool = pool_;
-            cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            cba.commandBufferCount = 1;
-            VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-            const bool ready = type != UINT32_MAX && vk.vkAllocateMemory(device, &allocate, nullptr, &mem) == VK_SUCCESS &&
-                               vk.vkBindBufferMemory(device, buffer, mem, 0) == VK_SUCCESS &&
-                               vk.vkMapMemory(device, mem, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS &&
-                               vk.vkAllocateCommandBuffers(device, &cba, &cmd) == VK_SUCCESS &&
-                               vkCreateFence_(device, &fci, nullptr, &fence) == VK_SUCCESS;
-            if (ready) {
-                VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-                begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                vk.vkBeginCommandBuffer(cmd, &begin);
-                for (const auto& piece : pieces)
-                    detail::image_barrier(fn, cmd, b, piece.range, piece.layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                          VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                          VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-                VkBufferImageCopy region{};
-                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                region.imageExtent = {b.width, b.height, 1};
-                fn.copy_image_to_buffer(cmd, b.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &region);
-                for (const auto& piece : pieces)
-                    detail::image_barrier(fn, cmd, b, piece.range, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, piece.layout,
-                                          VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                          VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-                                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-                vk.vkEndCommandBuffer(cmd);
-                VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-                submit.commandBufferCount = 1;
-                submit.pCommandBuffers = &cmd;
-                {
-                    std::lock_guard lock(context_.submit_mutex());
-                    context_.queue_submit(queue_, 1, &submit, fence);  // through the compile gate
-                }
-                vkWaitForFences_(device, 1, &fence, VK_TRUE, UINT64_MAX);
-                const std::uint32_t bpp = texel_bytes(b.format);
-                const auto* src = static_cast<const std::uint8_t*>(mapped);
-                std::vector<std::uint8_t> rgb(std::size_t(b.width) * b.height * 3);
-                double sum[4] = {};
-                for (std::size_t i = 0; i < std::size_t(b.width) * b.height; ++i) {
-                    float t[4];
-                    texel_rgba(b.format, src + i * bpp, t);
-                    for (int c = 0; c < 4; ++c) sum[c] += t[c];
-                    for (int c = 0; c < 3; ++c) rgb[i * 3 + c] = std::uint8_t(std::clamp(t[c], 0.0f, 1.0f) * 255.0f + 0.5f);
-                }
-                const double n = double(b.width) * b.height;
-                char name[160];
-                std::snprintf(name, sizeof name, "p%llu_target_%llx_%ux%u_f%d.ppm",
-                              static_cast<unsigned long long>(presented_), static_cast<unsigned long long>(id),
-                              b.width, b.height, int(b.format));
-                const std::string path = (capture_dir_.empty() ? std::string(".") : capture_dir_) + "/" + name;
-                if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
-                    std::fprintf(f, "P6\n%u %u\n255\n", b.width, b.height);
-                    std::fwrite(rgb.data(), 1, rgb.size(), f);
-                    std::fclose(f);
-                }
-                std::fprintf(stderr, "[rt] dump: target %llx %ux%u format %d mean rgba %.3f %.3f %.3f %.3f -> %s\n",
-                             static_cast<unsigned long long>(id), b.width, b.height, int(b.format), sum[0] / n,
-                             sum[1] / n, sum[2] / n, sum[3] / n, name);
-            }
-            if (fence) vkDestroyFence_(device, fence, nullptr);
-            if (mem) vk.vkFreeMemory(device, mem, nullptr);
-            vk.vkDestroyBuffer(device, buffer, nullptr);
-        }
-    }
 
     // The name VkFormat has in the index; the few formats a capture can be written from, else its number.
     static const char* capture_format_name(VkFormat format) {

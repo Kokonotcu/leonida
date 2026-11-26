@@ -40,7 +40,6 @@
 #include "../src/guarded_copy.h"
 #include "../src/shader_directory.h"
 #include "../src/dstorage_swizzle.h"
-#include "../src/dstorage_trace.h"
 #include "../src/dstorage_hold.h"
 #include "dstorage_xs_abi.h"
 #include "dstorage_staging.h"
@@ -589,20 +588,7 @@ void log_hold(const char* event, uint64_t n, unsigned capacity, size_t held_now)
 
 // ---- Queues -------------------------------------------------------------------------------------------------------
 
-// Only sampled when request tracing is enabled. Times include work done by the file/decode worker.
-struct Timing {
-    using Clock = std::chrono::steady_clock;
-    long long read{}, inflate{}, bcpack{}, copy{}, unshuffle{};
-    static Clock::time_point start() {
-        return leonida::dstorage::trace_enabled() ? Clock::now() : Clock::time_point{};
-    }
-    static long long elapsed(Clock::time_point begin) {
-        return leonida::dstorage::trace_enabled()
-            ? std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - begin).count() : 0;
-    }
-};
 struct Entry {
-    Timing timing;
     const char* reason = "none";
     enum class Type { Request, Status, Signal, Event } type = Type::Request;
     DSTORAGE_REQUEST request{};
@@ -1042,8 +1028,6 @@ private:
     void process(Entry& e, Prepared* prepared, bool pair_reserved = false) {
         HRESULT hr = e.enqueue_error;
         if (FAILED(hr)) e.reason = "enqueue";
-        const auto begin = Timing::start();
-        long long notify_us = 0;
         switch (e.type) {
             case Entry::Type::Request:
                 // A cancelled request is a success whatever else is wrong with it (the GDK: not counted as a failure).
@@ -1060,20 +1044,20 @@ private:
                     }
                     set_pending(-1);
                 }
-                if (FAILED(hr) || leonida::dstorage::trace_enabled()) {
+                if (FAILED(hr)) {
                     const auto& r = e.request;
                     const auto o = r.Options.AsUINT64;
                     const bool pages = (o & options::kDestinationPages) != 0;
                     std::fprintf(stderr, "[rt] ds-request queue=%p options=%llx zlib=%d bc=%llu sw=%llu "
                                  "dest=%s address=%p file=%ls offset=%llu src=%u mid=%u dst=%u cancelled=%d hr=%08lx "
-                                 "tick_ms=%llu page_offset=%u read_us=%lld inflate_us=%lld bc_us=%lld copy_us=%lld sw_us=%lld paired=%d reason=%s priority=%d\n",
+                                 "tick_ms=%llu page_offset=%u paired=%d reason=%s priority=%d\n",
                                  static_cast<void*>(this), o, int(options::zlib(o)), options::bcpack(o),
                                  options::swizzle(o), pages ? "pages" : "buffer", r.Destination,
                                  e.file ? e.file->path().c_str() : L"-", e.file ? r.FileOffset : 0ull,
                                  r.SourceSize, r.IntermediateSize, r.DestinationSize, int(e.cancelled),
                                  static_cast<unsigned long>(hr), GetTickCount64(),
-                                 pages ? unsigned(r.DestinationPageOffset) : 0u, e.timing.read, e.timing.inflate,
-                                 e.timing.bcpack, e.timing.copy, e.timing.unshuffle, int(prepared != nullptr), e.reason, int(desc_.Priority));
+                                 pages ? unsigned(r.DestinationPageOffset) : 0u, int(prepared != nullptr), e.reason,
+                                 int(desc_.Priority));
                     if (hr == E_DSTORAGE_ACCESS_VIOLATION) {
                         const void* cpu = pages ? r.DestinationPageArray : cpu_destination(r);
                         MEMORY_BASIC_INFORMATION info{};
@@ -1085,7 +1069,7 @@ private:
                                      info.BaseAddress, info.RegionSize, info.State, info.Protect, info.Type);
                     }
                     // Put failures on the same clock as title faults, even if another queue is active.
-                    if (FAILED(hr) && rt::startup_trace::enabled()) {
+                    if (rt::startup_trace::enabled()) {
                         rt::startup_trace::event("dstorage_failure",
                             "\"queue\":" + rt::startup_trace::quote(rt::startup_trace::hex(reinterpret_cast<uintptr_t>(this))) +
                             ",\"hr\":" + rt::startup_trace::quote(hr_text(hr)) +
@@ -1104,32 +1088,16 @@ private:
                     e.status->complete(e.index, result);
                     since_notify_ = S_OK;
                 }
-                notify_us = Timing::elapsed(begin);
-                if (leonida::dstorage::trace_enabled())
-                    std::fprintf(stderr, "[rt] ds-status queue=%p array=%p slot=%u hr=%08lx\n",
-                                 static_cast<void*>(this), static_cast<void*>(e.status), e.index,
-                                 static_cast<unsigned long>(result));
                 break;
             }
             case Entry::Type::Signal:
                 if (SUCCEEDED(hr)) hr = e.fence->Signal(e.value);
-                notify_us = Timing::elapsed(begin);
-                if (leonida::dstorage::trace_enabled())
-                    std::fprintf(stderr, "[rt] ds-signal queue=%p value=%llu hr=%08lx\n", static_cast<void*>(this),
-                                 e.value, static_cast<unsigned long>(hr));
                 since_notify_ = S_OK;
                 break;
             case Entry::Type::Event:
                 if (SUCCEEDED(hr) && !SetEvent(e.event)) hr = HRESULT_FROM_WIN32(GetLastError());
-                notify_us = Timing::elapsed(begin);
-                if (leonida::dstorage::trace_enabled())
-                    std::fprintf(stderr, "[rt] ds-event queue=%p hr=%08lx\n", static_cast<void*>(this),
-                                 static_cast<unsigned long>(hr));
                 break;
         }
-        if (e.type != Entry::Type::Request && leonida::dstorage::trace_enabled())
-            std::fprintf(stderr, "[rt] ds-notify queue=%p type=%u us=%lld\n", static_cast<void*>(this),
-                         static_cast<unsigned>(e.type), notify_us);
         if (FAILED(hr)) {
             DSTORAGE_ERROR_FIRST_FAILURE f{};
             f.HResult = hr;
@@ -1195,9 +1163,7 @@ private:
         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
         void* const destination = cpu_destination(r);
         if (memory) {
-            const auto begin = Timing::start();
             const auto hr = written(r, title_write(destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
-            e.timing.copy = Timing::elapsed(begin);
             if (FAILED(hr)) e.reason = "copy";
             return hr;
         }
@@ -1205,9 +1171,7 @@ private:
             e.reason = "destination-commit";
             return E_DSTORAGE_ACCESS_VIOLATION;
         }
-        const auto begin = Timing::start();
         const auto hr = read_file_range(e.file->handle(), r.FileOffset, destination, r.SourceSize, ReadTarget::Title);
-        e.timing.read = Timing::elapsed(begin);
         if (FAILED(hr)) e.reason = "file-read";
         return written(r, hr);
     }
@@ -1306,9 +1270,7 @@ private:
             std::vector<uint8_t> scratch;
             static const bool reported = (log_once("zlib", "zlib requests use CPU inflate (RFC 1950)"), true);
             (void)reported;
-            const auto begin = Timing::start();
             const auto hr = inflate(data, scratch, bc ? r.IntermediateSize : r.DestinationSize);
-            e.timing.inflate = Timing::elapsed(begin);
             if (FAILED(hr)) { e.reason = "inflate"; return hr; }
             data = std::move(scratch);
         }
@@ -1320,10 +1282,8 @@ private:
             // pages failed with E_DSTORAGE_DECOMPRESSION_ERROR, the loading screen starved, the title's watchdog
             // fired), so it decodes only where the table file is missing or VIctory's decoder refuses a stream.
             if (const leonida::bcpack_victory::Tables* tables = bcpack_tables()) {
-                const auto begin = Timing::start();
                 const char* why = nullptr;
                 const bool ok = leonida::bcpack_victory::decode(bc, data, scratch, *tables, &why);
-                e.timing.bcpack = Timing::elapsed(begin);
                 if (ok) {
                     static const bool reported =
                         (log_once("bcpack", "BCPack requests are unpacked on the CPU (VIctory's decoder, bcpack_victory.h)"),
@@ -1344,28 +1304,22 @@ private:
                 char value[2]{};
                 return GetEnvironmentVariableA("LEONIDA_DSTORAGE_FITTED", value, sizeof value) != 1 || value[0] != '0';
             }();
-            const auto begin = Timing::start();
             static const bool fast_entropy = [] {
                 char value[2]{};
                 return GetEnvironmentVariableA("LEONIDA_DSTORAGE_FAST_BCPACK", value, sizeof value) != 1 || value[0] != '0';
             }();
             const char* failure = nullptr;
             const auto quality = leonida::bcpack::decode(bc, data, scratch, allow_fitted, bc >= 6 ? bcpack_history() : nullptr, &failure, fast_entropy);
-            e.timing.bcpack = Timing::elapsed(begin);
             if (quality == leonida::bcpack::Quality::failed) { e.reason = failure; return E_DSTORAGE_DECOMPRESSION_ERROR; }
             if (quality == leonida::bcpack::Quality::fitted) {
                 static const bool reported = (log_once("fitted", "using fitted BCPack predictors"), true);
                 (void)reported;
-                if (leonida::dstorage::trace_enabled())
-                    std::fprintf(stderr, "[rt] ds-fitted bc=%u bytes=%u\n", bc, r.DestinationSize);
             }
             data = std::move(scratch);
         }
         if (sw) {
             std::vector<uint8_t> scratch(r.DestinationSize);
-            const auto begin = Timing::start();
             if (!leonida::dstorage::unshuffle(sw, data, scratch)) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
-            e.timing.unshuffle = Timing::elapsed(begin);
             data = std::move(scratch);
         }
         return S_OK;
@@ -1378,11 +1332,9 @@ private:
         const auto bc = unsigned(options::bcpack(o)), sw = unsigned(options::swizzle(o));
         data.resize(r.SourceSize);
         HRESULT hr = S_OK;
-        const auto read_begin = Timing::start();
         if (!memory) hr = read_file_range(e.file->handle(), r.FileOffset, data.data(), r.SourceSize, ReadTarget::Staging);
         else if (o & options::kSourcePages) hr = page_transfer(r.SourcePageArray, r.SourcePageOffset, data, false);
         else if (!data.empty() && !guarded_move(data.data(), r.Source, data.size())) hr = E_DSTORAGE_ACCESS_VIOLATION;
-        e.timing.read = Timing::elapsed(read_begin);
         if (FAILED(hr)) { e.reason = "read"; return hr; }
         if (bc || sw || options::zlib(o)) {
             set_decompression_pending(+1);
@@ -1404,9 +1356,7 @@ private:
     HRESULT publish(Entry& e, std::vector<uint8_t>& data) try {
         const auto& r = e.request;
         const auto o = r.Options.AsUINT64;
-        const auto bc = options::bcpack(o), sw = options::swizzle(o);
         HRESULT hr = S_OK;
-        const auto copy_begin = Timing::start();
         if (o & options::kDestinationPages) hr = page_transfer(r.DestinationPageArray, r.DestinationPageOffset, data, true);
         else if (!data.empty()) {
             void* const dest = cpu_destination(r);
@@ -1416,15 +1366,7 @@ private:
             }
             hr = written(r, title_write(dest, data.data(), data.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION);
         }
-        e.timing.copy = Timing::elapsed(copy_begin);
         if (FAILED(hr)) e.reason = "publish";
-        if (leonida::dstorage::trace_enabled() && SUCCEEDED(hr) && (bc || sw || (o & options::kDestinationPages) ||
-            leonida::title_gpu_views::other_view(reinterpret_cast<uintptr_t>(r.Destination)))) {
-            std::fprintf(stderr, "[rt] ds-write queue=%p dest=%p cpu=%p options=%llx bytes=%zu nonzero=%d\n",
-                         static_cast<void*>(this), r.Destination, (o & options::kDestinationPages) ? nullptr : cpu_destination(r),
-                         o, data.size(),
-                         int(std::any_of(data.begin(), data.end(), [](uint8_t byte) { return byte != 0; })));
-        }
         return hr;
     } catch (const std::bad_alloc&) { return E_OUTOFMEMORY; }
 
