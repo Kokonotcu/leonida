@@ -369,6 +369,33 @@ public:
         return d3d12_trace::result(method, S_OK);
     }
 
+    // The closed recording moved into a new list of this device and type (closed, reference 1), and this one left
+    // closed and empty, so its owner can Reset it at once. The console proxy's chained submission keeps the copy
+    // until the title next executes on a queue of the type, where the console runs a chained segment (see
+    // d3d12_xs_device.cpp queue_closed_list). Null when this list is not closed.
+    GraphicsCommandList* detach_recording() {
+        if (!list_.closed()) return nullptr;
+        auto* copy = new GraphicsCommandList(type_);
+        copy->attach_device(attached_device());
+        copy->list_ = std::move(list_);
+        copy->invalid_ = invalid_;
+        copy->memory_waits_ = std::move(memory_waits_);
+        copy->tables_ = std::move(tables_);
+        copy->directly_indexed_ = directly_indexed_;
+        copy->held_ = std::move(held_);  // the references move with the recording that uses them
+        copy->front_stencil_ref_ = front_stencil_ref_;
+        copy->back_stencil_ref_ = back_stencil_ref_;
+        copy->cbv_srv_uav_base_ = cbv_srv_uav_base_;
+        copy->sampler_base_ = sampler_base_;
+        list_ = leonida::CommandList{};
+        list_.close();
+        memory_waits_.clear();
+        tables_.clear();
+        held_.clear();
+        directly_indexed_ = false;
+        return copy;
+    }
+
     // CreateCommandList's pipeline state. As SetPipelineState on a direct list; on a bundle it is the first deferred
     // call, which the application did not make, so it is not traced.
     void set_initial_pipeline(ID3D12PipelineState* state) {
@@ -3615,6 +3642,16 @@ bool bound_descriptor_heap_bases(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRT
     cbv_srv_uav = l->cbv_srv_uav_base();
     sampler = l->sampler_base();
     return true;
+}
+
+ID3D12CommandList* detach_closed_recording(ID3D12CommandList* list) {
+    GraphicsCommandList* const l = list ? GraphicsCommandList::from(list) : nullptr;
+    GraphicsCommandList* const copy = l ? l->detach_recording() : nullptr;
+    if (!copy) return nullptr;
+    void* out = nullptr;
+    const HRESULT hr = copy->QueryInterface(__uuidof(ID3D12CommandList), &out);
+    copy->Release();  // the creation reference: `out` holds the one the caller gets
+    return SUCCEEDED(hr) ? static_cast<ID3D12CommandList*>(out) : nullptr;
 }
 
 }  // namespace rt::d3d12

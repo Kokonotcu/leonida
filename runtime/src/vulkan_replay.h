@@ -34,6 +34,7 @@
 // A list that needs a missing function fails with ReplayResult::unsupported before anything is written.
 
 #include "command_list.h"
+#include "dev_status.h"  // skipped_dispatches: compute work left out, for the dev overlay
 #include "indirect_draw_stats.h"
 #include "deferred_image_binding.h"
 #include "vulkan_device_fault.h"
@@ -4681,6 +4682,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (pipeline && pipeline->pending) {
                     request_compute(*pipeline);  // LEONIDA_LAZY_COMPUTE: the first dispatch starts the compile
                     p.skip = true;  // still compiling (LEONIDA_ASYNC_PSO)
+                    dev_status::skipped_dispatches().fetch_add(1, std::memory_order_relaxed);
                 } else {
                     if (!pipeline) return ReplayResult::unresolved_resource;
                     p.pipeline = *pipeline;
@@ -4689,7 +4691,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     if (pipeline->build || (!pipeline->pipeline && !pipeline->bind_shader)) {
                         const bool found = detail::first_use(*pipeline, PipelineCompiles::User::indirect_dispatch, vk, p);
                         if (!found && p.pipeline.skipped) continue;  // dropped on request, strict or not
-                        if (!found && p.pipeline.async_build && !strict_replay()) continue;
+                        if (!found && p.pipeline.async_build && !strict_replay()) {
+                            dev_status::skipped_dispatches().fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
                         if (!found) return ReplayResult::unresolved_resource;
                     }
                     if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set))
@@ -4893,6 +4898,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (pipeline && pipeline->pending) {
                 request_compute(*pipeline);  // LEONIDA_LAZY_COMPUTE: the first dispatch starts the compile
                 p.skip = true;  // still compiling (LEONIDA_ASYNC_PSO)
+                dev_status::skipped_dispatches().fetch_add(1, std::memory_order_relaxed);
             } else {
                 if (!pipeline) {
                     if (strict) return ReplayResult::unresolved_resource;
@@ -4912,6 +4918,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                         if (strict) return ReplayResult::unresolved_resource;
                         if (!p.pipeline.async_build) ReplayResult::unresolved_resource;
                         p.skip = true;
+                        dev_status::skipped_dispatches().fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                 }

@@ -2322,6 +2322,7 @@ struct ClosedList {
     DeviceProxy* device;
     D3D12_COMMAND_LIST_TYPE type;
     ID3D12CommandList* list;  // AddRef'd
+    std::int64_t held_since_ms = 0;  // a detached recording: when it was queued (chain_flusher)
 };
 struct ConsoleQueues {
     DeviceProxy* device;
@@ -2375,12 +2376,101 @@ void claim_console_queue(DeviceProxy* device, D3D12_COMMAND_LIST_TYPE type, ID3D
     ReleaseSRWLockExclusive(&q.lock);
 }
 
+std::int64_t chain_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// LEONIDA_CHAIN_HOLD_MS (default 8): how long a detached recording waits for the next execute of its type before it
+// runs on the type's queue anyway. The title closes some chained lists after the execute that would carry them and
+// waits for what they write before it executes again: held for the next execute only, they never ran and the loading
+// screen's main loop stood still until the title's watchdog ended the run (2026-11-26).
+std::int64_t chain_hold_ms() {
+    static const std::int64_t ms = [] {
+        const char* v = std::getenv("LEONIDA_CHAIN_HOLD_MS");
+        return v && *v ? std::max<std::int64_t>(0, std::atoll(v)) : std::int64_t{8};
+    }();
+    return ms;
+}
+
+// Submits the detached recordings held past chain_hold_ms on their type's queue (console_queue), in close order; a
+// type with no queue yet keeps its lists for the first execute. A thread of its own, every 2 ms.
+void flush_held_lists() {
+    const std::int64_t now = chain_now_ms(), hold = chain_hold_ms();
+    std::vector<ClosedList> due;
+    ClosedLists& q = closed_lists();
+    AcquireSRWLockExclusive(&q.lock);
+    auto keep = q.lists.begin();
+    for (auto& entry : q.lists) {
+        bool has_queue = false;
+        if (static_cast<unsigned>(entry.type) < 4)
+            for (const ConsoleQueues& c : q.queues)
+                if (c.device == entry.device && c.queue[entry.type]) has_queue = true;
+        if (entry.held_since_ms && now - entry.held_since_ms >= hold && has_queue) due.push_back(entry);
+        else *keep++ = entry;
+    }
+    q.lists.erase(keep, q.lists.end());
+    ReleaseSRWLockExclusive(&q.lock);
+    std::size_t i = 0;
+    while (i < due.size()) {  // runs of one device and type, in close order
+        std::size_t j = i;
+        std::vector<ID3D12CommandList*> lists;
+        while (j < due.size() && due[j].device == due[i].device && due[j].type == due[i].type)
+            lists.push_back(due[j++].list);
+        if (ID3D12CommandQueue* const queue = console_queue(due[i].device, due[i].type)) {
+            queue->ExecuteCommandLists(static_cast<UINT>(lists.size()), lists.data());
+            queue->Release();
+        }
+        for (ID3D12CommandList* list : lists) list->Release();
+        i = j;
+    }
+}
+
+void start_chain_flusher() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::thread([] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                flush_held_lists();
+            }
+        }).detach();
+    });
+}
+
 void queue_closed_list(DeviceProxy* device, ID3D12CommandList* list) {
     if (!list || !chained_submission_enabled()) return;
     // The title resets a list (console slot 139) right after closing it, before any execute names it: the console's
     // chained segments outlive that, a PC list's commands do not. So a list runs at its Close on the console queue of
     // its type, once one is known; D3D12 allows the Reset after that. Before the first console execute it waits.
     const auto type = list->GetType();
+    // With the D3D12 layer: the recording is moved into a list of its own (the title's list is left closed and empty
+    // for its Reset) and queued, and the title's next execute on a queue of the type submits it first, in close order.
+    // That is where the console runs a chained segment: behind the primary list the title executes, after the title
+    // has written what it reads (per-draw tables, descriptors, counts). Run at its Close instead, the GPU read those
+    // half written and stored through them into memory the title keeps its own data in: pointer arrays read back
+    // frame tokens and half floats, and the story load faulted in title code (runs of 2026-11-26).
+    // LEONIDA_CHAIN_DEFER=1 (off by default while it is being proven): the run of 2026-11-26 with it no longer faulted
+    // on corrupted title data, but the loading screen's main loop stood still at ~120 s until the title's watchdog.
+    static const bool defer = [] {
+        const char* v = std::getenv("LEONIDA_CHAIN_DEFER");
+        return v && v[0] == '1';
+    }();
+    if (const DetachRecording detach = defer ? g_detach_recording.load(std::memory_order_acquire) : nullptr) {
+        if (ID3D12CommandList* const recording = detach(list)) {
+            start_chain_flusher();
+            ClosedLists& q = closed_lists();
+            AcquireSRWLockExclusive(&q.lock);
+            q.lists.push_back({device, type, recording, chain_now_ms()});  // the reference detach handed out
+            ReleaseSRWLockExclusive(&q.lock);
+            static std::atomic<std::uint64_t> held{0};
+            const std::uint64_t n = held.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12_xs: %llu closed lists held for the next execute of their type\n",
+                             static_cast<unsigned long long>(n));
+            return;
+        }
+    }
     ID3D12CommandQueue* const queue = console_queue(device, type);
     {
         static std::atomic<int> told{0};

@@ -375,6 +375,11 @@ bool set_device_texture_provider(void* device, TextureByVaProvider provider);
 using TitleTextureFootprint = std::uint64_t (*)(ID3D12Resource* resource);
 inline std::atomic<TitleTextureFootprint> g_title_texture_footprint{nullptr};
 
+// The D3D12 layer's rt::d3d12::detach_closed_recording, installed by it (null without it: tests on mock lists): the
+// chained submission keeps a closed list's recording this way until the title executes on a queue of its type.
+using DetachRecording = ID3D12CommandList* (*)(ID3D12CommandList* list);
+inline std::atomic<DetachRecording> g_detach_recording{nullptr};
+
 // The console layout word (D3D12_RESOURCE_DESC::Layout as the title wrote it) of the texture the device is asked to
 // place on this thread right now (slot 133's handler, slot 70's texture provider), 0 otherwise (bd6529b5b).
 inline thread_local std::uint32_t g_placed_console_layout = 0;

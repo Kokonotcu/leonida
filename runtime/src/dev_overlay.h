@@ -52,6 +52,7 @@ struct Sample {
     std::uint64_t built = 0;
     std::string build;                                  // the last one started
     unsigned long long drawn = 0, skipped = 0;          // indirect draws so far
+    unsigned long long dispatches_left_out = 0;         // compute dispatches whose pipeline was not ready
     double cores = 0, free_gb = 0;
     memory_figures::ProcessMemory ram;                  // private memory and working set
     VramBudget vram;                                    // the device's VK_EXT_memory_budget; "n/a" without it
@@ -105,7 +106,8 @@ inline std::vector<std::string> lines(const Sample& s, double age) {
     else
         std::snprintf(text, sizeof text, "pipelines: %llu built", static_cast<unsigned long long>(s.built));
     out.emplace_back(text);
-    std::snprintf(text, sizeof text, "indirect draws: %llu drawn, %llu skipped", s.drawn, s.skipped);
+    std::snprintf(text, sizeof text, "indirect draws: %llu drawn, %llu skipped; compute dispatches left out: %llu",
+                  s.drawn, s.skipped, s.dispatches_left_out);
     out.emplace_back(text);
     std::snprintf(text, sizeof text, "%.1f cores, %.1f GB RAM free", s.cores, s.free_gb);
     out.emplace_back(text);
@@ -226,6 +228,7 @@ private:
         s.drawn = draws[std::size_t(indirect_stats::Event::emitted)].load(std::memory_order_relaxed);
         s.skipped = draws[std::size_t(indirect_stats::Event::record_skip)].load(std::memory_order_relaxed) +
                     draws[std::size_t(indirect_stats::Event::replay_skip)].load(std::memory_order_relaxed);
+        s.dispatches_left_out = dev_status::skipped_dispatches().load(std::memory_order_relaxed);
         FILETIME created{}, exited{}, kernel{}, user{};
         if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
             const auto ticks = [](const FILETIME& f) { return (std::uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime; };

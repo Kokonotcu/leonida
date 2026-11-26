@@ -54,6 +54,13 @@ inline void gpu_completed(std::uint64_t ticket, std::int64_t now_ns) {
     if (ticket > seen) g.progress_ns.store(now_ns, std::memory_order_relaxed);
 }
 
+// Compute dispatches the replay left out because their pipeline was not ready (LEONIDA_ASYNC_PSO, LEONIDA_LAZY_COMPUTE,
+// past the compute-wait budget): work the title asked for that never ran, whose outputs keep what they had.
+inline std::atomic<std::uint64_t>& skipped_dispatches() {
+    static std::atomic<std::uint64_t> count{0};
+    return count;
+}
+
 // One pipeline build, from construction to destruction.
 struct Build {
     explicit Build(const char* name) {
