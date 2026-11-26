@@ -130,11 +130,6 @@ class GeometryViews {
     std::vector<Address> written_vas_;
     std::vector<std::uint8_t> tile_scratch_;
     std::chrono::steady_clock::duration refresh_time_{};
-    struct Window {  // since the last periodic line
-        std::uint64_t refreshes = 0, tiles = 0, views = 0, bytes = 0;
-        std::chrono::steady_clock::duration time{};
-        std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
-    } window_;
     std::uint64_t cleared_{};
     bool retry_{};
 
@@ -570,10 +565,8 @@ public:
                 lock.lock();
             }
         }
-        const std::size_t changed_tiles = written_vas_.size();
         tile_reads_.clear();
         tile_scratch_.clear();
-        std::size_t changed_views = 0;
         for (const Address va : written_vas_) {
             const auto tile_it = tiles_.find(va);
             if (tile_it == tiles_.end()) continue;
@@ -586,10 +579,7 @@ public:
                 if (!v.alive) continue;
                 std::uint8_t& mark = marks_[id];
                 if (mark & (kPinned | kWhole)) continue;
-                if (!(mark & kTouched)) {
-                    mark |= kTouched;
-                    ++changed_views;
-                }
+                mark |= kTouched;
                 if (whole || !v.ready) {
                     mark |= kWhole;
                     continue;
@@ -622,26 +612,6 @@ public:
         refilled_ += uploaded_ - before;
         const auto end = std::chrono::steady_clock::now();
         refresh_time_ += end - start;
-        // Every 10 s: what the refreshes since the last line did.
-        window_.refreshes += 1;
-        window_.tiles += changed_tiles;
-        window_.views += changed_views;
-        window_.bytes += uploaded_ - before;
-        window_.time += end - start;
-        if (end - window_.since >= std::chrono::seconds(10)) {
-            std::fprintf(stderr,
-                         "[rt] geometry refresh: %llu refreshes with writes in %.0f s: %.1f written tiles and %.1f views "
-                         "each, %.1f KiB copied each, %.3f ms each; %zu tiles watched, %zu views\n",
-                         static_cast<unsigned long long>(window_.refreshes),
-                         std::chrono::duration<double>(end - window_.since).count(),
-                         double(window_.tiles) / double(window_.refreshes),
-                         double(window_.views) / double(window_.refreshes),
-                         double(window_.bytes) / 1024.0 / double(window_.refreshes),
-                         std::chrono::duration<double, std::milli>(window_.time).count() / double(window_.refreshes),
-                         tiles_.size(), live_views_);
-            window_ = {};
-            window_.since = end;
-        }
     }
 
     // The blocks the copies live in (TitleBufferWindows::for_each_block), without the views' locks.

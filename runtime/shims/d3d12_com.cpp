@@ -2467,10 +2467,6 @@ public:
             }
         }
         cv_.notify_one();
-        const std::uint64_t n = ++held_total_;
-        if ((n & (n - 1)) == 0)
-            std::fprintf(stderr, "[rt] d3d12: %llu batches held on console memory waits\n",
-                         static_cast<unsigned long long>(n));
     }
     // Every held batch is to be released (a present, the title blocking on a fence). Done by the watcher thread: the
     // release records and submits the held batches, which can take seconds (a host import in the driver took over 10 s
@@ -2596,7 +2592,6 @@ private:
     bool release_requested_ = false;
     const char* release_why_ = "";
     std::set<std::uint64_t> timed_out_;
-    std::atomic<std::uint64_t> held_total_{0};
 };
 
 // The waits of `list` a batch must hold for: not NEVER/ALWAYS ones, not on a cell the same list wrote before the wait
@@ -3042,15 +3037,6 @@ public:
         if (!f || f->context() != &context_ || f->attached_device() != attached_device()) {
             note_once("ID3D12CommandQueue::Signal refused: not this device's fence (E_INVALIDARG)");
             return d3d12_trace::result(method, E_INVALIDARG);
-        }
-        {
-            // Matched against "[rt] fence waits: no progress" (FenceWaitDispatcher::report_stall).
-            static std::atomic<std::uint64_t> signals{0};
-            const std::uint64_t n = signals.fetch_add(1, std::memory_order_relaxed) + 1;
-            if ((n & (n - 1)) == 0)
-                std::fprintf(stderr, "[rt] d3d12: queue Signal %llu: semaphore %p value %llu\n",
-                             static_cast<unsigned long long>(n), reinterpret_cast<void*>(f->semaphore()),
-                             static_cast<unsigned long long>(value));
         }
         std::lock_guard lock(mutex_);
         return d3d12_trace::result(method, f->queue_signal(value, [&] {

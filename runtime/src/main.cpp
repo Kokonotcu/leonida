@@ -42,9 +42,6 @@
 #include <cstring>
 #include <mutex>
 
-namespace rt::write_watch {
-void start_from_environment();
-}
 #include <cstring>
 
 namespace {
@@ -115,78 +112,9 @@ void keep_title_watchdog_kicked(std::uint8_t* base) {
     }
 }
 
-// LEONIDA_PEEK="<rva>:3,<rva>,<rva>" (diagnostic): a thread prints the 8-byte values at these RVAs of the
-// title's image (":n" = n consecutive values, at most 32; "RVA>OFF" reads through the pointer stored at the RVA, at
-// pointer + OFF, both hex) every LEONIDA_PEEK_SECONDS (default 10). For answering "what does this
-// global hold at run time" without a debugger: the reverse-engineering notes (docs/re/requests.md) ask for exactly
-// that. Reads are checked; nothing is written.
-void start_title_peek(std::uint8_t* base) {
-    static char spec[1024];
-    const DWORD n = GetEnvironmentVariableA("LEONIDA_PEEK", spec, sizeof(spec));
-    if (!n || n >= sizeof(spec)) return;
-    static std::uint8_t* image = base;
-    const HANDLE thread = CreateThread(
-        nullptr, 0,
-        [](LPVOID) -> DWORD {
-            char seconds[16]{};
-            DWORD period = 10;
-            if (GetEnvironmentVariableA("LEONIDA_PEEK_SECONDS", seconds, sizeof(seconds)) > 0)
-                period = std::max<DWORD>(1, static_cast<DWORD>(std::strtoul(seconds, nullptr, 10)));
-            for (unsigned tick = 0;; ++tick) {
-                std::string line = "[rt] peek t=" + std::to_string(tick * period) + "s:";
-                for (const char* at = spec; *at;) {
-                    char* end = nullptr;
-                    const std::uint64_t rva = std::strtoull(at, &end, 16);
-                    if (end == at) break;
-                    // "RVA>OFF": the 8-byte pointer at the RVA, then the values at pointer + OFF (both hex).
-                    bool deref = false;
-                    std::uint64_t offset = 0;
-                    if (*end == '>') {
-                        deref = true;
-                        offset = std::strtoull(end + 1, &end, 16);
-                    }
-                    unsigned count = 1;
-                    if (*end == ':') count = static_cast<unsigned>(std::strtoul(end + 1, &end, 10));
-                    char text[48];
-                    if (deref)
-                        std::snprintf(text, sizeof(text), " 0x%llx>%llx=", static_cast<unsigned long long>(rva),
-                                      static_cast<unsigned long long>(offset));
-                    else
-                        std::snprintf(text, sizeof(text), " 0x%llx=", static_cast<unsigned long long>(rva));
-                    line += text;
-                    const std::uint8_t* from = image + rva;
-                    if (deref) {
-                        std::uint64_t pointer = 0;
-                        SIZE_T got = 0;
-                        if (!ReadProcessMemory(GetCurrentProcess(), from, &pointer, sizeof(pointer), &got) ||
-                            got != sizeof(pointer) || !pointer)
-                            count = 0, line += "?";
-                        from = reinterpret_cast<const std::uint8_t*>(pointer + offset);
-                    }
-                    for (unsigned i = 0; i < count && i < 32; ++i) {
-                        std::uint64_t value = 0;
-                        SIZE_T got = 0;
-                        const bool ok = ReadProcessMemory(GetCurrentProcess(), from + 8ull * i, &value,
-                                                          sizeof(value), &got) && got == sizeof(value);
-                        std::snprintf(text, sizeof(text), ok ? "%s%llx" : "%s?", i ? "," : "",
-                                      static_cast<unsigned long long>(value));
-                        line += text;
-                    }
-                    at = *end == ',' ? end + 1 : end;
-                    if (at == end && *end) break;
-                }
-                std::fprintf(stderr, "%s\n", line.c_str());
-                Sleep(period * 1000);
-            }
-        },
-        nullptr, 0, nullptr);
-    if (thread) CloseHandle(thread);
-}
-
 }  // namespace
 
 #include "base_reservation.h"
-#include "big_alloc_log.h"
 #include "code_hooks.h"
 #include "cpu_emulation.h"
 #include "host_cpu.h"
@@ -194,7 +122,6 @@ void start_title_peek(std::uint8_t* base) {
 #include "pe_loader.h"
 #include "thread_stacks.h"
 #include "dev_overlay.h"
-#include "thread_sampler.h"
 #include "title_page_watch.h"
 #include "title_geometry_watch.h"
 #include "../shims/d3d12_trace.h"
@@ -592,7 +519,6 @@ static BOOL WINAPI show_package_window(HWND window, int command) {
 #endif
 
 int wmain(int argc, wchar_t** argv) {
-    leonida::big_alloc_log::install();  // LEONIDA_LOG_BIG_ALLOCS=1 (src/big_alloc_log.h)
 #ifdef LEONIDA_VULKAN_DEVICE
     if (argc > 1 && std::wstring(argv[1]) == L"--precompile-pipelines") return precompile_main(argc, argv);
     if (argc > 1 && std::wstring(argv[1]) == L"--compile-server") return compile_server_main(argc, argv);
@@ -768,7 +694,6 @@ int wmain(int argc, wchar_t** argv) {
                          ok ? 0ul : GetLastError());
         }
     }
-    rt::write_watch::start_from_environment();  // LEONIDA_WATCH_WRITE (src/write_watch.cpp), added after: runs first
     // Slot 133 imports the title's pages; xmem commits them on first touch, so they are committed first.
     rt::d3d12_xs::set_placed_at_va_pages_hook(&rt::xmem::commit_physical_range);
     if (rt::xmem::slot31_runs() && rt::xmem::queue_page_mappings_enabled())
@@ -901,9 +826,7 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("running %s\n", main_module.name.c_str());
         std::fflush(stdout);
         keep_title_watchdog_kicked(main_module.base);
-        start_title_peek(main_module.base);
         leonida::dev_overlay::start();  // LEONIDA_DEV_OVERLAY=1
-        leonida::thread_sampler::start(main_module.base, main_module.size);  // LEONIDA_SAMPLE_MS (diagnostic)
 #ifdef LEONIDA_VULKAN_DEVICE
         SetConsoleCtrlHandler(&stop_compiles_on_console_exit, TRUE);
         previous_fatal_filter = SetUnhandledExceptionFilter(&save_caches_on_fatal_exception);
@@ -912,10 +835,7 @@ int wmain(int argc, wchar_t** argv) {
 #ifdef LEONIDA_VULKAN_DEVICE
         leonida::thread_stack_hook.store(&rt::print_thread_stacks_now, std::memory_order_release);
 #endif
-        {
-            auto stacks = rt::start_thread_stacks();
-            code = rt::process::run_entry(main_module.base + main_module.entry_rva);
-        }
+        code = rt::process::run_entry(main_module.base + main_module.entry_rva);
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);
         rt::shims::report_called_unimplemented();

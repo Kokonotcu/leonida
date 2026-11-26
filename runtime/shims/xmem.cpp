@@ -45,7 +45,6 @@
 #include "title_memory.h"
 #include "xmem.h"
 #include "placed_image_map_note.h"
-#include "../src/dstorage_trace.h"
 #include "../src/gpu_label_memory.h"
 #include "../src/title_page_watch.h"
 #include "../src/title_geometry_watch.h"
@@ -3180,10 +3179,6 @@ bool transfer_physical(std::span<const uint64_t> pages, uint16_t offset, std::sp
                     // The D3D12 layer's title-texture watch (merge: ours beside upstream's texel-write notes).
                     if (const auto told = g_title_written.load(std::memory_order_acquire))
                         told(reinterpret_cast<void*>(address + offset), bytes);
-                    if (leonida::dstorage::trace_enabled())
-                        std::fprintf(stderr, "[rt] ds-scatter cpu=%llx bytes=%zu page=%llu\n",
-                                     static_cast<unsigned long long>(address + offset), bytes,
-                                     static_cast<unsigned long long>(page));
                 }
             }
         } else {

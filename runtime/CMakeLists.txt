@@ -187,7 +187,6 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
 
   add_executable(gta6rt
     src/main.cpp
-    src/write_watch.cpp
     src/host_cpu.cpp
     src/pe_loader.cpp
     src/thread_stacks.cpp
@@ -610,7 +609,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
   target_compile_options(bcrypt_rng_test PRIVATE /W4 /permissive- /utf-8)
   target_link_options(bcrypt_rng_test PRIVATE /OPT:NOREF)
 
-  # LEONIDA_STACKS's sampler (src/thread_stacks.cpp): call chains of helper threads, no game data.
+  # The thread-stack sampler of the fault reports (src/thread_stacks.cpp): call chains of helper threads, no game data.
   add_executable(thread_stacks_test
     test/thread_stacks_test.cpp
     src/thread_stacks.cpp

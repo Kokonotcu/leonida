@@ -590,7 +590,6 @@ private:
             if (stop_.load(std::memory_order_relaxed)) break;
             pass(false);
             watch_releaser();
-            summarize();
         }
     }
 
@@ -787,32 +786,6 @@ private:
                          std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count()));
         std::lock_guard lock(mutex_);
         busy_ = false;
-    }
-
-    // One line every 10 s while there is traffic, for boot logs.
-    void summarize() {
-        const auto now = Clock::now();
-        if (now < next_summary_) return;
-        next_summary_ = now + std::chrono::seconds(10);
-        const Counters& c = counters();
-        const auto get = [](const std::atomic<std::uint64_t>& v) {
-            return static_cast<unsigned long long>(v.load(std::memory_order_relaxed));
-        };
-        std::fprintf(stderr,
-                     "[rt] d3d12_xs: list values so far: %llu writes recorded, %llu landed, %llu failed; %llu waits "
-                     "recorded, %llu met at submission, %llu relayed; %llu gates held, %llu met, %llu timed out "
-                     "(%llu short, %llu demotions, %llu met late); %llu cuts (%llu deferred to a query's end, %llu "
-                     "failed), %llu on bundles; releaser %llu signals, %.1f ms, longest %.2f ms, %llu stalls; longest pump pass "
-                     "%.2f ms; %llu page remaps at the call (longest wait %.2f ms), %llu deferred (%llu failed); "
-                     "timestamps %llu from the GPU, %llu from the CPU clock\n",
-                     get(c.writes_recorded), get(c.writes_landed), get(c.writes_failed), get(c.waits_recorded),
-                     get(c.waits_met_at_submit), get(c.waits_relayed), get(c.gates_held), get(c.gates_met),
-                     get(c.gates_timed_out), get(c.gates_short), get(c.demotions), get(c.late_met), get(c.cuts),
-                     get(c.cuts_deferred), get(c.cut_failures), get(c.bundle_ops), get(c.releases),
-                     get(c.release_us) / 1000.0, get(c.release_us_max) / 1000.0, get(c.release_stalls),
-                     get(c.pass_us_max) / 1000.0,
-                     get(c.remaps_now), get(c.remap_wait_us_max) / 1000.0, get(c.remaps_deferred),
-                     get(c.remaps_failed), get(c.stamps_gpu), get(c.stamps_cpu));
     }
 
     // A timestamp write's value: the GPU's timestamp for the write's place in its list when the GPU wrote one, else
@@ -1036,7 +1009,6 @@ private:
     bool demoted_ = false;            // every wait gets the short timeout until one is met
     bool busy_ = false;               // a pass is landing or handing over what it took off the lists
     unsigned logged_met_ = 0;
-    Clock::time_point next_summary_ = Clock::now() + std::chrono::seconds(10);  // the pump thread's only
     std::mutex release_mutex_;        // releases_ and releasing_
     std::condition_variable release_ready_;
     std::deque<Release> releases_;

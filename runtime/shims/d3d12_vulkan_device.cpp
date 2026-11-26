@@ -39,7 +39,6 @@
 #include "../src/xg_console_layout.h"  // title textures in the console's tiled layout
 #include "xg_linear_layout.h"  // title-placed textures: the texture computer's layout
 #include "../src/arena_size.h"
-#include "../src/big_alloc_log.h"
 #include "../src/shader_module_cache.h"
 #include "../src/synthetic_va.h"
 #include "../src/gfx10_descriptors.h"
@@ -60,7 +59,6 @@
 #include "../src/resource_tiling.h"
 #include "../src/cached_pso.h"
 #include "../src/pipeline_cache_file.h"
-#include "../src/pipeline_profile.h"
 #include "../src/submit_phases.h"
 #include "../src/pipeline_cache_store.h"
 #include "../src/pipeline_cache_journal.h"
@@ -73,7 +71,6 @@
 #include "../src/pso_library.h"
 #include "../src/pso_recipe.h"
 #include "../src/vulkan_shader_objects.h"
-#include "../src/dstorage_trace.h"
 #include "../src/title_page_watch.h"
 #include "../src/guarded_copy.h"
 #include "../src/title_geometry_watch.h"
@@ -143,8 +140,6 @@
 namespace rt::d3d12 {
 // Below sync_title_textures; the device hands it to xmem (rt::xmem::g_title_written).
 void note_title_texture_write(const void* address, std::size_t size);
-// Below too: LEONIDA_WATCH_TRANSIENT's watch of the title's transient-memory pool.
-void start_transient_watch(leonida::VulkanContext* context);
 namespace {
 
 // Whether [host, host + bytes) may be offered to a host import (VK_EXT_external_memory_host). NVIDIA refuses an import
@@ -1745,7 +1740,6 @@ bool merge_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDe
                                   const leonida::cached_pso::Identity& identity) {
     if (!cache || !vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache || !vk.vkMergePipelineCaches) return false;
     if (!pipeline_cache_save_limit()) return false;  // LEONIDA_PIPELINE_CACHE_BYTES=0 turns the session file off
-    const auto start = compile_us();
     const PipelineCacheSeed seed(pipeline_cache_session_path());
     if (!seed.data()) return false;
     if (!seed.compatible(identity)) {
@@ -1754,19 +1748,13 @@ bool merge_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDe
     }
     const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, seed.size(),
                                            seed.data()};
-    const auto mapped = compile_us();
     VkPipelineCache session = VK_NULL_HANDLE;
     if (vk.vkCreatePipelineCache(device, &create, nullptr, &session) != VK_SUCCESS) {
         std::fprintf(stderr, "[rt] d3d12: Vulkan declined pipeline_cache.session.bin\n");
         return false;
     }
-    const auto created = compile_us();
     const VkResult result = vk.vkMergePipelineCaches(device, cache, 1, &session);
-    const auto merged = compile_us();
     vk.vkDestroyPipelineCache(device, session, nullptr);
-    if (trace_pipeline_compile())
-        std::fprintf(stderr, "[rt] pipeline-cache op=merge bytes=%zu map_us=%lld driver_us=%lld merge_us=%lld release_us=%lld result=%d\n",
-                     seed.size(), mapped-start, created-mapped, merged-created, compile_us()-merged, int(result));
     if (result == VK_SUCCESS)
         std::fprintf(stderr, "[rt] d3d12: merged %zu bytes from pipeline_cache.session.bin\n", seed.size());
     else
@@ -1869,12 +1857,11 @@ bool startup_cache_checkpoints_enabled() {
 
 // Writes the session cache at a startup checkpoint or during device teardown. The size cap applies to either write.
 void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
-                                 bool checkpoint = false, const char* op = nullptr) {
+                                 bool checkpoint = false) {
     if (!cache || !vk.vkGetPipelineCacheData) return;
     // The output is an opaque Vulkan blob. A prefix is not an incremental cache, so past the limit nothing is written.
     const auto limit = pipeline_cache_save_limit();
     if (!limit) return;
-    const auto start = compile_us();
     std::size_t size = 0;
     if (vk.vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS ||
         size <= sizeof(VkPipelineCacheHeaderVersionOne)) return;
@@ -1884,7 +1871,6 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
                              "%zu-byte write limit for what a session adds\n", size, seed, limit);
         return;
     }
-    const auto queried = compile_us();
     // A size query can itself serialize the driver cache. Let newly queued work run first.
     if (checkpoint && PipelineCompiler::instance().has_compile_waiter()) return;
     const auto path = pipeline_cache_session_path();
@@ -1896,13 +1882,8 @@ void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDev
     }
     auto written = size;
     const auto result = vk.vkGetPipelineCacheData(device, cache, &written, staging.data);
-    const auto filled = compile_us();
     const bool ok = result == VK_SUCCESS && written >= sizeof(VkPipelineCacheHeaderVersionOne) &&
                     written <= size && staging.publish(path, written);
-    if (trace_pipeline_compile())
-        std::fprintf(stderr, "[rt] pipeline-cache op=%s bytes=%zu query_us=%lld fill_us=%lld publish_us=%lld ok=%d result=%d\n",
-                     op ? op : checkpoint ? "checkpoint" : "teardown", written, queried-start, filled-queried,
-                     compile_us()-filled, int(ok), int(result));
     if (ok) std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.session.bin\n", written);
     else std::fprintf(stderr, "[rt] d3d12: pipeline cache snapshot incomplete (%d); previous session retained\n", int(result));
 }
@@ -2743,26 +2724,10 @@ struct DeviceState {
     // The live shadow buffers of Xbox device slot 133 (Resource::create_shadow_buffer): title-placed buffers whose
     // pages the driver would not import. Each is brought up to date from the title's pages before every submission
     // of command lists (VulkanContext::set_before_execute), copying only what the title wrote since the last one
-    // (ShadowPages). The title windows below are refreshed with them. The first refresh is logged with what it cost,
-    // then the refreshes of every 5 seconds.
+    // (ShadowPages). The title windows below are refreshed with them.
     mutable std::mutex shadow_mutex;  // nothing else is taken under it but the ShadowPages' own locks
     std::vector<ShadowPagesPtr> shadows;
-    std::uint64_t shadow_submissions = 0;
-    std::uint64_t shadow_logged = 0;    // shadow_submissions at the last log line
-    std::chrono::steady_clock::time_point shadow_log_time{};
-    std::uint64_t shadow_bytes = 0;     // copied since the last log line
-    std::uint64_t shadow_queries = 0;   // VirtualQuery calls since the last log line
-    std::uint64_t shadow_protects = 0;  // VirtualProtect calls since the last log line
-    std::uint64_t shadow_walks = 0;     // trackers that queried every page (the title memory map changed), likewise
-    std::uint64_t shadow_asks = 0;      // GetWriteWatch calls, likewise
-    std::uint64_t shadow_written = 0;   // write-watched pages they found written, likewise
-    std::array<std::uint64_t, unsigned(ShadowPages::Copy::count)> shadow_copy_bytes{};  // by cause, likewise
-    ShadowPages::Pieces shadow_pieces;  // summed over the refreshes since the last log line
     std::chrono::steady_clock::time_point shadow_alias_time{};  // the last refresh that copied aliased pages
-    double shadow_ms = 0;               // spent since the last log line
-    double shadow_max_ms = 0;           // the longest refresh since the last log line
-    double heap_ms = 0;                 // spent in refresh_console_heaps since the last log line
-    std::uint64_t shadow_faults = 0;    // the write faults counted at the last log line
 
     // A copy of the title's bytes [pages, pages + size) at `shadow`: filled now, then brought up to date before every
     // submission. Copies whose pages overlap or touch share one tracker (ShadowPages: a page has one owner that may
@@ -2814,12 +2779,10 @@ struct DeviceState {
     void refresh_shadows(bool heaps = true, bool pages = true) {
         using clock = std::chrono::steady_clock;
         // First, and without shadow_mutex: fixing a console heap's slots can make a title window (add_shadow).
-        const auto heaps_start = clock::now();
         if (heaps) {
             const leonida::submit_phases::Scope timed(leonida::submit_phases::heaps);
             refresh_console_heaps();
         }
-        heap_ms += std::chrono::duration<double, std::milli>(clock::now() - heaps_start).count();
         if (!pages) return;
         const leonida::submit_phases::Scope timed(leonida::submit_phases::shadows);
         std::lock_guard lock(shadow_mutex);
@@ -2835,73 +2798,7 @@ struct DeviceState {
         }());
         const bool copy_aliased = alias_period.count() == 0 || start - shadow_alias_time >= alias_period;
         if (copy_aliased) shadow_alias_time = start;
-        std::uint64_t copied = 0;
-        for (const ShadowPagesPtr& s : shadows) {
-            copied += s->refresh(copy_aliased);
-            shadow_queries += s->refresh_queries();
-            shadow_protects += s->refresh_protects();
-            shadow_walks += s->refresh_walked_all();
-            shadow_asks += s->refresh_asks();
-            shadow_written += s->refresh_written();
-            for (unsigned k = 0; k < shadow_copy_bytes.size(); ++k) shadow_copy_bytes[k] += s->copy_bytes()[k];
-            const ShadowPages::Pieces& p = s->pieces();
-            shadow_pieces.pieces += p.pieces;
-            shadow_pieces.short_pieces += p.short_pieces;
-            shadow_pieces.joinable += p.joinable;
-            shadow_pieces.calls += p.calls;
-            shadow_pieces.gpu_calls += p.gpu_calls;
-            shadow_pieces.walk_ms += p.walk_ms;
-            shadow_pieces.copy_ms += p.copy_ms;
-        }
-        const auto now = clock::now();
-        const double ms = std::chrono::duration<double, std::milli>(now - start).count();
-        shadow_ms += ms;
-        shadow_max_ms = std::max(shadow_max_ms, ms);
-        shadow_bytes += copied;
-        ++shadow_submissions;
-        if (shadow_submissions != 1 && now - shadow_log_time < std::chrono::seconds(5)) return;
-        std::uint64_t size = 0, faults = 0, copies = 0, watched = 0, hot = 0;
-        for (const ShadowPagesPtr& s : shadows)
-            size += s->size(), faults += s->faults(), copies += s->targets(), watched += s->watched_bytes(),
-                hot += s->hot_bytes();
-        const double count = double(shadow_submissions - shadow_logged);
-        std::fprintf(stderr,
-                     "[rt] d3d12: slot-133 shadow buffers and title windows (%llu KiB in %llu copies, %zu trackers, "
-                     "%zu title windows; %llu KiB of pages write-watched, %llu KiB hot): submissions %llu-%llu copied %.1f KiB each "
-                     "from the title's pages in %.3f ms on average (%.3f max; console heaps %.3f ms), %.1f VirtualQuery, "
-                     "%.1f VirtualProtect and %.1f GetWriteWatch calls (%.1f pages found written) and %.1f trackers "
-                     "walked in full per refresh, %llu write faults\n",
-                     static_cast<unsigned long long>(size / 1024), static_cast<unsigned long long>(copies),
-                     shadows.size(), title_window_count.load(std::memory_order_relaxed),
-                     static_cast<unsigned long long>(watched / 1024), static_cast<unsigned long long>(hot / 1024),
-                     static_cast<unsigned long long>(shadow_logged + 1),
-                     static_cast<unsigned long long>(shadow_submissions), double(shadow_bytes) / 1024.0 / count,
-                     shadow_ms / count, shadow_max_ms, heap_ms / count, double(shadow_queries) / count,
-                     double(shadow_protects) / count, double(shadow_asks) / count, double(shadow_written) / count,
-                     double(shadow_walks) / count,
-                     static_cast<unsigned long long>(faults >= shadow_faults ? faults - shadow_faults : faults));
-        const auto kib = [&](ShadowPages::Copy c) { return double(shadow_copy_bytes[unsigned(c)]) / 1024.0 / count; };
-        std::fprintf(stderr,
-                     "[rt] d3d12: slot-133 shadow copies by cause, KiB a submission: guarded now %.1f, unguarded %.1f, "
-                     "aliased %.1f, pinned %.1f, read-only (not ours) %.1f, copy-on-write %.1f, write-watched %.1f\n",
-                     kib(ShadowPages::Copy::guarded), kib(ShadowPages::Copy::unguarded), kib(ShadowPages::Copy::aliased),
-                     kib(ShadowPages::Copy::pinned), kib(ShadowPages::Copy::read_only),
-                     kib(ShadowPages::Copy::copy_on_write), kib(ShadowPages::Copy::write_watched));
-        std::fprintf(stderr,
-                     "[rt] d3d12: slot-133 shadow copies as pieces, a refresh: %.1f pieces (%.1f under 4 KiB, %.1f going on "
-                     "where the one before ended), %.1f copy calls (%.1f offered to the GPU); walk %.3f ms, copies %.3f "
-                     "ms\n",
-                     double(shadow_pieces.pieces) / count, double(shadow_pieces.short_pieces) / count,
-                     double(shadow_pieces.joinable) / count, double(shadow_pieces.calls) / count,
-                     double(shadow_pieces.gpu_calls) / count, shadow_pieces.walk_ms / count,
-                     shadow_pieces.copy_ms / count);
-        shadow_pieces = {};
-        shadow_copy_bytes = {};
-        shadow_logged = shadow_submissions;
-        shadow_log_time = now;
-        shadow_bytes = shadow_queries = shadow_protects = shadow_walks = shadow_asks = shadow_written = 0;
-        shadow_ms = shadow_max_ms = heap_ms = 0;
-        shadow_faults = faults;
+        for (const ShadowPagesPtr& s : shadows) s->refresh(copy_aliased);
     }
 
     // Textures the title keeps in its own memory, by the GPU address it names them by (Device::
@@ -4067,7 +3964,6 @@ struct DeviceState {
         // The high-water mark (D3D-55, open question 5): the arena's size is a guess until a run measures it.
         // `peak_end` is the highest end offset ever handed out, the size the arena must have; `peak_in_use` is the
         // most bytes live at once, which differs from it by fragmentation.
-        bool log = false;  // LEONIDA_ARENA_LOG=1: one line per VA handed out
         VkDeviceSize in_use = 0, peak_in_use = 0, peak_end = 0;
         VkDeviceSize use_in_use[4] = {}, use_peak[4] = {};
         std::uint64_t allocations = 0, failures = 0;
@@ -4113,7 +4009,7 @@ struct DeviceState {
         // Window pages waiting for a chunk the import worker is making (chunk start -> pages): settled meanwhile, and
         // unsettled when it is done so the next map takes them at once.
         std::unordered_map<std::uintptr_t, std::vector<std::uint64_t>> chunk_waiters;
-        std::uint64_t chunk_bytes = 0, chunk_failures = 0, chunks_released = 0, chunks_made = 0;
+        std::uint64_t chunk_bytes = 0, chunk_failures = 0, chunks_released = 0;
     } title_pages;
 
     // LEONIDA_ASYNC_CHUNK_IMPORTS=1: a chunk or run a recording needs is imported on this worker, not on the recording
@@ -4230,11 +4126,6 @@ struct DeviceState {
             return;  // the waiters stay settled; the failed chunk is retried after kFailedChunkFor
         }
         title_pages.chunk_bytes += end - start;
-        const std::uint64_t n = ++title_pages.chunks_made;
-        if ((n & (n - 1)) == 0)
-            std::fprintf(stderr, "[rt] d3d12: physical pages: %llu section imports made (worker), %zu held (%llu MiB)\n",
-                         static_cast<unsigned long long>(n), title_pages.imported.size() + 1,
-                         static_cast<unsigned long long>(title_pages.chunk_bytes >> 20));
         title_pages.imported.emplace(start, chunk);
         for (const std::uint64_t page : waiters) title_pages.settled.erase(page);
     }
@@ -4405,13 +4296,6 @@ struct DeviceState {
                 title_pages.mapped.insert(v);
                 ++title_pages.pages;
             }
-            const std::uint64_t n = title_pages.imports.size();
-            if ((n & (n - 1)) == 0)
-                std::fprintf(stderr, "[rt] d3d12: title page table: %llu imports, %llu pages (%llu MiB) mapped, %u "
-                                     "chunks, %llu pages refused\n",
-                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(title_pages.pages),
-                             static_cast<unsigned long long>(title_pages.pages / 16), title_pages.chunks,
-                             static_cast<unsigned long long>(title_pages.refused));
             any = true;
         }
         return any;
@@ -4636,13 +4520,6 @@ struct DeviceState {
             return title_pages.imported.end();
         }
         title_pages.chunk_bytes += end - start;
-        const std::uint64_t n = ++title_pages.chunks_made;
-        if ((n & (n - 1)) == 0)
-            std::fprintf(stderr, "[rt] d3d12: physical pages: %llu section imports made, %zu held (%llu MiB), %llu "
-                                 "given back\n",
-                         static_cast<unsigned long long>(n), title_pages.imported.size() + 1,
-                         static_cast<unsigned long long>(title_pages.chunk_bytes >> 20),
-                         static_cast<unsigned long long>(title_pages.chunks_released));
         return title_pages.imported.emplace(start, chunk).first;
     }
 
@@ -4810,7 +4687,6 @@ struct DeviceState {
 
     // What an arena range holds, for the high-water report (D3D-55).
     enum ArenaUse { arena_buffer, arena_descriptor_heap, arena_shader, arena_heap };
-    static constexpr const char* kArenaUseNames[4] = {"buffer", "descriptor heap", "shader", "heap"};
     // A fault line about the arena is rate-limited to this interval: the walk behind it costs a pass over every
     // free block, and a persistent fault would otherwise print on every allocation of a streaming frame.
     static constexpr ULONGLONG kArenaReportMs = 5000;
@@ -4872,9 +4748,6 @@ struct DeviceState {
             out);
         if (!found) {
             ++arena.failures;
-            if (arena.log)
-                std::fprintf(stderr, "[rt] d3d12: arena %s: no room for 0x%llx bytes\n", kArenaUseNames[use],
-                             (unsigned long long)bytes);
             // The search restarted to its limit: say so, since the request may have been refusable anyway.
             if (arena.blocks.interrupted() && arena_report_due())
                 std::fprintf(stderr, "[rt] d3d12: GPU address arena: the block map was cut under a search %d times; "
@@ -4898,9 +4771,6 @@ struct DeviceState {
         arena.peak_end = std::max(arena.peak_end, out + bytes);
         arena.use_in_use[use] += bytes;
         arena.use_peak[use] = std::max(arena.use_peak[use], arena.use_in_use[use]);
-        if (arena.log)
-            std::fprintf(stderr, "[rt] d3d12: arena %s VA 0x%llx + 0x%llx\n", kArenaUseNames[use],
-                         (unsigned long long)out, (unsigned long long)bytes);
         check_arena("an allocation");
         return true;
     }
@@ -4920,15 +4790,11 @@ struct DeviceState {
     }
 
     // A console VA outside the arena (an upload or readback buffer: its device address minus heap_base).
-    void log_va(const char* what, std::uint64_t va, VkDeviceSize bytes) {
+    void log_va(const char*, std::uint64_t va, VkDeviceSize bytes) {
         note_low_va(va, bytes);
-        if (arena.log)
-            std::fprintf(stderr, "[rt] d3d12: %s VA 0x%llx + 0x%llx (outside the arena)\n", what,
-                         (unsigned long long)va, (unsigned long long)bytes);
     }
 
-    // Printed once at device release, so a run reports the size the arena needs; the arena line also about once a
-    // minute with a console heap's log (report_arena_peak), since a run cut short never releases its device.
+    // Printed once at device release, so a run reports the size the arena needs.
     void report_arena() {
         report_arena_peak();
         report_title_memory();
@@ -5481,86 +5347,10 @@ struct DeviceState {
             }
         } gpu_end{*this, heap_pass};
         for (const auto& heap : console_heaps) {
-            const auto start = std::chrono::steady_clock::now();
             refresh_console_heap(*heap);
-            heap->ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
             ++heap->refreshes;
-            // A line at the first and 64th submission, then every 10 s (a crawl logs as often as a fast run).
-            const bool logged = heap->refreshes == 1 || heap->refreshes == 64 ||
-                                (heap->refreshes > 64 && start - heap->log_time >= std::chrono::seconds(10));
-            if (!logged) continue;
-            const double count = double(std::max<std::uint64_t>(1, heap->refreshes - heap->logged));
-            heap->logged = heap->refreshes;
-            heap->log_time = start;
-            std::fprintf(stderr,
-                         "[rt] d3d12: console descriptor heap 0x%llx (%s): submissions up to %llu %s %.1f KiB each "
-                         "in %.3f ms on average (pages %.3f, fixing copied slots %.3f, %llu left to retries past the "
-                         "budget, retrying %.3f: %.1f slots a "
-                         "submission, %zu waiting), %llu write faults; %llu title V#s rebased, %llu with no copy given "
-                         "no records (%zu naming nothing waiting for another look), T#s %llu known, %llu bound, %llu "
-                         "naming no texture, %llu refused, %llu words that are no V# or T# (data, null in the copy)\n",
-                         static_cast<unsigned long long>(heap->console_va), heap->imported ? "imported" : "copy",
-                         static_cast<unsigned long long>(heap->refreshes), "copied",
-                         double(heap->copied) / 1024.0 / count,
-                         heap->ms / count, heap->pages_ms / count, heap->fix_ms / count,
-                         static_cast<unsigned long long>(heap->deferred_fixes), heap->retry_ms / count,
-                         double(heap->retried) / count, heap->retries.size(),
-                         static_cast<unsigned long long>(heap->pages ? heap->pages->faults() : 0),
-                         static_cast<unsigned long long>(heap->vsharps),
-                         static_cast<unsigned long long>(heap->unbacked), heap->empty_slots.size(),
-                         static_cast<unsigned long long>(heap->images[unsigned(TitleImage::known)]),
-                         static_cast<unsigned long long>(heap->images[unsigned(TitleImage::bound)]),
-                         static_cast<unsigned long long>(heap->images[unsigned(TitleImage::unknown)]),
-                         static_cast<unsigned long long>(heap->images[unsigned(TitleImage::refused)]),
-                         static_cast<unsigned long long>(heap->images[unsigned(TitleImage::not_tsharp)]));
-            if (heap->release_sweeps && filter_heap_releases())
-                std::fprintf(stderr, "[rt] CPU release filter: %llu sweeps, %llu live slots, %llu fixes, %llu rebases, %llu full fallbacks\n",
-                    (unsigned long long)heap->release_sweeps, (unsigned long long)heap->release_candidates,
-                    (unsigned long long)heap->release_fixes, (unsigned long long)heap->release_rebases,
-                    (unsigned long long)heap->release_full);
-            heap->release_sweeps = heap->release_candidates = heap->release_fixes = heap->release_rebases = heap->release_full = 0;
-            if (heap->resource_heap) {
-                std::uint64_t paths[kVsharpPathCount];
-                for (unsigned i = 0; i < kVsharpPathCount; ++i)
-                    paths[i] = vsharp_paths[i].exchange(0, std::memory_order_relaxed);
-                std::fprintf(stderr,
-                             "[rt] d3d12: console descriptor heap 0x%llx changed slots per submission: %.1f zero, %.1f "
-                             "V# pairs, %.1f T#s, %.1f other; V# halves %.1f, %.1f%% seen before; rescans %llu (%.1f "
-                             "V# slots and %.3f ms each); V# resolutions since the last line: alias %llu, alias "
-                             "refused %llu, arena %llu, geometry %llu, window %llu, none %llu\n",
-                             static_cast<unsigned long long>(heap->console_va), double(heap->changed[0]) / count,
-                             double(heap->changed[1]) / count, double(heap->changed[2]) / count,
-                             double(heap->changed[3]) / count, double(heap->vsharp_halves) / count,
-                             heap->vsharp_halves ? 100.0 * double(heap->vsharp_repeats) / double(heap->vsharp_halves)
-                                                 : 0.0,
-                             static_cast<unsigned long long>(heap->rescans),
-                             heap->rescans ? double(heap->rescanned) / double(heap->rescans) : 0.0,
-                             heap->rescans ? heap->rescan_ms / double(heap->rescans) : 0.0,
-                             static_cast<unsigned long long>(paths[0]), static_cast<unsigned long long>(paths[1]),
-                             static_cast<unsigned long long>(paths[2]), static_cast<unsigned long long>(paths[3]),
-                             static_cast<unsigned long long>(paths[4]), static_cast<unsigned long long>(paths[5]));
-                for (auto& n : heap->changed) n = 0;
-                heap->vsharp_halves = heap->vsharp_repeats = heap->rescans = heap->rescanned = 0;
-                heap->rescan_ms = 0;
-            }
-            if (heap->gpu >= 0) log_console_heap_gpu(*heap, count);
-            std::string refused_breakdown;
-            for (const auto& [reason, count] : heap->refused_reasons)
-                refused_breakdown += (refused_breakdown.empty() ? "" : "; ") + reason + " " + std::to_string(count);
-            if (!refused_breakdown.empty())
-                std::fprintf(stderr, "[rt] d3d12: console descriptor heap 0x%llx unbound T#s by reason: %s\n",
-                             static_cast<unsigned long long>(heap->console_va), refused_breakdown.c_str());
-            heap->refused_reasons.clear();
-            heap->copied = heap->vsharps = heap->unbacked = heap->retried = heap->deferred_fixes = 0;
-            for (auto& n : heap->images) n = 0;
-            heap->ms = heap->pages_ms = heap->fix_ms = heap->retry_ms = 0;
-            if (start - arena_log_time >= std::chrono::seconds(60)) {
-                arena_log_time = start;
-                report_arena_peak();
-            }
         }
     }
-    std::chrono::steady_clock::time_point arena_log_time{};  // console_heap_mutex held
 
     // The heap's pages imported as host memory (see above): true with `heap` filled in, false when they cannot be
     // (no VK_EXT_external_memory_host, a page not committed or write-combined, a driver refusal, or a device address
@@ -6827,80 +6617,6 @@ struct DeviceState {
         gpu_counts.resolve_ms += std::chrono::duration<double, std::milli>(clock::now() - start).count();
     }
 
-    void log_console_heap_gpu(ConsoleHeap& heap, double count) {
-        const auto stats = heap_gpu->take_stats();
-        const std::size_t keys = heap_gpu->with_keys([](leonida::ConsoleHeapKeys& k) { return k.size(); });
-        std::size_t checked = 0;
-        for (const auto& r : gpu_ranges) checked += r.checked;
-        std::fprintf(stderr,
-                     "[rt] d3d12: console descriptor heap 0x%llx on the GPU: %.1f slots queued a submission; passes "
-                     "%llu (%llu slots, %llu key updates, %llu misses, %llu overflowed, %llu not submitted); resolved "
-                     "%llu words (%llu with no backing, %llu asked again, %llu answered later, %llu not entered), %llu "
-                     "misses already "
-                     "entered, %zu waiting (%zu with the resolver), %zu unbacked; %llu rescans (%llu slots), "
-                     "%llu filtered rescans (%llu slots looked at), %llu key entries dropped for %llu releases; %zu keys (%llu resets), %zu ranges (%zu checked), %zu "
-                     "backed spans (%llu rebuilds, %llu cuts, %.3f ms a submission), %zu ask spans; %.3f ms before "
-                     "and %.3f ms resolving a submission\n",
-                     static_cast<unsigned long long>(heap.console_va), double(heap.gpu_queued) / count,
-                     static_cast<unsigned long long>(stats.passes), static_cast<unsigned long long>(stats.slots),
-                     static_cast<unsigned long long>(stats.updates), static_cast<unsigned long long>(stats.misses),
-                     static_cast<unsigned long long>(stats.overflows), static_cast<unsigned long long>(stats.failed),
-                     static_cast<unsigned long long>(gpu_counts.resolved),
-                     static_cast<unsigned long long>(gpu_counts.none),
-                     static_cast<unsigned long long>(gpu_counts.retried),
-                     static_cast<unsigned long long>(gpu_counts.flips),
-                     static_cast<unsigned long long>(gpu_counts.put_failed),
-                     static_cast<unsigned long long>(gpu_counts.known_misses), gpu_unresolved.size(), gpu_asked,
-                     gpu_unbacked.size(), static_cast<unsigned long long>(gpu_counts.rescans),
-                     static_cast<unsigned long long>(stats.rescanned),
-                     static_cast<unsigned long long>(gpu_counts.filtered_rescans),
-                     static_cast<unsigned long long>(stats.filtered),
-                     static_cast<unsigned long long>(gpu_counts.dropped),
-                     static_cast<unsigned long long>(gpu_counts.released), keys,
-                     static_cast<unsigned long long>(gpu_counts.key_resets), gpu_ranges.size(), checked,
-                     gpu_backed.size(), static_cast<unsigned long long>(gpu_counts.backed_rebuilds),
-                     static_cast<unsigned long long>(gpu_counts.backed_cuts), gpu_counts.backed_ms / count,
-                     gpu_ask.size(),
-                     gpu_counts.begin_ms / count, gpu_counts.resolve_ms / count);
-        std::fprintf(stderr,
-                     "[rt] d3d12: console heap pass, before the heaps, ms a submission: alias probes %.3f, misses and "
-                     "releases %.3f, range table %.3f, backed table %.3f, ask table %.3f\n",
-                     gpu_counts.part_ms[0] / count, gpu_counts.part_ms[1] / count, gpu_counts.part_ms[2] / count,
-                     gpu_counts.part_ms[3] / count, gpu_counts.part_ms[4] / count);
-        if (tsharps_off_thread_enabled()) {
-            std::uint64_t t[5];
-            for (unsigned i = 0; i < 5; ++i) t[i] = gpu_tsharps[i].exchange(0, std::memory_order_relaxed);
-            std::fprintf(stderr,
-                         "[rt] d3d12: console heap T#s registered by the resolver: %llu known, %llu bound, %llu naming no "
-                         "texture, %llu refused\n",
-                         static_cast<unsigned long long>(t[0]), static_cast<unsigned long long>(t[1]),
-                         static_cast<unsigned long long>(t[2]), static_cast<unsigned long long>(t[3]));
-        }
-        if (shadow_gpu_enabled()) {
-            ShadowGpuCounts c;
-            std::size_t imports = 0;
-            std::uint64_t imported_bytes = 0;
-            {
-                std::lock_guard lock(shadow_import_mutex);
-                c = std::exchange(shadow_gpu_counts, ShadowGpuCounts{});
-                imports = shadow_imports.size();
-                imported_bytes = shadow_import_bytes;
-            }
-            std::fprintf(stderr,
-                         "[rt] d3d12: slot-133 shadows on the GPU: %llu copies (%.1f KiB a submission), %llu imports made "
-                         "(%llu MiB), %llu dropped after a map change, %llu refused, %llu with no GPU destination; %zu imports "
-                         "live (%llu MiB); passes copied %llu regions\n",
-                         static_cast<unsigned long long>(c.copies), double(c.bytes) / 1024.0 / count,
-                         static_cast<unsigned long long>(c.imports), static_cast<unsigned long long>(c.imported >> 20),
-                         static_cast<unsigned long long>(c.dropped), static_cast<unsigned long long>(c.refused),
-                         static_cast<unsigned long long>(c.outside), imports,
-                         static_cast<unsigned long long>(imported_bytes >> 20),
-                         static_cast<unsigned long long>(stats.copies));
-        }
-        heap.gpu_queued = 0;
-        gpu_counts = {};
-    }
-
     // One VkPipelineCache for every pipeline the device creates (docs/d3d12_vulkan.md section 3.6): a PSO created a
     // second time from the same shaders and state is satisfied from it. `pipeline_cache()` (above) makes it on first
     // use. With Vulkan 1.3 every creation also asks for VkPipelineCreationFeedback, which is how the layer counts the
@@ -7608,7 +7324,7 @@ struct DeviceState {
 
     // Large shaders compile one at a time (HeavyCompile): NVIDIA's compiler (nvgpucomp64.dll) reserves 0.7-2 GiB per
     // compile of the title's big ray-tracing compute shaders, and the twelve workers compiling several at once took
-    // the 32 GB PC into paging in the first loading screen (traced with LEONIDA_LOG_BIG_ALLOCS=2, 2026-11-25: ten GiB
+    // the 32 GB PC into paging in the first loading screen (2026-11-25: ten GiB
     // from nvgpucomp64 in the last minute, then 20 s stalls and the title's watchdog). Smaller ones run in parallel.
     // LEONIDA_HEAVY_COMPILES: how many may run at once (default 1); LEONIDA_HEAVY_SPIRV_KB: from what SPIR-V size
     // (default 512 KiB; graphics count their stages together).
@@ -10838,11 +10554,6 @@ public:
                 !(desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS));
             if (!tails_on_pages && streamed_texture &&
                 std::all_of(page_tiles.begin(), page_tiles.end(), [](const auto& tile) { return tile.opaque; })) {
-                static std::atomic<std::uint64_t> told{0};
-                const std::uint64_t n = ++told;
-                if ((n & (n - 1)) == 0)
-                    std::fprintf(stderr, "[rt] d3d12: %llu all-tail streamed textures made committed, not paged\n",
-                                 static_cast<unsigned long long>(n));
                 tail_committed_ = true;  // never released under a newer texture, as a paged one is not
                 return committed_instead();
             }
@@ -12093,7 +11804,6 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
         return !(v && v[0] == '0');
     }();
     if (evict && t->watch) {
-        static std::atomic<unsigned long long> evicted_count{0}, evicted_bytes{0};
         const auto begin = reinterpret_cast<std::uintptr_t>(t->title), end = begin + t->bytes;
         std::vector<TitleTexture*> under;
         auto& index = title_textures_by_start();
@@ -12106,10 +11816,6 @@ bool register_title_texture(Resource* texture, const void* address, const D3D12_
         }
         for (TitleTexture* o : under) {
             o->resource->evict_title_image();
-            const unsigned long long n = ++evicted_count, b = evicted_bytes += o->bytes;
-            if ((n & (n - 1)) == 0)
-                std::fprintf(stderr, "[rt] d3d12: %llu title textures under newer ones released (%llu MiB)\n", n,
-                             b >> 20);
             remove_title_texture(o);
         }
     }
@@ -13384,7 +13090,6 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             if (!path.empty()) compile_helper::unmark_building(path);
         }
     } unmark{marked};
-    static const std::string no_key;
     auto& vk = device.context->vk;
     const VkDevice dev = device.info.device;
     const leonida::ShaderLibrary* library = device.library();
@@ -13494,11 +13199,9 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     const ULONGLONG started = GetTickCount64();
     VkPipeline built = VK_NULL_HANDLE;
     CompileTrace trace;
-    trace.begin(pipeline_info, device.info.pipeline_creation_feedback, trigger, entry->name.c_str(), 0, bytes, options.cache_key ? *options.cache_key : no_key);
     // Was it in the cache? Core feedback on a Vulkan 1.3 device; pipeline_cache_control implies one.
     if (journal.enabled() && device.info.pipeline_cache_control) trace.request_feedback(pipeline_info);
     const leonida::dev_status::Build dev_build(entry->name.c_str());
-    const leonida::pipeline_profile::DriverCall profile("cs", trigger, entry->name.c_str());
     // What is building, once past the gate (in the driver): the compile gate's wait reports name it.
     auto& compiling = leonida::driver_compile;
     VkResult created = VK_ERROR_UNKNOWN;
@@ -13548,8 +13251,6 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         journal.finish(!from_shared && created == VK_SUCCESS && built, trace.hit(), driver_ms);
     }
     std::vector<std::uint32_t>().swap(words);
-    profile.finish(int(created));
-    trace.end(trigger, entry->name.c_str(), 0, bytes, created);
     if (big_lock.owns_lock()) big_lock.unlock();
     if (probe_compiled && device.journal_ask_shared.exchange(false))
         std::fprintf(stderr, "[rt] d3d12: pipeline journal: the driver compiled %s for "
@@ -14313,11 +14014,6 @@ public:
         };
         if (depth_bounds && !features.depthBounds)
             return stream_unsupported("depth-bounds tests need depthBounds, which the device lacks; stream subobject", 21);
-        if (depth_bounds) {  // how many PSOs use the test (they were all refused before)
-            static std::atomic<unsigned> made{0};
-            const unsigned n = ++made;
-            if ((n & (n - 1)) == 0) std::fprintf(stderr, "[rt] d3d12: depth-bounds PSO #%u\n", n);
-        }
 
         if (raster.polygonMode != VK_POLYGON_MODE_FILL && !features.fillModeNonSolid)
             return refuse("wireframe fill needs fillModeNonSolid, which the device lacks; fill mode", r.FillMode);
@@ -14972,7 +14668,7 @@ private:
     // variant is built later: a pipeline (and the shared pipeline libraries) no longer needs its modules once made,
     // and the NVIDIA driver holds ~3.5 MB per module. Kept for the PSO's life, the modules of the PSOs the title keeps
     // filled the driver's heaps: seven 1 GiB and two 2 GiB blocks of nvoglv64.dll, about 8 GB of the process's
-    // private bytes in the first loading screen (measured with LEONIDA_LOG_BIG_ALLOCS).
+    // private bytes in the first loading screen (measured 2026-11-25).
     VkPipeline build(std::uint32_t unbound) {
         const VkPipeline pipeline = build_with_modules(unbound);
         drop_built_modules();
@@ -17020,8 +16716,6 @@ public:
         // Acceleration-structure builds map their title ranges while they are recorded (d3d12_com.h).
         if (state_.arena.mapped && state_.get_host_pointer_properties)
             rt::d3d12::g_title_range_prefetch.store(&prefetch_title_range, std::memory_order_release);
-        // LEONIDA_LOG_BIG_ALLOCS=2: the driver's module is loaded now (src/big_alloc_log.h, iat::install).
-        leonida::big_alloc_log::iat::install();
         // Depth <-> colour copies are staged through scratch buffers (vulkan_scratch.h), on every GPU. With buffer
         // device addresses the same scratch holds the triangle indices of indexed quad lists (quad_index_expand.h):
         // a compute pass writes them through the chunk's address and the draw binds the chunk as its index buffer.
@@ -17601,9 +17295,6 @@ public:
                               check[0] != '0';
         }
         arena.peak_end = kArenaReserved;
-        char log[4] = {};
-        length = 0;
-        arena.log = getenv_s(&length, log, "LEONIDA_ARENA_LOG") == 0 && length > 1 && log[0] != '0';
         state_.context->set_heap_base(arena.address, arena.size);
         state_.context->set_zero_page(arena.buffer, 0, kZeroPage);
         state_.context->set_quad_indices(arena.buffer, kQuadIndexOffset, kQuadIndexCount);
@@ -17623,7 +17314,6 @@ public:
         arena_pages_ = std::make_shared<DeviceArenaPages>(state_);
         leonida::fault_memory::arena_mapped = arena.mapped;  // hang reports read descriptors through it
         leonida::fault_memory::arena_size = arena.size;
-        start_transient_watch(state_.context.get());
         // Hang reports follow V#s into the title's memory: committed, readable pages only (no fault in the report).
         leonida::fault_memory::read_title = [](std::uint64_t va, void* out, std::size_t bytes) {
             for (std::uint64_t at = va; at < va + bytes;) {
@@ -18293,7 +17983,6 @@ private:
         std::unordered_set<std::uint64_t> queued;
         bool stop = false, refresh = false;
         std::thread thread;
-        std::uint64_t filled = 0, skipped = 0;
         std::vector<std::uint8_t> tiled;      // the worker's own snapshot of a texture's bytes (fill_unlocked)
         std::vector<std::uint64_t> columns;   // its detiling scratch
         ~TitleFiller() {
@@ -18358,8 +18047,6 @@ private:
         title_filler_->wake.notify_one();
     }
     void run_title_filler(TitleFiller& f) {
-        using clock = std::chrono::steady_clock;
-        auto since = clock::now();
         for (;;) {
             std::uint64_t address = 0;
             bool refresh = false, fill = false;
@@ -18412,21 +18099,6 @@ private:
             if (r) {
                 filled = fill_unlocked(address, *r, layout, cpu, fills, every_byte, f);
                 r->Release();
-            }
-            std::size_t left = 0;
-            {
-                std::lock_guard lock(f.mutex);
-                (filled ? f.filled : f.skipped) += 1;
-                left = f.queue.size();
-            }
-            if (const auto now = clock::now(); now - since >= std::chrono::seconds(10)) {
-                std::fprintf(stderr, "[rt] d3d12: title texture fill worker: %llu filled, %llu skipped in %.0f s, %zu "
-                                     "queued\n",
-                             static_cast<unsigned long long>(f.filled), static_cast<unsigned long long>(f.skipped),
-                             std::chrono::duration<double>(now - since).count(), left);
-                std::lock_guard lock(f.mutex);
-                f.filled = f.skipped = 0;
-                since = now;
             }
         }
     }
@@ -18860,11 +18532,10 @@ private:
         hash_guarded(title_tiled_.data(), title_tiled_.size(), hash);
         t.full_hashed = t.every_byte() && hash_guarded(title_tiled_.data(), title_tiled_.size(), t.full_hash, true);
         const bool volume = layout.layout.dimension == rt::xg_xs::kTexture3D;
-        const bool trace_pool = leonida::dstorage::trace_enabled() && leonida::title_gpu_views::other_view(t.cpu);
         bool nonzero = false;
         bool ok = true;
         if (t.resource->staged_title()) {
-            ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero);
+            ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, false, nonzero);
             if (!ok) log_once("staged title texture upload failed, format", int(t.resource->format()));
         } else {
             for (std::uint32_t slice = 0; slice < slices && ok; ++slice) {
@@ -18875,8 +18546,6 @@ private:
                     title_linear_.resize(std::size_t(slice_pitch) * (volume ? mip.depth : 1));
                     rt::xg_xs::copy_elements<false>(layout, level, slice, title_tiled_.data(), title_linear_.data(),
                                                     row_pitch, slice_pitch, title_columns_);
-                    if (trace_pool && !nonzero)
-                        nonzero = std::any_of(title_linear_.begin(), title_linear_.end(), [](auto byte) { return byte != 0; });
                     const HRESULT hr =
                         t.resource->upload_title_subresource(level + slice * mips, title_linear_.data(), row_pitch,
                                                              slice_pitch, staged);
@@ -18891,10 +18560,6 @@ private:
             t.stale = true;
             return 0;
         }
-        if (trace_pool)
-            std::fprintf(stderr, "[rt] ds-pool-fill cpu=%llx size=%llu staged=%d nonzero=%d\n",
-                         static_cast<unsigned long long>(t.cpu), static_cast<unsigned long long>(span),
-                         int(staged), int(nonzero));
         if (t.owned && !t.fills) t.resource->publish_streamed_texture();
         t.hash = hash;
         t.hashed = true;
@@ -23265,7 +22930,7 @@ bool save_pipeline_caches_at_exit(unsigned wait_ms) {
         };
         auto write = std::make_shared<Write>();
         std::thread([write, d] {
-            save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, false, "exit");
+            save_session_pipeline_cache(d->context->vk, d->info.device, d->pipeline_cache_handle, false);
             std::lock_guard done_lock(write->mutex);
             write->done = true;
             write->done_cv.notify_all();
@@ -23724,81 +23389,6 @@ void note_title_texture_write(const void* address, std::size_t size) {
     writes.emplace_back(begin, begin + size);
 }
 
-// LEONIDA_WATCH_TRANSIENT=1: watches the title's transient-memory pool (GTA VI 1.0.2.1), whose node lists the title
-// walks at 0x144e9b480; a GPU write over them faulted the title there (0x144e9b54a / 0x144e9b578). Layout and design
-// from five-star-recomp's docs/debugging.md ("Transient pool watch", github.com/ThatRecompDev/five-star-recomp); the
-// code is ours. Globals: pool base 0x1475DF1B8, block records 0x1475DF1C0 (0x58 bytes each: block +0x10, retire
-// token +0x18, node list +0x48), block count 0x1475DF1C8, block size 0x1475DF1CC. Nodes are {next, object, token},
-// 0x18 bytes, inside the blocks. Every 5 ms each list is walked; a next pointer outside the pool or an object outside
-// user space, seen on three polls in a row, is logged once with the bytes around it and the kept dispatches (LEONIDA_DRED)
-// whose descriptor tables reach its block. Memory is read with ReadProcessMemory: an unmapped page is a failed read.
-void start_transient_watch(leonida::VulkanContext* context) {
-    static std::atomic<bool> started{false};
-    const char* on = std::getenv("LEONIDA_WATCH_TRANSIENT");
-    if (!on || on[0] != '1' || started.exchange(true)) return;
-    std::thread([context] {
-        const HANDLE self = GetCurrentProcess();
-        const auto read = [self](std::uint64_t at, void* out, std::size_t n) {
-            SIZE_T got = 0;
-            return ReadProcessMemory(self, reinterpret_cast<const void*>(at), out, n, &got) && got == n;
-        };
-        std::map<std::uint64_t, int> suspect;  // node address -> polls in a row it looked bad
-        std::set<std::uint64_t> told;
-        std::fprintf(stderr, "[rt] transient watch: on\n");
-        for (;;) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            std::uint64_t pool = 0, records = 0;
-            std::uint32_t count = 0, block_bytes = 0;
-            if (!read(0x1475DF1B8, &pool, 8) || !read(0x1475DF1C0, &records, 8) || !read(0x1475DF1C8, &count, 4) ||
-                !read(0x1475DF1CC, &block_bytes, 4) || !pool || !records || !count || count > 65536 || !block_bytes)
-                continue;
-            const std::uint64_t pool_end = pool + std::uint64_t(count) * block_bytes;
-            std::map<std::uint64_t, int> seen;
-            for (std::uint32_t b = 0; b < count; ++b) {
-                std::uint64_t rec[11] = {};
-                if (!read(records + std::uint64_t(b) * 0x58, rec, sizeof(rec))) break;
-                std::uint64_t node = rec[0x48 / 8];
-                for (int steps = 0; node && steps < 4096; ++steps) {
-                    std::uint64_t n[3] = {};
-                    if (!read(node, n, sizeof(n))) break;
-                    const bool next_ok = !n[0] || (n[0] >= pool && n[0] < pool_end);
-                    const bool object_ok = !n[1] || (n[1] >= 0x10000 && n[1] < 0x800000000000ull);
-                    if (!next_ok || !object_ok) {
-                        const int polls = seen[node] = (suspect.count(node) ? suspect[node] : 0) + 1;
-                        if (polls >= 3 && told.insert(node).second) {
-                            const std::uint64_t block = rec[0x10 / 8];
-                            std::fprintf(stderr,
-                                         "[rt] transient watch: block %u (%#llx, token %#llx) node %#llx: next %#llx "
-                                         "object %#llx token %#llx (pool %#llx..%#llx)\n",
-                                         b, static_cast<unsigned long long>(block),
-                                         static_cast<unsigned long long>(rec[0x18 / 8]),
-                                         static_cast<unsigned long long>(node), static_cast<unsigned long long>(n[0]),
-                                         static_cast<unsigned long long>(n[1]), static_cast<unsigned long long>(n[2]),
-                                         static_cast<unsigned long long>(pool), static_cast<unsigned long long>(pool_end));
-                            std::uint32_t around[24] = {};
-                            if (read(node - 0x30, around, sizeof(around)))
-                                for (int row = 0; row < 3; ++row)
-                                    std::fprintf(stderr, "[rt] transient watch:   %#llx: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-                                                 static_cast<unsigned long long>(node - 0x30 + row * 32),
-                                                 around[8 * row], around[8 * row + 1], around[8 * row + 2],
-                                                 around[8 * row + 3], around[8 * row + 4], around[8 * row + 5],
-                                                 around[8 * row + 6], around[8 * row + 7]);
-                            if (leonida::BreadcrumbRing* ring = context->breadcrumbs())
-                                ring->report_reaching(stderr, block, block + block_bytes);
-                            std::fflush(stderr);
-                        }
-                        break;  // the rest of this list is not to be trusted
-                    }
-                    node = n[0];
-                }
-            }
-            suspect.swap(seen);
-        }
-    }).detach();
-}
-
-// Where a slow sync_title_textures spent its time (over 400 ms: logged at its end). It held the submission for 47 s in
-// the first loading screen (2026-11-25), with every other submitting thread waiting behind it.
 void note_title_textures_copied(const std::vector<std::uintptr_t>& ids) {
     if (ids.empty() || !g_title_texture_count.load(std::memory_order_acquire)) return;
     std::lock_guard lock(title_texture_mutex());
@@ -25487,8 +25077,6 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (info.depth_range_unrestricted) device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
     info.pipeline_creation_feedback = v13.core || has_device_extension(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
     info.pipeline_cache_control = v13.core && v13.pipeline_creation_cache_control;
-    if (trace_pipeline_compile() && !v13.core && info.pipeline_creation_feedback)
-        device_extensions.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
     if (info.conservative_rasterization) device_extensions.push_back(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
     if (info.image_view_min_lod) device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     if (use_pageable) {

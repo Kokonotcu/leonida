@@ -1717,31 +1717,8 @@ void wait_for_fence_progress(FenceMirror* mirror) {
     SetThreadpoolWait(mirror->wait, mirror->event, &timeout);
 }
 
-// Every 10 s: how many fence mirrors are live and how often their thread-pool waits ran (on a completion event or on
-// the 10 ms timeout). Each run is a wake of Wine's wait-queue thread and a callback on a pool worker.
-std::atomic<std::uint64_t> g_mirrors_live{0}, g_mirror_signals{0}, g_mirror_timeouts{0};
-std::atomic<ULONGLONG> g_mirror_report{0};
-
-void note_mirror_run(TP_WAIT_RESULT result) {
-    (result == WAIT_OBJECT_0 ? g_mirror_signals : g_mirror_timeouts).fetch_add(1, std::memory_order_relaxed);
-    const ULONGLONG now = GetTickCount64();
-    ULONGLONG last = g_mirror_report.load(std::memory_order_relaxed);
-    if (!last) {
-        g_mirror_report.compare_exchange_strong(last, now, std::memory_order_relaxed);
-        return;
-    }
-    if (now - last < 10000 || !g_mirror_report.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
-    std::fprintf(stderr, "[rt] d3d12_xs: fence slot 12 mirrors: %llu live; in %.0f s %llu waits ended on an event, "
-                         "%llu on the 10 ms timeout\n",
-                 static_cast<unsigned long long>(g_mirrors_live.load(std::memory_order_relaxed)),
-                 double(now - last) / 1000.0,
-                 static_cast<unsigned long long>(g_mirror_signals.exchange(0, std::memory_order_relaxed)),
-                 static_cast<unsigned long long>(g_mirror_timeouts.exchange(0, std::memory_order_relaxed)));
-}
-
 VOID CALLBACK on_fence_progress(PTP_CALLBACK_INSTANCE, PVOID context, PTP_WAIT, TP_WAIT_RESULT result) {
     auto* mirror = static_cast<FenceMirror*>(context);
-    note_mirror_run(result);
     const std::uint64_t value = refresh_mirror(mirror);
     if (value == ~std::uint64_t{0}) return;
     if (result == WAIT_OBJECT_0) {
@@ -1773,7 +1750,6 @@ FenceMirror* fence_mirror(ChildProxy* self) {
         m->event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (m->event) m->wait = CreateThreadpoolWait(on_fence_progress, m, nullptr);
         if (m->wait) {
-            g_mirrors_live.fetch_add(1, std::memory_order_relaxed);
             wait_for_fence_progress(m);
             SetEvent(m->event);  // the callback makes the first SetEventOnCompletion
         } else {
@@ -1825,7 +1801,6 @@ void destroy_child(ChildProxy* self) {
         ReleaseSRWLockExclusive(&mirror->lock);
         WaitForThreadpoolWaitCallbacks(mirror->wait, TRUE);
         CloseThreadpoolWait(mirror->wait);
-        g_mirrors_live.fetch_sub(1, std::memory_order_relaxed);
     }
     if (mirror && mirror->link) {  // a fence-wait callback still pending (or running) no longer reaches the mirror
         AcquireSRWLockExclusive(&mirror->link->lock);
@@ -2411,11 +2386,6 @@ void queue_closed_list(DeviceProxy* device, ID3D12CommandList* list) {
     if (queue) {
         queue->ExecuteCommandLists(1, &list);
         queue->Release();
-        static std::atomic<std::uint64_t> runs{0};
-        const std::uint64_t n = runs.fetch_add(1, std::memory_order_relaxed) + 1;
-        if ((n & (n - 1)) == 0)
-            std::fprintf(stderr, "[rt] d3d12_xs: %llu console list(s) run at their Close\n",
-                         static_cast<unsigned long long>(n));
         return;
     }
     list->AddRef();
@@ -2498,13 +2468,6 @@ std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_
                 if (std::find(chained.begin(), chained.end(), named[i]) == chained.end()) combined.push_back(named[i]);
             count_word = combined.size();
             lists_word = reinterpret_cast<std::uint64_t>(combined.data());
-            static std::atomic<std::uint64_t> runs{0}, lists{0};
-            lists.fetch_add(chained.size(), std::memory_order_relaxed);
-            const std::uint64_t n = runs.fetch_add(1, std::memory_order_relaxed) + 1;
-            if ((n & (n - 1)) == 0)
-                std::fprintf(stderr, "[rt] d3d12_xs: chained submission %llu: %llu closed lists so far (this one %zu)\n",
-                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(lists.load()),
-                             chained.size());
         }
     }
     // Pass zero-extended UINT in 64-bit RDX so both 32-bit PC implementations and 64-bit mock thunks see clean count.
@@ -2657,12 +2620,9 @@ struct AsyncMapper {
     std::condition_variable wake;
     std::deque<AsyncMapping> jobs;
     bool started = false;
-    std::uint64_t done = 0, failed = 0;
-    std::chrono::steady_clock::duration wait{}, map{};
-    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+    std::uint64_t failed = 0;
 
     void run() {
-        using clock = std::chrono::steady_clock;
         for (;;) {
             AsyncMapping job;
             {
@@ -2671,31 +2631,15 @@ struct AsyncMapper {
                 job = std::move(jobs.front());
                 jobs.pop_front();
             }
-            const auto t0 = clock::now();
             HRESULT hr = job.fence->SetEventOnCompletion(job.value, nullptr);
             job.fence->Release();  // the reference the call took for this job: the queue may be gone by now
-            const auto t1 = clock::now();
             bool ok = SUCCEEDED(hr) &&
                       job.map(std::uint32_t(job.batches.size()), job.batches.data(), job.pool, job.pages, job.flags);
-            const auto t2 = clock::now();
             std::lock_guard lock(mutex);
-            ++done;
             failed += !ok;
-            wait += t1 - t0;
-            map += t2 - t1;
             if (!ok && failed <= 8)
                 std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31 (async): a batch could not be mapped (hr 0x%08x, "
                                      "error %lu)\n", unsigned(hr), GetLastError());
-            if (t2 - since >= std::chrono::seconds(10)) {
-                const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
-                std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31 (async worker): %llu calls mapped in %.0f s "
-                                     "(%llu failed): %.1f ms waiting for the queue, %.1f ms mapping; %zu queued\n",
-                             static_cast<unsigned long long>(done), std::chrono::duration<double>(t2 - since).count(),
-                             static_cast<unsigned long long>(failed), ms(wait), ms(map), jobs.size());
-                done = failed = 0;
-                wait = map = {};
-                since = t2;
-            }
         }
     }
 
@@ -2920,37 +2864,9 @@ HRESULT queue_copy_page_mappings(ChildProxy* self, UINT count, const xmem::PageB
         if (SUCCEEDED(hr)) hr = fence->SetEventOnCompletion(value, nullptr);
         if (SUCCEEDED(hr) && fence->GetCompletedValue() == UINT64_MAX) hr = DXGI_ERROR_DEVICE_REMOVED;
     }
-    const auto t1 = clock::now();
     if (SUCCEEDED(hr) && !deferred && !map(count, batches, pool, pages, flags)) {
         const DWORD error = GetLastError();
         hr = error ? HRESULT_FROM_WIN32(error) : E_FAIL;
-    }
-    const auto t2 = clock::now();
-    // Every 10 s: how long the calls of slot 31 kept the caller (the title's render thread) waiting for the queue's
-    // earlier work, and then mapping.
-    static std::mutex stats_mutex;
-    static struct {
-        std::uint64_t calls = 0, ranges = 0;
-        clock::duration wait{}, map{}, max{};
-        clock::time_point since = clock::now();
-    } stats;
-    {
-        std::lock_guard lock(stats_mutex);
-        ++stats.calls;
-        stats.ranges += count;
-        stats.wait += t1 - t0;
-        stats.map += t2 - t1;
-        stats.max = (std::max)(stats.max, t2 - t0);
-        if (t2 - stats.since >= std::chrono::seconds(10)) {
-            const auto ms = [](clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
-            std::fprintf(stderr, "[rt] d3d12_xs: queue slot 31: %llu calls (%llu batches) in %.0f s: %.1f ms waiting "
-                                 "for the queue, %.1f ms mapping, %.1f ms the longest call\n",
-                         static_cast<unsigned long long>(stats.calls), static_cast<unsigned long long>(stats.ranges),
-                         std::chrono::duration<double>(t2 - stats.since).count(), ms(stats.wait), ms(stats.map),
-                         ms(stats.max));
-            stats = {};
-            stats.since = t2;
-        }
     }
     return hr;
 }
@@ -4225,13 +4141,6 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
                             leonida::kernel_writes::write(reinterpret_cast<void*>(to), reinterpret_cast<const void*>(from),
                                                           static_cast<std::size_t>(bytes))) {
                             rt::xmem::note_title_written(reinterpret_cast<const void*>(to), static_cast<std::size_t>(bytes));
-                            static std::atomic<std::uint64_t> told{0};
-                            const std::uint64_t n = told.fetch_add(1, std::memory_order_relaxed) + 1;
-                            if ((n & (n - 1)) == 0)
-                                std::fprintf(stderr, "[rt] d3d12_xs: list slot 86 CopyResourceX: %llu buffer-to-texture "
-                                                     "copies into title memory (last %llux%u format %d, %llu bytes)\n",
-                                             static_cast<unsigned long long>(n), static_cast<unsigned long long>(dd.Width),
-                                             dd.Height, int(dd.Format), static_cast<unsigned long long>(bytes));
                             return 0;
                         }
                     }

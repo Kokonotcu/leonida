@@ -28,15 +28,8 @@ private:
     std::unique_ptr<std::byte[]> stack_;
 };
 
-// Parses LEONIDA_STACKS: comma-separated whole seconds. Returns false (and leaves `seconds` empty) on bad text.
-bool parse_stack_times(std::string_view text, std::vector<unsigned>& seconds);
-
-// LEONIDA_STACKS: snapshots of every thread at the listed times since this call, printed to stderr. Destroy the
-// sampler before unmapping the title image.
-std::jthread start_thread_stacks();
-
-// The call chain of thread `tid` now, or of every other thread when `tid` is 0, printed as LEONIDA_STACKS does under
-// the tag `why`. One call at a time; the device-loss diagnostics call it (vulkan_device_fault.h thread_stack_hook).
+// The call chain of thread `tid` now, or of every other thread when `tid` is 0, printed to stderr under the tag `why`.
+// One call at a time; the device-loss and stall reports call it (vulkan_device_fault.h thread_stack_hook).
 void print_thread_stacks_now(std::uint32_t tid, const char* why) noexcept;
 
 }  // namespace rt

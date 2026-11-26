@@ -1304,7 +1304,6 @@ struct ReplayFunctions {
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
     PFN_vkCmdSetDepthBounds set_depth_bounds = nullptr;  // for depth-bounds pipelines only
     PFN_vkCmdDraw draw = nullptr;
-    unsigned* mesh_draw_count = nullptr;  // opt-in count for this submission
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
     // ExecuteIndirect with a DISPATCH_MESH signature. Its 12-byte record is VkDrawMeshTasksIndirectCommandEXT.
     PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
@@ -3026,22 +3025,6 @@ inline bool same_target_view(const TargetView& a, const TargetView& b) {
 // attachments, area limits and vertex buffers, and with the same index buffer view its index buffer, instead of
 // resolving them again (I6). Within one prepare() the resources resolve the same way every time, so the result is
 // the same.
-// Draw outcomes across the process, printed when a count reaches a power of two (from 1): how many draws replay,
-// how many a stub or pending pipeline leaves out, and why the rest fail their list (ReplayResult value).
-enum class DrawOutcome { prepared, stub, failed };
-inline void count_draw(DrawOutcome outcome, int result = 0) {
-    static std::atomic<std::uint64_t> prepared{0}, stub{0}, failed[16]{};
-    std::atomic<std::uint64_t>& c = outcome == DrawOutcome::prepared ? prepared
-                                    : outcome == DrawOutcome::stub   ? stub
-                                                                     : failed[result & 15];
-    const std::uint64_t n = c.fetch_add(1, std::memory_order_relaxed) + 1;
-    if ((n & (n - 1)) == 0)
-        std::fprintf(stderr, "[rt] replay: draws %s%s = %llu (prepared %llu, stub/pending %llu)\n",
-                     outcome == DrawOutcome::prepared ? "prepared" : outcome == DrawOutcome::stub ? "left out" : "failed",
-                     outcome == DrawOutcome::failed ? (" with ReplayResult " + std::to_string(result)).c_str() : "",
-                     static_cast<unsigned long long>(n), static_cast<unsigned long long>(prepared.load()),
-                     static_cast<unsigned long long>(stub.load()));
-}
 
 // Every 64-bit pair of user-data dwords that is a title address (4 GiB up to 2^47) gets its memory mapped in the
 // page table before the command runs (ReplayFunctions::map_title): the root arguments the title gives a shader
@@ -3054,15 +3037,6 @@ inline void map_title_user_data(const ReplayFunctions& vk, const std::uint32_t* 
         if (va >> 32 == 0 || va >> 47) continue;
         vk.map_title(va);
     }
-}
-
-// The unresolved_resource exits of prepare_draw, numbered in source order, each named the first time it is taken
-// (1 pipeline, 2 render target, 3 depth, then vertex/index buffer exits).
-inline ReplayResult unresolved_site(int site) {
-    static std::atomic<std::uint32_t> seen{0};
-    if (!(seen.fetch_or(1u << site, std::memory_order_relaxed) & (1u << site)))
-        std::fprintf(stderr, "[rt] replay: a draw's resource is unknown at prepare_draw exit %d\n", site);
-    return ReplayResult::unresolved_resource;
 }
 
 template<typename Resolve>
@@ -3987,16 +3961,6 @@ template<typename Resolve>
 ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFunctions& vk, PreparedList& out,
                      bool statistics_helpers = false) {
     out.failed_command = PreparedList::no_command;
-    {
-        // Lists prepared, and lists already reopened (reset) by the time they are prepared, at powers of two.
-        static std::atomic<std::uint64_t> calls{0}, reopened{0};
-        if (!list.closed()) reopened.fetch_add(1, std::memory_order_relaxed);
-        const std::uint64_t n = calls.fetch_add(1, std::memory_order_relaxed) + 1;
-        if ((n & (n - 1)) == 0)
-            std::fprintf(stderr, "[rt] replay: lists prepared %llu, found reopened %llu, this one %zu commands\n",
-                         static_cast<unsigned long long>(n), static_cast<unsigned long long>(reopened.load()),
-                         list.commands().size());
-    }
     if (!list.closed()) return ReplayResult::list_open;
     if (list.queries_open()) return ReplayResult::invalid_query;  // a Vulkan query must end in its command buffer
     const auto commands = list.commands();
@@ -4959,13 +4923,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                    draw && vk.graphics_pipeline && draw->pipeline && vk.graphics_pipeline(draw->pipeline) &&
                    vk.graphics_pipeline(draw->pipeline)->pending) {
             p.skip = true;  // its PSO has no shader to draw with (LEONIDA_MISSING_SHADER_STUB): the draw is left out
-            detail::count_draw(detail::DrawOutcome::stub);
         } else if (const GraphicsPipeline* gp = draw && vk.graphics_pipeline && draw->pipeline
                                                     ? vk.graphics_pipeline(draw->pipeline) : nullptr;
                    gp && gp->deferred && gp->ready && !gp->ready()) {
             if (gp->request) gp->request();  // built in the background; this draw is left out meanwhile
             p.skip = true;
-            detail::count_draw(detail::DrawOutcome::stub);
         } else if (draw) {
             if (out.draw_count == out.draws.size()) out.draws.emplace_back();
             auto& prepared_draw = out.draws[out.draw_count];
@@ -4975,7 +4937,6 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             const detail::PreparedDraw* previous = previous_draw ? &out.draws[previous_draw_slot] : nullptr;
             if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw, previous_draw, previous);
                 r != ReplayResult::success) {
-                detail::count_draw(detail::DrawOutcome::failed, int(r));
                 if (r != ReplayResult::unresolved_resource || strict_replay()) return r;
                 // Upstream's policy: an unresolvable draw is dropped at emit (logged at its site), not the whole list.
                 // Its slot stays, marked skipped, so the command still names its own prepared draw.
@@ -4987,7 +4948,6 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 // Its pipeline configuration is being built in the background: left out, as a pending base one is.
                 --out.draw_count;
                 p.skip = true;
-                detail::count_draw(detail::DrawOutcome::stub);
                 continue;
             }
             if (draw->indexed && !draw->mesh && draw->topology == topology_quad_list) {
@@ -4996,7 +4956,6 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (const auto r = detail::prepare_quad_indices(*draw, vk, prepared_draw); r != ReplayResult::success)
                     return r;
             }
-            detail::count_draw(detail::DrawOutcome::prepared);
             previous_draw = draw;
             previous_draw_slot = p.draw;
         } else if (const auto raster = draw_command(command); raster.state && raster.arguments) {
@@ -6424,7 +6383,6 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                     vk.indirect_execute(command_buffer, p.indirect);
                 else
                     detail::emit_indirect(vk, command_buffer, p, *indirect);
-                if (indirect->kind == IndirectKind::dispatch_mesh && vk.mesh_draw_count) ++*vk.mesh_draw_count;
             } else if (raster.arguments) {
                 indirect_stats::note(indirect_stats::Event::emitted);
                 const auto& arg = *raster.arguments;
@@ -6449,7 +6407,6 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                                           count_offset, records, stride);
                     else
                         vk.draw_mesh_tasks_indirect(command_buffer, arguments_buffer, arguments_offset, records, stride);
-                    if (vk.mesh_draw_count) ++*vk.mesh_draw_count;
                 } else if (arg.count_buffer) {
                     const auto emit_counted = draw->indexed ? vk.draw_indexed_indirect_count : vk.draw_indirect_count;
                     emit_counted(command_buffer, arguments_buffer, arguments_offset, count_buffer, count_offset,
@@ -6460,7 +6417,6 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 }
             } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
-                if (vk.mesh_draw_count) ++*vk.mesh_draw_count;
             } else if (draw->topology == topology_quad_list) {
                 if (draw->indexed) {
                     // The triangle indices the compute pass wrote before this rendering scope, (i0 i1 i2) (i0 i2 i3)

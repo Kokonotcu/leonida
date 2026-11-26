@@ -30,7 +30,6 @@
 #include "vulkan_title_pages.h"
 #include "queue_families.h"
 #include "resource_tiling.h"
-#include "pipeline_profile.h"
 #include "submit_phases.h"
 #include "pipeline_wait.h"
 #include "title_va_alias.h"
@@ -4154,8 +4153,6 @@ private:
         // Provisional, so that prepare refuses set-0 pipelines on a device without one; re-read after the flush below.
         // The resource lock held from here keeps bindless_current_ in place.
         replay.bindless_set = context_.bindless_current_ ? context_.bindless_current_() : VK_NULL_HANDLE;
-        unsigned mesh_draws = 0;
-        if (pipeline_profile::enabled()) replay.mesh_draw_count = &mesh_draws;
         std::vector<VulkanContext::GeometryUpload> geometry;
         if (context_.geometry_provider_) {
             replay.title_memory = [&](std::uint64_t va, std::uint64_t bytes, VkBuffer& buffer, VkDeviceSize& offset) {
@@ -4729,9 +4726,6 @@ private:
         // named only when no VkResult does.
         if (!submitted)
             failure_.reason = !ended ? "vkEndCommandBuffer" : last_submit_result_ == VK_SUCCESS ? "vkQueueSubmit" : nullptr;
-        if (mesh_draws)
-            std::fprintf(stderr, "[rt] pso-mesh unix_ms=%lld draws=%u submitted=%d\n",
-                         pipeline_profile::unix_ms(), mesh_draws, int(submitted));
         if (!submitted && (!storage_images.empty() || !zero_buffers.empty())) {
             // not initialized after all: try again with the next submission
             std::lock_guard lock(context_.storage_mutex_);

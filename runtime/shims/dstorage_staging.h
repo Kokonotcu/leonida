@@ -3,7 +3,6 @@
 #pragma once
 
 #include "dstorage_xs_abi.h"
-#include "../src/dstorage_trace.h"
 #include <algorithm>
 #include <condition_variable>
 #include <cstdint>
@@ -69,20 +68,12 @@ public:
             std::lock_guard lock(pool_.mutex_);
             pool_.used_ -= bytes_;
             if (pair_) --pool_.helpers_;
-            if (!pool_.used_ && pool_.drained_ < pool_.peak_) {
-                pool_.drained_ = pool_.peak_;
-                if (trace_enabled()) std::fprintf(stderr, "[rt] ds-staging idle_bytes=0 peak_bytes=%llu\n", pool_.peak_);
-            }
             if (pool_.next_ != pool_.serving_) pool_.changed_.notify_all();
         }
     private:
         void take(uint64_t bytes) {
             bytes_ = bytes;
             pool_.used_ += bytes;
-            if (pool_.used_ > pool_.peak_) {
-                pool_.peak_ = pool_.used_;
-                if (trace_enabled()) std::fprintf(stderr, "[rt] ds-staging peak_bytes=%llu limit_bytes=%llu\n", pool_.peak_, limit);
-            }
         }
         StagingPool& pool_;
         uint64_t bytes_{};
@@ -93,7 +84,7 @@ private:
     std::mutex mutex_;
     std::condition_variable changed_;
     unsigned helpers_{};
-    uint64_t used_{}, peak_{}, drained_{}, next_{}, serving_{};
+    uint64_t used_{}, next_{}, serving_{};
 };
 
 inline StagingPool& staging_pool() {
