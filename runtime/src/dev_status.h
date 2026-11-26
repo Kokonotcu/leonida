@@ -61,6 +61,10 @@ inline std::atomic<std::uint64_t>& skipped_dispatches() {
     return count;
 }
 
+// Reports the dev overlay prints when it sees a stall (the GPU or the title's main loop still for 5 s), installed by
+// the layers that own the state: the console memory waits pending (d3d12_com.cpp). Null: nothing.
+inline std::atomic<void (*)()> stall_report_waits{nullptr};
+
 // One pipeline build, from construction to destruction.
 struct Build {
     explicit Build(const char* name) {

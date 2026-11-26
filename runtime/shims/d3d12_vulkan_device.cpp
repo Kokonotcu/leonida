@@ -417,10 +417,14 @@ inline std::uint64_t hashed_bytes(std::uint64_t bytes, bool every_byte = false) 
     return bytes <= (256u << 10) || every_byte ? bytes : bytes / 32 + 64;
 }
 
+// On unless LEONIDA_TEXTURE_REFRESH_ASYNC=0: a pass visits a rotating slice of 128 registered textures after the ones
+// the title wrote through a notified path (DirectStorage, our copies), not every texture. The full walk over the
+// loading screen's ~34,000 title textures every 16 ms held the submitting queue's lock for seconds at a time (the
+// stall report of 2026-11-26: a Subrender worker in title_texture_snapshot, three more waiting behind it).
 bool async_texture_refresh() {
     static const bool enabled = [] {
         const char* v = std::getenv("LEONIDA_TEXTURE_REFRESH_ASYNC");
-        return v && std::strcmp(v, "1") == 0;
+        return !(v && std::strcmp(v, "0") == 0);
     }();
     return enabled;
 }
@@ -14498,6 +14502,10 @@ public:
             return E_NOTIMPL;
         }
         const bool defer_modules = defer_graphics_enabled() && !device_.shader_objects_ready();
+        gparts().graphics.label.clear();
+        for (const Stage& stage : stages)
+            if (stage.entry)
+                gparts().graphics.label += (gparts().graphics.label.empty() ? "" : " + ") + stage.entry->name;
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
             // After the f16 link above, which can also edit the pixel shader's words.

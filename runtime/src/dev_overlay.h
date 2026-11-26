@@ -9,8 +9,10 @@
 // window's title bar.
 #include "dev_status.h"
 #include "indirect_draw_stats.h"
+#include "memory_census.h"
 #include "memory_figures.h"
 #include "submit_phases.h"
+#include "title_state.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -34,6 +36,10 @@
 #include <vector>
 
 namespace leonida::dev_overlay {
+
+// Every thread's call chain, printed with the stall's log line (main.cpp sets it to rt::print_thread_stacks_now): what
+// each thread waits in when the GPU or the main loop has stood still for 5 s. Null: no stacks.
+inline std::atomic<void (*)(std::uint32_t tid, const char* why) noexcept> stall_stacks{nullptr};
 
 // The counters between two looks. A total that went down was reset by its own log line: what it holds is the new part.
 inline std::uint64_t grown(std::uint64_t now, std::uint64_t& before) {
@@ -251,8 +257,17 @@ private:
         lines_ = lines(s, sp::process_age());
         // One log line a stall, when the GPU or the main loop has stood still for 5 s: what the overlay showed then.
         const bool stuck = s.gpu_stalled >= 5 || s.heartbeat >= 5;
-        if (stuck && !reported_)
+        if (stuck && !reported_) {
             for (const auto& line : lines_) std::fprintf(stderr, "[overlay] %s\n", line.c_str());
+            title_state::print("at the stall");
+            if (const auto waits = dev_status::stall_report_waits.load(std::memory_order_acquire)) waits();
+            if (const auto stacks = stall_stacks.load(std::memory_order_acquire)) stacks(0, "overlay stall");
+            memory_census::print("at the stall");
+            stall_since_ = sp::process_age();
+        } else if (!stuck && reported_) {
+            std::fprintf(stderr, "[overlay] stall over after %.0f s (at %.0f s)\n", sp::process_age() - stall_since_,
+                         sp::process_age());
+        }
         reported_ = stuck;
         place();
     }
@@ -326,6 +341,7 @@ private:
     std::uint64_t beat_value_ = 0;
     std::int64_t beat_ns_ = 0;
     bool reported_ = false;
+    double stall_since_ = 0;  // process age when the reported stall began
     Sample shown_;
 };
 #endif

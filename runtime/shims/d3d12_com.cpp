@@ -2514,6 +2514,37 @@ public:
         }
         cv_.notify_one();
     }
+    // For the dev overlay's stall report (dev_status::stall_report_waits): per queue with held batches, how many, how
+    // long the oldest has waited, and its waits against what memory holds now. Tries the lock only.
+    void report() {
+        std::unique_lock lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            std::fprintf(stderr, "[rt] memory waits at the stall: the watcher's lock is held\n");
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[rt] memory waits at the stall: %zu batches held over %zu queues, release asked %d, "
+                             "cut short %d\n", pending_, queues_.size(), int(release_requested_), int(cut_short_));
+        for (const auto& queue : queues_) {
+            std::unique_lock q(queue->mutex, std::try_to_lock);
+            if (!q.owns_lock() || queue->pending.empty()) continue;
+            const MemoryWaitBatch& oldest = queue->pending.front();
+            std::fprintf(stderr, "[rt]   queue %p: %zu held, oldest %lld ms, fence value %llu, next %llu\n",
+                         static_cast<void*>(queue.get()), queue->pending.size(),
+                         static_cast<long long>(
+                             std::chrono::duration_cast<std::chrono::milliseconds>(now - oldest.since).count()),
+                         static_cast<unsigned long long>(oldest.value), static_cast<unsigned long long>(queue->next));
+            for (std::size_t i = 0; i < oldest.waits.size() && i < 4; ++i) {
+                const ListMemoryWait& w = oldest.waits[i];
+                std::uint64_t m = 0;
+                const bool readable = read_title_word(w.va, w.width, m);
+                std::fprintf(stderr, "[rt]     wait %#llx op %u value %#llx mask %#llx: memory %s%#llx\n",
+                             static_cast<unsigned long long>(w.va), w.op, static_cast<unsigned long long>(w.value),
+                             static_cast<unsigned long long>(w.mask), readable ? "" : "unreadable ",
+                             static_cast<unsigned long long>(m));
+            }
+        }
+    }
     // Every held batch released now, on this thread (a queue going away: `only`).
     void release_all(const char* why, MemoryWaitQueue* only = nullptr) {
         std::vector<std::pair<std::shared_ptr<MemoryWaitQueue>, std::uint64_t>> release;
@@ -2633,6 +2664,11 @@ private:
 
 // The waits of `list` a batch must hold for: not NEVER/ALWAYS ones, not on a cell the same list wrote before the wait
 // (met in order on the GPU), not on an address that timed out before, and not those that hold already.
+[[maybe_unused]] const bool g_stall_waits_installed =
+    (leonida::dev_status::stall_report_waits.store([] { MemoryWaitWatcher::get().report(); },
+                                                   std::memory_order_release),
+     true);
+
 void unmet_memory_waits(const GraphicsCommandList& list, std::vector<ListMemoryWait>& out) {
     const auto& waits = list.memory_waits();
     if (waits.empty()) return;

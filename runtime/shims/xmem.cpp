@@ -50,6 +50,7 @@
 #include "../src/title_geometry_watch.h"
 #include "../src/title_va_alias.h"
 #include "../src/value_write_sink.h"
+#include "../src/debug_ring.h"  // LEONIDA_DEBUG_RING: maps, unmaps, page allocations and frees
 
 namespace {
 
@@ -678,7 +679,17 @@ struct PhysLock {
 // With g_phys_mutex held. Keeps leonida::title_page_aliases in step: a page mapped at two or more addresses is
 // aliased at each of them (the D3D12 layer's slot-133 shadows copy those pages at every submission instead of
 // waiting for a write fault, which a write through another address doesn't raise).
+// A page's identity for the debug ring: its 64 KiB in the section's scratch view (one address for the section's life,
+// whatever the title maps it at), 0 when the page is not live.
+uint64_t page_identity(uint64_t page) {
+    const auto it = g_pages.find(page);
+    if (it == g_pages.end() || !it->second.section || !it->second.section->scratch) return 0;
+    return reinterpret_cast<uint64_t>(it->second.section->scratch) + it->second.offset;
+}
+
 void note_mapping(uint64_t page, uintptr_t address, bool mapped) {
+    leonida::debug_ring::record(mapped ? leonida::debug_ring::Kind::xmem_map : leonida::debug_ring::Kind::xmem_unmap,
+                                address, page, page_identity(page));
     auto& addresses = g_page_addresses[page];
     if (mapped) {
         addresses.insert(address);
@@ -2026,6 +2037,7 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         g_pages[page] = PhysicalPage{section, i * kPhysicalPageSize};
         section->frames[i] = static_cast<uint32_t>(page);
         page_array[i] = page;
+        leonida::debug_ring::record(leonida::debug_ring::Kind::xmem_alloc, page, 0, page_identity(page));
     }
     return TRUE;
 }
@@ -2046,6 +2058,9 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
             SetLastError(ERROR_INVALID_PARAMETER);
             return FALSE;
         }
+        leonida::debug_ring::record(leonida::debug_ring::Kind::xmem_free, page_array[i],
+                                    g_page_addresses.count(page_array[i]) ? g_page_addresses[page_array[i]].size() : 0,
+                                    page_identity(page_array[i]));  // b: addresses it is still mapped at
         g_pages.erase(it);
         g_free_slots.push_back(page_array[i] / kFramesPerPage);
     }
@@ -3304,6 +3319,60 @@ uintptr_t mirror_address(uintptr_t address) { return leonida::title_gpu_views::o
 }  // namespace
 
 namespace rt::xmem {
+
+// leonida::debug_ring::identity_of: the identity of the page behind `address`, without waiting for the lock.
+std::uint64_t identity_now(std::uint64_t address) {
+    if (!g_phys_mutex.try_lock()) return 0;
+    std::uint64_t identity = 0;
+    if (const auto it = g_mapped.find(static_cast<uintptr_t>(address & ~std::uint64_t(kPhysicalPageSize - 1)));
+        it != g_mapped.end())
+        identity = page_identity(it->second);
+    g_phys_mutex.unlock();
+    return identity;
+}
+[[maybe_unused]] const bool g_identity_installed =
+    (leonida::debug_ring::identity_of.store(&identity_now, std::memory_order_release), true);
+
+void describe_address(std::uintptr_t address, const char* tag, std::uint64_t& page, std::uint64_t& identity) {
+    page = identity = 0;
+    const std::uintptr_t base = address & ~std::uintptr_t(kPhysicalPageSize - 1);
+    bool locked = false;
+    for (int i = 0; i < 200 && !(locked = g_phys_mutex.try_lock()); ++i) Sleep(1);
+    if (!locked) {
+        std::fprintf(stderr, "[rt] xmem %s %#llx: xmem's lock is held (200 ms), not described\n", tag,
+                     static_cast<unsigned long long>(address));
+        return;
+    }
+    const auto mapped = g_mapped.find(base);
+    if (mapped != g_mapped.end()) {
+        page = mapped->second;
+        identity = page_identity(page);
+    }
+    char peers[512] = {};
+    int at = 0;
+    if (page)
+        if (const auto addresses = g_page_addresses.find(page); addresses != g_page_addresses.end())
+            for (const std::uintptr_t a : addresses->second)
+                if (at < int(sizeof peers) - 24) at += std::snprintf(peers + at, sizeof peers - at, " %#llx",
+                                                                    static_cast<unsigned long long>(a));
+    const char* owner = "none";
+    unsigned long long age = 0, view_base = 0, view_pages = 0;
+    if (auto it = g_views.upper_bound(address); it != g_views.begin()) {
+        --it;
+        if (address < it->first + it->second.count * kPhysicalPageSize) {
+            static const char* const owners[] = {"physical", "scatter", "slot31", "mirror"};
+            owner = it->second.zero ? "zero page" : owners[static_cast<int>(it->second.owner) & 3];
+            age = GetTickCount64() - it->second.tick;
+            view_base = it->first;
+            view_pages = it->second.count;
+        }
+    }
+    g_phys_mutex.unlock();
+    std::fprintf(stderr, "[rt] xmem %s %#llx: page %#llx identity %#llx view %#llx (%llu pages, %s, made %llu ms ago) "
+                         "mapped at:%s\n",
+                 tag, static_cast<unsigned long long>(address), static_cast<unsigned long long>(page),
+                 static_cast<unsigned long long>(identity), view_base, view_pages, owner, age, peers);
+}
 
 // kernel_writes' unguarder (src/title_page_watch.h): the pages of [begin, end) in physical-page views whose window is
 // writable but that are read-only now are made writable again. A page there is read-only only while a guard of the

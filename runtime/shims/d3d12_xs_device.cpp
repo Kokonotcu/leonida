@@ -2376,6 +2376,67 @@ void claim_console_queue(DeviceProxy* device, D3D12_COMMAND_LIST_TYPE type, ID3D
     ReleaseSRWLockExclusive(&q.lock);
 }
 
+// The chained lists' submission thread (queue_closed_list): one FIFO for every type, so close order holds across them,
+// and a count per type of what was pushed and what has run, so a title execute on that type waits only for the lists
+// closed before it (wait_submitted).
+class ChainSubmitter {
+public:
+    void push(int type, ID3D12CommandQueue* queue, ID3D12CommandList* list) {
+        {
+            std::lock_guard lock(mutex_);
+            jobs_.push_back({type & 3, queue, list});
+            ++pushed_[type & 3];
+            if (!started_) {
+                started_ = true;
+                std::thread([this] { run(); }).detach();
+            }
+        }
+        wake_.notify_one();
+    }
+    // Until every list of `type` pushed so far has been submitted.
+    void wait_submitted(int type) {
+        if (type < 0) return;
+        std::unique_lock lock(mutex_);
+        const std::uint64_t target = pushed_[type & 3];
+        done_wake_.wait(lock, [&] { return done_[type & 3] >= target; });
+    }
+
+private:
+    struct Job {
+        int type;
+        ID3D12CommandQueue* queue;
+        ID3D12CommandList* list;
+    };
+    void run() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock lock(mutex_);
+                wake_.wait(lock, [&] { return !jobs_.empty(); });
+                job = jobs_.front();
+                jobs_.pop_front();
+            }
+            job.queue->ExecuteCommandLists(1, &job.list);
+            job.list->Release();
+            job.queue->Release();
+            {
+                std::lock_guard lock(mutex_);
+                ++done_[job.type];
+            }
+            done_wake_.notify_all();
+        }
+    }
+    std::mutex mutex_;
+    std::condition_variable wake_, done_wake_;
+    std::deque<Job> jobs_;
+    std::uint64_t pushed_[4]{}, done_[4]{};
+    bool started_ = false;
+};
+ChainSubmitter& chain_submitter() {
+    static ChainSubmitter* const s = new ChainSubmitter;  // never destroyed: its thread is detached
+    return *s;
+}
+
 std::int64_t chain_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
@@ -2478,7 +2539,19 @@ void queue_closed_list(DeviceProxy* device, ID3D12CommandList* list) {
             std::fprintf(stderr, "[rt] d3d12_xs: closed list %p type %d: %s\n", static_cast<void*>(list), int(type),
                          queue ? "runs now" : "queued");
     }
+    leonida::debug_ring::record(leonida::debug_ring::Kind::list_closed, reinterpret_cast<std::uint64_t>(list),
+                                static_cast<std::uint64_t>(type), reinterpret_cast<std::uint64_t>(queue));
     if (queue) {
+        // Off the title's thread: its recording moves into a list of its own (the title's list is left closed and
+        // empty for the Reset that follows) and our submission thread runs it, in close order. Run here, a Close
+        // took the queue's lock and ran the submission's texture refresh on the title's Subrender workers: three of
+        // them waited seconds behind a fourth there, the loading-screen frame waited for them, and the main loop
+        // stood still for 21 s (stall report of 2026-11-26). Without the D3D12 layer (tests) it runs here, as before.
+        if (const DetachRecording detach = g_detach_recording.load(std::memory_order_acquire))
+            if (ID3D12CommandList* const recording = detach(list)) {
+                chain_submitter().push(static_cast<int>(type), queue, recording);  // takes both references
+                return;
+            }
         queue->ExecuteCommandLists(1, &list);
         queue->Release();
         return;
@@ -2537,6 +2610,24 @@ bool execute_with_values(ChildProxy* self, UINT count, void* const* lists);
 // ExecuteBundle); the real queue never sees a proxy.
 // `console`: the call came through the console variant (slot 35), the retail title's execute: the chained lists run
 // first (ours, the chained submission above).
+// LEONIDA_FENCE_TRACE=1 (bisect switch): every fence operation of value 1 or 2 (a fence's first signals, what a
+// stuck queue was seen waiting for), and every Signal or Wait the proxy dropped because its argument is no fence it
+// knows, up to 4000 lines: the queue (null for the CPU), the fence as the title passed it, the value.
+void note_fence_op(const char* what, ChildProxy* queue, std::uint64_t fence, std::uint64_t value) {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_FENCE_TRACE");
+        return v && v[0] == '1';
+    }();
+    if (!on) return;
+    const bool dropped = std::strstr(what, "DROPPED") != nullptr;
+    if (!dropped && value > 2) return;
+    static std::atomic<int> lines{0};
+    if (lines.fetch_add(1, std::memory_order_relaxed) >= 4000) return;
+    std::fprintf(stderr, "[rt] fence-trace: %s: queue %p (type %d) fence %#llx value %llu tid %lu\n", what,
+                 static_cast<void*>(queue), queue ? queue->queue_type : -1, static_cast<unsigned long long>(fence),
+                 static_cast<unsigned long long>(value), GetCurrentThreadId());
+}
+
 // A console queue's executes and fence signals, one line at 1, 2, 4, 8... of each: which queues the title uses, and
 // which one it signals its fences on (chained lists run on the first queue of their type, claim_console_queue).
 void note_queue_use(ChildProxy* queue, bool signal) {
@@ -2550,6 +2641,11 @@ void note_queue_use(ChildProxy* queue, bool signal) {
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word,
                                           bool console = false) {
     note_queue_use(self, false);
+    // The lists the title closed before this execute run before it, as on the console (chained submission thread).
+    if (console) chain_submitter().wait_submitted(self->queue_type);
+    leonida::debug_ring::record(leonida::debug_ring::Kind::list_executed,
+                                count_word && lists_word ? *reinterpret_cast<const std::uint64_t*>(lists_word) : 0,
+                                reinterpret_cast<std::uint64_t>(self), count_word);
     if (lists_word &&
         execute_with_values(self, static_cast<UINT>(count_word), reinterpret_cast<void* const*>(lists_word)))
         return 0;
@@ -3111,9 +3207,12 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                                        std::memory_order_relaxed);
                     using Fn = HRESULT(WINAPI*)(IUnknown*, IUnknown*, UINT64);
                     if (Slot == 16) note_queue_use(self, true);
+                    note_fence_op(Slot == 16 ? "queue signal" : "queue wait", self, a1, a2);
                     return hr_to_u64(reinterpret_cast<Fn>(self->real_vtable[kQueueSignal + (Slot - 16)])(
                         self->real, fence, a2));
                 }
+                note_fence_op(Slot == 16 ? "queue signal DROPPED (not a fence)" : "queue wait DROPPED (not a fence)",
+                              self, a1, a2);
                 if (newer) return hr_to_u64(S_OK);  // proven newer: a non-fence Signal/Wait arg is malformed,
                 // not evidence of the older layout — do not downgrade the shared detection on it
                 if (self->queue_layout.load(std::memory_order_relaxed) ==
@@ -3158,6 +3257,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                         std::fprintf(stderr, "[rt] d3d12_xs: SignalX (queue slot %u) forwarded as Signal\n", Slot);
                     using Fn = HRESULT(WINAPI*)(IUnknown*, IUnknown*, UINT64);
                     note_queue_use(self, true);
+                    note_fence_op("queue signalx", self, a1, a2);
                     return hr_to_u64(reinterpret_cast<Fn>(self->real_vtable[kQueueSignal])(self->real, fence, a2));
                 }
                 return hr_to_u64(S_OK);
@@ -3282,6 +3382,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                                                  std::uint64_t, std::uint64_t, std::uint64_t);
         auto fn = reinterpret_cast<ForwardFn>(self->real_vtable[Slot]);
         if constexpr (K == ChildKind::fence && Slot == kFenceSignal) {
+            note_fence_op("cpu signal", nullptr, reinterpret_cast<std::uint64_t>(self), a1);
             const std::uint64_t result = fn(self->real, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14);
             if (FenceMirror* m = self->mirror.load(std::memory_order_acquire)) refresh_mirror(m);
             return result;
@@ -4117,6 +4218,7 @@ void list_value_op_ours(ListProxy* self, ConsoleValueOp op, unsigned slot, std::
     wait.width = wide ? 8u : 4u;
     noted = rt::d3d12::note_list_memory_wait(self->real, wait);
 #endif
+    leonida::debug_ring::record(leonida::debug_ring::Kind::value_wait, a1, wide ? a3 : (a3 & 0xffffffffu), comparison);
     static std::atomic<int> told{0};
     if (told.fetch_add(1, std::memory_order_relaxed) < 8)
         std::fprintf(stderr, "[rt] d3d12_xs: list slot %u: memory wait at %#llx op %u value %#llx%s\n", slot,

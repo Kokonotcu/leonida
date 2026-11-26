@@ -35,6 +35,8 @@
 
 #include "command_list.h"
 #include "dev_status.h"  // skipped_dispatches: compute work left out, for the dev overlay
+#include "debug_ring.h"  // LEONIDA_DEBUG_RING: value writes with the page they resolved to
+#include "submit_phases.h"  // LEONIDA_FRAME_REPORT: the present a draw belongs to
 #include "indirect_draw_stats.h"
 #include "deferred_image_binding.h"
 #include "vulkan_device_fault.h"
@@ -952,6 +954,7 @@ inline constexpr std::uint32_t rect_list_topology = 17;
 struct GraphicsPipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
+    std::string label;  // its shaders' entry names, for LEONIDA_FRAME_REPORT
     // A PSO made without a shader the translation lacks (LEONIDA_MISSING_SHADER_STUB): its draws are skipped, so the
     // title keeps the PSO object it asked for instead of a failure it would read through as null.
     bool pending = false;
@@ -1647,6 +1650,56 @@ struct PreparedDraw {
         target_layers = UINT32_MAX;
     }
 };
+
+// LEONIDA_FRAME_REPORT=<present>,<present>,... (at most 8): every draw recorded for the frame after each of those
+// presents, one line each (its shaders, the draw, its attachments and their formats and sizes, the area and scissor),
+// at most 4000 lines a frame. Nothing is read or written otherwise: one relaxed load a draw.
+inline bool frame_report_now() {
+    static const auto frames = [] {
+        std::array<std::uint64_t, 8> out{};
+        if (const char* v = std::getenv("LEONIDA_FRAME_REPORT")) {
+            std::size_t n = 0;
+            for (const char* p = v; *p && n < out.size();) {
+                char* end = nullptr;
+                const unsigned long long f = std::strtoull(p, &end, 10);
+                if (end == p) break;
+                out[n++] = f;
+                p = *end == ',' ? end + 1 : end;
+            }
+        }
+        return out;
+    }();
+    if (!frames[0]) return false;
+    const std::uint64_t now = submit_phases::totals().present_serial.load(std::memory_order_relaxed);
+    for (const std::uint64_t f : frames)
+        if (f && f == now) return true;
+    return false;
+}
+
+inline void frame_report_draw(const Draw& draw, const PreparedDraw& d, const GraphicsPipeline& graphics) {
+    static std::atomic<std::uint64_t> frame{0}, lines{0};
+    const std::uint64_t now = submit_phases::totals().present_serial.load(std::memory_order_relaxed);
+    if (frame.exchange(now, std::memory_order_relaxed) != now) lines.store(0, std::memory_order_relaxed);
+    if (lines.fetch_add(1, std::memory_order_relaxed) >= 4000) return;
+    char targets[256] = {};
+    int at = 0;
+    for (std::size_t s = 0; s < d.colors.size() && at < int(sizeof targets) - 48; ++s) {
+        const auto& a = d.colors[s];
+        at += std::snprintf(targets + at, sizeof targets - at, " c%zu:%s", s, a.id ? "" : "-");
+        if (a.id)
+            at += std::snprintf(targets + at, sizeof targets - at, "%#llx fmt %d %ux%u",
+                                static_cast<unsigned long long>(a.id), int(a.binding.format), a.binding.width,
+                                a.binding.height);
+    }
+    std::fprintf(stderr,
+                 "[rt] frame-report %llu: %s%s %u x%u topo %u pso %#llx [%s]%s depth %s%#llx fmt %d area %ux%u scissor "
+                 "%d,%d %ux%u\n",
+                 static_cast<unsigned long long>(now), draw.indexed ? "indexed" : "draw", draw.mesh ? " mesh" : "",
+                 draw.count, draw.instances, draw.topology, static_cast<unsigned long long>(draw.pipeline),
+                 graphics.label.c_str(), targets, d.depth.id ? "" : "-", static_cast<unsigned long long>(d.depth.id),
+                 int(d.depth.binding.format), d.area.width, d.area.height, d.scissor.offset.x, d.scissor.offset.y,
+                 d.scissor.extent.width, d.scissor.extent.height);
+}
 
 // D3D converts a float clear value to a normalised format by rounding to nearest even, so an exact tie goes to the
 // even neighbour (0.5 on 8 bits is 128). Vulkan leaves the rounding of ties to the GPU, and NVIDIA writes 127, one
@@ -4550,6 +4603,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             if (!vk.buffer_at(write->address, bytes, p.write_buffer, p.write_offset) || bytes < 4)
                 return ReplayResult::unresolved_resource;
             if (p.write_offset % 4) return ReplayResult::invalid_copy;
+            // The page it resolved to now (submission); the GPU writes it later, into this page whatever the title
+            // maps at the address by then.
+            if (debug_ring::enabled())
+                debug_ring::record(debug_ring::Kind::value_write, write->address, write->value,
+                                   debug_ring::identity_now(write->address));
             // WriteBufferImmediate resolves by VA and may target a readback buffer in COPY_DEST.
             out.wrote_readback = true;
             out.readback_src_stages |= VK_PIPELINE_STAGE_2_TRANSFER_BIT;
@@ -6247,6 +6305,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             constexpr VkPipelineStageFlags depth_stages =
                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
             const GraphicsPipeline& graphics = *d.graphics;
+            if (detail::frame_report_now()) detail::frame_report_draw(*draw, d, graphics);
             // The attachments as the open scope compares them: a draw with the same ones joins it.
             const bool depth_attached = d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT);
             const bool stencil_attached = d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT);

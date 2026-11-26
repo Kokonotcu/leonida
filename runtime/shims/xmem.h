@@ -154,4 +154,9 @@ bool write_title_bytes(const void* address, const void* bytes, std::size_t size)
 using LabelTargetFn = bool (*)(std::uintptr_t address, unsigned bytes, leonida::label::Target& out);
 inline LabelTargetFn label_target_fn = nullptr;
 
+// For the crash report: what `address` shows, printed under `tag`: its physical page number and identity (section
+// scratch + offset), every address the page is mapped at, and the view (owner, age) that maps it. Tries xmem's lock for
+// up to 200 ms and says so instead of waiting. Writes the page and identity out (0: not a mapped physical page).
+void describe_address(std::uintptr_t address, const char* tag, std::uint64_t& page, std::uint64_t& identity);
+
 }

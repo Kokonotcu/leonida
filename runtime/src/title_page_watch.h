@@ -46,8 +46,10 @@
 //
 // Header-only, so the D3D12 layer, xmem and the file shims share one state in a process without linking each other.
 #include <windows.h>
+#include <intrin.h>
 
 #include "guarded_copy.h"
+#include "debug_ring.h"  // LEONIDA_DEBUG_RING: kernel_writes into the title's memory
 
 #include <algorithm>
 #include <atomic>
@@ -896,6 +898,8 @@ inline bool store_guarded(void* destination, std::uint64_t value, std::size_t by
 // is not memory it can copy).
 inline bool write(void* destination, const void* source, std::size_t bytes) {
     if (!bytes) return true;
+    debug_ring::record(debug_ring::Kind::cpu_write, reinterpret_cast<std::uint64_t>(destination), bytes,
+                       reinterpret_cast<std::uint64_t>(_ReturnAddress()));
     const auto to = reinterpret_cast<std::uintptr_t>(destination), from = reinterpret_cast<std::uintptr_t>(source);
     const bool overlap = to < from + bytes && from < to + bytes;
     const std::uint64_t pin = begin_write(destination, bytes, nullptr);
@@ -909,6 +913,7 @@ inline bool write(void* destination, const void* source, std::size_t bytes) {
 // title thread polling it never reads a mix of the old and the new value; pinned and retried the same way.
 inline bool store(void* destination, std::uint64_t value, std::size_t bytes) {
     const auto to = reinterpret_cast<std::uintptr_t>(destination);
+    debug_ring::record(debug_ring::Kind::cpu_write, to, bytes, value);  // c: the value (a store's caller is the pump)
     if ((bytes != 4 && bytes != 8) || to % bytes) return write(destination, &value, bytes);
     const std::uint64_t pin = begin_write(destination, bytes, nullptr);
     bool ok = detail::store_guarded(destination, value, bytes);

@@ -122,6 +122,9 @@ void keep_title_watchdog_kicked(std::uint8_t* base) {
 #include "pe_loader.h"
 #include "thread_stacks.h"
 #include "dev_overlay.h"
+#include "debug_ring.h"
+#include "memory_census.h"
+#include "title_state.h"
 #include "title_page_watch.h"
 #include "title_geometry_watch.h"
 #include "../shims/d3d12_trace.h"
@@ -489,8 +492,63 @@ static LPTOP_LEVEL_EXCEPTION_FILTER WINAPI title_set_unhandled_exception_filter(
         InterlockedExchangePointer(&title_fatal_filter, reinterpret_cast<void*>(filter)));
 }
 
+// LEONIDA_DEBUG_RING=1: what the crash read, once per process before anything else is written. For each register
+// that points into user memory, and the faulting access: its region, the 64 bytes around it, what xmem maps there
+// (page, identity, every address of that page, the view's owner and age), and the debug ring's history of that
+// address, page and identity (maps, unmaps, frees, our CPU writes, console value writes with the page they resolved
+// to). Then the title's state machine, every thread's stack and the address-space census.
+static void report_crash_memory(const EXCEPTION_POINTERS* info) {
+    if (!leonida::debug_ring::enabled() || !info || !info->ContextRecord || !info->ExceptionRecord) return;
+    const CONTEXT& c = *info->ContextRecord;
+    const EXCEPTION_RECORD& r = *info->ExceptionRecord;
+    struct Reg {
+        const char* name;
+        DWORD64 value;
+    };
+    const Reg regs[] = {{"access", r.NumberParameters >= 2 ? r.ExceptionInformation[1] : 0},
+                        {"rax", c.Rax}, {"rbx", c.Rbx}, {"rcx", c.Rcx}, {"rdx", c.Rdx}, {"rsi", c.Rsi},
+                        {"rdi", c.Rdi}, {"rbp", c.Rbp}, {"r8", c.R8},   {"r9", c.R9},   {"r10", c.R10},
+                        {"r11", c.R11}, {"r12", c.R12}, {"r13", c.R13}, {"r14", c.R14}, {"r15", c.R15}};
+    std::fprintf(stderr, "[rt] crash report: code %#lx at rip %#llx, access %#llx\n", r.ExceptionCode,
+                 static_cast<unsigned long long>(c.Rip), static_cast<unsigned long long>(regs[0].value));
+    for (const Reg& reg : regs) {
+        const DWORD64 v = reg.value;
+        if (v < 0x10000 || v >= 0x7FFFFFFF0000ull) continue;
+        if (v + 0x100000 > c.Rsp && v < c.Rsp + 0x100000) continue;  // the faulting thread's stack
+        MEMORY_BASIC_INFORMATION m{};
+        if (VirtualQuery(reinterpret_cast<const void*>(v), &m, sizeof m) != sizeof m) continue;
+        std::fprintf(stderr, "[rt] crash %s=%#llx: region %p +%#llx, state %#lx type %#lx protect %#lx\n", reg.name,
+                     static_cast<unsigned long long>(v), m.BaseAddress,
+                     static_cast<unsigned long long>(v - reinterpret_cast<std::uintptr_t>(m.BaseAddress)), m.State,
+                     m.Type, m.Protect);
+        std::uint64_t around[8] = {};
+        SIZE_T got = 0;
+        const std::uint64_t from = (v & ~std::uint64_t(15)) - 32;
+        if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(from), around, sizeof around, &got))
+            std::fprintf(stderr, "[rt] crash %s   %#llx: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n",
+                         reg.name, static_cast<unsigned long long>(from), around[0], around[1], around[2], around[3],
+                         around[4], around[5], around[6], around[7]);
+        std::uint64_t page = 0, identity = 0;
+        rt::xmem::describe_address(static_cast<std::uintptr_t>(v), reg.name, page, identity);
+        leonida::debug_ring::Match match;
+        match.address = v & ~std::uint64_t(0xFFFF);
+        match.span = 0x10000;
+        match.page = page;
+        match.identity = identity;
+        leonida::debug_ring::dump(reg.name, match);
+    }
+    leonida::title_state::print("at the crash");
+    rt::print_thread_stacks_now(0, "crash");
+    leonida::memory_census::print("at the crash");
+    std::fflush(stderr);
+}
+
 static LONG WINAPI save_caches_on_fatal_exception(EXCEPTION_POINTERS* info) {
     const DWORD code = info && info->ExceptionRecord ? info->ExceptionRecord->ExceptionCode : 0;
+    {
+        static std::once_flag reported;
+        std::call_once(reported, [info] { report_crash_memory(info); });
+    }
     if (code != EXCEPTION_STACK_OVERFLOW) {
         // Several title threads can fault at once (measured: eight within a second). The first writes; the others
         // wait here for it, so none of them reaches the title's filter, which may end the process, mid-write.
@@ -836,6 +894,8 @@ int wmain(int argc, wchar_t** argv) {
 #ifdef LEONIDA_VULKAN_DEVICE
         leonida::thread_stack_hook.store(&rt::print_thread_stacks_now, std::memory_order_release);
 #endif
+        leonida::dev_overlay::stall_stacks.store(&rt::print_thread_stacks_now, std::memory_order_release);
+        leonida::dev_overlay::stall_stacks.store(&rt::print_thread_stacks_now, std::memory_order_release);
         code = rt::process::run_entry(main_module.base + main_module.entry_rva);
         std::fflush(stdout);
         std::printf("game exited with code %d\n", code);
