@@ -422,15 +422,17 @@ public:
         SubmitMutex& gate_;
     };
 
-    // merge: this tree's default, as runtime/README.md and compute_driver_turn have it: off unless
-    // LEONIDA_COMPILE_GATE=1. Upstream's default (on unless 0) came in with 9f98dcc61 and made every retail boot after
-    // the merge die 2-4 min in: one graphics pipeline create held each queue submission here for 17-27 s, and the
-    // title's GPU watchdog (exe+0x23CF683) ended the run. Without the gate the asynchronous workers compile while the
-    // queues submit, as in this tree's boots that reached the loading screen.
+    // On unless LEONIDA_COMPILE_GATE=0 (upstream's default, 9f98dcc61). With it off (6f0871a5c made it opt-in) every
+    // retail boot died 105-160 s in on title structures that GPU-made data had overwritten (half-float +-65504 bounds
+    // in the physical CPU window; exe+0x35A4245, 0x140108557, 0x1452ECF93): a bisect put the 2 h and 314 s boots on
+    // the gated side and every crashing one on the other, and the gated merge build ran 480 s clean. The 17-27 s
+    // submission waits that made it opt-in were inline host imports under the queue lock, not the gate: with the
+    // cached import types the gated boot logged no wait of 50 ms. LEONIDA_COMPILE_GATE=1 additionally takes
+    // compute_driver_turn (d3d12_vulkan_device.cpp), which holds the whole submit lock across compute compiles.
     static bool compile_gate_enabled() {
         static const bool on = [] {
             const char* value = std::getenv("LEONIDA_COMPILE_GATE");
-            return value && !std::strcmp(value, "1");
+            return !(value && !std::strcmp(value, "0"));
         }();
         return on;
     }

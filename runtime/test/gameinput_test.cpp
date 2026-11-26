@@ -1789,9 +1789,6 @@ int main(int argc, char** argv) {
         rt::gameinput::poll();
         check(pad_state(input, nullptr).buttons == GameInputGamepadX,
               "scripted X survives focus loss; reload does not replace it with Y");
-        // merge: since 9f98dcc61 a scripted press is held past its 0.3 s until the title has read the pads 6 times
-        // (gameinput.cpp, kReads), so a press a title never sees is not lost. Read them as a title would meanwhile.
-        for (int read = 0; read < 6; ++read) (void)pad_state(input, nullptr);
         Sleep(350);
         g_focus = true;
         rt::gameinput::poll();

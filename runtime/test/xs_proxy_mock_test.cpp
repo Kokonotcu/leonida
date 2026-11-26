@@ -142,6 +142,7 @@ struct Mock {
     // list: set by a call the Vulkan layer's list takes as invalid (a texture barrier with no resource at slot 80, a
     // clear at slot 48 of a view made with no resource); Close (slot 9) then fails, as that list's does.
     bool list_error;
+    unsigned closes_ok;  // list: Closes that succeeded (chained submission holds one reference for each)
     // list slot 80 (Barrier): what the last call carried, copied (the proxy's converted groups live for the call).
     UINT barrier_group_count;
     D3D12_BARRIER_TYPE barrier_group_types[4];
@@ -593,7 +594,11 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         m->om_dsv = dsv ? dsv->ptr : 0;
     }
     if (m->kind == Kind::list || m->kind == Kind::command_list) {
-        if (slot == 9) return static_cast<std::uint32_t>(m->list_error ? E_INVALIDARG : S_OK);  // Close
+        if (slot == 9) {  // Close
+            if (m->list_error) return static_cast<std::uint32_t>(E_INVALIDARG);
+            ++m->closes_ok;
+            return S_OK;
+        }
         if (slot == 48 && mock_is_null_rtv(static_cast<SIZE_T>(a1))) m->list_error = true;  // ClearRenderTargetView
         if (slot == 80) mock_barrier(m, a1, a2);                                             // Barrier
     }
@@ -5373,7 +5378,12 @@ int check_console_null_barrier_and_clear() {
     EXPECT(release(other_list) == 0 && other_real->refs == 0);
     EXPECT(release(other_allocator) == 0);
     EXPECT(release(other) == 0 && other_mock->refs == 0);
-    EXPECT(release(list) == 0 && real->refs == 0);
+    // merge: chained submission (LEONIDA_CHAIN_SUBMIT, on by default) holds each closed list until a console execute
+    // of its type runs it (none runs here): one reference per Close, as in the sections above.
+    // merge: chained submission (LEONIDA_CHAIN_SUBMIT, on by default) holds each list a Close succeeded on until a
+    // console execute of its type runs it (none runs here): one reference per successful Close. The Closes after an
+    // invalid clear or barrier fail (list_error) and hold none.
+    EXPECT(release(list) == 0 && real->refs == static_cast<long>(real->closes_ok));
     EXPECT(release(allocator) == 0);
     EXPECT(release(device) == 0 && mock->refs == 0);
     g_mock_null_rtv_count = 0;

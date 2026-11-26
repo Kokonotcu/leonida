@@ -11857,9 +11857,9 @@ public:
         // into the mapping for a read range, and uploads the CPU's writes at Unmap and before submissions. The pages
         // handed out below never see what the GPU wrote into the image (xbox_linear_texture_map read stale bytes).
         // A refusal (pages gone after a shared mapping) falls back to the pages, as before.
-        // LEONIDA_LINEAR_MAP_READBACK=1 only, for now: with it on, every boot died 2-3 min in on a title structure that
-        // GPU data (half-float +-65504 bounds, an RGBA16F target's contents) had overwritten; the read-back may write
-        // past what the title gave the lease (under investigation).
+        // LEONIDA_LINEAR_MAP_READBACK=1 only: it was switched off while boots died 2-3 min in on title structures that
+        // GPU data had overwritten. That was the compile gate being off (vulkan_device_fault.h), not this read-back,
+        // but the read-back is unproven on retail boots and stays opt-in until one runs with it.
         static const bool readback = [] {
             const char* v = std::getenv("LEONIDA_LINEAR_MAP_READBACK");
             return v && v[0] == '1';
@@ -17301,7 +17301,13 @@ public:
             // them under its lock, and the refresh below releases retired textures, whose ~Resource takes that lock
             // again on this thread (std::system_error "resource deadlock would occur"; merged boot 2). They carry
             // the layer's copies, not title work, so there is nothing for the refresh to bring up to date.
-            if (t_internal_submit) return;
+            // Its replay serial is still taken: after_execute pops one for every execute_lists, and without a push
+            // here an internal submission nested in a title replay popped the title's serial, so geometry views
+            // retired in that replay were stamped with a ticket short of its own submissions and freed under them.
+            if (t_internal_submit) {
+                state_.geometry_execute_begin();
+                return;
+            }
             namespace phases = leonida::submit_phases;
             // LEONIDA_REFRESH_PER_FRAME (for runs that only need the title to go on): 1 = the slot-133 shadows, title
             // windows and geometry copies are brought up to date only by the first submission after each present,
@@ -17313,7 +17319,7 @@ public:
                 const char* v = std::getenv("LEONIDA_REFRESH_PER_FRAME");
                 return v && *v ? std::atoi(v) : 0;
             }();
-            state_.geometry_execute_begin();
+            state_.geometry_execute_begin();  // paired with after_execute's geometry_execute_end
             bool full = true;
             if (per_frame) {
                 const std::uint64_t serial = phases::totals().present_serial.load(std::memory_order_relaxed);
