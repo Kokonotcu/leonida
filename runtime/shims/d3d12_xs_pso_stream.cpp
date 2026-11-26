@@ -6,6 +6,9 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
 namespace rt::d3d12_xs {
 namespace {
@@ -104,6 +107,46 @@ const unsigned char* own_blob(std::vector<std::vector<unsigned char>>& blobs, co
     const auto* src = static_cast<const unsigned char*>(bytes);
     blobs.emplace_back(src, src + count);
     return blobs.back().data();
+}
+
+// One shared copy per distinct content, for the bytes records point at (shader containers, input layouts and their
+// semantic names): the retail title creates tens of thousands of PSOs from a few thousand shaders, and each record
+// kept its own copy of every container (~39,000 DXBC copies in the default heap 100 s into a boot). Entries are weak:
+// a blob lives while a record holds it. The content is compared whole, the hash only picks the bucket.
+class BlobPool {
+public:
+    static BlobPool& instance() {
+        static auto* pool = new BlobPool;  // never destroyed: records may outlive static destruction order
+        return *pool;
+    }
+    PsoStreamRecord::ShaderData intern(const void* bytes, std::size_t count) {
+        const auto* src = static_cast<const unsigned char*>(bytes);
+        std::uint64_t hash = 14695981039346656037ull;  // FNV-1a
+        for (std::size_t i = 0; i < count; ++i) hash = (hash ^ src[i]) * 1099511628211ull;
+        hash ^= count;
+        std::lock_guard lock(mutex_);
+        const auto [first, last] = blobs_.equal_range(hash);
+        for (auto it = first; it != last; ++it)
+            if (auto live = it->second.lock();
+                live && live->size() == count && std::memcmp(live->data(), src, count) == 0)
+                return live;
+        auto made = std::make_shared<const std::vector<std::uint8_t>>(src, src + count);
+        // Forget the expired entries now and then, so the table does not grow with every blob ever made.
+        if (++inserted_ % 4096 == 0) std::erase_if(blobs_, [](const auto& entry) { return entry.second.expired(); });
+        blobs_.emplace(hash, made);
+        return made;
+    }
+
+private:
+    std::mutex mutex_;
+    std::unordered_multimap<std::uint64_t, std::weak_ptr<const std::vector<std::uint8_t>>> blobs_;
+    std::uint64_t inserted_ = 0;
+};
+
+// The shared copy of `count` bytes, held by `held` for the record's life; returns its address.
+const unsigned char* shared_blob(std::vector<PsoStreamRecord::ShaderData>& held, const void* bytes, std::size_t count) {
+    held.push_back(BlobPool::instance().intern(bytes, count));
+    return held.back()->data();
 }
 
 // Holds a PsoStreamRecord as an IUnknown: the object keeps one reference, the creation code drops its own.
@@ -303,7 +346,7 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
             if (code.pShaderBytecode && code.BytecodeLength) {
                 for (const auto& shader : payloads_->shaders)
                     if (shader->data() == code.pShaderBytecode && shader->size() == code.BytecodeLength) return true;
-                code.pShaderBytecode = own_blob(payloads_->blobs, code.pShaderBytecode, code.BytecodeLength);
+                code.pShaderBytecode = shared_blob(payloads_->shaders, code.pShaderBytecode, code.BytecodeLength);
                 std::memcpy(payload, &code, sizeof(code));
             }
             return true;
@@ -324,16 +367,18 @@ bool PsoStreamRecord::copy_pointed_data(std::size_t type, std::size_t payload_of
             D3D12_INPUT_LAYOUT_DESC layout{};
             std::memcpy(&layout, payload, sizeof(layout));
             if (!layout.pInputElementDescs || !layout.NumElements) return true;
-            const std::size_t bytes = layout.NumElements * sizeof(D3D12_INPUT_ELEMENT_DESC);
-            auto* elements = reinterpret_cast<D3D12_INPUT_ELEMENT_DESC*>(
-                const_cast<unsigned char*>(own_blob(payloads_->blobs, layout.pInputElementDescs, bytes)));
-            for (UINT i = 0; i < layout.NumElements; ++i) {
-                if (!elements[i].SemanticName) continue;
-                const std::size_t len = std::strlen(elements[i].SemanticName) + 1;
-                elements[i].SemanticName =
-                    reinterpret_cast<const char*>(own_blob(payloads_->blobs, elements[i].SemanticName, len));
+            // The names first (shared), then the element array that points at them (shared too: two equal layouts
+            // point at the same names, so their arrays are byte for byte equal).
+            std::vector<D3D12_INPUT_ELEMENT_DESC> elements(layout.pInputElementDescs,
+                                                           layout.pInputElementDescs + layout.NumElements);
+            for (D3D12_INPUT_ELEMENT_DESC& element : elements) {
+                if (!element.SemanticName) continue;
+                const std::size_t len = std::strlen(element.SemanticName) + 1;
+                element.SemanticName =
+                    reinterpret_cast<const char*>(shared_blob(payloads_->shaders, element.SemanticName, len));
             }
-            layout.pInputElementDescs = elements;
+            layout.pInputElementDescs = reinterpret_cast<const D3D12_INPUT_ELEMENT_DESC*>(shared_blob(
+                payloads_->shaders, elements.data(), elements.size() * sizeof(D3D12_INPUT_ELEMENT_DESC)));
             std::memcpy(payload, &layout, sizeof(layout));
             return true;
         }

@@ -42,7 +42,7 @@ inline constexpr unsigned kDerivedMaxRecords = 4;
 
 // An owned deep copy of one pipeline state stream. The root signature references are held until destruction; shader
 // bytecode, stream-output and input-layout arrays and strings, and cached blobs are copied, and their pointers in the
-// copy point at the copies.
+// copy point at the copies. Shader bytecode and input layouts are copies shared with every record of the same content.
 class PsoStreamRecord {
 public:
     // Null when the stream is malformed, holds a subobject type this module does not walk, or is too large.
@@ -74,6 +74,8 @@ private:
     std::vector<unsigned char> bytes_;
     struct Payloads {
         std::vector<std::vector<unsigned char>> blobs;  // owned copies; their buffers do not move when this grows
+        // The caller's shader containers, and the copies shared by content with every other record (shader bytecode,
+        // input layouts and their semantic names: BlobPool in d3d12_xs_pso_stream.cpp).
         std::vector<ShaderData> shaders;
         std::vector<ID3D12RootSignature*> roots;        // AddRef'd
         ~Payloads();

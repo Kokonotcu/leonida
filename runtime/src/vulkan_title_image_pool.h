@@ -75,11 +75,18 @@ public:
         // Eight size classes per power of two keep padding below one eighth (besides required alignment).
         const VkDeviceSize quantum = std::max(req.alignment, std::max(VkDeviceSize{1}, std::bit_floor(needed) / 8));
         const VkDeviceSize stride = (needed + quantum - 1) & ~(quantum - 1);
-        const VkDeviceSize page_size = std::min(VkDeviceSize{8} << 20, 256 * stride);
+        const VkDeviceSize largest_page = std::min(VkDeviceSize{8} << 20, 256 * stride);
         auto allocation = std::make_unique<PooledTitleImage>();
         std::lock_guard lock(mutex_);
         auto& pages = classes_[stride];
         std::erase_if(pages, [](const auto& page) { return page.expired(); });
+        // A class's first page holds 4 slots and each further one twice as many as the one before, up to
+        // `largest_page`. Every page used to be the largest at once: 100 s into the retail boot ~30 classes held one
+        // 8 MiB page each with a few slots used (~150 MiB of the pool's ~390 MiB of empty slots), video memory that
+        // pushed later pages past the VRAM budget into system memory.
+        const VkDeviceSize largest_slots = largest_page / stride;
+        const VkDeviceSize page_size =
+            std::min<VkDeviceSize>(largest_slots, VkDeviceSize{4} << std::min<std::size_t>(pages.size(), 6)) * stride;
         for (const auto& weak : pages) {
             auto page = weak.lock();
             if (page && (req.memoryTypeBits & (1u << page->type)) && page->take(allocation->slot)) {

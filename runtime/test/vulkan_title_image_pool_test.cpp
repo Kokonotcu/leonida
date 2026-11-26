@@ -7,7 +7,7 @@
 namespace {
 unsigned allocated, freed, destroyed, next_type;
 bool fail_alloc, fail_bind;
-VkDeviceSize last_offset;
+VkDeviceSize last_offset, last_page_size;
 VKAPI_ATTR VkResult VKAPI_CALL bind_image(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize offset) {
     last_offset = offset;
     return fail_bind ? VK_ERROR_OUT_OF_DEVICE_MEMORY : VK_SUCCESS;
@@ -24,8 +24,9 @@ int main() {
     const auto make = [&] {
         const auto image = (VkImage)(std::uintptr_t(++next_image));
         return pool.bind(VK_NULL_HANDLE, image, req, bind_image, destroy_image, free_memory,
-                         [](VkDeviceSize, std::uint32_t& type) {
+                         [](VkDeviceSize size, std::uint32_t& type) {
                              type = next_type;
+                             last_page_size = size;
                              return fail_alloc ? VkDeviceMemory{} : (VkDeviceMemory)(std::uintptr_t(++allocated));
                          });
     };
@@ -67,5 +68,23 @@ int main() {
     a = make(); b = make();
     CHECK(a && b && a->page == b->page && last_offset % req.alignment == 0);
     CHECK(last_offset >= req.size && last_offset <= req.size + req.size / 8);
-    std::puts("title image pool alignment, type separation, retirement, reuse and fallback OK");
+    a.reset(); b.reset();
+
+    // A class's pages grow: 4 slots first, then twice as many each time, up to 8 MiB (or 256 slots).
+    req = {65536, 65536, 1};
+    next_type = 0;
+    live.clear();
+    std::vector<VkDeviceSize> page_sizes;
+    for (int i = 0; i < 4 + 8 + 16; ++i) {
+        const unsigned before = allocated;
+        live.push_back(make());
+        CHECK(live.back());
+        if (allocated != before) page_sizes.push_back(last_page_size);
+    }
+    CHECK(page_sizes.size() == 3 && page_sizes[0] == 4 * 65536 && page_sizes[1] == 8 * 65536 &&
+          page_sizes[2] == 16 * 65536);
+    for (int i = 0; i < 300; ++i) live.push_back(make());
+    CHECK(last_page_size == VkDeviceSize{8} << 20);  // 128 slots of 64 KiB: the largest page
+    live.clear();
+    std::puts("title image pool alignment, type separation, retirement, reuse, fallback and page growth OK");
 }

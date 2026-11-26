@@ -26,6 +26,7 @@
 #include <cstring>
 #include <iterator>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -128,17 +129,69 @@ inline std::uint64_t library_key(Part part, const Recipe& r, bool per_sample = f
     return h;
 }
 
+// The identity of a vertex input or fragment output part: every recipe field LibraryCreateInfo reads for that part, as
+// bytes (compared whole, not hashed, so two parts are shared only when their create infos are equal). These parts
+// carry no shader; they were made per PSO (and per variant for the output part) until each turned out to cost the
+// NVIDIA driver ~7.5 KB of host memory (617.42: 20,000 identical vertex input parts took 144 MiB of private bytes,
+// D:\GTA6\analysis\tools\vkobj_cost.cpp), and the title's PSOs share a few hundred vertex layouts and target setups.
+inline std::string state_part_key(Part part, const Recipe& r) {
+    std::string key;
+    const auto put = [&key](const void* data, std::size_t bytes) {
+        key.append(static_cast<const char*>(data), bytes);
+    };
+    const auto value = [&put](const auto& v) { put(&v, sizeof(v)); };
+    const auto array = [&put, &value](const auto& items) {
+        value(items.size());
+        if (!items.empty()) put(items.data(), items.size() * sizeof(items[0]));
+    };
+    value(part);
+    if (part == Part::vertex_input) {
+        array(r.bindings);
+        array(r.attributes);
+        array(r.divisors);
+        value(r.topology);
+        value(r.primitive_restart);
+    } else if (part == Part::output) {
+        array(r.colors);
+        value(r.depth_format);
+        value(r.stencil_format);
+        array(r.blends);
+        value(r.logic_op_enable);
+        value(r.logic_op);
+        value(r.samples);
+        value(r.sample_shading);
+        value(r.min_sample_shading);
+        value(r.sample_mask);
+        value(r.alpha_to_coverage);
+        value(r.alpha_to_one);
+    }
+    return key;
+}
+
 // PSOs get link-time-optimised pipelines (from the pipeline cache at creation, else linked on the device's background
 // worker after the first draw), and the parts are created retaining their link-time-optimisation information for
-// that. LEONIDA_GPL_OPTIMIZE=0: fast links only, and parts that retain nothing (measured 2026-11-25: not where the
-// process's memory goes; the boots' stalls came from the compile gate, vulkan_device_fault.h).
+// that. LEONIDA_GPL_OPTIMIZE=0: fast links only, and parts that retain nothing.
+//
+// With LEONIDA_DEFER_GRAPHICS=1 it is off unless LEONIDA_GPL_OPTIMIZE=1 asks for it. A deferred PSO's pipelines are
+// all built through its variants (vulkan_replay.h takes the variant path for every draw of a deferred PSO and never
+// reaches the optimised link's request), so the optimised link never ran, while every shared part still kept its
+// retained data for the device's life: the NVIDIA driver holds a copy of the part's SPIR-V and its own intermediate
+// code in its 1 GiB heaps. Measured 100 s into a retail boot (2026-11-25, arena_scan): 144 SPIR-V copies (~262 MiB)
+// in those heaps with retention, 2 without, and the heaps grow with every new shader the title draws with.
 inline bool gpl_optimize() {
     static const bool on = [] {
         const char* value = std::getenv("LEONIDA_GPL_OPTIMIZE");
-        const bool off = value && value[0] == '0' && value[1] == 0;
-        if (off)
+        const char* defer = std::getenv("LEONIDA_DEFER_GRAPHICS");
+        const bool asked_off = value && value[0] == '0' && value[1] == 0;
+        const bool asked_on = value && value[0] == '1' && value[1] == 0;
+        const bool deferred = defer && defer[0] == '1';
+        if (asked_off)
             std::fprintf(stderr, "[rt] d3d12: LEONIDA_GPL_OPTIMIZE=0: pipeline-library PSOs keep their fast links only\n");
-        return !off;
+        else if (deferred && !asked_on)
+            std::fprintf(stderr, "[rt] d3d12: deferred graphics PSOs (LEONIDA_DEFER_GRAPHICS=1) keep their fast links "
+                                 "only; their parts retain no link-time-optimisation data (LEONIDA_GPL_OPTIMIZE=1 "
+                                 "keeps it)\n");
+        return !asked_off && (!deferred || asked_on);
     }();
     return on;
 }

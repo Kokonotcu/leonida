@@ -151,8 +151,6 @@ public:
     bool custom_border_color = false;  // VK_EXT_custom_border_color and customBorderColors enabled
     bool custom_border_color_without_format = false;
     bool shader_output_viewport_index = false;  // Vulkan 1.2 shaderOutputViewportIndex enabled
-    bool request_buffer_marker = false;  // set before initialize(): enable VK_AMD_buffer_marker where available
-    bool buffer_marker = false;          // VK_AMD_buffer_marker is enabled
     bool request_null_descriptor = false;  // set before initialize(): enable VK_EXT_robustness2 nullDescriptor
     bool null_descriptor = false;          // VK_EXT_robustness2 and nullDescriptor are enabled
     // VK_EXT_external_memory_host is enabled when non-zero: its minImportedHostPointerAlignment.
