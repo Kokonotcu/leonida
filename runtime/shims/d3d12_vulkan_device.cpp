@@ -2318,6 +2318,8 @@ struct TextureCreateInfo {
         if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
             (attachment_usable || format.format != VK_FORMAT_A4R4G4B4_UNORM_PACK16))
             info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        // A native A8 image is one the title may render into without having said so (the glyph cache: texture_format).
+        if (format.a8_as_alpha) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
         // No B8G8R8X8 view is ever a UAV, so its typeless family needs no storage usage (not every GPU has it for BGRA8).
         if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format)) {
@@ -7690,7 +7692,17 @@ struct DeviceState {
             }
         }
         Format format = texture_storage_format(desc.Format, desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
-        if (desc.Format == DXGI_FORMAT_A8_UNORM && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+        // Any plain 2D A8 texture is a VK_FORMAT_A8_UNORM_KHR image where the device renders that format, with or
+        // without the render-target flag: Scaleform's 2048x2048 A8 glyph cache is made from its slot-70 view (no
+        // flags) and then drawn into through A8 render-target views, which on an R8 image were null views, so every
+        // glyph draw was dropped and the cache stayed empty: no text on any screen (dump at the LEGAL NOTICES page,
+        // 2026-11-26). One byte a texel, as the R8 image was; samples read (0, 0, 0, a), as the console's A8.
+        if (desc.Format == DXGI_FORMAT_A8_UNORM && info.a8_render_target &&
+            desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && desc.SampleDesc.Count == 1 &&
+            !(desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))) {
+            format = Format{kA8UnormFormat, VK_IMAGE_ASPECT_COLOR_BIT};
+            format.a8_as_alpha = true;
+        } else if (desc.Format == DXGI_FORMAT_A8_UNORM && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
             // merge: upstream's VK_FORMAT_A8_UNORM_KHR image where the device has it (VulkanDeviceInfo::
             // a8_render_target; a plain 2D target): one byte a texel, so copies to and from buffers and other A8
             // textures move the title's bytes. Elsewhere ours, an RGBA8 image (kA8TargetFormat). Both render the
@@ -26301,6 +26313,9 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                                             VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
         info.a8_render_target = maintenance5.maintenance5 == VK_TRUE && (a8.optimalTilingFeatures & needed) == needed;
     }
+    std::fprintf(stderr, "[rt] d3d12: A8_UNORM textures are %s\n",
+                 info.a8_render_target ? "VK_FORMAT_A8_UNORM_KHR images (render targets too)"
+                                       : "R8_UNORM images (RGBA8 when made as render targets)");
 #endif
 
 #ifdef VK_KHR_MAINTENANCE_10_EXTENSION_NAME

@@ -4262,6 +4262,44 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
         note_list_slot(Slot, a1, a2, a3, a4, layout);
         constexpr unsigned pc = console_to_pc_list_slot(Slot);
         if constexpr (pc == kListNotForwarded) {
+            // The console's copy methods past the PC chain (newer layout; names from five-star-recomp's TextureCopies,
+            // after victory-gta6's list table: older slots 60 and 84). Both were dropped as unmodelled slots: the
+            // game's texture copies (texture to texture, and its upload ring to a texture: the glyph cache and the UI
+            // images) and its memory copies never happened, so their destinations kept what was there before.
+            if constexpr (Slot == 86) {
+                // CopyResourceX(dst, src, flags): CopyResource with a trailing flags word, which is dropped.
+                if (layout == kConsoleLayoutNewer && a1 && a2) {
+                    self->part_has_work = true;
+                    self->real->CopyResource(reinterpret_cast<ID3D12Resource*>(unwrap_object(a1)),
+                                             reinterpret_cast<ID3D12Resource*>(unwrap_object(a2)));
+                    return 0;
+                }
+            }
+            if constexpr (Slot == 62) {
+                // CopyMemoryToMemoryX(dst, src, bytes, flags) between the title's GPU addresses (unified memory on the
+                // console). The title's memory is reached on the GPU only through the page table, which a transfer
+                // cannot use, so the bytes move on the CPU as the call is recorded: what the game copies this way is
+                // staged data that is complete when it records the copy (the upload ring, moved resources). Through
+                // kernel_writes, so the layer's mirrors of the destination see the write, and a range the CPU cannot
+                // read here is left as it is instead of faulting.
+                if (layout == kConsoleLayoutNewer && a1 && a2 && a3) {
+                    self->part_has_work = true;
+                    const bool ok = leonida::kernel_writes::write(reinterpret_cast<void*>(a1),
+                                                                  reinterpret_cast<const void*>(a2),
+                                                                  static_cast<std::size_t>(a3));
+                    static std::atomic<std::uint64_t> copies{0}, failed{0};
+                    const std::uint64_t n = copies.fetch_add(1, std::memory_order_relaxed) + 1;
+                    const std::uint64_t f = ok ? failed.load(std::memory_order_relaxed)
+                                               : failed.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if ((n & (n - 1)) == 0 || (!ok && (f & (f - 1)) == 0))
+                        std::fprintf(stderr, "[rt] d3d12_xs: list slot 62 CopyMemoryToMemoryX: %llu copies, %llu not "
+                                             "readable or writable here (last %#llx <- %#llx, %llu bytes)\n",
+                                     static_cast<unsigned long long>(n), static_cast<unsigned long long>(f),
+                                     static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+                                     static_cast<unsigned long long>(a3));
+                    return 0;
+                }
+            }
             if constexpr (Slot == kConsoleAllocateUpload) {
                 // merge: ours (7e9db802c), a ring in title-range memory the page table resolves, so a pointer the
                 // caller hides in its data (XboxBvhBuilder.dll's build inputs) reaches the GPU as it is; upstream's

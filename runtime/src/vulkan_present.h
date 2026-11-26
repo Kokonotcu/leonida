@@ -882,6 +882,9 @@ private:
             presented_ % std::uint64_t(capture_every_) == 0)
         {
             probe_read_source(id, presented_ + 1, path);
+            // Plane 1 too (the title's front end draws its UI, prompts and loading screen there: shims/xbox_present.cpp).
+            if (planes && planes->count == 2 && planes->plane[1].source && planes->plane[1].source != id)
+                probe_read_source(planes->plane[1].source, presented_ + 1, "plane 1", "plane1");
             // LOCAL DIAGNOSTIC (fsdraw): the render targets of the frame's fullscreen draws, read back with it.
             for (const std::uint64_t target : fsdraw::targets())
                 if (target != id) probe_read_source(target, presented_ + 1, "fullscreen-draw target", "target");
@@ -1550,6 +1553,9 @@ private:
             }
             return true;
         case VK_FORMAT_R8_UNORM: out[0] = out[1] = out[2] = p[0] / 255.0f, out[3] = 1.0f; return true;
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        case VK_FORMAT_A8_UNORM_KHR: out[0] = out[1] = out[2] = p[0] / 255.0f, out[3] = 1.0f; return true;  // coverage
+#endif
         case VK_FORMAT_R16_UINT:          // the R16_UINT backing of a B5G5R5A1 UAV texture (uint_backed): A1R5G5B5
         case VK_FORMAT_A1R5G5B5_UNORM_PACK16: {
             std::uint16_t v;
@@ -1571,6 +1577,9 @@ private:
     static std::uint32_t texel_bytes(VkFormat f) {
         switch (f) {
         case VK_FORMAT_R8_UNORM: return 1;
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        case VK_FORMAT_A8_UNORM_KHR: return 1;
+#endif
         case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16_UINT: case VK_FORMAT_A1R5G5B5_UNORM_PACK16: return 2;
         case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
         default: return 4;

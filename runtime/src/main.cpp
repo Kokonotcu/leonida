@@ -463,6 +463,11 @@ LONG CALLBACK crash_logger(EXCEPTION_POINTERS* info) {
             }
             std::fprintf(stderr, "\n");
         }
+        // LOCAL DIAGNOSTIC (2026-11-26): a recent host write (a file read, a DirectStorage copy) into the title's
+        // memory that covers what a register points at: a title object found holding a stream's bytes was either
+        // read over (this names the write) or written by the GPU (nothing here).
+        for (const auto& reg : regs)
+            if (reg.value >= 0x10000) leonida::kernel_writes::report_recent_writes(reg.value, reg.name);
     }
     // Diagnostic: the retail frame path reads through 0x100000000 (the synthetic-VA base). Commit one guard page
     // there so a read of that address is a value, not a fault, while the caller is being identified.

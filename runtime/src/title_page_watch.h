@@ -755,6 +755,32 @@ inline State& state() {
     return s;
 }
 
+// LOCAL DIAGNOSTIC (2026-11-26: title objects in the physical window found holding a serialized BVH stream's bytes):
+// the last 4,096 host writes into title memory begun here (file reads, DirectStorage copies), so the crash report can
+// name one that covers an address it shows. A fixed array: the crash handler reads it without allocating or locking.
+struct RecentWrite {
+    std::uint64_t begin, end, tick;
+};
+inline RecentWrite g_recent_writes[4096];
+inline std::atomic<std::uint64_t> g_recent_next{0};
+inline void note_recent_write(const void* buffer, std::size_t bytes) {
+    const std::uint64_t slot = g_recent_next.fetch_add(1, std::memory_order_relaxed) & 4095;
+    const auto begin = reinterpret_cast<std::uintptr_t>(buffer);
+    g_recent_writes[slot] = {begin, begin + bytes, GetTickCount64()};
+}
+// For the crash handler: every recorded write covering [address - slack, address + slack], with its age.
+inline void report_recent_writes(std::uint64_t address, const char* what, std::uint64_t slack = 0x10000) {
+    const std::uint64_t now = GetTickCount64();
+    const std::uint64_t written = (std::min)(g_recent_next.load(std::memory_order_relaxed), std::uint64_t(4096));
+    for (std::uint64_t i = 0; i < written; ++i) {
+        const RecentWrite w = g_recent_writes[i];
+        if (w.begin && w.begin <= address + slack && address < w.end + slack)
+            std::fprintf(stderr, "[rt] crash-writes: %s=%#llx in a host write %#llx..%#llx %llu ms before the crash\n",
+                         what, static_cast<unsigned long long>(address), static_cast<unsigned long long>(w.begin),
+                         static_cast<unsigned long long>(w.end), static_cast<unsigned long long>(now - w.tick));
+    }
+}
+
 inline void set_opener(Opener opener) { state().opener.store(opener, std::memory_order_release); }
 inline void set_committer(Committer committer) { state().committer.store(committer, std::memory_order_release); }
 inline void set_unguarder(Unguarder unguarder) { state().unguarder.store(unguarder, std::memory_order_release); }
@@ -787,6 +813,7 @@ void for_each_pin(std::uintptr_t begin, std::uintptr_t end, F&& f) {
 // Before the kernel writes [buffer, buffer + bytes): pins the range (until end_write(), or until `overlapped` completes
 // when it is not null) and opens it. Returns the pin's id, 0 when nothing was pinned.
 inline std::uint64_t begin_write(const void* buffer, std::size_t bytes, const OVERLAPPED* overlapped) {
+    if (buffer && bytes) note_recent_write(buffer, bytes);
     State& s = state();
     const Opener opener = s.opener.load(std::memory_order_acquire);
     if (!opener || !buffer || !bytes) return 0;
