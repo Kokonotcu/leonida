@@ -422,10 +422,15 @@ public:
         SubmitMutex& gate_;
     };
 
+    // merge: this tree's default, as runtime/README.md and compute_driver_turn have it: off unless
+    // LEONIDA_COMPILE_GATE=1. Upstream's default (on unless 0) came in with 9f98dcc61 and made every retail boot after
+    // the merge die 2-4 min in: one graphics pipeline create held each queue submission here for 17-27 s, and the
+    // title's GPU watchdog (exe+0x23CF683) ended the run. Without the gate the asynchronous workers compile while the
+    // queues submit, as in this tree's boots that reached the loading screen.
     static bool compile_gate_enabled() {
         static const bool on = [] {
             const char* value = std::getenv("LEONIDA_COMPILE_GATE");
-            return !(value && !std::strcmp(value, "0"));
+            return value && !std::strcmp(value, "1");
         }();
         return on;
     }

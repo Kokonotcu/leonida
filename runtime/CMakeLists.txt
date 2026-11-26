@@ -1253,6 +1253,11 @@ if(BUILD_TESTING)
     set_target_properties(tiny_game_ga PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
+    # gta6rt_no_tls_dtor: no thread_local with a destructor in gta6rt.exe (the title's CRT aborts at startup).
+    add_executable(no_tls_dtor_test test/no_tls_dtor_test.cpp)
+    target_compile_definitions(no_tls_dtor_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_compile_options(no_tls_dtor_test PRIVATE /W4 /permissive- /utf-8)
+    add_dependencies(no_tls_dtor_test gta6rt)
     add_executable(tiny_game_exit_code_test test/tiny_game_exit_code_test.cpp)
     target_compile_definitions(tiny_game_exit_code_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_compile_options(tiny_game_exit_code_test PRIVATE /W4 /permissive- /utf-8)
@@ -1990,6 +1995,9 @@ if(BUILD_TESTING)
              "-DTOOL=$<TARGET_FILE:gta6rt>" "-DWANT=${GTA6RT_STACK}"
              -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_stack_reserve.cmake")
     add_test(NAME run_tiny_game_stack COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42 stack)
+    # A thread_local with a destructor anywhere in gta6rt links the CRT's TLS destructor callback, whose startup
+    # registration the retail title's CRT then repeats and aborts on (0xC0000409 at 0.9 s, upstream 861bb0546).
+    add_test(NAME gta6rt_no_tls_dtor COMMAND no_tls_dtor_test $<TARGET_FILE:gta6rt>)
     # A /GA executable under --run and --init reads its TLS from slot 0, and the trace names gta6rt.exe as the image
     # whose index 0 moved.
     add_test(NAME run_tiny_tls_ga COMMAND ${CMAKE_COMMAND}

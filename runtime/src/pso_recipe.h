@@ -14,6 +14,7 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -642,6 +643,44 @@ inline bool read_recipes(const std::filesystem::path& path, RecipesFile& out) {
         else ++out.bad_lines;
     }
     return header;
+}
+
+// pso_prebuilt.txt beside pso_recipes.jsonl: the keys (16 hex digits a line) of the recipes `gta6rt
+// --prebuild-pipelines` built as whole, optimised pipelines into the pipeline cache it saved. A run asks the cache for
+// exactly these (cache only, VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) and fast-links every other PSO
+// from its parts, so no optimised compile runs while the game does.
+inline std::filesystem::path prebuilt_path(const std::filesystem::path& recipes) {
+    return recipes.parent_path() / L"pso_prebuilt.txt";
+}
+inline std::unordered_set<std::uint64_t> read_prebuilt(const std::filesystem::path& path) {
+    std::unordered_set<std::uint64_t> keys;
+    std::ifstream in(path, std::ios::binary);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.size() != 16) continue;
+        char* end = nullptr;
+        const unsigned long long k = std::strtoull(line.c_str(), &end, 16);
+        if (end && !*end) keys.insert(k);
+    }
+    return keys;
+}
+// Written whole to a temporary name and renamed over the old file, so a reader never sees half of it.
+inline bool write_prebuilt(const std::filesystem::path& path, const std::unordered_set<std::uint64_t>& keys) {
+    const std::filesystem::path temp = path.wstring() + L".tmp";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        char line[24];
+        for (const std::uint64_t k : keys) {
+            std::snprintf(line, sizeof line, "%016llx\n", static_cast<unsigned long long>(k));
+            out << line;
+        }
+        if (!out) return false;
+    }
+    std::error_code ec;
+    std::filesystem::rename(temp, path, ec);
+    return !ec;
 }
 
 class Recorder {

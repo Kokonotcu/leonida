@@ -2993,9 +2993,14 @@ struct DeviceState {
                                 forget_geometry_alias);
     }
     // ExecuteCommandLists replays in progress, for GeometryViews::kAfterExecutes (see drain_geometry_releases).
+    // merge: no thread_local with a destructor in gta6rt. One makes the exe register a TLS destructor callback, and the
+    // title's own CRT then registers its callback too, which the CRT takes as a second registration and terminates
+    // (register_thread_local_exe_atexit_callback -> abort, 0xC0000409 at 0.9 s into every boot). The vector is made
+    // once per thread that submits (a few) and left to the process's end; the pointer itself needs no destructor.
     static std::vector<std::uint64_t>& geometry_execute_serials() {
-        thread_local std::vector<std::uint64_t> serials;
-        return serials;
+        thread_local std::vector<std::uint64_t>* serials = nullptr;
+        if (!serials) serials = new std::vector<std::uint64_t>();
+        return *serials;
     }
     void geometry_execute_begin() {
         if (!geometry.cap()) return;
@@ -4101,8 +4106,133 @@ struct DeviceState {
         std::unordered_map<std::uintptr_t, std::chrono::steady_clock::time_point> failed_chunks;  // host start
         std::unordered_set<std::uint64_t> importing;  // pages a map_title_memory call imports outside the lock
         std::unordered_set<std::uintptr_t> importing_chunks;  // chunk starts physical_chunk imports outside it
+        // Window pages waiting for a chunk the import worker is making (chunk start -> pages): settled meanwhile, and
+        // unsettled when it is done so the next map takes them at once.
+        std::unordered_map<std::uintptr_t, std::vector<std::uint64_t>> chunk_waiters;
         std::uint64_t chunk_bytes = 0, chunk_failures = 0, chunks_released = 0, chunks_made = 0;
     } title_pages;
+
+    // LEONIDA_ASYNC_CHUNK_IMPORTS=1: a chunk or run a recording needs is imported on this worker, not on the recording
+    // thread. Each import is a driver host import that took 0.5-1 s with the process's ~60,000 regions, inside
+    // map_title_memory with the queue's lock held: a recording spent 1-1.9 s in title maps, the next
+    // ExecuteCommandLists waited 24.5 s for that lock, and the title's GPU watchdog ended the run (2026-11-25 21:0x).
+    // Off by default: meanwhile the page reads the scratch page, which other shaders write, and a dispatch that read
+    // it hung the GPU (lib_cs_02006). The root arguments' pages are mapped before the queue's lock instead
+    // (CommandQueue::map_title_root_arguments), so a recording rarely imports anything.
+    std::mutex chunk_worker_mutex;
+    std::condition_variable chunk_worker_wake;
+    // [start, end): a chunk of a section's view (physical pages), or (`run`) a run of title memory imported by address.
+    struct ChunkJob {
+        bool run;
+        std::uintptr_t start, end;
+    };
+    std::deque<ChunkJob> chunk_jobs;
+    bool chunk_worker_stop = false;
+    std::thread chunk_worker;
+    static bool async_chunk_imports() {
+        static const bool on = [] {
+            const char* v = std::getenv("LEONIDA_ASYNC_CHUNK_IMPORTS");
+            return v && v[0] == '1';
+        }();
+        return on;
+    }
+    void chunk_import_enqueue(std::uintptr_t start, std::uintptr_t end, bool run = false) {
+        std::lock_guard lock(chunk_worker_mutex);
+        if (chunk_worker_stop) return;
+        chunk_jobs.push_back({run, start, end});
+        if (!chunk_worker.joinable())
+            chunk_worker = std::thread([this] {
+                std::unique_lock lock(chunk_worker_mutex);
+                for (;;) {
+                    chunk_worker_wake.wait(lock, [this] { return chunk_worker_stop || !chunk_jobs.empty(); });
+                    if (chunk_worker_stop) return;
+                    const ChunkJob job = chunk_jobs.front();
+                    chunk_jobs.pop_front();
+                    lock.unlock();
+                    if (job.run) import_run_now(job.start, job.end);
+                    else import_chunk_now(job.start, job.end);
+                    lock.lock();
+                }
+            });
+        chunk_worker_wake.notify_one();
+    }
+    void stop_chunk_worker() {
+        {
+            std::lock_guard lock(chunk_worker_mutex);
+            chunk_worker_stop = true;
+            chunk_jobs.clear();
+        }
+        chunk_worker_wake.notify_all();
+        if (chunk_worker.joinable()) chunk_worker.join();
+    }
+    // The worker's import of a run of title memory by address (map_title_memory left it to the worker): its pages get
+    // their entries, or settle for kFailedChunkFor when the driver refuses it. They were marked importing until now.
+    void import_run_now(std::uintptr_t p, std::uintptr_t q) {
+        constexpr std::uint64_t page = 0x10000;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory imported = VK_NULL_HANDLE;
+        std::uint32_t types = 0;
+        // Still committed? The title may have freed it since the walk.
+        bool still = true;  // a run may span several regions, each committed when the walk saw it
+        for (std::uintptr_t at = p; still && at < q;) {
+            MEMORY_BASIC_INFORMATION region{};
+            still = VirtualQuery(reinterpret_cast<const void*>(at), &region, sizeof(region)) &&
+                    region.State == MEM_COMMIT && region.Type != MEM_MAPPED;
+            at = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
+        }
+        const VkDeviceAddress device_address =
+            still ? import_host(reinterpret_cast<void*>(p), q - p, buffer, imported, types) : 0;
+        std::lock_guard lock(title_pages.mutex);
+        for (std::uint64_t v = p; v < q; v += page) title_pages.importing.erase(v);
+        if (!device_address) {
+            const auto later = std::chrono::steady_clock::now() + (kFailedChunkFor - kSettledFor);
+            for (std::uint64_t v = p; v < q; v += page) title_pages.settled[v] = later;
+            title_pages.refused += (q - p) / page;
+            return;
+        }
+        title_pages.imports.emplace_back(buffer, imported);
+        title_pages.runs[p] = {q, buffer};
+        for (std::uint64_t v = p; v < q; v += page) {
+            if (title_pages.mapped.count(v)) continue;  // mapped meanwhile (a window page's remap)
+            if (!set_page_entry(v, device_address + (v - p))) break;
+            title_pages.mapped.insert(v);
+            ++title_pages.pages;
+        }
+    }
+
+    // The worker's import of one chunk; the pages that waited for it are unsettled.
+    void import_chunk_now(std::uintptr_t start, std::uintptr_t end) {
+        TitlePages::Chunk chunk;
+        chunk.end = end;
+        std::uint32_t types = 0;
+        if (VirtualAlloc(reinterpret_cast<void*>(start), end - start, MEM_COMMIT, PAGE_READWRITE))
+            chunk.address = import_host(reinterpret_cast<void*>(start), end - start, chunk.buffer, chunk.memory, types);
+        std::lock_guard lock(title_pages.mutex);
+        title_pages.importing_chunks.erase(start);
+        std::vector<std::uint64_t> waiters;
+        if (const auto w = title_pages.chunk_waiters.find(start); w != title_pages.chunk_waiters.end()) {
+            waiters = std::move(w->second);
+            title_pages.chunk_waiters.erase(w);
+        }
+        if (!chunk.address) {
+            title_pages.failed_chunks[start] = std::chrono::steady_clock::now();
+            const std::uint64_t n = ++title_pages.chunk_failures;
+            if ((n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: physical pages %#llx + %#llx could not be imported for the page table "
+                                     "(worker; VkResult %d; %llu failures)\n",
+                             static_cast<unsigned long long>(start), static_cast<unsigned long long>(end - start),
+                             static_cast<int>(last_import_result), static_cast<unsigned long long>(n));
+            return;  // the waiters stay settled; the failed chunk is retried after kFailedChunkFor
+        }
+        title_pages.chunk_bytes += end - start;
+        const std::uint64_t n = ++title_pages.chunks_made;
+        if ((n & (n - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12: physical pages: %llu section imports made (worker), %zu held (%llu MiB)\n",
+                         static_cast<unsigned long long>(n), title_pages.imported.size() + 1,
+                         static_cast<unsigned long long>(title_pages.chunk_bytes >> 20));
+        title_pages.imported.emplace(start, chunk);
+        for (const std::uint64_t page : waiters) title_pages.settled.erase(page);
+    }
     // 2 MiB: imported memory is pinned, and the driver refused imports past about 3.4 GiB in all (1.2 GiB of 4 MiB
     // chunks, most of each unused, beside 2.2 GiB imported by address); 16 MiB chunks pinned 2 GiB for 1 MiB demands.
     static constexpr std::uint64_t kPhysicalChunk = 2ull << 20;
@@ -4219,6 +4349,7 @@ struct DeviceState {
             std::uint32_t types = 0;
         };
         std::vector<Run> runs;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> async_runs;  // left to the import worker
         std::vector<std::uint64_t> refused_pages;
         for (std::size_t i = 0; i < claimed.size();) {
             const std::uint64_t p = claimed[i];
@@ -4250,6 +4381,11 @@ struct DeviceState {
                 ++i;
                 continue;
             }
+            if (async_chunk_imports()) {  // the worker imports it; its pages stay `importing` until then
+                async_runs.emplace_back(p, q);
+                i = j;
+                continue;
+            }
             Run r;
             r.p = p;
             r.q = q;
@@ -4261,7 +4397,12 @@ struct DeviceState {
             i = j;
         }
         std::lock_guard lock(title_pages.mutex);
-        for (const std::uint64_t p : claimed) title_pages.importing.erase(p);
+        for (const std::uint64_t p : claimed) {
+            bool queued = false;  // the worker's now: it clears `importing` when its import lands
+            for (const auto& [a, b] : async_runs) queued = queued || (p >= a && p < b);
+            if (!queued) title_pages.importing.erase(p);
+        }
+        for (const auto& [a, b] : async_runs) chunk_import_enqueue(a, b, true);
         for (const std::uint64_t p : refused_pages) {
             ++title_pages.refused;
             title_pages.settled[p] = std::chrono::steady_clock::now();
@@ -4472,6 +4613,11 @@ struct DeviceState {
             f != title_pages.failed_chunks.end() && now - f->second < kFailedChunkFor)
             return title_pages.imported.end();
         if (title_pages.importing_chunks.count(start)) return title_pages.imported.end();  // another thread's import
+        if (lock && async_chunk_imports()) {  // a recording's walk: the worker imports it (chunk_import_enqueue)
+            title_pages.importing_chunks.insert(start);
+            chunk_import_enqueue(start, end);
+            return title_pages.imported.end();
+        }
         TitlePages::Chunk chunk;
         chunk.end = end;
         std::uint32_t types = 0;
@@ -4570,7 +4716,14 @@ struct DeviceState {
         auto chunk = title_pages.imported.end();
         if (backing) {
             chunk = physical_chunk(host, reinterpret_cast<std::uintptr_t>(section), bytes, make, lock);
-            if (chunk != title_pages.imported.end()) value = chunk->second.address + (host - chunk->first);
+            if (chunk != title_pages.imported.end()) {
+                value = chunk->second.address + (host - chunk->first);
+            } else if (make) {
+                // Its chunk is being imported (by the worker): this page is asked again once it is there.
+                const auto sec = reinterpret_cast<std::uintptr_t>(section);
+                const std::uintptr_t start = sec + (host - sec) / kPhysicalChunk * kPhysicalChunk;
+                if (title_pages.importing_chunks.count(start)) title_pages.chunk_waiters[start].push_back(address);
+            }
         }
         // The chunk the entry pointed into before loses a user, the new one gains one (chunk_unused frees idle ones).
         auto before = title_pages.imported.end();
@@ -7948,6 +8101,7 @@ struct DeviceState {
 
     // At teardown, once no PSO links with them.
     void destroy_gpl_libraries() {
+        stop_chunk_worker();  // no chunk import may land in a device that is going
         stop_compile_workers();
         stop_gpl_worker();
         std::lock_guard lock(gpl_mutex);
@@ -11630,6 +11784,16 @@ public:
         // which is also how the pages are read into the image at each submission. The PC refusal (E_INVALIDARG) sent
         // the retail title down a path that sized a CPU copy at 0 bytes and wrote a 256x1 RGBA32F row through it into
         // the next heap block (boots 15-25, game_scarlett_master.exe+0x550e2d0).
+        // A linear lease the GPU writes (a render target or UAV the title reads back through Map: the exposure
+        // readback is a 1x1 RGBA32F linear target) takes upstream's map_title_texture first: it reads the image back
+        // into the mapping for a read range, and uploads the CPU's writes at Unmap and before submissions. The pages
+        // handed out below never see what the GPU wrote into the image (xbox_linear_texture_map read stale bytes).
+        // A refusal (pages gone after a shared mapping) falls back to the pages, as before.
+        if (title_linear_ && image_ && va_ && data &&
+            (desc_.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) {
+            if (SUCCEEDED(map_title_texture(subresource, read, data))) return S_OK;
+            *data = nullptr;
+        }
         if (image_ && va_ && data) {
             rt::xg::ResourceLayout layout;
             D3D12_PLACED_SUBRESOURCE_FOOTPRINT f{};
@@ -11877,7 +12041,10 @@ private:
         }
         const auto address=shared ? title_address : reinterpret_cast<std::uintptr_t>(pinned.get());
         TitleMap map{std::move(pinned),address,UINT(row),UINT(size),1,{},shared};
-        if ((!read || read->End>read->Begin) && (!shared || gpu_referenced_.load(std::memory_order_acquire))) {
+        // Shared pages hold what the title wrote; the image is read into them once the GPU may have written it. Our
+        // images are bound when made (no deferred attachment), so the GPU may have at any time: read it back then.
+        if ((!read || read->End>read->Begin) &&
+            (!shared || !deferred_attachment_ || gpu_referenced_.load(std::memory_order_acquire))) {
             const HRESULT hr=cpu_copy(false,sub,nullptr,map.data.get(),map.row,map.bytes);
             if(FAILED(hr)) return hr;
             map.fingerprint=fingerprint(map);
@@ -14362,6 +14529,9 @@ public:
                 return E_FAIL;
             }
             vs_stage.edited = ps_stage.edited = true;
+            edit_f16_ = true;
+            edit_vs_ = vs_stage.entry;
+            edit_ps_ = ps_stage.entry;
         }
         // A stage that declares a storage image or buffer it may write needs a device feature outside compute
         // (src/spirv_stores.h). Without it the pipeline would be created all the same and break
@@ -14393,14 +14563,15 @@ public:
                 } else {
                     stage.words = std::move(patched);
                     stage.edited = true;
+                    edit_depth24_ = true;
+                    depth24_bias_ = depth24_bias;
                 }
             }
             // Deferred: no module yet. build() makes it from the library's file (or this PSO's edited words) at the
             // first draw; ~2,000 distinct modules made at creation held ~3.5 MB of driver memory each (boot 36).
             VkShaderModule module = VK_NULL_HANDLE;
             if (defer_modules) {
-                deferred_modules_.push_back(
-                    {stage_infos.size(), stage.entry, stage.edited ? stage.words : std::vector<std::uint32_t>{}});
+                deferred_modules_.push_back({stage_infos.size(), stage.entry, stage.edited});
             } else {
                 module = device_.shader_modules().acquire(stage.words);
                 if (!module) return E_FAIL;
@@ -15348,8 +15519,22 @@ private:
         if (!deferred_modules_.empty()) {
             const leonida::ShaderLibrary* library = device_.library();
             for (const DeferredModule& d : deferred_modules_) {
-                const std::vector<std::uint32_t> words =
-                    !d.words.empty() ? d.words : library ? library->spirv(*d.entry) : std::vector<std::uint32_t>{};
+                std::vector<std::uint32_t> words;
+                if (d.edited) {
+                    const auto bit = d.stage_index < recipe_.stages.size()
+                                         ? recipe_.stages[d.stage_index].stage
+                                         : VK_SHADER_STAGE_ALL;
+                    words = edited_words(bit, d.entry);
+                    // Made again exactly as create() made them, or not used at all.
+                    if (words.empty() || d.stage_index >= stage_meta_.size() ||
+                        leonida::pso::spirv_hash(words) != stage_meta_[d.stage_index].hash) {
+                        log_once("an edited shader stage could not be made again as it was created; stage bit",
+                                 int(bit));
+                        return VK_NULL_HANDLE;
+                    }
+                } else if (library) {
+                    words = library->spirv(*d.entry);
+                }
                 const VkShaderModule module = words.empty() ? VK_NULL_HANDLE : device_.shader_modules().acquire(words);
                 if (!module || d.stage_index >= recipe_.stages.size()) {
                     log_once("a deferred shader module could not be made; stage index", int(d.stage_index));
@@ -15436,7 +15621,8 @@ private:
         gpl_outputs_.push_back(output);
         const std::array<VkPipeline, 4> parts{gpl_input_, pre_raster, fragment, output};
         if (leonida::pso::Recorder* recorder = device_.pso_recorder()) recorder->record(recipe);
-        if (base && device_.info.pipeline_creation_cache_control && device_.gpl_cached_link) {
+        if (base && leonida::pso::gpl_optimize() && device_.info.pipeline_creation_cache_control &&
+            device_.gpl_cached_link) {
             const leonida::pso::LinkCreateInfo cached_create(parts, graphics_.layout, Link::cached);
             VkResult result = VK_SUCCESS;
             if (const VkPipeline optimized = device_.gpl_create(cached_create.info, cached, &result)) {
@@ -15454,7 +15640,7 @@ private:
         ++device_.gpl_links;
         if (cached) ++device_.gpl_links_cached;
         device_.pipeline_created();
-        if (base) start_upgrade(parts, pipeline);
+        if (base && leonida::pso::gpl_optimize()) start_upgrade(parts, pipeline);  // no second pipeline otherwise
         return pipeline;
     }
 
@@ -15531,7 +15717,7 @@ private:
         std::size_t words = 0;
         const leonida::ShaderLibrary* library = device_.library();
         for (const DeferredModule& d : module_sources_)
-            words += !d.words.empty() ? d.words.size() : library && d.entry ? library->spirv(*d.entry).size() : 0;
+            words += library && d.entry ? library->spirv(*d.entry).size() : 0;  // an edited stage: about as many
         spirv_words_ = words;
         return words;
     }
@@ -15587,11 +15773,44 @@ private:
     std::vector<VkShaderModule> modules_;
     // A graphics stage whose module build() makes (LEONIDA_DEFER_GRAPHICS): its place in recipe_.stages, its index
     // entry, and its words only when this PSO edited them.
+    // `edited`: the stage's words differ from the library's file (the PS rewrite, the f16 link, the depth24 patch).
+    // They are not kept: build() makes them again from the library's files and this PSO's edit settings
+    // (edited_words) and checks them against the hash create() recorded (stage_meta_). Kept, they were 1.4-3.5 MiB per
+    // PSO and stage for the retail title's translated shaders: gigabytes of heap in the first two minutes.
     struct DeferredModule {
         std::size_t stage_index;
         const leonida::ShaderEntry* entry;
-        std::vector<std::uint32_t> words;
+        bool edited;
     };
+    // What create() did to the stages' words, for edited_words.
+    const leonida::ShaderEntry* edit_vs_ = nullptr;  // the f16-linked pair, when edit_f16_
+    const leonida::ShaderEntry* edit_ps_ = nullptr;
+    bool edit_f16_ = false;
+    bool edit_depth24_ = false;
+    leonida::Depth24Bias depth24_bias_{};
+
+    // The words of an edited stage (`bit`, library entry `entry`) as create() made them; empty when they cannot be.
+    std::vector<std::uint32_t> edited_words(VkShaderStageFlagBits bit, const leonida::ShaderEntry* entry) const {
+        const leonida::ShaderLibrary* library = device_.library();
+        if (!library || !entry) return {};
+        const bool pixel = bit == VK_SHADER_STAGE_FRAGMENT_BIT;
+        std::vector<std::uint32_t> vs, ps;
+        if (edit_f16_ && edit_vs_ && edit_ps_) {
+            vs = library->spirv(*edit_vs_);
+            ps = library->spirv(*edit_ps_);
+        } else if (pixel) {
+            ps = library->spirv(*entry);
+        } else {
+            vs = library->spirv(*entry);
+        }
+        std::string why;
+        if (!ps.empty() && (rgba4_mask_ || dual_source_) && !rewrite_fragment(ps, why)) return {};
+        if (edit_f16_ && edit_vs_ && edit_ps_ &&
+            !leonida::link_f16_halves(vs, *edit_vs_, ps, *edit_ps_, &why, device_.f16_half_top_location))
+            return {};
+        if (pixel && edit_depth24_) ps = leonida::depth24_patch_fragment(ps, depth24_bias_, why);
+        return pixel ? ps : vs;
+    }
     std::vector<DeferredModule> deferred_modules_;
     std::vector<DeferredModule> module_sources_;  // deferred_modules_ as made at creation: build() restores it
     std::vector<VkShaderModule> built_modules_;   // made for the build in progress (build_with_modules)
@@ -20713,10 +20932,13 @@ public:
                     }
                 } else if (requested != rd.Format) {
                     // Typed textures cast only between UNORM and SRGB of 8-bit RGBA/BGRA, which their images are
-                    // created mutable for (TextureCreateInfo::srgb_pair); any other cast is refused.
+                    // created mutable for (TextureCreateInfo::srgb_pair); any other cast is refused. A texture made
+                    // with a castable list takes only what the list names (above), as in D3D12: its image lists
+                    // those formats and its own, not the twin, so a twin view would not be valid in Vulkan either.
                     const VkFormat asked_vk = vulkan_format(requested, false).format;
                     const VkFormat own_vk = vulkan_format(rd.Format, false).format;
-                    if (asked_vk != VK_FORMAT_UNDEFINED && TextureCreateInfo::srgb_pair(own_vk) == asked_vk)
+                    if (asked_vk != VK_FORMAT_UNDEFINED && TextureCreateInfo::srgb_pair(own_vk) == asked_vk &&
+                        !(r && r->has_castable_formats()))
                         view.format = static_cast<leonida::ColorViewFormat>(asked_vk);
                     else
                         view = {};
@@ -26968,6 +27190,8 @@ int prebuild_recorded_pipelines(const std::filesystem::path& recipes_path, unsig
     const std::uint32_t hits_before = s.pipeline_cache_hits.load();
     const std::uint32_t created_before = s.pipelines_created.load();
     std::atomic<std::size_t> next{0}, built{0}, missing{0}, changed{0}, failed{0};
+    std::mutex built_keys_mutex;
+    std::unordered_set<std::uint64_t> built_keys;  // pso_prebuilt.txt: what a run may ask the cache for
     const auto worker = [&] {
         for (std::size_t i = next++; i < file.recipes.size(); i = next++) {
             const leonida::pso::Recipe& r = file.recipes[i];
@@ -27017,6 +27241,8 @@ int prebuild_recorded_pipelines(const std::filesystem::path& recipes_path, unsig
                     ++built;
                     s.pipeline_created();
                     vk.vkDestroyPipeline(dev, pipeline, nullptr);
+                    std::lock_guard lock(built_keys_mutex);
+                    built_keys.insert(leonida::pso::key(r));
                 } else {
                     ++failed;
                 }
@@ -27041,6 +27267,15 @@ int prebuild_recorded_pipelines(const std::filesystem::path& recipes_path, unsig
                  file.recipes.size(), built.load(), hits, counted, seconds, n, missing.load(), changed.load(),
                  failed.load(), file.bad_lines);
     s.save_pipeline_cache();
+    // The built ones join the list a run takes whole pipelines for (pso_recipe.h, prebuilt_path). The list is only
+    // as good as the cache file just saved (another driver drops the cache, and the list with it means nothing).
+    const std::filesystem::path list = leonida::pso::prebuilt_path(recipes_path);
+    std::unordered_set<std::uint64_t> keys = leonida::pso::read_prebuilt(list);
+    keys.insert(built_keys.begin(), built_keys.end());
+    if (!leonida::pso::write_prebuilt(list, keys))
+        std::fprintf(stderr, "[rt] prebuild: cannot write %s\n", list.string().c_str());
+    else
+        std::fprintf(stderr, "[rt] prebuild: %zu whole pipelines listed in %s\n", keys.size(), list.string().c_str());
     return file.recipes.empty() || built.load() ? 0 : 4;
 }
 

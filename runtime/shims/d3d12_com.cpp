@@ -2913,6 +2913,38 @@ public:
     }
 
     bool ok() const { return queue_.ok(); }
+
+    // Every title address in the root arguments of these lists' draws, dispatches and indirect executes gets its
+    // page-table entries here, before this queue's lock: the recording later finds them mapped. Imported while the
+    // recording held the lock, one 0.5-1 s driver import after another kept every other ExecuteCommandLists on the
+    // queue waiting (24.5 s once) until the title's GPU watchdog fired; deferred to a worker instead, a shader read
+    // the scratch page for a page not imported yet and hung the GPU (lib_cs_02006, 2026-11-25 21:2x).
+    void map_title_root_arguments(UINT count, ID3D12CommandList* const* lists) {
+        if (!lists || !count) return;
+        const std::function<void(std::uint64_t)> map = context_.title_mapper();
+        if (!map) return;
+        std::vector<std::uint64_t> seen;  // the 64 KiB pages asked for already in this call
+        const auto scan = [&](const std::array<std::uint32_t, 32>& s) {
+            for (std::size_t i = 0; i + 1 < s.size(); ++i) {
+                const std::uint64_t va = std::uint64_t(s[i]) | (std::uint64_t(s[i + 1]) << 32);
+                if (va >> 32 == 0 || va >> 47) continue;  // as map_title_user_data (vulkan_replay.h) takes them
+                const std::uint64_t page = va & ~std::uint64_t(0xFFFF);
+                if (std::find(seen.begin(), seen.end(), page) != seen.end()) continue;
+                seen.push_back(page);
+                map(va);
+            }
+        };
+        for (UINT i = 0; i < count; ++i) {
+            const GraphicsCommandList* list = GraphicsCommandList::from(lists[i]);
+            if (!list) continue;
+            for (const auto& command : list->commands().commands()) {
+                if (const auto* d = std::get_if<leonida::Dispatch>(&command)) scan(d->user_data);
+                else if (const auto* g = std::get_if<leonida::Draw>(&command)) scan(g->user_data);
+                else if (const auto* e = std::get_if<leonida::ExecuteIndirect>(&command)) scan(e->user_data);
+            }
+        }
+    }
+
     leonida::ReplayResult last_result() {
         // A batch the queue held fails when it is released, after the call returned: the failure is the result.
         if (const auto held = queue_.take_held_failure(); held != leonida::ReplayResult::success) last_result_ = held;
@@ -2956,6 +2988,7 @@ public:
             note_title_textures_copied(copied_into);
         }
         sync_title_textures();
+        map_title_root_arguments(count, lists);
         const auto textures_synced = slow_clock::now();
         std::lock_guard lock(mutex_);
         const auto locked = slow_clock::now();

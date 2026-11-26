@@ -1807,6 +1807,13 @@ public:
         std::unique_lock lock(resource_mutex_);
         replay_.map_title = std::move(mapper);
     }
+    // The same mapper with no lock of ours held: ExecuteCommandLists maps its lists' root-argument title addresses
+    // before it takes its queue's lock (d3d12_com.cpp, map_title_root_arguments), so the driver's host imports (0.5-1 s
+    // each) hold only the submitting thread, not every queue user behind the lock.
+    std::function<void(std::uint64_t)> title_mapper() {
+        std::shared_lock lock(resource_mutex_);
+        return replay_.map_title;
+    }
     // Page-table entries for a whole title range (va, bytes) before a command that reads or writes it through the
     // table (the XDXR builder's paged addresses). Called while commands are recorded, like map_title.
     void set_title_range_mapper(std::function<void(std::uint64_t, std::uint64_t)> mapper) {

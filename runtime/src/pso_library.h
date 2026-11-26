@@ -21,6 +21,8 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <span>
@@ -126,6 +128,21 @@ inline std::uint64_t library_key(Part part, const Recipe& r, bool per_sample = f
     return h;
 }
 
+// PSOs get link-time-optimised pipelines (from the pipeline cache at creation, else linked on the device's background
+// worker after the first draw), and the parts are created retaining their link-time-optimisation information for
+// that. LEONIDA_GPL_OPTIMIZE=0: fast links only, and parts that retain nothing (measured 2026-11-25: not where the
+// process's memory goes; the boots' stalls came from the compile gate, vulkan_device_fault.h).
+inline bool gpl_optimize() {
+    static const bool on = [] {
+        const char* value = std::getenv("LEONIDA_GPL_OPTIMIZE");
+        const bool off = value && value[0] == '0' && value[1] == 0;
+        if (off)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_GPL_OPTIMIZE=0: pipeline-library PSOs keep their fast links only\n");
+        return !off;
+    }();
+    return on;
+}
+
 // One part's create info. modules[i] is the module for recipe.stages[i]; the part takes the stages it compiles
 // (vertex and geometry for pre_raster, the pixel shader for fragment). `per_sample`: a fragment part whose shader runs
 // per sample carries the recipe's multisample state (spirv_runs_per_sample). The state a shared part does not depend
@@ -136,8 +153,9 @@ public:
                       bool per_sample = false) {
         library_.flags = VkGraphicsPipelineLibraryFlagsEXT(part);
         info.pNext = &library_;
-        // Retained so the same parts can be linked again with link-time optimisation (LinkCreateInfo, Link::optimized).
-        info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
+        // Retained only when the same parts are linked again with link-time optimisation (gpl_optimize).
+        info.flags = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR |
+                     (gpl_optimize() ? VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT : 0);
         const std::span<const VkDynamicState> dynamic =
             library_dynamic_states(part, !r.bindings.empty(), r.viewport_with_count);
         dynamic_.dynamicStateCount = std::uint32_t(dynamic.size());
