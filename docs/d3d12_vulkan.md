@@ -2775,8 +2775,9 @@ Pipeline creation:
   `pipelineCreationCacheControl` feature unless `LEONIDA_PIPELINE_COMPILE=cache-only` asks for it. A cache-only create
   (`cache-only`) is left as it is.
   `LEONIDA_SKIP_COMPUTE=<part of a name>[,<part>...]` (`all`: every compute program) never builds the matching
-  compute programs and drops their dispatches, direct and indirect; the first dropped dispatch of each is logged.
-  It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
+  compute programs at play and drops their dispatches, direct and indirect; the first dropped dispatch of each is
+  logged. It is a way past a program that hangs the GPU while the program or its input is fixed, not a fix.
+  `--precompile-pipelines` (below) builds them anyway unless it is given `--skip-listed`.
   `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` also schedules a snapshot after a successful pipeline build,
   at most once per 120 seconds. It starts on the compile worker when queued builds have drained and the device
   has no active builds. The driver fills a mapped staging
@@ -2815,7 +2816,8 @@ Pipeline creation:
   folders can share one; the file names and the driver's checks keep a pipeline from one build from being taken
   for another's.
   `gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--all] [--smallest-first] [--limit N]
-  [--min-bytes N] [--max-bytes N] [--filter PART]... [--list]` fills the journal ahead of play, with no game: it
+  [--min-bytes N] [--max-bytes N] [--filter PART]... [--skip-listed] [--list]` fills the journal ahead of play, with
+  no game: it
   creates the Vulkan device as `--run` does (so the same environment gives the same journal names and driver keys:
   LEONIDA_SHADERS, LEONIDA_PIPELINE_CACHE_DIR, and LEONIDA_DEVICE_FAULT/LEONIDA_AFTERMATH, whose diagnostics config
   makes other pipelines) and builds every compute entry of the library through the dispatch path
@@ -2825,6 +2827,19 @@ Pipeline creation:
   4 threads: modules of 3.6-5.8 MB took 46-145 s each, 12 in 312 s, about 3.5 GB of host memory each while in the
   driver (14.5 GB peak for four). Graphics pipelines are not covered: they are built at a title's draw from its PSO
   description and the bound formats, and take milliseconds.
+  `LEONIDA_SKIP_COMPUTE` does not narrow the build: it is a play-time setting, players run the pre-compile with the
+  game's environment, and a program left out here would stay out of the journal after the list is shortened. The run
+  says how many entries the list names and builds them; `--skip-listed` leaves them out on purpose. The last line
+  counts what was built (compiled, or found in a cache), what was journaled already or being built by another
+  process, what failed, and what was left out and why: by `--skip-listed`, not buildable on this device (no SPIR-V,
+  set-0 bindings without a bindless set, workgroup memory over the limit), or filtered out (`--filter`, the size
+  bounds, `--limit`). The 89-167 s per program behind the skip list of the large `library/` programs came from
+  wave64-emulated packs. Measured with a native wave64 pack on an RX 7900 XTX (RADV, Mesa 26.3.1, Wine): all 721
+  programs of 2 MiB or more built, 360 of them in 170 s on 32 threads, 2.5-32 s each, the largest (13 MiB) in 28.5 s
+  alone, at a peak of 14 GiB of RAM for the process. With all of them in the journal and no skip list, two world runs
+  took them all from the journal (none built in the game) and ended as runs with the skip list do, in an idle-queue
+  device loss or a stop with the GPU idle ([running.md](running.md#settings-every-platform-needs)); whether their
+  output is correct is not measured.
   `LEONIDA_COMPILE_HELPER=1` (`shims/d3d12_compile_helper.h`) keeps first-ever compiles out of the title's process:
   the driver's locks, which a long `vkCreateComputePipelines` holds and a `vkQueueSubmit` of the same process waits
   for, are per process. A compute build of `LEONIDA_COMPILE_HELPER_MIN_BYTES` or more (128 KiB) with no journal file
@@ -4623,6 +4638,29 @@ Not implemented yet:
     instead of 0.
   - Dispatch signatures bind the list's compute pipeline and root arguments first (`ExecuteIndirect::pipeline` and
     `user_data`, from M4's capture), then generate the dispatches.
+- The indirect arguments are clamped on the GPU before the command reads them (D3D-17's replay,
+  `runtime/src/vulkan_indirect_clamp.h`, shader `runtime/src/indirect_clamp.comp`). The title's own compute writes
+  them, and a pass the replay drops (an async pipeline that is not built yet, a stub pipeline,
+  `LEONIDA_SKIP_COMPUTE`) or mistranslates leaves whatever the memory held: a dispatch of billions of groups or a
+  draw of four billion vertices runs until the host resets the display driver. One small compute pass per
+  `ExecuteIndirect` call copies the active records into device-local scratch with their values bounded - 2^24
+  vertices or indices, 2^26 vertex instances (count times instances), 65 535 groups per dimension, 2^20 groups per
+  dispatch and a 2^27-unit work budget per call that saturates through an atomic compare-and-swap - and writes an
+  empty record past `min(count, max_command_count)` and past the budget, and the clamped count word a `*Count` draw
+  then reads (so the count is at most `maxDrawCount`, VUID-vkCmdDrawIndirectCount-countBuffer-02717). A draw record
+  of 2^23 vertices or indices an instance or more is a slot the title has not filled: it runs empty and charges
+  nothing (RT-INDIRECT-DRAW-UNFILLED-COUNT). Before, each was cut to 2^24 and charged that, so eight of them used up
+  the budget and every later draw in the list ran empty; a census in a VIctory fork found 90 such records in one
+  list. The indirect command reads that scratch. A draw emits the pass before its rendering scope opens: `vkCmdCopyBuffer` and a
+  memory barrier with a transfer access are not allowed inside a dynamic-rendering scope. The records are
+  bit-identical to the application's when they are within the limits, the argument and count buffers are left
+  untouched, and the scratch comes from a per-submission pool (`vulkan_scratch.h`) that a list with many indirect
+  calls reuses. `LEONIDA_INDIRECT_CLAMP=0` reads the application's buffer again, as before. The pass's counters
+  (records checked, records clamped, counts clamped, records past the budget) are copied to one host-visible slot
+  per call, read once the submission completes, logged in full at the first use and then rate-limited. Covered by
+  `indirect_clamp_test` (every kind and the counted variants,
+  in-range and garbage records, the budget), by `d3d12_m4_compute_test` (a garbage dispatch record beside the
+  in-range one) and by `d3d12_indirect_rt_test` (a draw whose instance count is garbage).
 - Predication (`SetPredication`) maps to `VK_EXT_conditional_rendering` (D3D-18). Done: `GraphicsCommandList::
   SetPredication` records a `Predication` command (`runtime/src/command_list.h`; offset 8-byte aligned, op
   `EQUAL_ZERO` or `NOT_EQUAL_ZERO`, a null buffer turns it off). The replay (`runtime/src/vulkan_replay.h`) begins

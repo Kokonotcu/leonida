@@ -1683,6 +1683,15 @@ inline float quantize_unorm(float value, double maximum) {
     return static_cast<float>(round_half_even(nearest_float(double(value) * maximum)) / maximum);
 }
 
+// 16-bit UNORM depth clear quantisation matching depth24_fragment.h's Patch::quantise(levels = 65535.0f):
+// float multiply by 65535.0f, round-half-even, and nearest float to d / 65535, with NaN and negatives -> 0.0f.
+inline float quantize_depth16(float value) {
+    if (!(value > 0.0f)) return 0.0f;
+    if (value >= 1.0f) return 1.0f;
+    const float product = value * 65535.0f;
+    return static_cast<float>(round_half_even(double(product)) / 65535.0);
+}
+
 // The same for a signed normalised format: -1..1 on a scale of 127 (8 bits) or 32767 (16 bits), where D3D writes -1.0
 // as -127 and ties go to the even neighbour.
 inline float quantize_snorm(float value, double maximum) {
@@ -5629,7 +5638,8 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             // together, clearing depth alone leaves the stencil to be zeroed.
             detail::initialize(vk, command_buffer, p.binding, id, pieces, image_layout(p.binding, state.layout), tracker,
                                p.rects.empty() && !(range.aspectMask & ~p.range.aspectMask));
-            float depth = p.binding.xbox_depth16_stencil8 ? std::round(std::clamp(depth_clear->depth,0.0f,1.0f)*65535.0f)/65535.0f : p.binding.depth24 ? depth24_clear_value(depth_clear->depth)  // see depth24.h
+            float depth = p.binding.xbox_depth16_stencil8 ? detail::quantize_depth16(depth_clear->depth)
+                          : p.binding.depth24             ? depth24_clear_value(depth_clear->depth)  // see depth24.h
                           : p.binding.format == VK_FORMAT_D16_UNORM
                               ? detail::quantize_unorm(depth_clear->depth, 65535.0)  // see quantize_unorm
                               : depth_clear_value(depth_clear->depth);  // a denormal clears to 0

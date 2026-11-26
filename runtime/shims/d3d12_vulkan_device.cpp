@@ -1934,6 +1934,7 @@ bool merge_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDe
 // never built and every dispatch of theirs is dropped ("all" or "*": every compute program). For getting past a
 // program that hangs the GPU, such as a translated loop that never ends on the input it is given here, while the
 // program or its input is being fixed. What the program would have written keeps its previous contents.
+// gta6rt --precompile-pipelines builds the listed programs anyway unless it is given --skip-listed.
 bool skip_compute(const std::string& name) {
     static const std::vector<std::string> parts = [] {
         std::vector<std::string> out;
@@ -14336,8 +14337,10 @@ public:
         // D24_UNORM_S8_UINT stored as D32_SFLOAT_S8_UINT (no D24 on the GPU): the pixel stage writes the depth D24
         // would hold, biased in D24 units and quantised (src/depth24_fragment.h, D3D-309), and the rasterizer's own
         // bias is turned off. Multisampled targets keep the old path: a FragDepth write is per pixel.
-        const bool d24_as_float = desc.DSVFormat != DXGI_FORMAT_UNKNOWN &&
-                                  vulkan_format(desc.DSVFormat, true).format == VK_FORMAT_D24_UNORM_S8_UINT &&
+        const VkFormat dsv_vk = desc.DSVFormat != DXGI_FORMAT_UNKNOWN
+                                    ? vulkan_format(desc.DSVFormat, true).format
+                                    : VK_FORMAT_UNDEFINED;
+        const bool d24_as_float = dsv_vk == VK_FORMAT_D24_UNORM_S8_UINT &&
                                   !device_.depth_usable(VK_FORMAT_D24_UNORM_S8_UINT);
         // Upstream: a console D16S8 target whose D16_UNORM_S8_UINT the GPU lacks is stored wider; its depth is written
         // the same way at 16-bit precision (Depth24Bias::levels).
@@ -26102,10 +26105,10 @@ public:
     DeviceState& state() { return *device_; }
     const leonida::ShaderLibrary* library() const { return library_; }
 
-    // Why create_compute would refuse the entry, or null.
+    // Why create_compute could not build the entry on this device, or null. LEONIDA_SKIP_COMPUTE is not a reason here:
+    // it drops a program's dispatches at play, and each caller decides whether it also keeps the program unbuilt.
     const char* unbuildable(const leonida::ShaderEntry& entry, std::size_t bytes) const {
         if (!bytes) return "no .spv";
-        if (skip_compute(entry.name)) return "LEONIDA_SKIP_COMPUTE";
         if (entry.binding_count && !with_set0_) return "set-0 bindings and no bindless set";
         if (entry.lds_bytes && max_shared_ && entry.lds_bytes > max_shared_) return "workgroup memory over the limit";
         return nullptr;
@@ -26137,13 +26140,15 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
     if (!host.open()) return 1;
     const leonida::ShaderLibrary* library = host.library();
 
-    // What to build: every compute entry the runtime could create a pipeline for.
+    // What to build: every compute entry the runtime could create a pipeline for. LEONIDA_SKIP_COMPUTE is a setting
+    // for play (the game drops the listed programs' dispatches); the journal is kept for every program unless
+    // --skip-listed asks to leave them out too, so a later run without the list finds them built.
     struct Job {
         const leonida::ShaderEntry* entry;
         std::size_t bytes;
     };
     std::vector<Job> jobs;
-    std::size_t not_buildable = 0, filtered = 0;
+    std::size_t not_buildable = 0, filtered = 0, listed = 0, listed_left_out = 0;
     for (const leonida::ShaderEntry* entry : library->stage_entries("cs")) {
         if (!options.filters.empty() &&
             std::none_of(options.filters.begin(), options.filters.end(),
@@ -26156,6 +26161,15 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
             ++filtered;
             continue;
         }
+        if (skip_compute(entry->name)) {
+            ++listed;
+            if (options.skip_listed) {
+                ++listed_left_out;
+                std::fprintf(stderr, "[precompile] %s: not built (LEONIDA_SKIP_COMPUTE, --skip-listed)\n",
+                             entry->name.c_str());
+                continue;
+            }
+        }
         if (const char* why = host.unbuildable(*entry, bytes)) {
             ++not_buildable;
             std::fprintf(stderr, "[precompile] %s: not built (%s)\n", entry->name.c_str(), why);
@@ -26166,14 +26180,22 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
     std::stable_sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
         return options.smallest_first ? a.bytes < b.bytes : a.bytes > b.bytes;
     });
-    if (options.limit && jobs.size() > options.limit) jobs.resize(options.limit);
+    if (options.limit && jobs.size() > options.limit) {
+        filtered += jobs.size() - options.limit;
+        jobs.resize(options.limit);
+    }
     std::uint64_t total_bytes = 0;
     for (const Job& job : jobs) total_bytes += job.bytes;
     const unsigned threads = (std::max)(1u, options.threads);
     const unsigned big_threads = options.big_threads ? (std::min)(options.big_threads, threads) : threads;
-    std::fprintf(stderr, "[precompile] %zu compute entries to build (%.1f MB of SPIR-V; %zu filtered out, %zu not "
-                         "buildable), %s first, %u thread(s), at most %u on modules over %zu bytes; journal %ls\n",
-                 jobs.size(), double(total_bytes) / 1e6, filtered, not_buildable,
+    if (listed && !options.skip_listed)
+        std::fprintf(stderr, "[precompile] LEONIDA_SKIP_COMPUTE names %zu of the entries: built anyway, since the list "
+                             "drops their dispatches at play only (--skip-listed leaves them out of this run)\n",
+                     listed);
+    std::fprintf(stderr, "[precompile] %zu compute entries to build (%.1f MB of SPIR-V; %zu filtered out, %zu left "
+                         "out by --skip-listed, %zu not buildable), %s first, %u thread(s), at most %u on modules over "
+                         "%zu bytes; journal %ls\n",
+                 jobs.size(), double(total_bytes) / 1e6, filtered, listed_left_out, not_buildable,
                  options.smallest_first ? "smallest" : "largest", threads, big_threads, options.big_bytes,
                  pipeline_journal_dir().c_str());
     if (options.dry_run) {
@@ -26183,7 +26205,7 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
 
     std::atomic<std::size_t> next{0};
     std::mutex progress_mutex;
-    std::size_t done = 0, compiled = 0, skipped = 0, hits = 0, failed = 0;
+    std::size_t done = 0, compiled = 0, skipped = 0, hits = 0, failed = 0, journaled = 0, elsewhere = 0;
     std::uint64_t done_bytes = 0;
     std::mutex big_mutex;
     std::condition_variable big_free;
@@ -26222,8 +26244,8 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
             ++done;
             done_bytes += job.bytes;
             const char* what = "failed";
-            if (build.skipped) ++skipped, what = "journaled already";
-            else if (build.busy) ++skipped, what = "being built by another process";
+            if (build.skipped) ++skipped, ++journaled, what = "journaled already";
+            else if (build.busy) ++skipped, ++elsewhere, what = "being built by another process";
             else if (build.result != VK_SUCCESS || (!build.pipeline && !build.skipped)) ++failed;
             else if (build.journal_hit || build.from_shared) ++hits, what = "found in a cache";
             else ++compiled, what = build.journaled ? "compiled and journaled" : "compiled (not journaled)";
@@ -26240,8 +26262,12 @@ int precompile_compute_pipelines(const PrecompileOptions& options) {
     std::vector<std::thread> pool;
     for (unsigned t = 0; t < threads; ++t) pool.emplace_back(worker);
     for (std::thread& t : pool) t.join();
-    std::fprintf(stderr, "[precompile] done: %zu compiled, %zu from a cache, %zu journaled already, %zu failed, %zu "
-                         "not buildable, in %.0f s\n", compiled, hits, skipped, failed, not_buildable,
+    // One line for the whole run: what was built, what was there already, and what was left out and why.
+    std::fprintf(stderr, "[precompile] done: %zu built (%zu compiled, %zu from a cache), %zu journaled already, %zu "
+                         "being built by another process, %zu failed; left out: %zu of %zu listed in "
+                         "LEONIDA_SKIP_COMPUTE%s, %zu not buildable, %zu filtered out; in %.0f s\n",
+                 compiled + hits, compiled, hits, journaled, elsewhere, failed, listed_left_out, listed,
+                 options.skip_listed ? " (--skip-listed)" : "", not_buildable, filtered,
                  std::chrono::duration<double>(Clock::now() - began).count());
     return failed ? 2 : 0;
 }
@@ -26360,6 +26386,7 @@ int compile_server(const CompileServerOptions& options) {
             const leonida::ShaderEntry* entry = it == by_name.end() ? nullptr : it->second;
             const std::size_t bytes = entry ? library->spirv_bytes(*entry) : 0;
             if (!entry) failure = "no compute entry of that name in this library";
+            else if (skip_compute(entry->name)) failure = "LEONIDA_SKIP_COMPUTE";  // the game drops its dispatches
             else if (const char* why = host.unbuildable(*entry, bytes)) failure = why;
             // LOCAL FIX (compile helper: the journal name was checked after the build): the name is hashed from the
             // module and this device's environment, which costs no driver call. A request from a game whose environment
@@ -26484,7 +26511,7 @@ int compile_server(const CompileServerOptions& options) {
                 return;
             }
             const leonida::ShaderEntry& entry = *fill_order[i];
-            if (host.unbuildable(entry, fill_bytes[i])) continue;
+            if (skip_compute(entry.name) || host.unbuildable(entry, fill_bytes[i])) continue;
             std::error_code stat;
             const auto spv = library->spirv_file(entry);
             const long long mtime = static_cast<long long>(std::filesystem::last_write_time(spv, stat).time_since_epoch().count());

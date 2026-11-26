@@ -362,6 +362,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_WATCHDOG_TABLE` | unset | *Diagnostic.* `<store RVA>,<table RVA>` (hex, measured locally and not kept in the repository): the title watchdog's write to 0 and its table of 64 busy records. When the startup trace sees that write fault at the store, it logs each busy record with its ages (`shims/startup_trace.h`); every other thread's stack is logged on any write to 0 either way. |
 | `LEONIDA_INPUT_SCRIPT` | unset | Timed pad presses, `button@seconds` separated by commas (`a@70,a@85,start@120`), each held 300 ms or its own `button@seconds:hold`; the clock starts with the shim. Works with and without SDL3: with SDL3 it drives the keyboard pad (`LEONIDA_KEYBOARD_PAD=always`), without SDL3 one scripted pad that is the only device. Controllers and the keyboard pad still need SDL3. Format and buttons in [docs/gameinput.md](../docs/gameinput.md#environment-variables). |
 | `LEONIDA_INPUT_LOG` | on | The GameInput shim logs every press in `LEONIDA_INPUT_SCRIPT`'s form (`name@seconds`), so a session played by hand can be replayed. `0` turns the lines off. |
+| `LEONIDA_INPUT_TRACE` | unset | `1` (diagnostic, the GameInput shim built without SDL3) logs the title's reading calls on the scripted pad: the first 128, then each one with a button down and every 1000th. Details in [docs/gameinput.md](../docs/gameinput.md#scripted-input-without-sdl3). |
 | `LEONIDA_PIPELINE_COMPILE` | unset | `on-demand` (the `--first-run-ui` profile sets it) prepares pipeline-state streams and sampled views at bind time: a placed 2D texture then waits for its memory until a command or a view first uses it. `cache-only` makes an eager build (`LEONIDA_LAZY_PIPELINES=0`) ask the driver's cache first and leaves what would have to be compiled to the first draw. `first-use` is accepted and means the default. When a pipeline is compiled is `LEONIDA_LAZY_PIPELINES`. |
 | `LEONIDA_GRAPHICS_STAGE_LAYOUT` | on | Graphics root arguments are laid out as the console does for the vertex, pixel and geometry stages (from `s8`, a descriptor table in one dword). `0` keeps `rt::rootsig::pack()` (from `s0`, two dwords per address) for every graphics signature. |
 | `LEONIDA_FRAME_PACING` | unset | `1` (the `--first-run-ui` profile sets it) hands device slots 78 to 81 (`SetFrameIntervalX`, `ScheduleFrameEventX`, `WaitFrameEventX`, `GetFrameStatisticsX`) to the device's own presentation once the first `PresentX` has built it, with the title's interval and origin event replayed to its pacer. Unset, the slots answer from the device's token counter with no wait. |
@@ -562,9 +563,14 @@ The game's `atexit` handlers and static destructors go to a table of the run's o
 shared with gta6rt): `exit` and a return from `main` run them newest first before the run ends, `_cexit` runs them and
 returns, and `_exit`, `quick_exit`, `ExitProcess` and `abort` skip them, as natively. `run_tiny_atexit` runs a stand-in
 program natively and through `--run` for each of those paths (and for `_exit` from a second thread during `exit`) and
-holds both to the Windows sequence (under Wine, whose CRT differs, a native difference is only reported). Not covered
-yet: `at_quick_exit` handlers (`quick_exit` runs none) and the thread-local destructor callback
-(`_register_thread_local_exe_atexit_callback`); both still reach the host CRT.
+holds both to the Windows sequence (under Wine, whose CRT differs, a native difference is only reported). The
+executable's thread-local destructor callback (`_register_thread_local_exe_atexit_callback`) is kept by the run too:
+the host UCRT accepts one per process and fast-fails the second, and gta6rt's own startup registers the first. `exit`
+and `_cexit` call it once, as `(nullptr, DLL_PROCESS_DETACH, nullptr)`, before the atexit handlers, as the UCRT does,
+so the leaving thread's `thread_local` objects end before the static ones; `_exit`, `quick_exit`, `ExitProcess` and
+`abort` do not. Other threads' `thread_local` objects end through the loader's thread-detach notification, which calls
+the same function from the executable's TLS directory. `run_tiny_atexit` covers `exit` and `_cexit` with a
+`thread_local` object. `at_quick_exit` handlers are not covered (`quick_exit` runs none).
 `run_tiny_frame` does it with a stand-in that imports `d3d12_xs.dll!D3D12XboxCreateDevice` and, with
 `LEONIDA_D3D12=vulkan`, clears a render target and reads it back on the Vulkan device: the loader, the game thread,
 the Xbox-ABI proxies and the device in one process (`test/fixtures/tiny_frame.cpp`; `test/check_tiny_frame.py` checks
