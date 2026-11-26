@@ -221,6 +221,7 @@ uint64_t align_apu_region(uint64_t size) {
 struct ApuRegion {
     void* base = nullptr;
     uint64_t size = 0;
+    uint64_t touched = 0;  // the end of the furthest range ever handed out (allocate)
     std::map<uint32_t, uint32_t> blocks;  // offset -> size of active allocations
 
     bool contains(const void* ptr) const {
@@ -269,7 +270,12 @@ struct ApuRegion {
         const uint32_t offset = static_cast<uint32_t>(at);
         blocks.emplace(offset, alloc_size);
         uint8_t* ptr = static_cast<uint8_t*>(base) + offset;
-        std::memset(ptr, 0, alloc_size);
+        // Zeroed only where an earlier allocation may have written: past `touched` the pages are still the zero pages
+        // VirtualAlloc committed, and writing zeros there would only make them resident. The retail title asks for a
+        // 255 MiB cached heap and allocates most of it at once; it then held ~117 MiB of resident zero pages.
+        const uint64_t end = at + alloc_size;
+        if (at < touched) std::memset(ptr, 0, static_cast<std::size_t>((end < touched ? end : touched) - at));
+        if (end > touched) touched = end;
         if (out_offset) *out_offset = offset;
         return ptr;
     }
@@ -286,6 +292,7 @@ struct ApuRegion {
             base = nullptr;
         }
         size = 0;
+        touched = 0;
         blocks.clear();
     }
 };
