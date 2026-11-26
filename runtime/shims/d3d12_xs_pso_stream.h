@@ -53,7 +53,7 @@ public:
     static std::unique_ptr<PsoStreamRecord> capture(const D3D12_PIPELINE_STATE_STREAM_DESC& desc,
                                                      std::span<const ShaderData> shaders, bool console = false);
     static std::unique_ptr<PsoStreamRecord> derived(const PsoStreamRecord& base, std::vector<unsigned char> stream);
-    ~PsoStreamRecord() = default;
+    ~PsoStreamRecord();
     PsoStreamRecord(const PsoStreamRecord&) = delete;
     PsoStreamRecord& operator=(const PsoStreamRecord&) = delete;
 
@@ -70,8 +70,10 @@ public:
 private:
     PsoStreamRecord() = default;
     bool copy_pointed_data(std::size_t type, std::size_t payload_offset);
+    void note_made();  // LOCAL DIAGNOSTIC (mem probe): counts the record and its stream's content
 
     std::vector<unsigned char> bytes_;
+    std::uint64_t probe_hash_ = 0;  // the stream's content hash, when the mem probe counts records
     struct Payloads {
         std::vector<std::vector<unsigned char>> blobs;  // owned copies; their buffers do not move when this grows
         // The caller's shader containers, and the copies shared by content with every other record (shader bytecode,
@@ -92,6 +94,14 @@ DeriveStatus derive_stream(const PsoStreamRecord& base, const unsigned char* rec
 
 // Keeps `record` on `object` (lifetime follows the object) and finds it again. attach returns false on failure, and
 // then the record is dropped. find returns null when no record was attached to that object.
+// LOCAL DIAGNOSTIC (LEONIDA_MEM_PROBE): live records, their stream bytes, and how many distinct stream contents
+// they hold (with those contents' bytes). All zero without the mem probe.
+struct PsoStreamStats {
+    std::size_t records = 0, distinct = 0;
+    std::uint64_t bytes = 0, distinct_bytes = 0;
+};
+PsoStreamStats pso_stream_stats();
+
 bool attach_pso_record(ID3D12Object* object, std::unique_ptr<PsoStreamRecord> record);
 bool share_pso_record(ID3D12Object* source, ID3D12Object* target);
 const PsoStreamRecord* find_pso_record(ID3D12Object* object);

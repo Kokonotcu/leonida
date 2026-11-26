@@ -4,6 +4,7 @@
 #include "../src/shader_library.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -283,6 +284,63 @@ void audit_pso_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, HRESULT hr, 
                  types.c_str(), shaders.c_str(), d3d12_trace::stream_refusal ? d3d12_trace::stream_refusal : "-");
 }
 
+namespace {
+// LOCAL DIAGNOSTIC (mem probe): live records by stream content hash, with that content's size.
+bool probe_records() {
+    static const bool on = [] {
+        const char* v = std::getenv("LEONIDA_MEM_PROBE");
+        return v && v[0] && v[0] != '0';
+    }();
+    return on;
+}
+struct ProbeRecords {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::pair<std::size_t, std::size_t>> by_hash;  // count, bytes
+    std::size_t records = 0;
+    std::uint64_t bytes = 0;
+};
+ProbeRecords& probe_state() {
+    static auto* s = new ProbeRecords;
+    return *s;
+}
+}  // namespace
+
+void PsoStreamRecord::note_made() {
+    if (!probe_records()) return;
+    std::uint64_t hash = 14695981039346656037ull;
+    for (const unsigned char c : bytes_) hash = (hash ^ c) * 1099511628211ull;
+    probe_hash_ = hash ^ bytes_.size() ^ 1;  // never 0 in practice
+    ProbeRecords& s = probe_state();
+    std::lock_guard lock(s.mutex);
+    auto& entry = s.by_hash[probe_hash_];
+    ++entry.first;
+    entry.second = bytes_.size();
+    ++s.records;
+    s.bytes += bytes_.size();
+}
+
+PsoStreamRecord::~PsoStreamRecord() {
+    if (!probe_hash_) return;
+    ProbeRecords& s = probe_state();
+    std::lock_guard lock(s.mutex);
+    const auto it = s.by_hash.find(probe_hash_);
+    if (it != s.by_hash.end() && !--it->second.first) s.by_hash.erase(it);
+    --s.records;
+    s.bytes -= bytes_.size();
+}
+
+PsoStreamStats pso_stream_stats() {
+    PsoStreamStats out;
+    if (!probe_records()) return out;
+    ProbeRecords& s = probe_state();
+    std::lock_guard lock(s.mutex);
+    out.records = s.records;
+    out.bytes = s.bytes;
+    out.distinct = s.by_hash.size();
+    for (const auto& [hash, entry] : s.by_hash) out.distinct_bytes += entry.second;
+    return out;
+}
+
 PsoStreamRecord::Payloads::~Payloads() {
     for (ID3D12RootSignature* root : roots)
         if (root) root->Release();
@@ -308,6 +366,7 @@ std::unique_ptr<PsoStreamRecord> PsoStreamRecord::capture(const D3D12_PIPELINE_S
         if (console) std::memcpy(record->bytes_.data() + sub.tag_offset, &sub.type, sizeof(sub.type));
         if (!record->copy_pointed_data(sub.type, sub.payload)) return nullptr;
     }
+    record->note_made();
     return record;
 }
 
@@ -317,6 +376,7 @@ std::unique_ptr<PsoStreamRecord> PsoStreamRecord::derived(const PsoStreamRecord&
     std::unique_ptr<PsoStreamRecord> record(new PsoStreamRecord());
     record->bytes_ = std::move(stream);
     record->payloads_ = base.payloads_;
+    record->note_made();
     return record;
 }
 

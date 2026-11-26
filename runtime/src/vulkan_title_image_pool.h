@@ -112,6 +112,30 @@ public:
         return allocation;
     }
 
+    // What the pool holds now: its pages' bytes, the bytes of their slots in use, and the size classes.
+    struct Stats {
+        std::size_t pages = 0, classes = 0;
+        VkDeviceSize page_bytes = 0, used_bytes = 0;
+    };
+    Stats stats() {
+        Stats s;
+        std::lock_guard lock(mutex_);
+        for (const auto& [stride, pages] : classes_) {
+            bool any = false;
+            for (const auto& weak : pages) {
+                const auto page = weak.lock();
+                if (!page) continue;
+                std::lock_guard page_lock(page->mutex);
+                any = true;
+                ++s.pages;
+                s.page_bytes += stride * page->capacity;
+                s.used_bytes += stride * (page->allocated - page->returned.size());
+            }
+            s.classes += any;
+        }
+        return s;
+    }
+
 private:
     std::mutex mutex_;
     std::map<VkDeviceSize, std::vector<std::weak_ptr<TitleImagePage>>> classes_;
