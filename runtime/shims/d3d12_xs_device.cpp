@@ -78,6 +78,7 @@
 #include <deque>
 #include <condition_variable>
 #include <set>
+#include <unordered_map>
 #include <new>
 #include <vector>
 #include <memory>
@@ -2437,6 +2438,62 @@ ChainSubmitter& chain_submitter() {
     return *s;
 }
 
+// Pending chained lists in the order the console runs them as far as their tokens tell: a list that waits on a token
+// another pending list writes goes after that writer; otherwise close order. The title chains each Subrender list
+// through slot 139 with tokens it shares with the list before and after it (a wait on the one before, a write of its
+// own at its end), and closes them in whatever order its workers finish. Run in close order, a list closed before its
+// predecessor waited on a token that only the list behind it on the same queue would write: the wait held the queue,
+// timed out (the debug run of 2026-11-26: tokens at 0xa0417fe.. timed out at 200 ms and 4 ms with memory 0), and the
+// list ran on its predecessor's missing results. A cycle keeps close order for what is left.
+void order_by_tokens(std::vector<ID3D12CommandList*>& lists) {
+    const ChainAddresses addresses = g_chain_addresses.load(std::memory_order_acquire);
+    if (!addresses || lists.size() < 2) return;
+    const std::size_t n = lists.size();
+    std::vector<std::vector<std::uint64_t>> writes(n), waits(n);
+    std::unordered_map<std::uint64_t, std::size_t> writer;  // token address -> the first pending list writing it
+    for (std::size_t i = 0; i < n; ++i) {
+        addresses(lists[i], writes[i], waits[i]);
+        for (const std::uint64_t a : writes[i]) writer.emplace(a, i);
+    }
+    std::vector<std::vector<std::size_t>> after(n);  // writer -> the lists waiting on it
+    std::vector<std::size_t> pending(n, 0);
+    for (std::size_t i = 0; i < n; ++i)
+        for (const std::uint64_t a : waits[i])
+            if (const auto it = writer.find(a); it != writer.end() && it->second != i) {
+                after[it->second].push_back(i);
+                ++pending[i];
+            }
+    std::vector<ID3D12CommandList*> ordered;
+    ordered.reserve(n);
+    std::vector<bool> placed(n, false);
+    // Kahn's algorithm, always taking the earliest-closed list that is ready.
+    std::set<std::size_t> ready;
+    for (std::size_t i = 0; i < n; ++i)
+        if (!pending[i]) ready.insert(i);
+    while (ordered.size() < n) {
+        std::size_t next;
+        if (!ready.empty()) {
+            next = *ready.begin();
+            ready.erase(ready.begin());
+        } else {  // a cycle: the earliest-closed of the rest
+            next = 0;
+            while (placed[next]) ++next;
+        }
+        placed[next] = true;
+        ordered.push_back(lists[next]);
+        for (const std::size_t j : after[next])
+            if (!placed[j] && pending[j] && --pending[j] == 0) ready.insert(j);
+    }
+    if (ordered != lists) {
+        static std::atomic<std::uint64_t> reordered{0};
+        const std::uint64_t r = reordered.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((r & (r - 1)) == 0)
+            std::fprintf(stderr, "[rt] d3d12_xs: %llu chained submissions reordered so a token's writer runs first\n",
+                         static_cast<unsigned long long>(r));
+    }
+    lists.swap(ordered);
+}
+
 std::int64_t chain_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
@@ -2478,6 +2535,7 @@ void flush_held_lists() {
         std::vector<ID3D12CommandList*> lists;
         while (j < due.size() && due[j].device == due[i].device && due[j].type == due[i].type)
             lists.push_back(due[j++].list);
+        order_by_tokens(lists);
         if (ID3D12CommandQueue* const queue = console_queue(due[i].device, due[i].type)) {
             queue->ExecuteCommandLists(static_cast<UINT>(lists.size()), lists.data());
             queue->Release();
@@ -2574,6 +2632,7 @@ std::vector<ID3D12CommandList*> take_closed_lists(DeviceProxy* device, D3D12_COM
     }
     q.lists.erase(keep, q.lists.end());
     ReleaseSRWLockExclusive(&q.lock);
+    order_by_tokens(out);
     return out;
 }
 // The device proxy is going: its console queues and the lists still queued for them are released (never run: no

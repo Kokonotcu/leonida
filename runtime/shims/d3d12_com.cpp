@@ -3680,6 +3680,16 @@ bool bound_descriptor_heap_bases(ID3D12GraphicsCommandList* list, D3D12_GPU_VIRT
     return true;
 }
 
+void chain_addresses(ID3D12CommandList* list, std::vector<std::uint64_t>& writes, std::vector<std::uint64_t>& waits) {
+    writes.clear();
+    waits.clear();
+    const GraphicsCommandList* const l = list ? GraphicsCommandList::from(list) : nullptr;
+    if (!l) return;
+    for (const auto& command : l->commands().commands())
+        if (const auto* w = std::get_if<leonida::WriteImmediate>(&command)) writes.push_back(w->address & ~7ull);
+    for (const ListMemoryWait& w : l->memory_waits()) waits.push_back(w.va & ~7ull);
+}
+
 ID3D12CommandList* detach_closed_recording(ID3D12CommandList* list) {
     GraphicsCommandList* const l = list ? GraphicsCommandList::from(list) : nullptr;
     GraphicsCommandList* const copy = l ? l->detach_recording() : nullptr;

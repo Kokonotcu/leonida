@@ -27023,6 +27023,8 @@ std::uint64_t title_texture_footprint(ID3D12Resource* resource) {
 // For the console proxy's chained submission (d3d12_xs_device.h g_detach_recording), from the start.
 [[maybe_unused]] const bool g_detach_recording_installed =
     (rt::d3d12_xs::g_detach_recording.store(&detach_closed_recording, std::memory_order_release), true);
+[[maybe_unused]] const bool g_chain_addresses_installed =
+    (rt::d3d12_xs::g_chain_addresses.store(&chain_addresses, std::memory_order_release), true);
 
 std::filesystem::path configured_shader_directory(std::string* error, const std::filesystem::path& config) {
     return leonida::shader_paths::configured(error, config);

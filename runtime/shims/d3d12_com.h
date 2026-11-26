@@ -614,6 +614,10 @@ std::uint64_t title_texture_footprint(ID3D12Resource* resource);
 // A closed command list's recording moved into a new closed list (returned with one reference), the list itself left
 // closed and empty for its Reset; null when `list` is not one of this layer's lists or is not closed.
 ID3D12CommandList* detach_closed_recording(ID3D12CommandList* list);
+// The console memory writes (WriteBufferImmediate addresses) and waits (addresses) a closed list of this layer
+// recorded, each rounded down to 8 bytes: the chained submission orders lists so a token's writer runs before its
+// waiter. Both empty for a list that is not this layer's.
+void chain_addresses(ID3D12CommandList* list, std::vector<std::uint64_t>& writes, std::vector<std::uint64_t>& waits);
 // Gives each S# a sampler in that set and a key in its hash table, as CreateSampler does, without a heap slot: for
 // the literal S#s a shader builds from immediates (`literal_samplers` in the shader index). An S# that has them
 // already is left as it is. E_INVALIDARG when `device` is not such a device; E_FAIL when one of them could not be

@@ -607,10 +607,14 @@ void test_physical_pages(const PhysicalApi& api) {
     check(api.free_pages(kPages, pages) == TRUE, "XMemFreePhysicalPages frees the pages");
     check(api.free_pages(1, pages) == FALSE, "freeing a page twice fails");
 
-    // Freed numbers are reused.
+    // Freed numbers are reused by single-page allocations (a run takes new consecutive numbers while there are any).
     uint64_t again[kPages]{};
-    count = kPages;
-    check(api.allocate(0x180, &count, again) == TRUE && count == kPages, "pages can be allocated again");
+    bool each = true;
+    for (uint64_t i = 0; i < kPages; ++i) {
+        count = 1;
+        each &= api.allocate(0x180, &count, &again[i]) == TRUE && count == 1;
+    }
+    check(each, "pages can be allocated again");
     bool reused = true;
     for (uint64_t i = 0; i < kPages; ++i) {
         bool found = false;
@@ -1406,10 +1410,41 @@ void test_zero_pool_rollover(const PhysicalApi& api) {
 // Section pages outside the title's reserved memory are not the title's, however a wild write reaches them: a write
 // into a physical page's scratch view (xmem's own mirror of its section), into a section view another component mapped,
 // or into a view mapped where the title released a placeholder of its own, faults and leaves the page uncommitted.
-void test_foreign_section_writes(const PhysicalApi& api) {
+// A frame is one page of memory for the run, as on the console: one the title frees while it is still mapped comes
+// back from its next allocation as the same page, zeroed, so the old mapping and the new one show the same bytes.
+void test_freed_frame_keeps_its_page(const PhysicalApi& api) {
+    auto* const first = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
+    auto* const second = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE));
     uint64_t page = 0, count = 1;
-    check(api.allocate(0x280, &count, &page) == TRUE && count == 1, "a physical page for the scratch-view write");
-    if (count == 1) {
+    check(first && second && api.allocate(0x280, &count, &page) == TRUE && count == 1,
+          "a frame and two windows for the free-while-mapped case");
+    if (!first || !second || count != 1) return;
+    check(api.map(first, 1, &page) == first, "the frame maps at the first window");
+    fill_page(first, 0x1234);
+    check(api.free_pages(1, &page) == TRUE, "the frame is freed while still mapped there");
+    uint64_t again = 0;
+    count = 1;
+    check(api.allocate(0x280, &count, &again) == TRUE && count == 1 && again == page,
+          "the next single-page allocation hands the same frame out again");
+    check(api.map(second, 1, &again) == second, "it maps at the second window");
+    check(read_u32(second, 4) == 0 && read_u32(first, 4) == 0,
+          "it comes back zeroed, and the old mapping shows the zeroes too");
+    fill_page(second, 0x5678);
+    check(page_holds(first, 0x5678), "a write through the new mapping shows at the old one: one page of memory");
+    api.map(first, 1, nullptr);
+    api.map(second, 1, nullptr);
+    api.free_pages(1, &again);
+}
+
+void test_foreign_section_writes(const PhysicalApi& api) {
+    // Two pages: a run takes a new section, whose pages were never touched. A single page would be a frame an earlier
+    // test freed, which keeps its touched page (a frame is one page of memory for the run).
+    uint64_t pages[2] = {}, count = 2;
+    uint64_t& page = pages[0];
+    check(api.allocate(0x280, &count, pages) == TRUE && count == 2, "a physical page for the scratch-view write");
+    if (count == 2) {
         auto* const scratch = reinterpret_cast<uint8_t*>(rt::xmem::physical_page_scratch(page));
         MEMORY_BASIC_INFORMATION info{};
         check(scratch && VirtualQuery(scratch, &info, sizeof(info)) && info.State == expected_xmem_section_state(),
@@ -1426,7 +1461,7 @@ void test_foreign_section_writes(const PhysicalApi& api) {
                       "a write into a committed section's scratch view completes and reads back");
             }
         }
-        api.free_pages(1, &page);
+        api.free_pages(2, pages);
     }
 
     const HANDLE section =
@@ -2964,6 +2999,7 @@ int main(int argc, char** argv) {
         test_decision_races(physical);
         test_zero_pool_rollover(physical);
         test_foreign_section_writes(physical);
+        test_freed_frame_keeps_its_page(physical);
         test_failed_map_records(physical);
         test_commit_physical_pages(physical);
         test_first_touch_during_remap(physical);

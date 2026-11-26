@@ -484,6 +484,30 @@ std::unordered_map<uint64_t, PhysicalPage, std::hash<uint64_t>, std::equal_to<ui
                    leonida::host_heap::Allocator<std::pair<const uint64_t, PhysicalPage>>>
     g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
+// The physical page each freed frame keeps until XMemAllocatePhysicalPages hands the number out again: a frame number
+// is one page of memory for the run, as on the console (its section stays alive while a frame of it is kept).
+std::unordered_map<uint64_t, PhysicalPage, std::hash<uint64_t>, std::equal_to<uint64_t>,
+                   leonida::host_heap::Allocator<std::pair<const uint64_t, PhysicalPage>>>
+    g_freed_backing;
+
+// A kept page made zero again for its next owner, as a fresh allocation is: only its committed part needs it (a page
+// of a reserve-only section that was never touched still reads zero).
+void zero_backing(const PhysicalPage& page) {
+    if (!page.section || !page.section->scratch) return;
+    auto* const at = static_cast<std::uint8_t*>(page.section->scratch) + page.offset;
+    for (std::size_t done = 0; done < kPhysicalPageSize;) {
+        MEMORY_BASIC_INFORMATION m{};
+        if (VirtualQuery(at + done, &m, sizeof m) != sizeof m) return;
+        const std::size_t left = kPhysicalPageSize - done;
+        const std::size_t run = std::min<std::size_t>(
+            left, reinterpret_cast<std::uintptr_t>(m.BaseAddress) + m.RegionSize - reinterpret_cast<std::uintptr_t>(at + done));
+        if (m.State == MEM_COMMIT && (m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)))
+            std::memset(at + done, 0, run);
+        done += run;
+    }
+}
+
+std::shared_ptr<Section> new_physical_section(uint64_t count);
 uint64_t g_next_slot = 1;
 // A mapped run: `count` pages of one section at consecutive offsets, mapped as one view at its base. One view per run
 // rather than per page: under Wine each view costs a placeholder split and a section map whose time grows with the
@@ -2000,6 +2024,50 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
         SetLastError(ERROR_NOT_SUPPORTED);
         return FALSE;
     }
+    // The frames first: freed numbers before new ones. A freed frame keeps the physical page it always had
+    // (g_freed_backing), so only the others need a new section.
+    // As five-star-recomp's page store: a run of several pages takes new consecutive numbers (one section, so its pages
+    // map as few views) while there are numbers left, and a single page a freed one first.
+    std::vector<uint64_t, leonida::host_heap::Allocator<uint64_t>> slots(count);
+    const bool run = count > 1 && kPageSlotLimit - g_next_slot >= count;
+    uint64_t fresh = 0;
+    for (uint64_t i = 0; i < count; ++i) {
+        if (!run && !g_free_slots.empty()) {
+            slots[i] = g_free_slots.back();
+            g_free_slots.pop_back();
+        } else {
+            slots[i] = g_next_slot++;
+        }
+        fresh += !g_freed_backing.count(slots[i] * kFramesPerPage);
+    }
+    std::shared_ptr<Section> section;
+    if (fresh && !(section = new_physical_section(fresh))) {
+        for (uint64_t i = count; i-- > 0;) g_free_slots.push_back(slots[i]);  // given back: nothing was handed out
+        *page_count = 0;
+        return FALSE;
+    }
+    uint64_t next = 0;  // the next unused page of the new section
+    for (uint64_t i = 0; i < count; ++i) {
+        const uint64_t page = slots[i] * kFramesPerPage;
+        // On the console a frame number is one page of memory for the whole run, so every mapping of it, a stale one
+        // the title left when it freed the frame included, shows the same bytes. A freed frame comes back with that
+        // page, zeroed; a new section page for it, as before, gave the old mappings and the new ones different memory.
+        if (const auto kept = g_freed_backing.find(page); kept != g_freed_backing.end()) {
+            g_pages[page] = kept->second;
+            zero_backing(kept->second);
+            g_freed_backing.erase(kept);
+        } else {
+            g_pages[page] = PhysicalPage{section, next * kPhysicalPageSize};
+            section->frames[next++] = static_cast<uint32_t>(page);
+        }
+        page_array[i] = page;
+        leonida::debug_ring::record(leonida::debug_ring::Kind::xmem_alloc, page, 0, page_identity(page));
+    }
+    return TRUE;
+}
+
+// A new section of `count` 64 KiB pages with its scratch view, its frames vector sized; null on failure.
+std::shared_ptr<Section> new_physical_section(uint64_t count) {
     const uint64_t bytes = count * kPhysicalPageSize;  // below 2^37: count is below 2^21
     HANDLE handle = file_backed_section(bytes);
     const bool use_file = handle != nullptr;
@@ -2009,37 +2077,17 @@ BOOL WINAPI XMemAllocatePhysicalPages(uint64_t attributes, uint64_t* page_count,
     const DWORD flags = PAGE_READWRITE | (sections_committed() ? SEC_COMMIT : SEC_RESERVE);
     if (!handle) handle = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, flags,
                                              static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
-    if (!handle) {
-        *page_count = 0;
-        return FALSE;
-    }
+    if (!handle) return nullptr;
     // From host_heap: the unmap that drops the last reference frees it under g_fault_lock.
     const auto section = std::allocate_shared<Section>(leonida::host_heap::Allocator<Section>{}, handle, use_file);
-    if (!section->scratch) {
-        *page_count = 0;
-        return FALSE;
-    }
+    if (!section->scratch) return nullptr;
     // Diagnostic: where the host put each large section's scratch view, host memory a title write must never reach.
     static std::atomic<int> scratch_shown{0};
     if (count >= 256 && scratch_shown.fetch_add(1, std::memory_order_relaxed) < 64)
         std::fprintf(stderr, "[rt] xmem: %llu physical pages, scratch view %p size %llu\n",
                      static_cast<unsigned long long>(count), section->scratch, static_cast<unsigned long long>(bytes));
     section->frames.resize(count);
-    for (uint64_t i = 0; i < count; ++i) {
-        uint64_t slot;
-        if (!g_free_slots.empty()) {
-            slot = g_free_slots.back();
-            g_free_slots.pop_back();
-        } else {
-            slot = g_next_slot++;
-        }
-        const uint64_t page = slot * kFramesPerPage;
-        g_pages[page] = PhysicalPage{section, i * kPhysicalPageSize};
-        section->frames[i] = static_cast<uint32_t>(page);
-        page_array[i] = page;
-        leonida::debug_ring::record(leonida::debug_ring::Kind::xmem_alloc, page, 0, page_identity(page));
-    }
-    return TRUE;
+    return section;
 }
 
 // BOOL XMemFreePhysicalPages(UINT64 pageCount, UINT64* pageArray). Measured at three call sites: RCX is the count (the
@@ -2061,6 +2109,7 @@ BOOL WINAPI XMemFreePhysicalPages(uint64_t page_count, const uint64_t* page_arra
         leonida::debug_ring::record(leonida::debug_ring::Kind::xmem_free, page_array[i],
                                     g_page_addresses.count(page_array[i]) ? g_page_addresses[page_array[i]].size() : 0,
                                     page_identity(page_array[i]));  // b: addresses it is still mapped at
+        g_freed_backing[page_array[i]] = std::move(it->second);  // the frame keeps its page for its next owner
         g_pages.erase(it);
         g_free_slots.push_back(page_array[i] / kFramesPerPage);
     }

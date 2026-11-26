@@ -380,6 +380,12 @@ inline std::atomic<TitleTextureFootprint> g_title_texture_footprint{nullptr};
 using DetachRecording = ID3D12CommandList* (*)(ID3D12CommandList* list);
 inline std::atomic<DetachRecording> g_detach_recording{nullptr};
 
+// The D3D12 layer's rt::d3d12::chain_addresses (null without it): a list's token writes and waits, for the order the
+// chained submission runs pending lists in.
+using ChainAddresses = void (*)(ID3D12CommandList* list, std::vector<std::uint64_t>& writes,
+                                std::vector<std::uint64_t>& waits);
+inline std::atomic<ChainAddresses> g_chain_addresses{nullptr};
+
 // The console layout word (D3D12_RESOURCE_DESC::Layout as the title wrote it) of the texture the device is asked to
 // place on this thread right now (slot 133's handler, slot 70's texture provider), 0 otherwise (bd6529b5b).
 inline thread_local std::uint32_t g_placed_console_layout = 0;
