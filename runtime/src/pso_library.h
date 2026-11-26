@@ -26,6 +26,7 @@
 #include <cstring>
 #include <iterator>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -126,6 +127,45 @@ inline std::uint64_t library_key(Part part, const Recipe& r, bool per_sample = f
         mix(r.alpha_to_one);
     }
     return h;
+}
+
+// The identity of a vertex input or fragment output part: every recipe field LibraryCreateInfo reads for that part, as
+// bytes (compared whole, not hashed, so two parts are shared only when their create infos are equal). These parts
+// carry no shader; they were made per PSO (and per variant for the output part) until each turned out to cost the
+// NVIDIA driver ~7.5 KB of host memory (617.42: 20,000 identical vertex input parts took 144 MiB of private bytes,
+// D:\GTA6\analysis\tools\vkobj_cost.cpp), and the title's PSOs share a few hundred vertex layouts and target setups.
+inline std::string state_part_key(Part part, const Recipe& r) {
+    std::string key;
+    const auto put = [&key](const void* data, std::size_t bytes) {
+        key.append(static_cast<const char*>(data), bytes);
+    };
+    const auto value = [&put](const auto& v) { put(&v, sizeof(v)); };
+    const auto array = [&put, &value](const auto& items) {
+        value(items.size());
+        if (!items.empty()) put(items.data(), items.size() * sizeof(items[0]));
+    };
+    value(part);
+    if (part == Part::vertex_input) {
+        array(r.bindings);
+        array(r.attributes);
+        array(r.divisors);
+        value(r.topology);
+        value(r.primitive_restart);
+    } else if (part == Part::output) {
+        array(r.colors);
+        value(r.depth_format);
+        value(r.stencil_format);
+        array(r.blends);
+        value(r.logic_op_enable);
+        value(r.logic_op);
+        value(r.samples);
+        value(r.sample_shading);
+        value(r.min_sample_shading);
+        value(r.sample_mask);
+        value(r.alpha_to_coverage);
+        value(r.alpha_to_one);
+    }
+    return key;
 }
 
 // PSOs get link-time-optimised pipelines (from the pipeline cache at creation, else linked on the device's background

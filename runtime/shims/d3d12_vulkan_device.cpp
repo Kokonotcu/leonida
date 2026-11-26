@@ -7898,6 +7898,37 @@ struct DeviceState {
         return gpl_ok;
     }
 
+    // Pipeline layouts, one per push range and set 0, shared by every PSO that asks for that pair. Each PSO made a
+    // layout of its own before, and the NVIDIA driver keeps ~15 KB of host memory per VkPipelineLayout, however small
+    // (617.42, RTX 3080 Laptop: 20,000 identical layouts took 287 MiB of private bytes and as much working set,
+    // D:\GTA6\analysis\tools\vkobj_cost.cpp), so the retail title's tens of thousands of PSOs held hundreds of MiB of
+    // identical layouts. Layouts made from the same push range and set layout are identically defined, so pipelines
+    // made with one and binds and push constants recorded with another behave as before. Made on first use; destroyed
+    // with the device (destroy_shared_layouts), after every PSO.
+    std::mutex shared_layouts_mutex;
+    std::map<std::tuple<VkShaderStageFlags, std::uint32_t, VkDescriptorSetLayout>, VkPipelineLayout> shared_layouts;
+    VkPipelineLayout shared_layout(VkShaderStageFlags push_stages, std::uint32_t push_size, VkDescriptorSetLayout set0) {
+        std::lock_guard lock(shared_layouts_mutex);
+        const auto key = std::make_tuple(push_stages, push_size, set0);
+        if (const auto it = shared_layouts.find(key); it != shared_layouts.end()) return it->second;
+        leonida::pso::Recipe layout_recipe;
+        layout_recipe.push_stages = push_stages;
+        layout_recipe.push_size = push_size;
+        layout_recipe.bindless = set0 != VK_NULL_HANDLE;
+        const leonida::pso::LayoutCreateInfo create(layout_recipe, set0);
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        if (context->vk.vkCreatePipelineLayout(info.device, &create.info, nullptr, &layout) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+        shared_layouts.emplace(key, layout);
+        return layout;
+    }
+    void destroy_shared_layouts() {
+        std::lock_guard lock(shared_layouts_mutex);
+        if (context)
+            for (const auto& [key, layout] : shared_layouts) context->vk.vkDestroyPipelineLayout(info.device, layout, nullptr);
+        shared_layouts.clear();
+    }
+
     // The push range of every GPL PSO's layout and of the shared parts': every graphics stage the device has (the
     // parts must be made with identically defined layouts, VUID-VkGraphicsPipelineCreateInfo-pLibraries-06613).
     VkShaderStageFlags gpl_push_stages() const {
@@ -8099,14 +8130,38 @@ struct DeviceState {
         return it->second;
     }
 
+    // A vertex input or fragment output part (no shader), shared by every PSO whose recipe makes the same create info
+    // (pso::state_part_key): each PSO made its own before, one more output part per variant, at ~7.5 KB of NVIDIA
+    // driver memory apiece. Made outside the lock as gpl_library does; kept until the device goes.
+    std::map<std::string, VkPipeline> gpl_state_parts;  // under gpl_mutex
+    VkPipeline gpl_state_part(leonida::pso::Part part, const leonida::pso::Recipe& recipe,
+                              const std::vector<VkShaderModule>& modules) {
+        std::string key = leonida::pso::state_part_key(part, recipe);
+        {
+            std::lock_guard lock(gpl_mutex);
+            if (const auto it = gpl_state_parts.find(key); it != gpl_state_parts.end()) return it->second;
+        }
+        const leonida::pso::LibraryCreateInfo create(part, recipe, modules, VK_NULL_HANDLE);
+        bool cached = false;
+        const VkPipeline made = gpl_create(create.info, cached);
+        if (!made) return VK_NULL_HANDLE;
+        std::lock_guard lock(gpl_mutex);
+        const auto [it, inserted] = gpl_state_parts.emplace(std::move(key), made);
+        if (!inserted) context->vk.vkDestroyPipeline(info.device, made, nullptr);
+        return it->second;
+    }
+
     // At teardown, once no PSO links with them.
     void destroy_gpl_libraries() {
         stop_chunk_worker();  // no chunk import may land in a device that is going
         stop_compile_workers();
         stop_gpl_worker();
         std::lock_guard lock(gpl_mutex);
-        if (context)
+        if (context) {
             for (const auto& [key, library] : gpl_libraries) context->vk.vkDestroyPipeline(info.device, library, nullptr);
+            for (const auto& [key, part] : gpl_state_parts) context->vk.vkDestroyPipeline(info.device, part, nullptr);
+        }
+        gpl_state_parts.clear();
         if (!gpl_libraries.empty() || gpl_links.load())
             std::fprintf(stderr, "[rt] d3d12: pipeline libraries: %zu shared shader parts (%u of %u made from the "
                                  "pipeline cache), %u PSOs linked (%u from the cache); optimised links: %u taken from "
@@ -14065,7 +14120,7 @@ public:
         const VkDevice dev = device_.info.device;
         if (registered_) device_.context->remove_pipeline(id());
         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
-        if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
+        // pipeline_.layout and graphics_.layout are the device's shared layouts (DeviceState::shared_layout).
         if (module_) device_.shader_modules().release(module_);
         if (gpl_upgrade_) {
             // Waits for a running optimised link; one not started yet finds itself cancelled.
@@ -14076,9 +14131,6 @@ public:
         }
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
-        for (VkPipeline output : gpl_outputs_) vk.vkDestroyPipeline(dev, output, nullptr);
-        if (gpl_input_) vk.vkDestroyPipeline(dev, gpl_input_, nullptr);
-        if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
         for (VkShaderModule module : modules_) device_.shader_modules().release(module);
         for (VkShaderModule module : built_modules_) device_.shader_modules().release(module);
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
@@ -14220,7 +14272,6 @@ public:
     HRESULT create_graphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc, const D3D12_SHADER_BYTECODE* ms = nullptr,
                             const D3D12_SHADER_BYTECODE* as = nullptr, const StencilFaceMasks* back_masks = nullptr, bool depth_bounds = false) {
         auto& vk = device_.context->vk;
-        const VkDevice dev = device_.info.device;
         const bool mesh = ms && ms->pShaderBytecode && ms->BytecodeLength;
         if (stub_pipelines_enabled()) {
             graphics_.pending = true;
@@ -14932,16 +14983,11 @@ public:
             layout_bindless_ = device_.bindless != nullptr;
             uses_bindless = layout_bindless_;
         }
-        {
-            leonida::pso::Recipe layout_recipe;
-            layout_recipe.push_stages = layout_push_stages_;
-            layout_recipe.push_size = layout_push_size_;
-            layout_recipe.bindless = layout_bindless_;
-            const leonida::pso::LayoutCreateInfo layout(layout_recipe,
-                                                        uses_bindless ? device_.bindless->layout() : VK_NULL_HANDLE);
-            graphics_.uses_set0 = uses_bindless;  // the set itself is read at submit, under the descriptor lock
-            if (vk.vkCreatePipelineLayout(dev, &layout.info, nullptr, &graphics_.layout) != VK_SUCCESS) return E_FAIL;
-        }
+        // The device's layout for this push range and set 0 (DeviceState::shared_layout), not one of the PSO's own.
+        graphics_.uses_set0 = uses_bindless;  // the set itself is read at submit, under the descriptor lock
+        graphics_.layout = device_.shared_layout(layout_push_stages_, layout_push_size_,
+                                                 uses_bindless ? device_.bindless->layout() : VK_NULL_HANDLE);
+        if (!graphics_.layout) return E_FAIL;
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
@@ -15262,18 +15308,16 @@ public:
             if (!module_) return E_FAIL;
         }
         compute_entry_ = entry;
-        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
-        VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layout_info.pushConstantRangeCount = 1;
-        layout_info.pPushConstantRanges = &push;
+        // The compute push range, and set 0 when the program reads descriptors: the device's shared layout for them
+        // (DeviceState::shared_layout), not one of the PSO's own.
         VkDescriptorSetLayout set0_layout = VK_NULL_HANDLE;
         if (entry->binding_count) {
             set0_layout = device_.bindless->layout();
-            layout_info.setLayoutCount = 1;
-            layout_info.pSetLayouts = &set0_layout;
             pipeline_.uses_set0 = true;  // the set itself is read at submit, under the descriptor lock
         }
-        if (vk.vkCreatePipelineLayout(dev, &layout_info, nullptr, &pipeline_.layout) != VK_SUCCESS) return E_FAIL;
+        pipeline_.layout =
+            device_.shared_layout(VK_SHADER_STAGE_COMPUTE_BIT, sizeof(leonida::ShaderUserData), set0_layout);
+        if (!pipeline_.layout) return E_FAIL;
         VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
         pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -15594,32 +15638,28 @@ private:
     }
 
     // docs/aot_pipelines.md step 3: the pipeline as a fast link of four parts (src/pso_library.h). The vertex input
-    // and fragment output parts are this PSO's (cheap: no shader); the two shader parts are the device's shared ones,
-    // which --prebuild-shaders has put in the pipeline cache. The recipe is recorded as for a whole pipeline, so
-    // --prebuild-pipelines still has it. Called under variants_mutex_ for a variant, from create_graphics otherwise.
+    // and fragment output parts (no shader) are the device's, shared by equal create infos; the two shader parts are
+    // the device's shared ones, which --prebuild-shaders has put in the pipeline cache. The recipe is recorded as for
+    // a whole pipeline, so --prebuild-pipelines still has it. Called under variants_mutex_ for a variant, from
+    // create_graphics otherwise.
     // `base` (the PSO's own pipeline, not a variant for unbound slots): the optimised link (pso::Link) is taken from
     // the pipeline cache when an earlier run left it there; otherwise the fast link is returned and the optimised one
     // is made in the background after its first draw (graphics_.upgrade, start_upgrade).
     VkPipeline link(const leonida::pso::Recipe& recipe, const std::vector<VkShaderModule>& modules, bool base) {
         using leonida::pso::Link;
         using leonida::pso::Part;
-        auto& vk = device_.context->vk;
         bool cached = false;
-        if (!gpl_input_) {
-            const leonida::pso::LibraryCreateInfo create(Part::vertex_input, recipe, modules, VK_NULL_HANDLE);
-            gpl_input_ = device_.gpl_create(create.info, cached);
-        }
-        const leonida::pso::LibraryCreateInfo output_create(Part::output, recipe, modules, VK_NULL_HANDLE);
-        const VkPipeline output = device_.gpl_create(output_create.info, cached);
+        // All four parts are the device's, shared with every PSO that makes the same ones (gpl_state_part,
+        // gpl_library); the PSO destroys none of them.
+        const VkPipeline input = device_.gpl_state_part(Part::vertex_input, recipe, modules);
+        const VkPipeline output = device_.gpl_state_part(Part::output, recipe, modules);
         const VkPipeline pre_raster = device_.gpl_library(Part::pre_raster, recipe, modules);
         const VkPipeline fragment = device_.gpl_library(Part::fragment, recipe, modules, gpl_per_sample_);
-        if (!gpl_input_ || !output || !pre_raster || !fragment) {
-            if (output) vk.vkDestroyPipeline(device_.info.device, output, nullptr);
+        if (!input || !output || !pre_raster || !fragment) {
             log_once("a graphics PSO could not be linked from pipeline libraries; stages", int(recipe.stages.size()));
             return VK_NULL_HANDLE;
         }
-        gpl_outputs_.push_back(output);
-        const std::array<VkPipeline, 4> parts{gpl_input_, pre_raster, fragment, output};
+        const std::array<VkPipeline, 4> parts{input, pre_raster, fragment, output};
         if (leonida::pso::Recorder* recorder = device_.pso_recorder()) recorder->record(recipe);
         if (base && leonida::pso::gpl_optimize() && device_.info.pipeline_creation_cache_control &&
             device_.gpl_cached_link) {
@@ -15754,12 +15794,10 @@ private:
     std::atomic<bool> base_requested_{false};  // its background build was asked for (GraphicsPipeline::request)
     std::uint32_t vs_outputs_ = 0;              // the VS's output locations: the rect-list geometry shader's size
     bool has_geometry_ = false;                 // the PSO has its own GS (no rect-list variant then)
-    // Pipeline libraries (docs/aot_pipelines.md step 3): this PSO's vertex input part and its fragment output parts
-    // (one per variant), kept with the pipelines linked from them; the shader parts are the device's.
+    // Pipeline libraries (docs/aot_pipelines.md step 3): all four parts are the device's (gpl_state_part,
+    // gpl_library), shared by the PSOs that make the same ones.
     bool gpl_ = false;
     bool gpl_per_sample_ = false;
-    VkPipeline gpl_input_ = VK_NULL_HANDLE;
-    std::vector<VkPipeline> gpl_outputs_;
     std::shared_ptr<GplUpgrade> gpl_upgrade_;  // null unless the base pipeline is a fast link with an upgrade pending
     VkShaderModule module_ = VK_NULL_HANDLE;
     const leonida::ShaderEntry* compute_entry_ = nullptr;  // a compute PSO's program in the library (its module's words)
@@ -18263,6 +18301,7 @@ public:
         }
         state_.destroy_shader_objects();
         state_.destroy_gpl_libraries();
+        state_.destroy_shared_layouts();  // every PSO, the only users, is gone
         state_.report_arena();
         if (state_.context && state_.arena.buffer) {
             leonida::fsdraw::forget_arena(state_.arena.mapped);
