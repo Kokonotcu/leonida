@@ -3439,6 +3439,25 @@ struct DeviceState {
         const auto it = bvh_sizes.find(title_va);
         return it == bvh_sizes.end() ? 0 : it->second;
     }
+    // The room the title gave a structure the XboxBvhBuilder shim rebuilds from geometry (a rehydrated BLAS: the
+    // console's own size, 64 * (totalSizeIn64BNodes + 1), which the title allocated, and which our layout's worst-case
+    // size can exceed). Our builds write the title's pages in place (d3d12_com.cpp, BuildRaytracingAccelerationStructure),
+    // so what is written there must stay inside it: past it lies the title's next allocation, and BOX16 nodes written
+    // there (+-65504 bounds) were read back as pointers (boots dying 105-215 s in, 2026-11-25/26). The shim builds such
+    // a structure in a buffer of its own when it does not fit, and a copy into a noted room is bounded by it
+    // (resolve_xdxr_copy).
+    std::unordered_map<std::uint64_t, std::uint64_t> bvh_rooms;  // under bvh_size_mutex
+    void bvh_note_room(std::uint64_t title_va, std::uint64_t bytes) {
+        if (!title_va || !bytes) return;
+        std::lock_guard lock(bvh_size_mutex);
+        if (bvh_rooms.size() >= (1u << 16)) bvh_rooms.clear();
+        bvh_rooms[title_va] = bytes;
+    }
+    std::uint64_t bvh_room(std::uint64_t title_va) {
+        std::lock_guard lock(bvh_size_mutex);
+        const auto it = bvh_rooms.find(title_va);
+        return it == bvh_rooms.end() ? 0 : it->second;
+    }
 
     // BuildRaytracingAccelerationStructure: every address of `b` in place, or false (logged) when one has no copy.
     // Unchanged on a device that builds KHR structures (they are named by their resources' VAs) or none.
@@ -3521,6 +3540,14 @@ struct DeviceState {
             return bvh_refuse(bvh_copy_src, c.src_va, want), false;
         c.src_va = out;
         c.src_room = room;
+        // A destination with a room the title gave it (bvh_note_room: a structure the shim rebuilt from geometry and
+        // compacts into the title's memory): written where it is, as builds are (the replay maps its pages,
+        // xdxr_copy), and no further than the room, which is all the title allocated there.
+        if (const std::uint64_t title_room = bvh_room(title_dst)) {
+            c.dst_room = title_room;
+            if (known) bvh_note_size(title_dst, std::min(known, title_room));
+            return true;
+        }
         if (!bvh_va(c.dst_va, want, true, out, &room) || (out & 255))
             return bvh_refuse(bvh_copy_dst, c.dst_va, want), false;
         c.dst_va = out;
@@ -18457,6 +18484,7 @@ public:
     // Xbox device slots 70/71 (rt::d3d12::write_placed_buffer_view): the slot is zeroed first, as Create*View does.
     bool resolve_xdxr_build(leonida::BuildAccelerationStructure& build) { return state_.resolve_xdxr_build(build); }
     bool resolve_xdxr_copy(leonida::CopyAccelerationStructure& copy) { return state_.resolve_xdxr_copy(copy); }
+    void note_xdxr_room(std::uint64_t va, std::uint64_t bytes) { state_.bvh_note_room(va, bytes); }
     bool resolve_xdxr_postbuild(leonida::AccelerationStructurePostbuild& info) {
         return state_.resolve_xdxr_postbuild(info);
     }
@@ -24396,6 +24424,10 @@ bool resolve_acceleration_structure_copy(IUnknown* device, leonida::CopyAccelera
 bool resolve_acceleration_structure_postbuild(IUnknown* device, leonida::AccelerationStructurePostbuild& info) {
     Device* d = list_device(device);
     return !d || d->resolve_xdxr_postbuild(info);
+}
+
+void note_acceleration_structure_room(IUnknown* device, std::uint64_t va, std::uint64_t bytes) {
+    if (Device* d = list_device(device)) d->note_xdxr_room(va, bytes);
 }
 
 IUnknown* descriptor_heap_info(ID3D12DescriptorHeap* heap, D3D12_DESCRIPTOR_HEAP_DESC& desc,

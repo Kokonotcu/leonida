@@ -422,13 +422,12 @@ public:
         SubmitMutex& gate_;
     };
 
-    // On unless LEONIDA_COMPILE_GATE=0 (upstream's default, 9f98dcc61). With it off (6f0871a5c made it opt-in) every
-    // retail boot died 105-160 s in on title structures that GPU-made data had overwritten (half-float +-65504 bounds
-    // in the physical CPU window; exe+0x35A4245, 0x140108557, 0x1452ECF93): a bisect put the 2 h and 314 s boots on
-    // the gated side and every crashing one on the other, and the gated merge build ran 480 s clean. The 17-27 s
-    // submission waits that made it opt-in were inline host imports under the queue lock, not the gate: with the
-    // cached import types the gated boot logged no wait of 50 ms. LEONIDA_COMPILE_GATE=1 additionally takes
-    // compute_driver_turn (d3d12_vulkan_device.cpp), which holds the whole submit lock across compute compiles.
+    // On unless LEONIDA_COMPILE_GATE=0 (upstream's default, 9f98dcc61; 6f0871a5c had made it opt-in). It was blamed
+    // for the boots dying 105-215 s in on title memory holding BOX16 nodes; that was the rehydrated BLASes written
+    // past their room (shims/xbox_bvh_builder.cpp), and gated boots died the same way. The 17-27 s submission waits
+    // that made it opt-in were inline host imports under the queue lock, not the gate: with the cached import types a
+    // gated boot logged no wait of 50 ms. LEONIDA_COMPILE_GATE=1 additionally takes compute_driver_turn
+    // (d3d12_vulkan_device.cpp), which holds the whole submit lock across compute compiles.
     static bool compile_gate_enabled() {
         static const bool on = [] {
             const char* value = std::getenv("LEONIDA_COMPILE_GATE");

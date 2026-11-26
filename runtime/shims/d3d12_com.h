@@ -791,6 +791,10 @@ bool console_descriptor_heap_range(D3D12_GPU_VIRTUAL_ADDRESS va, std::uint64_t& 
 bool resolve_acceleration_structure_build(IUnknown* device, leonida::BuildAccelerationStructure& build);
 bool resolve_acceleration_structure_copy(IUnknown* device, leonida::CopyAccelerationStructure& copy);
 bool resolve_acceleration_structure_postbuild(IUnknown* device, leonida::AccelerationStructurePostbuild& info);
+// The title gave the structure at `va` only `bytes` of room (a rehydrated BLAS: the console's own size). From now on a
+// copy into it is written at the title's address itself and at most `bytes`. Nothing when `device` is not a Vulkan
+// device of this module.
+void note_acceleration_structure_room(IUnknown* device, std::uint64_t va, std::uint64_t bytes);
 
 // Reads the shader-visible descriptor heap GPU base addresses currently bound on `list` (0 when unbound).
 // Returns false when `list` is not one of this module's command lists.
