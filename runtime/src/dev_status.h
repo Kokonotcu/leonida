@@ -34,6 +34,26 @@ inline Builds& builds() {
     return instance;
 }
 
+// The GPU's progress over all queues, in retirement tickets (VulkanContext): what was submitted, what has completed,
+// and when the completed figure last moved (steady-clock nanoseconds). Relaxed atomics, written where the context
+// already counts them. The title ends itself after 30 s with no GPU progress (its "GPU Loc Sig" watchdog), so the
+// overlay shows the time since the last progress while work is outstanding.
+struct Gpu {
+    std::atomic<std::uint64_t> submitted{0}, completed{0};
+    std::atomic<std::int64_t> progress_ns{0};
+};
+inline Gpu& gpu() {
+    static Gpu instance;
+    return instance;
+}
+inline void gpu_completed(std::uint64_t ticket, std::int64_t now_ns) {
+    Gpu& g = gpu();
+    std::uint64_t seen = g.completed.load(std::memory_order_relaxed);
+    while (ticket > seen && !g.completed.compare_exchange_weak(seen, ticket, std::memory_order_relaxed)) {
+    }
+    if (ticket > seen) g.progress_ns.store(now_ns, std::memory_order_relaxed);
+}
+
 // One pipeline build, from construction to destruction.
 struct Build {
     explicit Build(const char* name) {

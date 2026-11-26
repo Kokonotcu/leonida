@@ -61,6 +61,8 @@
 #include <thread>
 #include <vector>
 
+#include "renderdoc_capture.h"
+
 namespace leonida {
 
 // A sub-rectangle of a back buffer in texels; left/top inclusive, right/bottom exclusive (D3D12_RECT's convention).
@@ -754,6 +756,7 @@ private:
         // is recreated next time, and the caller sees VK_SUCCESS, since its work was submitted.
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
             const auto shown = ++presented_;
+            renderdoc::after_present(shown);  // LEONIDA_RENDERDOC: the next present is captured when listed
             if (debug_targets::dump_at() && debug_targets::dump_now(presented_)) dump_targets();
             submit_phases::totals().presents.fetch_add(1, std::memory_order_relaxed);  // frames a second, phase line
             submit_phases::totals().present_serial.fetch_add(1, std::memory_order_relaxed);

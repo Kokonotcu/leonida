@@ -32,6 +32,7 @@
 #include "resource_tiling.h"
 #include "pipeline_profile.h"
 #include "submit_phases.h"
+#include "dev_status.h"
 #include "pipeline_wait.h"
 #include "title_va_alias.h"
 #include "xdxr_build.h"
@@ -2492,6 +2493,7 @@ public:
             std::uint64_t seen = completed_ticket_seen_.load(std::memory_order_relaxed);
             while (ticket > seen && !completed_ticket_seen_.compare_exchange_weak(seen, ticket, std::memory_order_acq_rel)) {
             }
+            dev_status::gpu_completed(ticket, submit_phases::now_ns());  // the dev overlay's GPU progress
         }
         return lost ? 0 : ticket;
     }
@@ -2514,6 +2516,7 @@ public:
     // monotonic even when another queue completes first; global tickets are retired in order.
     void record_submit_locked(VkSemaphore progress, std::uint64_t value) {
         const auto ticket = submitted_ticket_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        dev_status::gpu().submitted.store(ticket, std::memory_order_relaxed);  // the dev overlay's GPU progress
         retire_tickets_.record(ticket, progress, value);
         note_image_work_locked();
     }

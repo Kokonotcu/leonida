@@ -25753,6 +25753,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     {
         const std::lock_guard<std::mutex> lock(process_instance_mutex);
         if (!process_instance.instance) {
+            leonida::renderdoc::load();  // LEONIDA_RENDERDOC: its Vulkan layer comes on with the instance made below
             const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(get(nullptr, "vkCreateInstance"));
             const auto enum_inst_exts = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
                 get(nullptr, "vkEnumerateInstanceExtensionProperties"));

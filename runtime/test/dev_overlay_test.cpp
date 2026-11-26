@@ -141,9 +141,10 @@ int main() {
 
     dov::Sample s;
     auto text = dov::lines(s, 12);
-    CHECK(text.size() == 7);
+    CHECK(text.size() == 8);
     // No counters and no device figure: "n/a", never a false 0.
     CHECK(has(text, "RAM n/a   VRAM n/a"));
+    CHECK(has(text, "frame 0   GPU 0 behind   main loop n/a"));
     CHECK(has(text, "12 s") && has(text, "now: the title's own code") && has(text, "pipelines: 0 built"));
     CHECK(!has(text, "building"));
     s.frames = 8.44;
@@ -159,6 +160,17 @@ int main() {
     text = dov::lines(s, 147);
     CHECK(has(text, "8.4 fps") && has(text, "now: refreshing textures for 3 s") && has(text, "copies 3.5"));
     CHECK(has(text, "853 built, 3 building (nnn") && has(text, "3029 drawn, 38363 skipped"));
+    s.presents = 900;
+    s.gpu_submitted = 747;
+    s.gpu_completed = 746;
+    s.gpu_stalled = 12.4;
+    s.heartbeat = 0.3;
+    text = dov::lines(s, 150);
+    CHECK(has(text, "frame 900   GPU STUCK 12 s (1 behind)   main loop ok"));
+    s.gpu_stalled = 0.5;
+    s.heartbeat = 25;
+    text = dov::lines(s, 150);
+    CHECK(has(text, "GPU 1 behind   main loop STUCK 25 s"));
     for (const auto& line : text) CHECK(line.size() < 160);
     if (const int failed = check_memory_figures()) return failed;
     std::puts("dev_overlay_test: ok");

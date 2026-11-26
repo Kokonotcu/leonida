@@ -55,6 +55,11 @@ struct Sample {
     double cores = 0, free_gb = 0;
     memory_figures::ProcessMemory ram;                  // private memory and working set
     VramBudget vram;                                    // the device's VK_EXT_memory_budget; "n/a" without it
+    std::uint64_t presents = 0;                         // presents so far: the numbers LEONIDA_CAPTURE and
+                                                        // LEONIDA_RENDERDOC take
+    std::uint64_t gpu_submitted = 0, gpu_completed = 0; // retirement tickets over all queues (dev_status::gpu)
+    double gpu_stalled = -1;                            // seconds without GPU progress while work is outstanding
+    double heartbeat = -1;                              // seconds since the title's main loop last beat; -1 unknown
 };
 
 // The text of one sample: pure, for the test.
@@ -62,6 +67,22 @@ inline std::vector<std::string> lines(const Sample& s, double age) {
     char text[160];
     std::vector<std::string> out;
     std::snprintf(text, sizeof text, "Leonida dev  %.0f s   %.1f fps   %.1f submissions/s", age, s.frames, s.submissions);
+    out.emplace_back(text);
+    // Frame number, GPU progress and the title's main loop. The title ends itself after 30 s of no GPU progress or no
+    // main-loop heartbeat (its two watchdogs); a STUCK line is drawn red.
+    char gpu[64], beat[40];
+    const unsigned long long behind = s.gpu_submitted > s.gpu_completed ? s.gpu_submitted - s.gpu_completed : 0;
+    if (s.gpu_stalled >= 2)
+        std::snprintf(gpu, sizeof gpu, "GPU STUCK %.0f s (%llu behind)", s.gpu_stalled, behind);
+    else
+        std::snprintf(gpu, sizeof gpu, "GPU %llu behind", behind);
+    if (s.heartbeat < 0)
+        std::snprintf(beat, sizeof beat, "main loop n/a");
+    else if (s.heartbeat >= 2)
+        std::snprintf(beat, sizeof beat, "main loop STUCK %.0f s", s.heartbeat);
+    else
+        std::snprintf(beat, sizeof beat, "main loop ok");
+    std::snprintf(text, sizeof text, "frame %llu   %s   %s", static_cast<unsigned long long>(s.presents), gpu, beat);
     out.emplace_back(text);
     double total = 0;
     for (const double ms : s.phase_ms) total += ms;
@@ -215,8 +236,40 @@ private:
         s.vram = memory_figures::latest_vram();  // reads the device at most once per 500 ms
         MEMORYSTATUSEX status{sizeof status};
         if (GlobalMemoryStatusEx(&status)) s.free_gb = double(status.ullAvailPhys) / double(1u << 30);
+        s.presents = totals.present_serial.load(std::memory_order_relaxed);
+        dev_status::Gpu& gpu = dev_status::gpu();
+        s.gpu_submitted = gpu.submitted.load(std::memory_order_relaxed);
+        s.gpu_completed = gpu.completed.load(std::memory_order_relaxed);
+        if (s.gpu_completed < s.gpu_submitted) {
+            const std::int64_t since = gpu.progress_ns.load(std::memory_order_relaxed);
+            s.gpu_stalled = since ? std::max(0.0, double(now - since) * 1e-9) : 0;
+        }
+        s.heartbeat = heartbeat_age(now);
         lines_ = lines(s, sp::process_age());
+        // One log line a stall, when the GPU or the main loop has stood still for 5 s: what the overlay showed then.
+        const bool stuck = s.gpu_stalled >= 5 || s.heartbeat >= 5;
+        if (stuck && !reported_)
+            for (const auto& line : lines_) std::fprintf(stderr, "[overlay] %s\n", line.c_str());
+        reported_ = stuck;
         place();
+    }
+
+    // The title's main loop writes a QueryPerformanceCounter value to 0x1471B6338 each frame; its hang watchdog ends the
+    // game after 30 s without a change (five-star-recomp docs/debugging.md, "Hang watchdog"). The image always loads at
+    // its base, 0x140000000. Read only when the page is committed and readable; -1 before the first beat.
+    double heartbeat_age(std::int64_t now) {
+        constexpr std::uintptr_t kHeartbeat = 0x1471B6338;
+        MEMORY_BASIC_INFORMATION info{};
+        if (!VirtualQuery(reinterpret_cast<const void*>(kHeartbeat), &info, sizeof info) || info.State != MEM_COMMIT ||
+            !(info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+            return -1;
+        const std::uint64_t value = *reinterpret_cast<const volatile std::uint64_t*>(kHeartbeat);
+        if (!value) return -1;
+        if (value != beat_value_) {
+            beat_value_ = value;
+            beat_ns_ = now;
+        }
+        return double(now - beat_ns_) * 1e-9;
     }
 
     void place() {
@@ -248,7 +301,8 @@ private:
         SetBkMode(memory, TRANSPARENT);
         int y = 4;
         for (std::size_t i = 0; i < lines_.size(); ++i, y += 17) {
-            SetTextColor(memory, i == 0 ? RGB(120, 255, 140) : RGB(235, 235, 235));
+            const bool stuck = lines_[i].find("STUCK") != std::string::npos;
+            SetTextColor(memory, stuck ? RGB(255, 90, 80) : i == 0 ? RGB(120, 255, 140) : RGB(235, 235, 235));
             TextOutA(memory, 6, y, lines_[i].data(), int(lines_[i].size()));
         }
         BitBlt(dc, 0, 0, area.right, area.bottom, memory, 0, 0, SRCCOPY);
@@ -266,6 +320,9 @@ private:
     std::uint64_t frames_ = 0, submissions_ = 0, cpu_ = 0, ns_[submit_phases::kCount]{};
     std::uint64_t window_frames_ = 0, window_submissions_ = 0, window_ns_[submit_phases::kCount]{};
     double window_seconds_ = 0;
+    std::uint64_t beat_value_ = 0;
+    std::int64_t beat_ns_ = 0;
+    bool reported_ = false;
     Sample shown_;
 };
 #endif
