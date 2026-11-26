@@ -6196,6 +6196,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.indirect_execute(command_buffer, p.indirect);  // per-record root arguments, then the dispatch
             else
                 detail::emit_indirect(vk, command_buffer, p, *ind);
+            if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (const auto* xdxr_build = std::get_if<BuildAccelerationStructure>(&command);
                    xdxr_build && vk.xdxr_record) {
             vk.xdxr_record(command_buffer, *xdxr_build, p.xdxr_blases);
@@ -6313,6 +6314,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             }
             vk.push_constants(command_buffer, p.pipeline.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(data), &data);
             vk.dispatch(command_buffer, dispatch->x, dispatch->y, dispatch->z);
+            if constexpr (Checkpoints) checkpoints->dispatched(command_buffer);
         } else if (const Draw* draw = raster.state ? raster.state : detail::draw_of(command)) {
             const detail::PreparedDraw& d = prepared.draws[p.draw];
             if (d.skipped) continue;  // could not be resolved in prepare: dropped

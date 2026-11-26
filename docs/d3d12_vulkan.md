@@ -4789,6 +4789,36 @@ when it cannot sample the submission lock for that long. A progress warning leav
 device state intact. The driver checkpoint and fault-info queries run after Vulkan reports device loss. This mode
 is off by default.
 
+Each dispatch line carries a `seq`: a number every recorded dispatch gets, across queues and submissions, in the
+order the submissions were recorded. The list keeps the last 64, so its numbers can have gaps where a submission
+recorded more than that.
+
+**AMD breadcrumbs.** NVIDIA's checkpoints say where a queue stopped; RADV has none. With `LEONIDA_DEVICE_MARKERS=1`
+as well, on a device with `VK_AMD_buffer_marker`, every numbered dispatch writes its `seq` into its queue's slot of
+one persistent buffer twice (`src/vulkan_device_markers.h`): at top of pipe before the dispatch (started) and at
+bottom of pipe after it (finished), with `vkCmdWriteBufferMarker2AMD` (or `vkCmdWriteBufferMarkerAMD` without
+synchronization2). A bottom-of-pipe write waits for all earlier work on the queue, so the finished value is the last
+dispatch before which everything had completed, and the queue's dispatches after it up to the started value are the
+ones the GPU began and did not finish. The oldest of them is the likely hang. The buffer is host-visible and
+coherent, in system memory where the device has such a type, so it can still be read after a device loss. The loss
+and stall reports then add lines like these (the shader names are made up):
+
+```
+[rt] device-markers: AMD buffer markers, read after the device loss; best-effort: only what the GPU wrote before it stopped, and a reset may have lost the last writes
+[rt] device-markers: queue 0000000012345678 (compute) finished seq=1203 started seq=1205; started, not finished: 1204 1205
+[rt] device-markers: likely hang: seq=1204 execute=88 queue=0000000012345678 (compute) list=0 command=17 shader=cs_example_a
+[rt] device-markers: queue 00000000123456a0 (direct) idle: finished seq=1199, nothing started after it; next submitted seq=1206 not started (waiting, or behind other work of the queue)
+[rt] device-fault: submitted dispatch seq=1204 execute=88 queue=0000000012345678 (compute) list=0 command=17 shader=cs_example_a groups=64,1,1 <- likely hang (device-markers)
+```
+
+A separate history of the last 16,384 dispatches names the likely hang when it has already left the 64-entry list.
+An idle queue (finished equals started) is not called hung: if it still has dispatches submitted, it was waiting
+on a semaphore or stuck in work that is not a dispatch (a draw, a copy). The values are what the GPU wrote before
+it stopped; after a loss and a ring reset they may be stale, so read them as a pointer, not a proof. The cost with
+the switch on is two marker writes per dispatch (a command-processor write and an end-of-pipe event, no wait) plus
+one entry in the history; with it off nothing is recorded. Without the extension, or without
+`LEONIDA_DEVICE_FAULT`, the runtime logs one `device-markers: unavailable` line and runs as before.
+
 For a local pre-submit inspection, also set `LEONIDA_COMPUTE_INPUTS` to comma-separated shader name fragments and
 `LEONIDA_COMPUTE_INPUT_SLOTS` to comma-separated decimal `root/slot` pairs. For example, `4/86,5/0,5/2,7/0` reads
 four 32-byte descriptors. The probe logs the bound heap and root layout, the saved user SGPRs, observed descriptor
