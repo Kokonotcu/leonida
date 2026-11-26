@@ -18184,6 +18184,18 @@ def mix_literal(raw, printed, op):
     return stored
 
 
+def restore_text_cut_mix_literal(ins, enc):
+    """llvm-mc 21.1.8 can print a v_fma_mix* literal cut to its low 16 bits in the text while its printed encoding
+    holds all 32 (the printed-encoding check then passes, and the text alone reads the high half as +0.0): take the
+    literal from the printed encoding. Measured on 1.0.2.1: 47,910 such instructions in 1,218 pipeline-library
+    programs and 6 in one FidelityFX FSPX program; none among the game's own shaders."""
+    if len(enc) != 12 or enc[3] != 0xCC or not base_op(ins["op"]).startswith("v_fma_mix"):
+        return
+    literal = int.from_bytes(enc[8:], "little")
+    if literal >> 16 and any(a.get("k") == "imm" and a.get("v") == literal & 0xFFFF for a in ins["args"][1:4]):
+        restore_mix_literal(ins, enc, literal)
+
+
 def restore_mix_literal(ins, raw, literal):
     """Give every source of ``ins`` that the stored bytes encode as the literal (SRC field 0xff) its 32-bit value."""
     w1 = int.from_bytes(raw[4:8], "little")
@@ -18547,6 +18559,9 @@ def check_printed_encodings(path, info):
     Only a listing whose header names the code range it was disassembled from (shader_disasm.py), with a blob that
     holds that range, is checked: a hand-written listing, run_gpu_tests.py's "code 0x0..0x0 (synthetic)" and a
     test's header-only blob are not the bytes the text came from."""
+    for ins in info["insns"]:
+        if ins.get("enc"):      # needs only the printed encoding, so it runs before the blob checks below
+            restore_text_cut_mix_literal(ins, bytes.fromhex(ins["enc"]))
     with open(path, encoding="utf-8", errors="replace") as f:
         m = HDR.match(f.readline())
     if not m or int(m.group(3), 16) <= int(m.group(2), 16):
@@ -18715,6 +18730,7 @@ def _translate(path):
         exact = bool(bad) and len(bad) == info["invalid"]
         for ins in insns:
             enc = bytes.fromhex(ins["enc"])
+            restore_text_cut_mix_literal(ins, enc)
             op, operand_count = ins["op"], len(ins["args"])
             if exact:
                 while pos in bad and not same_encoding(blob[pos:pos + len(enc)], enc, op, operand_count):

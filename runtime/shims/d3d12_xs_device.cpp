@@ -1534,6 +1534,9 @@ struct ChildProxy {
     std::atomic<unsigned char> queue_layout{kQueueLayoutUnknown};
     // Queues only: the D3D12_COMMAND_LIST_TYPE it was created with (device slots 8, 48, 75); -1 when unknown.
     int queue_type = -1;
+    // Queues only: executes and fence signals so far (note_queue_use), to tell which queue the title signals on
+    // against the one chained lists run on.
+    std::atomic<std::uint64_t> executes{0}, signals{0};
     // Allocators only: callback and context recorded by console slot 9 (SetAllocatorCallbackX).
     std::atomic<std::uintptr_t> allocator_callback{0};
     std::atomic<std::uintptr_t> allocator_callback_context{0};
@@ -2366,6 +2369,8 @@ void claim_console_queue(DeviceProxy* device, D3D12_COMMAND_LIST_TYPE type, ID3D
     if (!it->queue[type]) {
         it->queue[type] = queue;
         queue->AddRef();
+        std::fprintf(stderr, "[rt] d3d12_xs: real queue %p runs the chained lists of type %d\n",
+                     static_cast<void*>(queue), static_cast<int>(type));
     }
     ReleaseSRWLockExclusive(&q.lock);
 }
@@ -2442,8 +2447,19 @@ bool execute_with_values(ChildProxy* self, UINT count, void* const* lists);
 // ExecuteBundle); the real queue never sees a proxy.
 // `console`: the call came through the console variant (slot 35), the retail title's execute: the chained lists run
 // first (ours, the chained submission above).
+// A console queue's executes and fence signals, one line at 1, 2, 4, 8... of each: which queues the title uses, and
+// which one it signals its fences on (chained lists run on the first queue of their type, claim_console_queue).
+void note_queue_use(ChildProxy* queue, bool signal) {
+    const std::uint64_t n = (signal ? queue->signals : queue->executes).fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n & (n - 1)) return;
+    std::fprintf(stderr, "[rt] d3d12_xs: console queue %p (real %p, type %d): %llu %s\n", static_cast<void*>(queue),
+                 static_cast<void*>(queue->real), queue->queue_type, static_cast<unsigned long long>(n),
+                 signal ? "fence signals" : "executes");
+}
+
 std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_word, std::uint64_t lists_word,
                                           bool console = false) {
+    note_queue_use(self, false);
     if (lists_word &&
         execute_with_values(self, static_cast<UINT>(count_word), reinterpret_cast<void* const*>(lists_word)))
         return 0;
@@ -3004,6 +3020,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                     self->device->console_layout.store(ChildProxy::kQueueLayoutNewer,
                                                        std::memory_order_relaxed);
                     using Fn = HRESULT(WINAPI*)(IUnknown*, IUnknown*, UINT64);
+                    if (Slot == 16) note_queue_use(self, true);
                     return hr_to_u64(reinterpret_cast<Fn>(self->real_vtable[kQueueSignal + (Slot - 16)])(
                         self->real, fence, a2));
                 }
@@ -3050,6 +3067,7 @@ std::uint64_t WINAPI child_slot(ChildProxy* self, std::uint64_t a1, std::uint64_
                     if (!logged.exchange(true, std::memory_order_relaxed))
                         std::fprintf(stderr, "[rt] d3d12_xs: SignalX (queue slot %u) forwarded as Signal\n", Slot);
                     using Fn = HRESULT(WINAPI*)(IUnknown*, IUnknown*, UINT64);
+                    note_queue_use(self, true);
                     return hr_to_u64(reinterpret_cast<Fn>(self->real_vtable[kQueueSignal])(self->real, fence, a2));
                 }
                 return hr_to_u64(S_OK);
@@ -4809,7 +4827,11 @@ HRESULT proxy_create_command_queue(DeviceProxy* self, const D3D12_COMMAND_QUEUE_
     if (FAILED(hr)) return hr;
     const HRESULT wrapped = wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
     // The proxy keeps the queue's list type (the chained submission's key), so no execute asks the queue for it.
-    if (SUCCEEDED(wrapped) && desc && *out) static_cast<ChildProxy*>(*out)->queue_type = static_cast<int>(desc->Type);
+    if (SUCCEEDED(wrapped) && desc && *out) {
+        static_cast<ChildProxy*>(*out)->queue_type = static_cast<int>(desc->Type);
+        std::fprintf(stderr, "[rt] d3d12_xs: console queue %p (real %p) made by slot 8, type %d, priority %d\n", *out,
+                     created, static_cast<int>(desc->Type), desc->Priority);
+    }
 #ifdef LEONIDA_VULKAN_DEVICE
     if (SUCCEEDED(wrapped) && desc && desc->Type == D3D12_COMMAND_LIST_TYPE_DIRECT && rt::package_splash::configured() &&
         !g_presentation_factory.load(std::memory_order_acquire))  // merge: our presenter owns the window
@@ -5235,9 +5257,12 @@ HRESULT proxy_create_command_queue1(DeviceProxy* self, std::uint64_t desc, std::
     const HRESULT hr = create(self->real, desc, creator_id, &__uuidof(ID3D12CommandQueue), &created);
     if (FAILED(hr)) return hr;
     const HRESULT wrapped = wrap_child<ChildKind::queue>(static_cast<IUnknown*>(created), self, riid, out);
-    if (SUCCEEDED(wrapped) && desc && *out)  // as slot 8: the list type, kept on the proxy
+    if (SUCCEEDED(wrapped) && desc && *out) {  // as slot 8: the list type, kept on the proxy
         static_cast<ChildProxy*>(*out)->queue_type =
             static_cast<int>(reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(desc)->Type);
+        std::fprintf(stderr, "[rt] d3d12_xs: console queue %p (real %p) made by slot 75, type %d\n", *out, created,
+                     static_cast<int>(reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(desc)->Type));
+    }
     return wrapped;
 }
 

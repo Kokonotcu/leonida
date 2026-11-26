@@ -75,6 +75,7 @@
 #include "../src/pso_library.h"
 #include "../src/pso_recipe.h"
 #include "../src/vulkan_shader_objects.h"
+#include "../src/shadow_keep.h"
 #include "../src/title_page_watch.h"
 #include "../src/guarded_copy.h"
 #include "../src/title_geometry_watch.h"
@@ -84,7 +85,6 @@
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
 #include "../src/title_va_alias.h"
-#include "../src/console_heap_copy.h"
 #include "../src/console_heap_vsharp_slots.h"
 #include "../src/title_window_plan.h"
 #include "../src/vulkan_present.h"
@@ -511,6 +511,7 @@ public:
         last_ = (end_ + kPage - 1) & ~(kPage - 1);
         state_.assign((last_ - first_) / kPage, 0);
         idle_.assign(state_.size(), 0);
+        sums_.assign(state_.size() * kPieces, 0);
         cover_.assign(state_.size(), 1);
         targets_.push_back({begin_, end_, shadow});
         index_targets();
@@ -726,6 +727,7 @@ public:
                     if (state_[i] & kZero) continue;
                     const auto [offset, bytes] = span_of(i, i + 1);
                     zero_targets(offset, bytes);
+                    leonida::shadow_keep::forget(sums_.data(), first_, begin_ + offset, begin_ + offset + bytes);
                     if (!zeroed_.empty() && zeroed_.back().offset + zeroed_.back().bytes == offset)
                         zeroed_.back().bytes += bytes;
                     else
@@ -793,6 +795,10 @@ public:
         pieces_.walk_ms = std::chrono::duration<double, std::milli>(copy_start - walk_start).count();
         std::size_t copied = 0;
         for (const Job& job : jobs_) {
+            if (keep_gpu_writes()) {  // only the pieces whose title bytes changed (src/shadow_keep.h)
+                copied += copy_changed(job);
+                continue;
+            }
             std::uint8_t* run_dst = nullptr;
             const std::uint8_t* run_src = nullptr;
             std::size_t run_bytes = 0;
@@ -843,12 +849,14 @@ public:
             const std::size_t n = (first_ - first) / kPage;
             state_.insert(state_.begin(), n, std::uint8_t(0));
             idle_.insert(idle_.begin(), n, std::uint8_t(0));
+            sums_.insert(sums_.begin(), n * kPieces, std::uint64_t(0));
             cover_.insert(cover_.begin(), n, 0u);
             first_ = first;
         }
         if (last > last_) {
             state_.resize((last - first_) / kPage, 0);
             idle_.resize(state_.size(), 0);
+            sums_.resize(state_.size() * kPieces, 0);
             cover_.resize(state_.size(), 0);
             last_ = last;
         }
@@ -868,6 +876,8 @@ public:
             state_[at + i] |= other.state_[i];
             cover_[at + i] += other.cover_[i];
             idle_[at + i] = other.idle_[i];
+            std::copy_n(other.sums_.begin() + std::ptrdiff_t(i * kPieces), kPieces,
+                        sums_.begin() + std::ptrdiff_t((at + i) * kPieces));
         }
         targets_.insert(targets_.end(), other.targets_.begin(), other.targets_.end());
         if (other.map_generation_ != map_generation_) map_generation_ = ~std::uint64_t(0);
@@ -912,12 +922,39 @@ public:
                 kind = classify(region);
             }
             const std::uintptr_t from = std::max(at, begin), to = std::min(next, end);
-            if (kind == Kind::zero)
+            if (kind == Kind::zero) {
                 std::memset(shadow + (from - begin), 0, to - from);
-            else
-                copy_run(shadow + (from - begin), reinterpret_cast<const std::uint8_t*>(from), to - from,
-                         (region.Protect & PAGE_WRITECOMBINE) != 0);
+            } else {
+                const bool streaming = (region.Protect & PAGE_WRITECOMBINE) != 0;
+                copy_run(shadow + (from - begin), reinterpret_cast<const std::uint8_t*>(from), to - from, streaming);
+                // The sums stand for what every target holds. The new target now holds the title's current bytes, so
+                // the pieces where those differ from the sums are brought to the other targets too, and the sums
+                // follow; otherwise a title that later writes the old bytes back would leave the new target behind.
+                // Whole pieces (inside this page, so this region) up to the targets' ends, as a refresh sums them: a
+                // piece cut at the new target's edge would be summed short and copied again at the next refresh.
+                constexpr std::uintptr_t kPiece = leonida::shadow_keep::kPiece;
+                if (keep_gpu_writes())
+                    reconcile(std::max(from & ~(kPiece - 1), begin_), std::min((to + kPiece - 1) & ~(kPiece - 1), end_),
+                              streaming);
+            }
             at = next;
+        }
+    }
+
+    // [from, to), readable title pages: the pieces whose bytes differ from the sums are copied to every target over
+    // them and their sums updated, as a refresh does.
+    void reconcile(std::uintptr_t from, std::uintptr_t to, bool streaming) {
+        alignas(64) std::uint8_t page[kPage];
+        for (std::uintptr_t va = from; va < to;) {
+            const std::size_t n = std::min<std::size_t>(to - va, kPage - (va & (kPage - 1)));
+            copy_run(page, reinterpret_cast<const std::uint8_t*>(va), n, streaming);
+            leonida::shadow_keep::copy_changed(
+                page, va, n, sums_.data(), first_, [&](std::uintptr_t a, std::uintptr_t b, const std::uint8_t* source) {
+                    for_each_target(a, b, [&](const Target& t, std::uintptr_t lo, std::uintptr_t hi) {
+                        std::memcpy(t.shadow + (lo - t.begin), source + (lo - a), hi - lo);
+                    });
+                });
+            va += n;
         }
     }
 
@@ -1215,6 +1252,40 @@ private:
         jobs_.push_back({offset, bytes, streaming, aliased});
     }
 
+    // LEONIDA_SHADOW_KEEP (on; 0: every job copied whole, as before): a job's bytes reach the copies only where they
+    // differ from those copied last (src/shadow_keep.h), so a shader's write into a copy of pages copied without a
+    // sign that the title wrote them stays until the title changes those bytes.
+    // shortcut: a title that rewrites the same bytes to reset a GPU-written value is not seen; needs a real write
+    // signal (a write-back to the title's pages) then.
+    static bool keep_gpu_writes() {
+        static const bool on = [] {
+            char value[2] = {};
+            std::size_t length = 0;
+            return getenv_s(&length, value, sizeof(value), "LEONIDA_SHADOW_KEEP") != 0 || length == 0 ||
+                   value[0] != '0';
+        }();
+        return on;
+    }
+    static constexpr std::size_t kPieces = kPage / leonida::shadow_keep::kPiece;
+    std::size_t copy_changed(const Job& job) {
+        std::size_t copied = 0;
+        alignas(64) std::uint8_t page[kPage];
+        for (std::size_t at = job.offset, end = job.offset + job.bytes; at < end;) {
+            const std::uintptr_t va = begin_ + at;
+            const std::size_t n = std::min<std::size_t>(end - at, kPage - (va & (kPage - 1)));
+            copy_run(page, reinterpret_cast<const std::uint8_t*>(va), n, job.streaming);
+            leonida::shadow_keep::copy_changed(
+                page, va, n, sums_.data(), first_, [&](std::uintptr_t a, std::uintptr_t b, const std::uint8_t* source) {
+                    for_each_target(a, b, [&](const Target& t, std::uintptr_t from, std::uintptr_t to) {
+                        std::memcpy(t.shadow + (from - t.begin), source + (from - a), to - from);
+                        copied += to - from;
+                    });
+                });
+            at += n;
+        }
+        return copied;
+    }
+
     // The targets sorted by start, the bytes they hold, and reach_[k], the furthest end among targets_[0..k]: the
     // targets over [from, to) are found from the first whose reach passes `from`.
     void index_targets() {
@@ -1341,6 +1412,7 @@ private:
     std::uint64_t reader_ = 0;
     std::size_t watched_pages_ = 0, hot_pages_ = 0;  // covered pages write-watched, and hot
     Vector<std::uint8_t> idle_;  // per 4 KiB page: refreshes a hot page went without a write (kCool)
+    Vector<std::uint64_t> sums_;  // per 256-byte piece from first_: sum of the bytes copied last, 0: not known
     bool runs_stale_ = false;         // a page became hot or cold: watch_runs_ is rebuilt at the next refresh
     std::uint64_t refresh_asks_ = 0;
     std::uint64_t refresh_written_ = 0;
@@ -3151,8 +3223,8 @@ struct DeviceState {
     // another queue's replay that translated its slots before this retirement may still name it. A ticket read here
     // would be one short of this submission, which records its own only after before_execute_ (and with an idle GPU
     // the view would be reaped in this very call).
-    // A retired view's last copy is made here from the title's pages as they are now (GeometryViews::retire_range): a
-    // range the title remapped (xmem's RemapReleases) holds its new bytes, which the refresh below would have copied.
+    // A retired view's last copy is made here from the title's pages as they are now, when they are still readable
+    // (GeometryViews::retire_range).
     // A stream-pool extent it backed leaves pool_spans: the next request for those pages makes a new mapping.
     void drain_geometry_releases() {
         if (!context || !geometry.has_pending_reclaim()) return;
@@ -3790,8 +3862,8 @@ struct DeviceState {
             for (auto& t : b.triangles) {
                 const std::uint64_t triangles = (t.index_type ? t.index_count : t.vertex_count) / 3;
                 if (!triangles) continue;
-                // Unindexed: three vertices a triangle. Indexed: the VertexCount the title declared (indices past
-                // it read past the buffer, as on the console).
+                // Unindexed: three vertices a triangle. Indexed: the VertexCount the title declared (an index past
+                // it is not read: xdxr_build.comp vertex() makes its triangle inactive).
                 const std::uint64_t vertices = t.index_type ? t.vertex_count : 3 * triangles;
                 const std::uint64_t element = t.vertex_format == VK_FORMAT_R32G32_SFLOAT ? 8 : 12;
                 const std::uint64_t vertex_bytes = vertices ? (vertices - 1) * t.vertex_stride + element : 0;
@@ -5331,10 +5403,7 @@ struct DeviceState {
         VkDeviceSize guard = 0;       // null bytes after the GPU copy (heap_guard_bytes/heap_guard_for), its allocation
         bool resource_heap = false;   // a CBV/SRV/UAV heap; a sampler heap's S#s are copied as written
         bool imported = false;
-        // The translated copy shaders read, and its host-RAM mirror (src/console_heap_copy.h): written only through
-        // copy.write()/copy.zero(), read on the CPU only through copy.view().
-        leonida::ConsoleHeapCopy copy;
-        std::uint64_t mirror_checks = 0, mirror_mismatches = 0;  // LEONIDA_HEAP_MIRROR_CHECK, since the last log line
+        std::uint8_t* copy = nullptr;  // writable GPU mirror of the console heap
         // Keep large scratch allocations out of the low addresses the title can use for its heap.
         std::unique_ptr<std::uint8_t, FreeConsoleScratch> scratch;
         std::uint8_t* input{};
@@ -5513,7 +5582,7 @@ struct DeviceState {
         }
         if (empty) heap.empty_slots.insert(std::uint32_t(slot));
         else if (!heap.empty_slots.empty()) heap.empty_slots.erase(std::uint32_t(slot));
-        heap.copy.write(slot * kDescriptorSize, w, kDescriptorSize);
+        std::memcpy(heap.copy + slot * kDescriptorSize, w, kDescriptorSize);
         heap.live_vsharps.set(slot, leonida::ConsoleHeapVsharpSlots::is_live_vsharp(w));
         return settled;
     }
@@ -5561,7 +5630,7 @@ struct DeviceState {
         }();
         const std::size_t end = std::min<std::size_t>(offset + bytes, std::size_t(heap.bytes));
         if (!heap.resource_heap) {
-            heap.copy.write(offset, heap.input + offset, end - offset);
+            std::memcpy(heap.copy + offset, heap.input + offset, end - offset);
             return;
         }
         for (std::size_t at = offset & ~std::size_t(kDescriptorSize - 1); at + kDescriptorSize <= end;
@@ -5581,7 +5650,7 @@ struct DeviceState {
             std::memcpy(&w3, heap.previous + at + 12, sizeof(w3));
             const bool is_buffer_vsharp = !(w3 >> 30);
             if (heap.fix_over && !is_buffer_vsharp) {
-                heap.copy.zero(at, kDescriptorSize);
+                std::memset(heap.copy + at, 0, kDescriptorSize);
                 heap.live_vsharps.clear(slot);
                 ++heap.deferred_fixes;
                 if (!heap.retry[slot]) {
@@ -5674,60 +5743,6 @@ struct DeviceState {
         unbound_tsharp_tracker().note(heap.console_va, offset, words, why);
     }
 
-    // LEONIDA_HEAP_MIRROR=1: a host-RAM mirror of a console heap's copy in the arena (src/console_heap_copy.h), which
-    // the release sweep reads instead of the copy. Off by default: on, a world run on the RX 7900 XTX hung in a
-    // compute program about a minute in and lost the device; off, the same run went past five minutes.
-    static bool heap_mirror_enabled() {
-        static const bool on = [] {
-            char value[4] = {};
-            return GetEnvironmentVariableA("LEONIDA_HEAP_MIRROR", value, sizeof(value)) == 1 && value[0] == '1';
-        }();
-        return on;
-    }
-    // LEONIDA_HEAP_MIRROR_CHECK=1: the mirror compared with the copy at every release sweep (it reads the whole copy,
-    // so it costs what the mirror saves), the first slots that differ logged.
-    static bool heap_mirror_check_enabled() {
-        static const bool on = [] {
-            char value[4] = {};
-            return GetEnvironmentVariableA("LEONIDA_HEAP_MIRROR_CHECK", value, sizeof(value)) == 1 && value[0] == '1';
-        }();
-        return on;
-    }
-    // The slots whose mirror differs from the copy (0: none, or no mirror); the first few logged, for the first
-    // sweeps that find any.
-    std::size_t check_console_heap_mirror(ConsoleHeap& heap) {  // console_heap_mutex held
-        if (!heap.copy.mirrored()) return 0;
-        constexpr std::size_t kShown = 8;
-        std::vector<std::size_t> slots;
-        const std::size_t count = heap.copy.mismatches(kDescriptorSize, kShown, slots);
-        ++heap.mirror_checks;
-        heap.mirror_mismatches += count;
-        static std::atomic<unsigned> reports{0};
-        if (count && reports.fetch_add(1, std::memory_order_relaxed) < 16) {
-            std::fprintf(stderr, "[rt] d3d12: LEONIDA_HEAP_MIRROR_CHECK: console descriptor heap 0x%llx: %zu slots of "
-                                 "the host mirror differ from the copy\n",
-                         static_cast<unsigned long long>(heap.console_va), count);
-            for (const std::size_t slot : slots) {
-                std::uint32_t mirror[8], copy[8];
-                std::memcpy(mirror, heap.copy.view() + slot * kDescriptorSize, sizeof(mirror));
-                std::memcpy(copy, heap.copy.gpu() + slot * kDescriptorSize, sizeof(copy));
-                std::fprintf(stderr, "[rt] d3d12:   slot %zu: mirror %08x %08x %08x %08x %08x %08x %08x %08x, copy %08x "
-                                     "%08x %08x %08x %08x %08x %08x %08x\n",
-                             slot, mirror[0], mirror[1], mirror[2], mirror[3], mirror[4], mirror[5], mirror[6], mirror[7],
-                             copy[0], copy[1], copy[2], copy[3], copy[4], copy[5], copy[6], copy[7]);
-            }
-        }
-        return count;
-    }
-    // Tests: the mirror of the console heap at `console_va` compared with its copy now. -1: no such heap, or no mirror.
-    long long console_heap_mirror_mismatches(std::uint64_t console_va) {
-        std::lock_guard lock(console_heap_mutex);
-        for (const auto& heap : console_heaps)
-            if (heap->console_va == console_va)
-                return heap->copy.mirrored() ? static_cast<long long>(check_console_heap_mirror(*heap)) : -1;
-        return -1;
-    }
-
     void refresh_console_heap(ConsoleHeap& heap) {  // console_heap_mutex held
         if (heap.imported) return;  // directly imported sampler heap
         if (heap.gpu >= 0) return refresh_console_heap_gpu(heap);
@@ -5738,7 +5753,7 @@ struct DeviceState {
         const auto t0 = clock::now();
         heap.copied += heap.pages->refresh();
         heap.pages->for_each_zeroed([&](std::size_t offset, std::size_t bytes) {
-            heap.copy.zero(offset, bytes);
+            std::memset(heap.copy + offset, 0, bytes);
             std::memset(heap.previous + offset, 0, bytes);
             const auto first = std::uint32_t(offset / kDescriptorSize);
             const auto end = std::uint32_t((offset + bytes) / kDescriptorSize);
@@ -5789,16 +5804,13 @@ struct DeviceState {
             ++heap.rescans;
             const auto rescan_start = clock::now();
             // Even an unchanged title slot may name a buffer released since the last submission.
-            // Walk the host-RAM V# bitset instead of reading every slot of `heap.copy` (which may be uncached WC VRAM),
-            // and read the copy's words from its host-RAM mirror.
-            if (heap_mirror_check_enabled()) check_console_heap_mirror(heap);
-            const std::uint8_t* const translated = heap.copy.view();
+            // Walk the host-RAM V# bitset instead of reading every slot of `heap.copy` (which may be uncached WC VRAM).
             heap.live_vsharps.for_each([&](std::size_t slot) {
                 ++heap.release_candidates;
                 if (filtered) {
                     const auto at = slot * kDescriptorSize;
                     const auto* src = reinterpret_cast<const uint32_t*>(heap.previous + at);
-                    const auto* dst = reinterpret_cast<const uint32_t*>(translated + at);
+                    const auto* dst = reinterpret_cast<const uint32_t*>(heap.copy + at);
                     if (!affected(src, dst) && !affected(src + 4, dst + 4)) return;
                 }
                 ++heap.release_fixes;
@@ -5968,7 +5980,7 @@ struct DeviceState {
                     heap->input = heap->scratch.get();
                     heap->previous = heap->scratch.get() + bytes;
                     heap->shader_va = offset;
-                    heap->copy.attach(arena.mapped + offset, std::size_t(bytes), heap_mirror_enabled());
+                    heap->copy = arena.mapped + offset;
                     heap->guard = guard;
                     heap->imported = false;
                     in_arena = true;
@@ -5991,7 +6003,7 @@ struct DeviceState {
             if (heap->scratch) {
                 auto* backing = heap->scratch.get();
                 if (import_console_heap(*heap, reinterpret_cast<std::uintptr_t>(backing), bytes + guard)) {
-                    heap->copy.attach(backing, std::size_t(bytes), false);  // host RAM already: no mirror
+                    heap->copy = backing;
                     heap->guard = guard;
                 }
                 heap->input = backing + bytes + guard;
@@ -6028,10 +6040,9 @@ struct DeviceState {
                              "a heap index past it reads the arena's next bytes; guard MiB",
                              int(guard >> 20));
                 heap->shader_va = offset;
-                // A sampler heap's copy is read by no CPU sweep: no mirror.
-                heap->copy.attach(arena.mapped + offset, std::size_t(bytes), resource_heap && heap_mirror_enabled());
+                heap->copy = arena.mapped + offset;
             }
-            heap->copy.zero(0, std::size_t(bytes + heap->guard));
+            std::memset(heap->copy, 0, std::size_t(bytes + heap->guard));
             if (!heap->input) {
                 heap->mirror.assign(std::size_t(bytes), 0);
                 heap->made.assign(std::size_t(bytes), 0);
@@ -6573,7 +6584,6 @@ struct DeviceState {
             return;
         }
         heap.gpu = index;
-        heap.copy.drop_mirror();  // the pass writes the copy from now on; the CPU neither writes nor reads it
         heap.vsharp_bits.assign((heap.bytes / kDescriptorSize + 63) / 64, 0);
         std::fprintf(stderr, "[rt] d3d12: LEONIDA_CONSOLE_HEAP_GPU: console descriptor heap 0x%llx (%llu slots) is "
                              "translated by the pass (heap %d)\n",
@@ -24595,14 +24605,6 @@ bool read_arena(ID3D12Device* device, std::uint64_t va, void* out, std::size_t b
     if (!d || !d->state().arena.mapped || va > d->state().arena.size || bytes > d->state().arena.size - va) return false;
     std::memcpy(out, d->state().arena.mapped + va, bytes);
     return true;
-}
-
-long long console_heap_mirror_mismatches(ID3D12Device* device, std::uint64_t console_va) {
-    if (!device) return -1;
-    ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
-    if (!real) real = device;
-    Device* d = Device::from<Device>(real);
-    return d ? d->state().console_heap_mirror_mismatches(console_va) : -1;
 }
 
 namespace {

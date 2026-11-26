@@ -4485,22 +4485,6 @@ if(TARGET Vulkan::Headers)
     target_compile_options(d3d12_unmapped_vsharp_test PRIVATE /W4 /permissive- /utf-8)
     add_test(NAME d3d12_unmapped_vsharp COMMAND d3d12_unmapped_vsharp_test)
     set_tests_properties(d3d12_unmapped_vsharp PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_CONSOLE_FIX_US=0;LEONIDA_TITLE_COPIES=1")  # merge: upstream's title VA aliases
-    # The host-RAM mirror of a console heap's GPU copy (src/console_heap_copy.h) agrees with the copy through the first
-    # refresh, title writes and a filtered release sweep; run again without the mirror, where the copy must not change.
-    add_executable(d3d12_console_heap_mirror_test test/d3d12_console_heap_mirror_test.cpp shims/d3d12_xs_device.cpp)
-    target_link_libraries(d3d12_console_heap_mirror_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
-    target_compile_definitions(d3d12_console_heap_mirror_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX LEONIDA_VULKAN_DEVICE)
-    target_compile_options(d3d12_console_heap_mirror_test PRIVATE /W4 /permissive- /utf-8)
-    add_test(NAME d3d12_console_heap_mirror COMMAND d3d12_console_heap_mirror_test)
-    set_tests_properties(d3d12_console_heap_mirror PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT
-                         "LEONIDA_CONSOLE_FIX_US=0;LEONIDA_CONSOLE_RELEASE_FILTER=1;LEONIDA_HEAP_MIRROR=1;LEONIDA_HEAP_MIRROR_CHECK=1;LEONIDA_TITLE_COPIES=1")  # merge: upstream title-copy paths)
-    add_test(NAME d3d12_console_heap_mirror_off COMMAND d3d12_console_heap_mirror_test)
-    set_tests_properties(d3d12_console_heap_mirror_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT
-                         "LEONIDA_CONSOLE_FIX_US=0;LEONIDA_CONSOLE_RELEASE_FILTER=1;LEONIDA_HEAP_MIRROR=0;LEONIDA_TITLE_COPIES=1")
-    # The default: no mirror unless LEONIDA_HEAP_MIRROR=1.
-    add_test(NAME d3d12_console_heap_mirror_default COMMAND d3d12_console_heap_mirror_test)
-    set_tests_properties(d3d12_console_heap_mirror_default PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT
-                         "LEONIDA_CONSOLE_FIX_US=0;LEONIDA_CONSOLE_RELEASE_FILTER=1;LEONIDA_TITLE_COPIES=1")
     add_executable(d3d12_indirect_zero_test test/d3d12_indirect_zero_test.cpp)
     target_link_libraries(d3d12_indirect_zero_test PRIVATE gta6rt_d3d12_com d3d12 dxgi)
     target_compile_definitions(d3d12_indirect_zero_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -4702,6 +4686,12 @@ if(TARGET Vulkan::Headers)
       # The same return copy for a slot-133 buffer's shadow (the write-back of a compute result the title reads again).
       add_test(NAME d3d12_placed_write_back COMMAND d3d12_title_va_test --placed-writeback)
       set_tests_properties(d3d12_placed_write_back PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_TITLE_COPIES=1")
+      # Two shadows over one page share their sums: a newly filled one must still follow the title's bytes, with
+      # LEONIDA_SHADOW_KEEP on and off (review by lixonik).
+      add_test(NAME d3d12_shadow_keep_refill COMMAND d3d12_title_va_test --shadow-keep-refill)
+      set_tests_properties(d3d12_shadow_keep_refill PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_SHADOW_KEEP=1")
+      add_test(NAME d3d12_shadow_keep_refill_off COMMAND d3d12_title_va_test --shadow-keep-refill)
+      set_tests_properties(d3d12_shadow_keep_refill_off PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_SHADOW_KEEP=0")
       add_test(NAME d3d12_api_descriptor_copy COMMAND d3d12_title_va_test --api-descriptor-copy)
       set_tests_properties(d3d12_api_descriptor_copy PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "LEONIDA_DESC_MIRROR=1;LEONIDA_TITLE_COPIES=1")
       add_test(NAME d3d12_api_descriptor_copy_off COMMAND d3d12_title_va_test --api-descriptor-copy-off)
@@ -5607,12 +5597,12 @@ if(TARGET Vulkan::Headers)
       target_compile_options(console_heap_vsharp_slots_test PRIVATE /W4 /permissive- /utf-8)
     endif()
     add_test(NAME console_heap_vsharp_slots COMMAND console_heap_vsharp_slots_test)
-    # Host-RAM mirror of a console resource heap's GPU copy (src/console_heap_copy.h).
-    add_executable(console_heap_copy_test test/console_heap_copy_test.cpp)
+    # A slot-133 shadow keeps a GPU write until the title's bytes under it change (src/shadow_keep.h).
+    add_executable(shadow_keep_test test/shadow_keep_test.cpp)
     if(WIN32 AND MSVC)
-      target_compile_options(console_heap_copy_test PRIVATE /W4 /permissive- /utf-8)
+      target_compile_options(shadow_keep_test PRIVATE /W4 /permissive- /utf-8)
     endif()
-    add_test(NAME console_heap_copy COMMAND console_heap_copy_test)
+    add_test(NAME shadow_keep COMMAND shadow_keep_test)
     # Queue construction cleans its Vulkan handles if holder registration runs out of host memory.
     add_executable(vk_host_texture_order_test test/vk_host_texture_order_test.cpp)
     target_link_libraries(vk_host_texture_order_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})

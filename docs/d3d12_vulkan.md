@@ -1784,24 +1784,14 @@ The copies:
     as VIctory keeps its copies of title memory (approach only). In a world run on the RX 7900 XTX the copies held
     4.4-6 GB of VRAM. The cost moves to the bus: the GPU reads every vertex and index of a copy from system memory,
     so a geometry-heavy pass can take longer; measure frame time with and without it before making it a default.
-  - **When a copy goes**: a view is retired when its title range is freed, decommitted or unmapped. With
-    `LEONIDA_GEOMETRY_REMAP_RELEASE=1` (off by default) also when a remap gives one of its pages another frame or
-    none (`XMemMapPhysicalPages` with pages, the scatter call, `CopyPageMappingsBatchX`; xmem's `RemapReleases`):
-    the title streams by remapping its pools' frames, and otherwise the copies of what those pages held stay for the
-    device's life (`evicted 0` in every world run). It is off because a remap leaves the address valid on the
-    console, and not everything that names a copy's address is rewritten when the copy goes: a root view is
-    resolved while its list is recorded (`d3d12_com.cpp`, `GraphicsCommandList::address`), so a list recorded before the
-    retirement and executed after it reads the freed copy, and so does a placed buffer view written outside a
-    console heap. On by default, it retired 15 010 copies in 40 s of a world run on the
-    RX 7900 XTX (RADV) and ended it in a GPUVM page fault and a lost device; the same run without it went eight
-    minutes with no fault. Making it safe needs a copy kept until nothing recorded or written can still name it.
-    A page mapped again to the frame it had is no change. A retired
+  - **When a copy goes**: a view is retired when its title range is freed, decommitted or unmapped. A remap of
+    physical pages retires nothing: the copies follow the new pages through the refresh. A retired
     view leaves the lookups at once, its alias ranges and translated heap slots are invalidated, its stream-pool
     extent is forgotten, and its memory is freed only after every ExecuteCommandLists replay in progress at the
     retirement has recorded its submissions and those have completed (`kAfterExecutes`). Before it leaves the
-    refresh it is copied once more from its pages if they are readable: a list recorded before a remap that took the
-    view's address (a root view) reads the new bytes, as on the console. The next view of the range makes a new copy.
-    `geometry_views_test` cases 14-16 and `xmem_test` (`test_remap_releases`) cover this without a GPU.
+    refresh it is copied once more from its pages if they are still readable (a heap block freed in memory that
+    stays committed). The next view of the range makes a new copy.
+    `geometry_views_test` cases 14-16 cover this without a GPU.
 - **Which pages changed** since the last refresh: where xmem reserved the title's memory with `MEM_WRITE_WATCH`
   (`XMemVirtualAlloc`'s ordinary regions and the title's `VirtualAlloc` reservations, not placeholders or
   physical-page windows), the kernel says (`GetWriteWatch` with reset, its answers kept for every copy over the page:
@@ -1813,6 +1803,15 @@ The copies:
   write-fault handler waits for the trackers' locks while the faulting thread may hold the process heap's lock (the
   title's `XMemAlloc` blocks are `_aligned_malloc`'s), so the state changed under those locks allocates from a heap of
   the runtime's own (`leonida::host_heap`), never the process heap.
+- **What the GPU wrote into a copy stays** until the title changes the bytes under it. Some pages are copied at
+  every refresh without a sign that the title wrote them (mapped at two addresses, left writable, reopened with the
+  64 KiB around a written page, write-watched or pinned); copied whole, they overwrote a value a compute program had
+  stored in the copy for the next frame with the title's unchanged bytes, so it read back as the title's old value
+  every other frame. `ShadowPages` keeps a 64-bit sum per 256-byte piece of the bytes it copied last
+  (`runtime/src/shadow_keep.h`) and copies a piece only when the title's bytes differ; a piece zeroed because its page
+  went away is copied again in full once it comes back. Limit: a title that writes the same bytes again to reset a
+  value the GPU changed is not seen (that needs the GPU's writes to reach the title's pages). `LEONIDA_SHADOW_KEEP=0`
+  copies every page as before.
 - **Only the title's memory** gets a copy: the blocks and ranges the xmem shims hand the title (`XMemAlloc`,
   `XMemAllocDefault`, `XMemVirtualAlloc`, the title's `VirtualAlloc`). An address anywhere else, the runtime's or a
   host DLL's memory included, is left as it was and counted, as is an arena VA or a buffer the layer made.
@@ -2127,11 +2126,7 @@ The game can use D3D12 descriptors in three ways, and the layer must handle all 
    arguments for direct and indirect compute dispatches with an inline signature. Bound console descriptor heap
    base addresses are remapped through `console_descriptor_table_va` so that user SGPRs receive the arena copy's
    shader virtual address (where GPU descriptor reads land, preventing `READ_INVALID` device loss during world
-   load), while unshadowed host heaps remain unchanged. The CPU reads that copy too (the release sweep of
-   `LEONIDA_CONSOLE_RELEASE_FILTER=1`), uncached across PCIe when it is in ReBAR memory. `LEONIDA_HEAP_MIRROR=1`
-   gives those reads a host-RAM mirror of the copy (`src/console_heap_copy.h`). It is off by default: with it, a
-   world run on the RX 7900 XTX (RADV) hung in a library compute program about a minute in and lost the device,
-   and without it the same run went on for more than five minutes. Why is not known yet. An unbound heap contributes
+   load), while unshadowed host heaps remain unchanged. An unbound heap contributes
    zero, and rebinding affects later commands. A heap that cannot fit in the inline user data is reported once,
    and a signature whose compute arguments spill gets nothing written (logged once). Set
    `LEONIDA_COMPUTE_DIRECT_HEAPS=0` to restore the previous compute arguments.

@@ -32,7 +32,6 @@
 #include "title_memory.h"
 #include "xmem.h"
 #include "../src/title_page_watch.h"
-#include "../src/title_geometry_watch.h"
 
 // The process heap as test_heap_lock_faults needs it (the same gate as d3d12_existing_heap_test's): an allocation that
 // waits while a thread holds the heap's lock. The NT heap's low-fragmentation front end serves most small sizes
@@ -480,99 +479,6 @@ struct PhysicalApi {
     XMemMapPhysicalPagesFn map;
     XMemMapPhysicalPagesScatterFn scatter;
 };
-
-// A remap that gives watched pages another frame reports them released (geometry_writes::note_released), so the
-// geometry copies of what they held are retired; a page mapped again to the frame it had is no change. Through
-// XMemMapPhysicalPages, the scatter call and CopyPageMappingsBatchX.
-void test_remap_releases(const PhysicalApi& api) {
-    namespace watch = leonida::geometry_writes;
-    constexpr uint64_t kPages = 3;
-    auto* const window = static_cast<uint8_t*>(api.virtual_alloc(
-        nullptr, kPages * kPage64k, MEM_RESERVE | kXmem64kPages, 0x23, PAGE_READWRITE | PAGE_GRAPHICS_READWRITE));
-    uint64_t pages[4]{};
-    uint64_t count = 4;
-    if (!window || api.allocate(0x280, &count, pages) != TRUE || count != 4) {
-        check(false, "remap releases: a window and four physical pages");
-        return;
-    }
-    const auto base = reinterpret_cast<uintptr_t>(window);
-    watch::ReleaseQueue queue;
-    watch::subscribe(queue);
-    for (uint64_t i = 0; i < kPages; ++i) watch::acquire(base + i * kPage64k);  // as a geometry copy over the pages
-    std::vector<std::pair<uintptr_t, uintptr_t>> released;
-    const auto take = [&] {
-        watch::take_released(queue, released);
-        return released;
-    };
-    const auto covers = [&](uintptr_t from, uintptr_t to) {
-        for (const auto& [lo, hi] : released)
-            if (lo <= from && hi >= to) return true;
-        return false;
-    };
-    const auto any_overlap = [&](uintptr_t from, uintptr_t to) {
-        for (const auto& [lo, hi] : released)
-            if (lo < to && hi > from) return true;
-        return false;
-    };
-
-    // Off by default: a remap keeps the address valid, and a root view recorded before it (or a placed buffer view)
-    // names the copy's address after it, so a copy freed then is read by the GPU (a page fault and a lost device).
-    char previous[8]{};
-    const DWORD had = GetEnvironmentVariableA("LEONIDA_GEOMETRY_REMAP_RELEASE", previous, sizeof(previous));
-    SetEnvironmentVariableA("LEONIDA_GEOMETRY_REMAP_RELEASE", nullptr);
-    rt::xmem::reload_remap_release_setting();
-    const uint64_t first[kPages] = {pages[0], pages[1], pages[2]};
-    const uint64_t other[kPages] = {pages[3], pages[2], pages[1]};
-    check(api.map(window, kPages, first) == window && api.map(window, kPages, other) == window && take().empty(),
-          "remap releases: off by default, a remap releases nothing");
-    SetEnvironmentVariableA("LEONIDA_GEOMETRY_REMAP_RELEASE", "0");
-    rt::xmem::reload_remap_release_setting();
-    check(api.map(window, kPages, first) == window && take().empty(),
-          "remap releases: LEONIDA_GEOMETRY_REMAP_RELEASE=0 releases nothing");
-    check(api.map(window, kPages, nullptr) == window && !take().empty() && covers(base, base + 3 * kPage64k),
-          "remap releases: unmapping releases the range whatever the setting");
-    SetEnvironmentVariableA("LEONIDA_GEOMETRY_REMAP_RELEASE", "1");
-    rt::xmem::reload_remap_release_setting();
-
-    check(api.map(window, kPages, first) == window && take().empty(),
-          "remap releases: a first mapping of unmapped pages releases nothing");
-    check(api.map(window + kPage64k, 1, &pages[1]) == window + kPage64k && take().empty(),
-          "remap releases: a page mapped again to the frame it has is no change");
-    check(api.map(window + kPage64k, 1, &pages[3]) == window + kPage64k && !take().empty() &&
-              covers(base + kPage64k, base + 2 * kPage64k) && !any_overlap(base, base + kPage64k) &&
-              !any_overlap(base + 2 * kPage64k, base + 3 * kPage64k),
-          "remap releases: a page given another frame is released, its neighbours are not");
-    const uint64_t rotated[kPages] = {pages[2], pages[0], pages[1]};
-    check(api.map(window, kPages, rotated) == window && !take().empty() && covers(base, base + 3 * kPage64k),
-          "remap releases: a run given other frames is released whole");
-    const uint64_t partly[kPages] = {pages[2], pages[3], pages[1]};
-    check(api.map(window, kPages, partly) == window && !take().empty() &&
-              covers(base + kPage64k, base + 2 * kPage64k) && !any_overlap(base, base + kPage64k) &&
-              !any_overlap(base + 2 * kPage64k, base + 3 * kPage64k),
-          "remap releases: of a remapped run, only the page whose frame changed is released");
-    void* const last = window + 2 * kPage64k;
-    check(api.scatter(&last, 1, &pages[0]) == TRUE && !take().empty() &&
-              covers(base + 2 * kPage64k, base + 3 * kPage64k) && !any_overlap(base, base + 2 * kPage64k),
-          "remap releases: the scatter call releases the page it gives another frame");
-    check(api.scatter(&last, 1, &pages[0]) == TRUE && take().empty(),
-          "remap releases: the scatter call with the frame the page has releases nothing");
-    // CopyPageMappingsBatchX: page 0 gets the frame at page 1 (kind 0 from a pool at the window itself).
-    const rt::xmem::PageRange range{0, 1, 1};
-    const rt::xmem::PageBatch batch{base, 1, &range};
-    check(rt::xmem::copy_page_mappings(1, &batch, base, kPages, 0) && !take().empty() &&
-              covers(base, base + kPage64k) && !any_overlap(base + kPage64k, base + 3 * kPage64k),
-          "remap releases: CopyPageMappingsBatchX releases the page it gives another frame");
-
-    check(api.map(window, kPages, nullptr) == window && !take().empty() && covers(base, base + 3 * kPage64k),
-          "remap releases: unmapping releases the range");
-    SetEnvironmentVariableA("LEONIDA_GEOMETRY_REMAP_RELEASE",
-                            had > 0 && had < sizeof(previous) ? previous : nullptr);
-    rt::xmem::reload_remap_release_setting();
-    for (uint64_t i = 0; i < kPages; ++i) watch::release(base + i * kPage64k);
-    watch::unsubscribe(queue);
-    api.free_pages(4, pages);
-    VirtualFree(window, 0, MEM_RELEASE);
-}
 
 // Physical pages in a 64 KiB-page window, as the measured callers use them: reserve a window, allocate pages, map them,
 // remap them elsewhere and in another order, unmap, free.
@@ -3042,7 +2948,6 @@ int main(int argc, char** argv) {
         // Keep the direct SEC_RESERVE control ahead of the first physical allocation, which installs xmem's VEH.
         g_section_write_control = measure_section_write_control();
         test_physical_pages(physical);
-        test_remap_releases(physical);
         if (argc == 2 && std::strcmp(argv[1], "--file-pools") == 0) {
             test_placeholders(physical);
             print_result();

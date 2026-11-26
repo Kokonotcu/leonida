@@ -18,7 +18,7 @@
 //      completed (a ticket read in the drain reaps it at once); its answers made without an alias are invalidated
 //      (forget_copy); its destroyed block leaves the lock-free block list and is reported to the device;
 //  14. LEONIDA_GEOMETRY_HOST picks a system-memory type (write-back for 1, write-combined for 2), never the BAR;
-//  15. a retired view is copied once more from its pages when they are readable (a remap), not when they are not;
+//  15. a retired view is copied once more from its pages when they are readable, not when they are not;
 //  16. a full release queue joins touching ranges before it collapses to one covering range.
 #include <windows.h>
 
@@ -569,15 +569,15 @@ int main() {
         _putenv_s("LEONIDA_GEOMETRY_HOST", "");
         check(g_live_buffers == 0, "the memory-type views free their blocks");
 
-        // 15. A retired view is copied once more from the title's pages when they are readable (a remap gave them new
-        // bytes), and keeps what it held when they are not (freed or unmapped).
+        // 15. A retired view is copied once more from the title's pages when they are readable (they hold new bytes),
+        // and keeps what it held when they are not (decommitted or unmapped).
         rt::d3d12::GeometryViews last;
         std::memset(host_title, 0x11, kView);
         const std::uint64_t va_l = last.resolve(device, hbase, kView, copy);
         std::uint64_t host_l = 0, bytes_l = 0;
         check(va_l && last.lookup(device.arena.address + va_l, host_l, bytes_l), "a view to retire");
         auto* held = reinterpret_cast<const std::uint8_t*>(host_l);
-        // The remapped pages' bytes: the watched tiles are opened first (no fault handler here).
+        // The pages' new bytes: the watched tiles are opened first (no fault handler here).
         leonida::geometry_writes::notify(hbase, hbase + kView, leonida::geometry_writes::Event::open);
         std::memset(host_title, 0x22, kView);
         g_copies.clear();
@@ -600,7 +600,7 @@ int main() {
         check(last.reap(device, 2) == 2 && last.bytes() == 0, "both are freed at their tickets");
         last.release(device);
 
-        // 16. A full release queue first joins ranges that touch (remaps report page runs): 65536 neighbouring ranges
+        // 16. A full release queue first joins ranges that touch (unmaps report page runs): 65536 neighbouring ranges
         // and one apart from them are two ranges, not one covering everything between them.
         rt::d3d12::GeometryViews coalesce;
         check(coalesce.resolve(device, hbase, kView, copy) != 0, "a view to watch the pages");

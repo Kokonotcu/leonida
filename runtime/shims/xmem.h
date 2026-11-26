@@ -30,8 +30,6 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
                         std::uint32_t pool_pages, std::uint32_t flags);
 
 void geometry_aliases(std::uintptr_t va, std::vector<std::uintptr_t>& addresses);
-// Test seam: LEONIDA_GEOMETRY_REMAP_RELEASE is read again at the next remap.
-void reload_remap_release_setting();
 bool commit_physical_range(const void* address, std::size_t size);
 // A lifetime-pinned alias of a contiguous range of the title's writable mapped physical pages.
 std::shared_ptr<std::uint8_t> pin_mapped_data(const void* address, std::size_t size);
