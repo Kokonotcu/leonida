@@ -16,8 +16,8 @@ int failures = 0;
     if (!(condition)) { std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); ++failures; } \
 } while (0)
 
-// xdxr_build.comp `Push` byte offsets
-constexpr std::size_t off_mode = 48, off_count = 52, off_base = 104;
+// xdxr_build.comp `Push` byte offsets (base after upstream's vertex_count since the 2026-11-26 merge)
+constexpr std::size_t off_mode = 48, off_count = 52, off_base = 108;
 constexpr std::uint32_t mode_init = 0, mode_triangles = 1, mode_morton = 3, mode_radix_count = 7,
                         mode_radix_scatter = 9, mode_copy_as = 12, mode_kept = 14, mode_kept_index = 16;
 
