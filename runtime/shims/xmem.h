@@ -30,6 +30,8 @@ bool copy_page_mappings(std::uint32_t count, const PageBatch* batches, std::uint
                         std::uint32_t pool_pages, std::uint32_t flags);
 
 void geometry_aliases(std::uintptr_t va, std::vector<std::uintptr_t>& addresses);
+// Test seam: LEONIDA_GEOMETRY_REMAP_RELEASE is read again at the next remap.
+void reload_remap_release_setting();
 bool commit_physical_range(const void* address, std::size_t size);
 // A lifetime-pinned alias of a contiguous range of the title's writable mapped physical pages.
 std::shared_ptr<std::uint8_t> pin_mapped_data(const void* address, std::size_t size);
@@ -56,7 +58,7 @@ enum class FaultExit : int {
     answered,        // a mapped page committed, or found committed and allowed (another thread's map or commit)
     planted,         // a window page the title never mapped, backed by a zero page
     committed,       // a section page in the title's reservation with no view of xmem's, committed
-    passed_guarded,  // a committed page of xmem's views whose protection refuses the access: its guard's to answer
+    passed_guarded,  // a committed page whose protection refuses the access, or a host guarded read of an unmapped page
     passed_foreign,  // memory that is not the title's reservation and not only reserved: someone else's fault
     left_to_title,   // the title's reservation, or a write into memory that is only reserved: noted (FaultNote)
     count

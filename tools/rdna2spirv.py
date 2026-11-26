@@ -120,6 +120,33 @@ PC_TAIL_SET, PC_TAIL_BINDING = 1, 0
 F16_HALVES = False
 F16_HALF_TOP = 29
 OPT_SPIRV = False       # --opt: run tools/spirv_opt.py basic-block peephole pass on emitted SPIR-V (#884)
+# --address-guard: every access through heap_base + VA is checked against what the runtime backs (docs/d3d12_vulkan.md,
+# "Address guard"); one that fails reads 0 and drops its store. The runtime (LEONIDA_ADDRESS_GUARD=1) writes a header
+# at arena offset GUARD_HEADER: GUARD_MAGIC (u64), the arena's size (u64, offsets below it pass without a lookup), the
+# page table's address minus heap_base (u64), a count of refused accesses (u32, the shaders add to it) and the last
+# refused offset (u64). Without the magic every access passes, so a guarded module runs unchanged on a runtime with
+# the guard off. A refused load reads the zero area, a refused store or atomic writes the dump area; both are in the
+# arena's reserved first 512 KiB. Shared with runtime/src/address_guard.h.
+ADDRESS_GUARD = False
+# --address-guard (diagnostics): the module's id, FNV-1a of its file stem, which a refused access stores in the header
+# (+28) next to its offset, so the runtime's refusal line names the module. Set by _translate for each file.
+GUARD_MODULE_ID = 0
+
+
+def fnv1a32(text):
+    """32-bit FNV-1a of a UTF-8 string (the address guard's module id; tools/address_guard.py --module maps names)."""
+    h = 0x811C9DC5
+    for b in text.encode("utf-8"):
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+GUARD_HEADER = 0x70000
+GUARD_ZERO = 0x71000
+GUARD_DUMP = 0x78000
+GUARD_MAGIC = int.from_bytes(b"LGUARD01", "little")
+GUARD_L1 = 1 << 16          # level-1 entries: bits 47..32 of the 48-bit offset (4 GiB each)
+GUARD_BLOCK_WORDS = 1 << 15  # level-2 block: one bit per 4 KiB page of a 4 GiB chunk
 
 
 # The heap base as one %ulong, in the entry block of %main: the push constants don't change during the invocation, and
@@ -142,6 +169,109 @@ PAGE_TABLE_DIR_BYTES = 0x40000
 PAGE_TABLE_CHUNK_BYTES = 0x80000
 PAGE_TABLE_CHUNKS = 64
 PAGE_TABLE_LOW_TAG = 0x4C4F0000        # dir[0] = tag | chunk: the VAs below 4 GiB go through the table (note_low_va)
+
+
+def guard_entry(cl, cu):
+    """--address-guard: the entry-block lines that read the runtime's guard header at heap_base + GUARD_HEADER once
+    per invocation: %gd_on (the magic is there), %gd_limit (the arena's size) and %gd_table (the page table's address
+    minus heap_base). The header is in the arena's reserved range, so the read itself is always backed."""
+    L = [f"%gd_hp = OpIAdd %ulong %heap_base {cl(GUARD_HEADER)}",
+         "%gd_p = OpConvertUToPtr %_ptr_PSB_arr %gd_hp"]
+    for i in range(6):
+        L += [f"%gd_w{i}p = OpAccessChain %_ptr_PSB_uint %gd_p {cu(i)}", f"%gd_w{i} = OpLoad %uint %gd_w{i}p Aligned 4"]
+    for name, lo, hi in (("magic", 0, 1), ("limit", 2, 3), ("table", 4, 5)):
+        L += [f"%gd_{name}_l = OpUConvert %ulong %gd_w{lo}", f"%gd_{name}_h = OpUConvert %ulong %gd_w{hi}",
+              f"%gd_{name}_s = OpShiftLeftLogical %ulong %gd_{name}_h %c64_32",
+              f"%gd_{name} = OpBitwiseOr %ulong %gd_{name}_s %gd_{name}_l"]
+    L.append(f"%gd_on = OpIEqual %bool %gd_magic {cl(GUARD_MAGIC)}")
+    return L
+
+
+def guard_function(cl, cu):
+    """--address-guard: %guard_fn(heap_base, on, limit, table, offset, delta, sink) -> host address.
+
+    `offset` is the access's sign-extended 48-bit heap offset and `delta` its span minus one. Without the runtime's
+    guard (`on` false), or when [offset, offset + delta] is below `limit` (the arena, all of it backed), the result is
+    heap_base + offset after one compare. Otherwise the page table at heap_base + table decides, per 4 KiB page of the
+    first and the last byte: level 1 is GUARD_L1 words indexed by offset bits 47..32 (the level-2 block of that 4 GiB
+    chunk: 0 none backed, 1 all), level 2 is one bit per page (bits 31..12), GUARD_BLOCK_WORDS words a block, after
+    level 1. A refused access counts itself in the header and goes to heap_base + sink + (offset & 0xFFF)."""
+    ul = "%ulong"
+    L = ["%guard_fn = OpFunction %ulong None %fn_guard",
+         "%ga_hb = OpFunctionParameter %ulong", "%ga_on = OpFunctionParameter %bool",
+         "%ga_lim = OpFunctionParameter %ulong", "%ga_tab = OpFunctionParameter %ulong",
+         "%ga_off = OpFunctionParameter %ulong", "%ga_delta = OpFunctionParameter %ulong",
+         "%ga_sink = OpFunctionParameter %ulong",
+         "%ga_entry = OpLabel",
+         f"%ga_end = OpIAdd {ul} %ga_off %ga_delta",
+         f"%ga_a = OpULessThan %bool %ga_off %ga_lim",
+         f"%ga_b = OpULessThan %bool %ga_end %ga_lim",
+         "%ga_in = OpLogicalAnd %bool %ga_a %ga_b",
+         "%ga_off_n = OpLogicalNot %bool %ga_on",
+         "%ga_pass = OpLogicalOr %bool %ga_in %ga_off_n",
+         "OpSelectionMerge %ga_m None",
+         "OpBranchConditional %ga_pass %ga_m %ga_slow",
+         "%ga_slow = OpLabel",
+         f"%ga_tb = OpIAdd {ul} %ga_hb %ga_tab"]
+
+    def bit(k, o):
+        """Lines for %ga_bit{k}: the page-table bit of heap offset id `o`."""
+        return [f"%ga_c{k} = OpShiftRightLogical {ul} {o} %c64_32",
+                f"%ga_ci{k} = OpBitwiseAnd {ul} %ga_c{k} {cl(GUARD_L1 - 1)}",
+                f"%ga_ca{k} = OpShiftLeftLogical {ul} %ga_ci{k} {cl(2)}",
+                f"%ga_cp{k} = OpIAdd {ul} %ga_tb %ga_ca{k}",
+                f"%ga_cq{k} = OpConvertUToPtr %_ptr_PSB_uint %ga_cp{k}",
+                f"%ga_e{k} = OpLoad %uint %ga_cq{k} Aligned 4",
+                f"%ga_e64{k} = OpUConvert {ul} %ga_e{k}",
+                f"%ga_pg{k} = OpShiftRightLogical {ul} {o} {cl(12)}",
+                f"%ga_pm{k} = OpBitwiseAnd {ul} %ga_pg{k} {cl(0xFFFFF)}",
+                f"%ga_pw{k} = OpShiftRightLogical {ul} %ga_pm{k} {cl(5)}",
+                f"%ga_eb{k} = OpIMul {ul} %ga_e64{k} {cl(GUARD_BLOCK_WORDS)}",
+                f"%ga_wi0{k} = OpIAdd {ul} %ga_eb{k} %ga_pw{k}",
+                f"%ga_wi{k} = OpIAdd {ul} %ga_wi0{k} {cl(GUARD_L1)}",
+                f"%ga_wa{k} = OpShiftLeftLogical {ul} %ga_wi{k} {cl(2)}",
+                f"%ga_wp{k} = OpIAdd {ul} %ga_tb %ga_wa{k}",
+                f"%ga_wq{k} = OpConvertUToPtr %_ptr_PSB_uint %ga_wp{k}",
+                f"%ga_w{k} = OpLoad %uint %ga_wq{k} Aligned 4",
+                f"%ga_pl{k} = OpUConvert %uint %ga_pm{k}",
+                f"%ga_sh{k} = OpBitwiseAnd %uint %ga_pl{k} {cu(31)}",
+                f"%ga_bs{k} = OpShiftRightLogical %uint %ga_w{k} %ga_sh{k}",
+                f"%ga_b1{k} = OpBitwiseAnd %uint %ga_bs{k} {cu(1)}",
+                f"%ga_bit{k} = OpINotEqual %bool %ga_b1{k} {cu(0)}"]
+    L += bit(0, "%ga_off") + bit(1, "%ga_end")
+    hdr = cl(GUARD_HEADER)
+    L += ["%ga_ok = OpLogicalAnd %bool %ga_bit0 %ga_bit1",
+          "OpSelectionMerge %ga_rm None",
+          "OpBranchConditional %ga_ok %ga_rm %ga_ref",
+          "%ga_ref = OpLabel",
+          # The refusal count (header +24) and the last refused offset (+32, low dword first): what the runtime logs.
+          f"%ga_h = OpIAdd {ul} %ga_hb {hdr}",
+          "%ga_hp = OpConvertUToPtr %_ptr_PSB_arr %ga_h",
+          f"%ga_cnt = OpAccessChain %_ptr_PSB_uint %ga_hp {cu(6)}",
+          f"%ga_old = OpAtomicIAdd %uint %ga_cnt {cu(1)} {cu(0)} {cu(1)}",
+          "%ga_lo = OpUConvert %uint %ga_off",
+          "%ga_hs = OpShiftRightLogical %ulong %ga_off %c64_32",
+          "%ga_hi = OpUConvert %uint %ga_hs",
+          f"%ga_lp = OpAccessChain %_ptr_PSB_uint %ga_hp {cu(8)}",
+          "OpStore %ga_lp %ga_lo Aligned 4",
+          f"%ga_hq = OpAccessChain %_ptr_PSB_uint %ga_hp {cu(9)}",
+          "OpStore %ga_hq %ga_hi Aligned 4",
+          # The refusing module's id (+28, diagnostics): GUARD_MODULE_ID, FNV-1a of the translated file's stem.
+          f"%ga_ip = OpAccessChain %_ptr_PSB_uint %ga_hp {cu(7)}",
+          f"OpStore %ga_ip {cu(GUARD_MODULE_ID)} Aligned 4",
+          "OpBranch %ga_rm",
+          "%ga_rm = OpLabel",
+          "OpBranch %ga_m",
+          "%ga_m = OpLabel",
+          "%ga_okp = OpPhi %bool %true %ga_entry %ga_ok %ga_rm",
+          f"%ga_good = OpIAdd {ul} %ga_hb %ga_off",
+          f"%ga_po = OpBitwiseAnd {ul} %ga_off {cl(0xFFF)}",
+          f"%ga_sb = OpIAdd {ul} %ga_hb %ga_sink",
+          f"%ga_bad = OpIAdd {ul} %ga_sb %ga_po",
+          f"%ga_r = OpSelect {ul} %ga_okp %ga_good %ga_bad",
+          "OpReturnValue %ga_r",
+          "OpFunctionEnd"]
+    return L
 
 
 def pc_tail_chain(name, member, c):
@@ -434,6 +564,7 @@ class Gen:
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
         self.uses_storage3d = False
         self.uses_heap = False
+        self.uses_guard = False   # --address-guard: an access called %guard_fn (the entry block reads the header)
         self.uses_codebase = False
         self.uses_pc_tail = False       # --pc-tail-ubo and the shader reads the tail (set in assemble)
         self.uses_long = False
@@ -453,6 +584,8 @@ class Gen:
         self.fmt_fn = None    # lines of the typed-buffer format-decode function, once a dynamic-format load needs it
         self.fmt_norm_fn = None    # lines of the shared exact norm quotient for a run-time width (SHADER-849)
         self.fmt_enc_fn = None    # shared format encoder for stores through a dynamic V#
+        self.guard_fn = None      # --address-guard: lines of %guard_fn, once an access needs it
+        self.guard_last = None    # --address-guard: (guarded address, unguarded address) of the last host_addr
         self.uses_fmt_tables = False    # %fmt_desc_tab / %fmt_norm_rep_tab: a format's kind and channel widths
         self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
@@ -3173,7 +3306,7 @@ class Gen:
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
         ptr, p, init = self.tmp(), self.tmp(), self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr, 'rmw')}")
         self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
         self.emit(f"{init} = OpAtomicLoad %uint {p} {self.cu(1)} {self.cu(0)}")
         self.emit(f"OpBranch {lbl_hdr}")
@@ -3191,6 +3324,7 @@ class Gen:
         self.emit(f"{lbl_cont} = OpLabel")
         self.emit(f"OpBranch {lbl_hdr}")
         self.emit(f"{lbl_exit} = OpLabel")
+        cur = self.guard_zero(cur)
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
         old = self.tmp()
@@ -3238,7 +3372,7 @@ class Gen:
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
         ptr, p = self.tmp(), self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full, 'rmw')}")
         self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
         if is_inc_dec:
             res, done_lbl = self.atomic_inc_dec_cas(p, val, kind, lbl_do)
@@ -3251,6 +3385,7 @@ class Gen:
                 self.emit(f"{res} = OpAtomicCompareExchange %uint {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val} {cmp}")
             else:
                 self.emit(f"{res} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {val}")
+        res = self.guard_zero(res)
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
         self.emit(f"{old} = OpPhi %uint {res} {done_lbl} {self.cu(0)} {pre}")
@@ -3302,13 +3437,14 @@ class Gen:
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
         ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full)}")
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full, 'rmw', 8)}")
         res = []
         for w in range(2):
             p, r = self.tmp(), self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(w)}")
             self.emit(f"{r} = {spv} %uint {p} {self.cu(1)} {self.cu(0)} {vals[w]}")
             res.append(r)
+        res = [self.guard_zero(r) for r in res]
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
         olds = []
@@ -3376,7 +3512,7 @@ class Gen:
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
         ptr, p = self.tmp(), self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr, 'rmw')}")
         self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(0)}")
         if is_inc_dec:
             res_do, done_lbl = self.atomic_inc_dec_cas(p, val, kind, lbl_do)
@@ -3394,6 +3530,7 @@ class Gen:
                 self.emit(f"{res_do} = OpAtomicExchange %uint {p} {self.cu(1)} {self.cu(0)} {val}")
             else:
                 self.emit(f"{res_do} = {spv} %uint {p} {self.cu(1)} {self.cu(0)} {val}")
+        res_do = self.guard_zero(res_do)
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
         self.emit(f"{old} = OpPhi %uint {res_do} {done_lbl} {self.cu(0)} {pre_label}")
@@ -3444,13 +3581,14 @@ class Gen:
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
         ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr)}")
+        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr, 'rmw', 8)}")
         res = []
         for w in range(2):
             p, r = self.tmp(), self.tmp()
             self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(w)}")
             self.emit(f"{r} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {vals[w]}")
             res.append(r)
+        res = [self.guard_zero(r) for r in res]
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
         olds = []
@@ -4064,7 +4202,7 @@ class Gen:
         "global_load_sbyte_d16": (1, False, True, 0), "global_load_sbyte_d16_hi": (1, False, True, 1),
         "global_load_short_d16": (2, False, False, 0), "global_load_short_d16_hi": (2, False, False, 1)}
 
-    def global_byte_ptr(self, va):
+    def global_byte_ptr(self, va, kind="load"):
         """(pointer to the dword holding byte `va`, bit offset of that byte in it) for a ulong Xbox VA."""
         lo, b3, b64, al, arr, p, sh = (self.tmp() for _ in range(7))
         self.emit(f"{lo} = OpUConvert %uint {va}")
@@ -4072,7 +4210,7 @@ class Gen:
         self.emit(f"{b64} = OpUConvert %ulong {b3}")
         self.emit(f"{al} = OpISub %ulong {va} {b64}")
         # MoltenVK 1.4.0 needs an addressable array element for the Metal atomic operations (as buffer stores).
-        self.emit(f"{arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al)}")
+        self.emit(f"{arr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(al, kind)}")
         self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {arr} {self.cu(0)}")
         self.emit(f"{sh} = OpShiftLeftLogical %uint {b3} {self.cu(3)}")
         return p, sh
@@ -16616,6 +16754,10 @@ def assemble(gen):
             types.append("%fn_desc_lookup = OpTypeFunction %uint " + " ".join(["%uint"] * 8))
     if gen.tbuffer_norm_fns:
         types.append("%fn_tbuffer_norm = OpTypeFunction %uint %uint")
+    if gen.guard_fn:
+        # --address-guard: (heap_base, on, limit, table, offset, delta, sink) -> host address; no other function
+        # type of the module has this signature.
+        types.append("%fn_guard = OpTypeFunction %ulong %ulong %bool %ulong %ulong %ulong %ulong %ulong")
     if gen.fmt_fn or gen.fmt_enc_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
     if gen.fmt_fn:
@@ -16920,6 +17062,8 @@ def assemble(gen):
         gen.consts.setdefault(1, "%c1")
         gen.consts.setdefault(2, "%c2")
         fn += [pc_tail_chain("%ud_base_lo_p", 1, gen.cu), pc_tail_chain("%ud_base_hi_p", 2, gen.cu)] + HEAP_BASE_ENTRY
+        if gen.uses_guard:
+            fn += guard_entry(gen.cl, gen.cu)
     if gen.uses_codebase:
         fn += [pc_tail_chain("%ud_code_lo_p", 3, gen.cu), pc_tail_chain("%ud_code_hi_p", 4, gen.cu)]
     # A mesh shader reads its root arguments from the graphics window (user_data_dword, GRAPHICS_ROOT_DWORD).
@@ -17045,7 +17189,7 @@ def assemble(gen):
         fn.append(f"{p} = OpAccessChain %_ptr_Function_uint {arr} {gen.cu(r)}")
     # Spill pointers last: a spilled value's type may be declared anywhere above.
     types += [f"{ptr} = OpTypePointer Function {t}" for t, ptr in gen.x_ptr_types.items()]
-    helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or [])
+    helpers = (gen.desc_fn or []) + (gen.fmt_fn or []) + (gen.fmt_enc_fn or []) + (gen.guard_fn or [])
     for function in gen.tbuffer_norm_fns.values():
         helpers.extend(function)
     for function in gen.x_round_fns.values():
@@ -18546,6 +18690,8 @@ def barriers_under_control_flow(text):
 
 
 def _translate(path):
+    global GUARD_MODULE_ID
+    GUARD_MODULE_ID = fnv1a32(os.path.splitext(os.path.basename(path))[0])
     info = parse_file(path)
     stage = stage_of(info["name"], path)
     if stage not in ("vs", "ps", "cs", "ms", "gs"):
@@ -19273,11 +19419,19 @@ def translate(path):
 
     A workgroup barrier has to be reached by every invocation. NVIDIA waits for every thread, so one that
     an invocation never reaches stands the group until the driver resets the card (Xid 109, device lost).
-    A program that hangs costs a whole run; re-translating it costs one more pass offline."""
+    A program that hangs costs a whole run; re-translating it costs one more pass offline.
+
+    Only a multi-wave plan falls back. A single-wave workgroup (`inline_all`, `x_lanes == 64`) is one wave:
+    its barriers sit at the top level or under `%pc` guards, and `%pc` between blocks comes from scalar state
+    and votes read back from `%x_buf`, so all invocations take the same path; lane-local `%pc` exists only in
+    `emit_folded_region`'s `if (%active)` bodies, which emit no exchange and no barrier. The round loop is
+    also what drives RADV/ACO's spiller to tens of GB and the program 10-100 times slower (docs/design.md,
+    "Wave64 emulation: single-wave barrier fallback")."""
     global WAVE64_PLAN
     asm = _translate(path)
     gen = _translate.last_gen
-    if (gen is not None and getattr(gen, "emulate_plan", None) is not None
+    plan = getattr(gen, "emulate_plan", None) if gen is not None else None
+    if (plan is not None and plan.get("mode") != "inline_all"
             and barriers_under_control_flow(asm)):
         WAVE64_PLAN = False
         try:
@@ -19852,6 +20006,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
         lay["params"] = {str(k): v for k, v in lay["params"].items()}
         m["mesh_compute"] = lay
         m["push_constant_bytes"] = lay["push_constant_bytes"]
+    if g.uses_guard:
+        m["address_guard"] = True   # --address-guard: its accesses read the runtime's guard header
     if PC_TAIL_UBO:
         # --pc-tail-ubo: s0..s31 alone in push constants; the tail, if the shader reads it, in a uniform block.
         m["push_constant_bytes"] = 4 * USER_SGPRS
@@ -20271,6 +20427,10 @@ def main():
                     help="keep only s0..s31 (128 bytes) in push constants and read the heap base, code base and "
                          "--mesh-compute output address from a uniform block at set 1, binding 0 (metadata: pc_tail), "
                          "for devices whose maxPushConstantsSize is below 144")
+    ap.add_argument("--address-guard", action="store_true",
+                    help="check every heap_base + VA access against the runtime's page table of backed memory "
+                         "(LEONIDA_ADDRESS_GUARD=1): an unbacked one reads 0 and drops its store instead of reaching "
+                         "a wild GPU address (metadata: address_guard; docs/d3d12_vulkan.md, Address guard)")
     ap.add_argument("--descriptor-hash", choices=DESCRIPTOR_HASHES, default="fnv1a",
                     help="bindless descriptor table hash shared with the runtime (default: fnv1a)")
     ap.add_argument("--descriptor-table", choices=DESCRIPTOR_TABLES, default="tagged",
@@ -20310,8 +20470,9 @@ def main():
     LOOP_LIMIT = a.loop_limit
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
-    global PC_TAIL_UBO
+    global PC_TAIL_UBO, ADDRESS_GUARD
     PC_TAIL_UBO = a.pc_tail_ubo
+    ADDRESS_GUARD = a.address_guard
     global FMA_EXACT
     FMA_KHR = a.fma == "khr"
     SHADER_CLOCK = a.shader_clock == "khr"
