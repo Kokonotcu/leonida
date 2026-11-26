@@ -116,6 +116,7 @@ public:
     struct Stats {
         std::size_t pages = 0, classes = 0;
         VkDeviceSize page_bytes = 0, used_bytes = 0;
+        std::uint64_t images = 0;  // slots in use
     };
     Stats stats() {
         Stats s;
@@ -130,6 +131,7 @@ public:
                 ++s.pages;
                 s.page_bytes += stride * page->capacity;
                 s.used_bytes += stride * (page->allocated - page->returned.size());
+                s.images += page->allocated - page->returned.size();
             }
             s.classes += any;
         }

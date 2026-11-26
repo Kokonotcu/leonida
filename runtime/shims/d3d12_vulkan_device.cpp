@@ -143,6 +143,7 @@
 #include <vector>
 
 #include "../src/quiet_av.h"  // leonida_quiet_av: set around the guarded reads of the title's pages
+#include "../src/vram_ledger.h"  // every vkAllocateMemory counted: what of a heap is ours
 
 namespace rt::d3d12 {
 // Below sync_title_textures; the device hands it to xmem (rt::xmem::g_title_written).
@@ -216,6 +217,10 @@ constexpr std::uint32_t kConstantBufferRow = 16;  // a CBV's V# STRIDE: the row 
 // The first 64 KiB of the GPU address arena are never handed out: VA 0 stays invalid, and the page is kept zero
 // for unbound vertex and index buffers to read (D3D12 reads zeros there).
 constexpr VkDeviceSize kZeroPage = 64 * 1024;  // zeroed: what unbound vertex and index buffers read
+// Title texture memory (the title pages' blocks, the title image pool, a title image's own memory) is VRAM only while
+// this much of the VRAM budget stays free for what is made after it: render targets, buffers, the driver's own. Past
+// that it comes from system memory, so the card never goes past its budget for textures.
+constexpr VkDeviceSize kTextureVramHeadroom = VkDeviceSize(1536) << 20;
 // The title-memory page table after it (tools/rdna2spirv.py PAGE_TABLE_*, Gen.host_addr: keep the two in step): a
 // VA at or above 4 GiB is the title's own memory, found through dir[(va >> 32) & 0xffff] (a 1-based chunk number)
 // and chunk[(va >> 16) & 0xffff] (the device address of that 64 KiB page, imported). Unmapped VAs use the scratch.
@@ -9015,7 +9020,8 @@ struct DeviceState {
     VkDeviceMemory allocate(const VkMemoryRequirements& requirements, VkMemoryPropertyFlags required,
                             VkMemoryPropertyFlags preferred, VkMemoryPropertyFlags* chosen = nullptr,
                             bool device_address = false, std::uint32_t* chosen_type = nullptr,
-                            VkImage dedicated_image = VK_NULL_HANDLE) const {
+                            VkImage dedicated_image = VK_NULL_HANDLE,
+                            VkDeviceSize headroom = VkDeviceSize(192) << 20) const {
         // merge: kept both (our VRAM budget check in allocate_type, upstream's dedicated image and its
         // out-of-host-memory retries, now inside allocate_type so suballocator blocks get them too)
         VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
@@ -9023,7 +9029,8 @@ struct DeviceState {
         for (const std::uint32_t i :
              leonida::memory_type_order(memory, requirements.memoryTypeBits, required, preferred, requirements.size)) {
             if (const VkDeviceMemory out =
-                    allocate_type(i, requirements.size, device_address, dedicated_image ? &dedicated : nullptr)) {
+                    allocate_type(i, requirements.size, device_address, dedicated_image ? &dedicated : nullptr,
+                                  headroom)) {
                 if (chosen) *chosen = memory.memoryTypes[i].propertyFlags;
                 if (chosen_type) *chosen_type = i;
                 note_spill(required, preferred, i, requirements.size);
@@ -9209,6 +9216,8 @@ struct DeviceState {
             }
         };
         if (!suballocate) {
+            const leonida::vram_ledger::Purpose purpose(leonida::vram_ledger::t_purpose ? leonida::vram_ledger::t_purpose
+                                                                                        : "own allocation");
             out.memory = allocate(requirements, required, preferred, chosen, device_address);
             if (out.memory) map_own(out);
             return out;
@@ -9223,6 +9232,8 @@ struct DeviceState {
             const auto sizes = leonida::suballoc_block_sizes(memory.memoryHeaps[memory.memoryTypes[type].heapIndex].size,
                                                              info.max_memory_allocation_size);
             if (leonida::suballoc_dedicated(requirements.size, sizes, driver_asks)) {
+                const leonida::vram_ledger::Purpose purpose(leonida::vram_ledger::t_purpose ? leonida::vram_ledger::t_purpose
+                                                                                            : "dedicated resource");
                 out.memory = allocate_type(type, requirements.size, device_address, query2 ? &dedicated_info : nullptr);
                 if (!out.memory) continue;
                 map_own(out);
@@ -9240,6 +9251,7 @@ struct DeviceState {
                     if (now_ms < type_refused_until_ms[type].load(std::memory_order_relaxed)) continue;
                     VkDeviceSize block = suballocator.next_block_size(pool, sizes, requirements.size);
                     VkDeviceMemory memory_block = VK_NULL_HANDLE;
+                    const leonida::vram_ledger::Purpose purpose("suballocator block");
                     while (!(memory_block = allocate_type(type, block, device_address, nullptr)) &&
                            block / 2 >= requirements.size && block / 2 >= leonida::kSuballocMiB)
                         block /= 2;
@@ -9332,8 +9344,42 @@ struct DeviceState {
                 at += std::snprintf(layouts + at, sizeof(layouts) - at, " %#x:%u", seen[i].second, seen[i].first);
         }
         std::fprintf(stderr, "%s dedicated made %llu MiB; resources alive %lld; title textures %zu (%llu MiB); console "
-                             "layouts%s\n",
-                     text, g_dedicated_bytes.load() >> 20, g_live_resources.load(), titles, title_bytes >> 20, layouts);
+                             "layouts%s; %s\n",
+                     text, g_dedicated_bytes.load() >> 20, g_live_resources.load(), titles, title_bytes >> 20, layouts,
+                     (pool_text() + leonida::vram_ledger::text(memory)).c_str());
+    }
+    // The title image pool by its own count: pages, the bytes they hold, the bytes of the slots in use, and the images
+    // in them now; set against the ledger's "title image pool" figure.
+    std::string pool_text() {
+        const auto pool = title_image_pool.stats();
+        std::size_t live = 0, addresses = 0;
+        {
+            std::lock_guard lock(placed_mutex);
+            live = placed_live;
+            addresses = placed_vas.size();
+        }
+        char out[260];
+        std::snprintf(out, sizeof out, "title image pool: %zu pages in %zu classes, %llu MiB, %llu MiB in use by %llu "
+                                       "images; title-placed textures: %zu live at %zu addresses; ",
+                      pool.pages, pool.classes, static_cast<unsigned long long>(pool.page_bytes >> 20),
+                      static_cast<unsigned long long>(pool.used_bytes >> 20),
+                      static_cast<unsigned long long>(pool.images), live, addresses);
+        return out;
+    }
+    // Live textures the title placed at each of its addresses: more textures than addresses are textures placed over
+    // memory an older one still names, each with its own copy of the bytes.
+    std::mutex placed_mutex;
+    std::unordered_map<std::uint64_t, unsigned> placed_vas;
+    std::size_t placed_live = 0;
+    void note_placed_texture(std::uint64_t va, bool added) {
+        std::lock_guard lock(placed_mutex);
+        if (added) {
+            ++placed_vas[va];
+            ++placed_live;
+        } else if (const auto it = placed_vas.find(va); it != placed_vas.end()) {
+            if (--it->second == 0) placed_vas.erase(it);
+            --placed_live;
+        }
     }
     std::atomic<long long> memory_stats_next_ms{0};
     void maybe_print_memory_stats(std::uint32_t type, VkDeviceSize bytes) {
@@ -10333,6 +10379,7 @@ public:
             memory_ = {};
         }
         if (in_arena_) device_.arena_release(arena_offset_, desc_.Width, DeviceState::arena_buffer);
+        if (placed_va_) device_.note_placed_texture(std::exchange(placed_va_, 0), false);
         if (pooled_image_)
             device_.context->defer_destroy(leonida::DeferredDeletionQueue::Kind::pooled_title_image, pooled_image_.release());
         else if (image_ && !sparse_image_)
@@ -10985,6 +11032,7 @@ public:
         vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
         // As an upload buffer (D3D-96): the CPU writes it at every submission and the GPU reads it, so VRAM through
         // Resizable BAR where there is one, system memory otherwise.
+        const leonida::vram_ledger::Purpose purpose("upload buffer");
         memory_.memory = device_.allocate(requirements,
                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                                           device_.upload_in_vram ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0,
@@ -11598,7 +11646,14 @@ private:
                     vk.vkBindImageMemory, vk.vkDestroyImage, vk.vkFreeMemory, [&](VkDeviceSize size, std::uint32_t& type) {
                         auto page = pool_requirements;
                         page.size = size;
-                        return device_.allocate(page, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, false, &type);
+                        // Like the title pages' blocks: VRAM while 1.5 GiB of the budget stays free for what is made
+                        // after them (render targets, buffers, the driver's own), system memory past it. With the
+                        // default 192 MiB this pool alone took 3.2 GB of an 8 GB card by the first loading screen,
+                        // the card went past its budget and the driver moved our memory out to shared memory, the
+                        // GPU then crawled and the title's main loop stood still (runs of 2026-11-26).
+                        const leonida::vram_ledger::Purpose purpose("title image pool");
+                        return device_.allocate(page, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, false, &type,
+                                                VK_NULL_HANDLE, kTextureVramHeadroom);
                     });
                 if (pooled_image_) memory_flags_ = device_.memory.memoryTypes[pooled_image_->page->type].propertyFlags;
             }
@@ -11609,8 +11664,10 @@ private:
         if (!pooled_image_) {
             auto selected = requirements;
             selected.memoryTypeBits &= allowed_types;
+            const leonida::vram_ledger::Purpose purpose("title image");
             memory_.memory = device_.allocate(selected, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &memory_flags_, false,
-                                              &type, dedicated.requiresDedicatedAllocation ? image_ : VK_NULL_HANDLE);
+                                              &type, dedicated.requiresDedicatedAllocation ? image_ : VK_NULL_HANDLE,
+                                              kTextureVramHeadroom);
         }
         if (!pooled_image_ && (!memory_ || vk.vkBindImageMemory(device_.info.device, image_, memory_.memory, 0) != VK_SUCCESS)) {
             if (memory_) vk.vkFreeMemory(device_.info.device, memory_.memory, nullptr);
@@ -11748,6 +11805,8 @@ public:
         device_.forget_image(va);  // an earlier texture placed at this address, still alive: its views are stale
         image_address_ = va;
         device_.note_image_address(image_address_, this);
+        if (placed_va_) device_.note_placed_texture(placed_va_, false);
+        device_.note_placed_texture(placed_va_ = va, true);
         DeviceState::trace_image(image_address_, id(), "registered");
     }
     // The title's own address for a texture Xbox slot 133 placed. The image is still the committed fallback, so its
@@ -12480,6 +12539,7 @@ private:
     VkMemoryPropertyFlags memory_flags_ = 0;
     VkDeviceSize image_backing_bytes_ = 0;  // Vulkan image memory requirement; excludes pool alignment/padding.
     std::unique_ptr<leonida::PooledTitleImage> pooled_image_;
+    std::uint64_t placed_va_ = 0;  // the title address this texture is counted at (DeviceState::note_placed_texture)
     VkAccelerationStructureKHR accel_ = VK_NULL_HANDLE;
     void* mapped_ = nullptr;
     VkFormat format_ = VK_FORMAT_UNDEFINED;
@@ -13206,6 +13266,7 @@ public:
             if (!image) memory_types = device_.sparse_buffer_memory_types();
             const VkMemoryRequirements requirements{desc_.SizeInBytes, leonida::tile_size_in_bytes,
                                                     memory_types};
+            const leonida::vram_ledger::Purpose purpose("tile heap");
             const auto memory = device_.allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0,
                                                   nullptr, !image, &memory_type);
             if (!memory) return {};
@@ -17878,8 +17939,9 @@ public:
             DeviceState* const device_state = &state_;
             state_.context->enable_title_pages(state_.memory, sparse_families,
                                                [device_state](std::uint32_t type, VkDeviceSize size) {
+                                                   const leonida::vram_ledger::Purpose purpose("title pages");
                                                    return device_state->allocate_type(type, size, false, nullptr,
-                                                                                      VkDeviceSize(1536) << 20);
+                                                                                      kTextureVramHeadroom);
                                                });
             state_.context->set_title_pages_queue(state_.info.title_pages_queue);
             state_.title_pages_3d = info.features.sparseResidencyImage3D == VK_TRUE;
@@ -18261,6 +18323,7 @@ public:
                                  "device's %s\n",
                          static_cast<unsigned long long>(size.bytes >> 20),
                          static_cast<unsigned long long>(size.requested >> 20), leonida::arena_cap_name(size.capped));
+        const leonida::vram_ledger::Purpose arena_purpose("GPU address arena");
         arena.memory = state_.allocate(requirements, leonida::kArenaRequiredMemory, leonida::kArenaPreferredMemory,
                                        nullptr, true, &arena.memory_type);
         void* mapped = nullptr;
@@ -25728,9 +25791,11 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // LEONIDA_AFTERMATH=1: GPU crash dumps on before the Vulkan instance and device exist (src/vulkan_aftermath.h).
     leonida::aftermath::enable();
     static const HMODULE library = LoadLibraryA("vulkan-1.dll");
-    const auto get = library ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(
-                                   reinterpret_cast<void*>(GetProcAddress(library, "vkGetInstanceProcAddr")))
-                             : nullptr;
+    // Through the VRAM ledger (src/vram_ledger.h): every device function the runtime loads comes from here.
+    const auto get = leonida::vram_ledger::wrap(
+        library ? reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+                      reinterpret_cast<void*>(GetProcAddress(library, "vkGetInstanceProcAddr")))
+                : nullptr);
     if (!get) {
         std::fprintf(stderr, "[rt] d3d12: vulkan-1.dll not found\n");
         return E_FAIL;

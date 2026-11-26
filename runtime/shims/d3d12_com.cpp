@@ -2655,7 +2655,14 @@ bool memory_wait_holds(const ListMemoryWait& w) {
     }
 }
 
-constexpr auto kMemoryWaitLimit = std::chrono::seconds(5);
+// How long a batch is held for its memory: kMemoryWaitLimit, and kMemoryWaitShortLimit for every batch after one timed
+// out, until a held batch is met by its memory again (upstream's list values do the same, d3d12_xs_list_values.h).
+// The limit was 5 s: on the loading screen the writer of a waited cell is often a list submitted behind the held batch,
+// so the wait could only end at its limit; a dozen such waits in a row (one a Subrender job, a new address each frame)
+// held the queues past the title's 30 s watchdog and the game froze or ended there (runs of 2026-11-26: waits met only
+// after a forced release, 2.7 s in, or timed out at 5 s).
+constexpr auto kMemoryWaitLimit = std::chrono::milliseconds(200);
+constexpr auto kMemoryWaitShortLimit = std::chrono::milliseconds(4);
 
 struct MemoryWaitBatch {
     std::vector<ListMemoryWait> waits;
@@ -2776,7 +2783,9 @@ private:
                     MemoryWaitBatch& batch = queue->pending.front();
                     bool all = true;
                     for (const ListMemoryWait& w : batch.waits) all = all && memory_wait_holds(w);
-                    if (!all && !forced && now - batch.since < kMemoryWaitLimit) break;
+                    if (!all && !forced && now - batch.since < (cut_short_ ? kMemoryWaitShortLimit : kMemoryWaitLimit))
+                        break;
+                    if (!forced) cut_short_ = !all;  // a timeout shortens the next waits, a met wait restores them
                     const auto waited =
                         std::chrono::duration_cast<std::chrono::milliseconds>(now - batch.since).count();
                     if (!all && !forced) {
@@ -2828,6 +2837,7 @@ private:
     const char* release_why_ = "";
     std::set<std::uint64_t> timed_out_;
     std::atomic<std::uint64_t> held_total_{0};
+    bool cut_short_ = false;  // the watcher thread's own: the last batch it let go had timed out
 };
 
 // The waits of `list` a batch must hold for: not NEVER/ALWAYS ones, not on a cell the same list wrote before the wait
