@@ -91,6 +91,8 @@ struct TitleHeapHeader {
 };
 HANDLE title_heap() {
     static const HANDLE heap = [] {
+        // merge: opt-in, as ours was (upstream made it the default): our blocks of 64 KiB or more come from the
+        // title's 40-bit range on pages of their own (below), which the page table and XboxBvhBuilder need.
         const char* v = std::getenv("LEONIDA_TITLE_HEAP");
         if (!v || std::strcmp(v, "1") != 0) return HANDLE(nullptr);
         const HANDLE h = HeapCreate(0, 0, 0);
@@ -454,12 +456,12 @@ uintptr_t stream_cpu, stream_gpu, stream_size;
 bool mirror_stream;
 leonida::host_heap::map<uintptr_t, Window> stream_offsets;
 std::mutex g_phys_mutex;
-std::map<uintptr_t, Window> g_windows;              // base -> window
+leonida::host_heap::map<uintptr_t, Window> g_windows;  // base -> window (host_heap: see g_pages)
 // merge: kept ours (Review M8): each window the title reserved fresh (not a carve), base -> size as reserved, under
 // g_phys_mutex. g_windows loses the pieces a commit cut out; a release at the base frees the whole reservation.
-std::map<uintptr_t, SIZE_T> g_window_reservations;
+leonida::host_heap::map<uintptr_t, SIZE_T> g_window_reservations;  // host_heap, as g_windows
 // Drops the entries of `table` (base -> size) that overlap [start, start + size).
-void forget_range_entries(std::map<uintptr_t, SIZE_T>& table, uintptr_t start, SIZE_T size) {
+void forget_range_entries(leonida::host_heap::map<uintptr_t, SIZE_T>& table, uintptr_t start, SIZE_T size) {
     auto it = table.lower_bound(start);
     if (it != table.begin() && std::prev(it)->first + std::prev(it)->second > start) it = std::prev(it);
     while (it != table.end() && it->first < start + size) it = table.erase(it);
@@ -472,7 +474,10 @@ leonida::host_heap::map<uintptr_t, Window> g_fault_windows;
 // until the title releases them (TitleVirtualFree). With the windows these are the title's reserved memory: the only
 // place the fault handler commits a mapped section page it has no view of (commit_title_section_page).
 leonida::host_heap::map<uintptr_t, Window> g_title_placeholders;
-std::unordered_map<uint64_t, PhysicalPage> g_pages;  // page number -> backing
+// Keep page table nodes on the runtime heap alongside the window table.
+std::unordered_map<uint64_t, PhysicalPage, std::hash<uint64_t>, std::equal_to<uint64_t>,
+                   leonida::host_heap::Allocator<std::pair<const uint64_t, PhysicalPage>>>
+    g_pages;  // page number -> backing
 std::vector<uint64_t> g_free_slots;
 uint64_t g_next_slot = 1;
 // A mapped run: `count` pages of one section at consecutive offsets, mapped as one view at its base. One view per run
@@ -975,11 +980,16 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
     // same size made just before it (src/title_page_watch.h, title_gpu_views).
     const DWORD host_type = allocation_type & kXmemHostAllocationTypeMask;
     if (result && host_type && !(host_type & MEM_COMMIT)) {
-        const bool gpu_only = gpu_only_protect(protect);
-        if (leonida::title_gpu_views::note_reservation(reinterpret_cast<uintptr_t>(result), size, gpu_only))
-            std::fprintf(stderr, "[rt] xmem: GPU-only view %p (%llu MiB, protect 0x%lx) reads at the CPU view %p\n",
+        const bool gpu_only = gpu_only_protect(protect);  // ours: the console protect bits are not CPU access
+        const auto base = reinterpret_cast<uintptr_t>(result);
+        const bool stream_queue_view = allocation_type == 0x20402000 && gpu_only &&
+            reinterpret_cast<uintptr_t>(_ReturnAddress()) - kTitleImage == 0x1e1d03e &&
+            rt::xmem::slot31_runs() && rt::xmem::queue_page_mappings_enabled();
+        if (leonida::title_gpu_views::note_reservation(base, size, gpu_only, stream_queue_view))
+            std::fprintf(stderr, "[rt] xmem: GPU-only view %p (%llu MiB, protect 0x%lx) paired with CPU view %p (%s)\n",
                          result, static_cast<unsigned long long>(size >> 20), static_cast<unsigned long>(protect),
-                         reinterpret_cast<void*>(leonida::title_gpu_views::to_cpu(reinterpret_cast<uintptr_t>(result))));
+                         reinterpret_cast<void*>(leonida::title_gpu_views::other_view(base)),
+                         stream_queue_view ? "separate queue mappings" : "CPU backing");
         else if (gpu_only && size >= (64u << 20))
             std::fprintf(stderr, "[rt] xmem: GPU-only reservation %p (%llu MiB, protect 0x%lx) has no CPU view\n", result,
                          static_cast<unsigned long long>(size >> 20), static_cast<unsigned long>(protect));

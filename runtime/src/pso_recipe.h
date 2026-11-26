@@ -202,6 +202,8 @@ public:
         }
         dynamic_states_[dynamic_count++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
         dynamic_states_[dynamic_count++] = VK_DYNAMIC_STATE_BLEND_CONSTANTS;
+        // A depth-bounds pipeline (DEPTH_STENCIL1/2) takes its bounds from OMSetDepthBounds at each draw.
+        if (r.depth_bounds) dynamic_states_[dynamic_count++] = VK_DYNAMIC_STATE_DEPTH_BOUNDS;
         if (!r.mesh && !r.bindings.empty())
             dynamic_states_[dynamic_count++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
         dynamic_.dynamicStateCount = dynamic_count;
@@ -246,7 +248,7 @@ private:
     VkPipelineDepthStencilStateCreateInfo depth_{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     std::vector<VkPipelineColorBlendAttachmentState> blends_;
     VkPipelineColorBlendStateCreateInfo blend_{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    VkDynamicState dynamic_states_[7]{};
+    VkDynamicState dynamic_states_[8]{};
     VkPipelineDynamicStateCreateInfo dynamic_{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
 };
 

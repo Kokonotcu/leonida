@@ -1338,11 +1338,18 @@ and any validation error fails them.
   `d3d12_stateful_indirect_counted_pixels`: positive D3D12-to-Vulkan graphics tests. Compare every readback
   pixel with both a direct-draw reference and a known pattern for each draw kind; the counted variant fills
   its argument and count buffers by GPU copy before use.
-- `d3d12_indirect_rt_test`: a native Vulkan counted-draw reference (count 0 leaves the clear colour,
-  count 1 renders), a D3D12 command-signature creation check, and optional
+- `d3d12_indirect_rt_test`: validates `ID3D12Device::CreateCommandSignature` + `ExecuteIndirect` with a GPU
+  `CountBuffer` (`vkCmdDrawIndirectCount`, `count = 0` skipped and `count = 1` rendered), a draw whose record asks
+  for four billion instances (clamped on the GPU, section 4.7), and a native Vulkan counted-draw reference over the
+  same suballocated argument/count offsets (`count = 0` leaves the clear colour, `count = 1` renders; it is
+  independent of the D3D12 command replay); optional
   `VK_KHR_acceleration_structure` + `VK_KHR_ray_query` (`GetRaytracingAccelerationStructurePrebuildInfo`, BLAS + TLAS
   `BuildRaytracingAccelerationStructure`, and a `RayQueryKHR` compute shader verifying hit vs. miss; clean SKIP on
   GPUs without RT).
+- `indirect_clamp_test`: the `ExecuteIndirect` argument clamp pass itself (section 4.7), with no game files: every
+  argument kind (draw, draw indexed, dispatch, mesh dispatch) and the counted variants, in-range records
+  bit-identical, garbage records bounded, records and counts past `max_command_count` empty, and the per-batch work
+  budget saturating; clean SKIP without a Vulkan device.
 - `d3d12_gcl8_test`: the public `ID3D12GraphicsCommandList8` surface: `QueryInterface` for its IID,
   `OMSetFrontAndBackStencilRef(1, 2)` with the recorded values, and the reference count around the query. It
   creates only an allocator and a list, so it needs no GPU or Vulkan loader.
@@ -2551,13 +2558,104 @@ Pipeline creation:
   has no active builds. These snapshots have an additional 512 MiB ceiling. The driver fills a mapped staging
   file directly. A successful snapshot atomically replaces the session. An interrupted write preserves the
   previous cache; the next launch removes unheld staging files older than ten minutes.
+  While the compute warm-up has builds queued that idle checkpoint never starts, and a boot that ends by a crash,
+  a device loss or a kill never reaches teardown, so neither file used to keep that boot's compute pipelines.
+  Compute pipelines are therefore journaled one file each (`src/pipeline_cache_journal.h`):
+  `pipeline_cache.d/cs-<hash>.bin` beside the session file, named by a hash of the SPIR-V words, the stage flags and
+  subgroup request, the push-constant range and the bindless layout. A build creates a `VkPipelineCache` from its
+  file (if the header names this device and pipeline-cache UUID) and creates the pipeline against it; when the
+  driver reports a compile (creation feedback without `APPLICATION_PIPELINE_CACHE_HIT`, or no file), that cache is
+  written back to the file at once, through a staging file renamed over it. Without a file, and with
+  `pipelineCreationCacheControl`, the shared cache is first asked with
+  `VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT` when it was seeded from a file, so the offline seed
+  still serves a first boot. NVIDIA 630.20 answers that flag with a compiled pipeline (seconds) instead of
+  `VK_PIPELINE_COMPILE_REQUIRED`, so the first answer that took 250 ms or more without the cache-hit bit stops the
+  asking, and that pipeline is built again against its journal cache so it gets a file (a fast answer without the
+  bit is the driver's own disk cache, and a valid one; `LEONIDA_PIPELINE_JOURNAL_ASK_SHARED=0`: never ask). All
+  driver calls of a compute build (shader module, journal cache, pipeline) run in one turn of the compile gate, with
+  no file I/O in it: from the journal a build takes milliseconds, the warm-up worker makes them back to back, and
+  three warm boots whose cache and module calls were outside the gate lost the device in a `vkQueueSubmit` 20-25 s
+  in (no GPU fault, no TDR). The files take 2-3 MiB a pipeline on that driver (about 3.6 GiB for the 1700 a boot
+  builds); `LEONIDA_PIPELINE_JOURNAL_BYTES` (32 GiB by default) caps them. At a device's first pipeline, staging files
+  older than ten minutes are removed and, past the budget, the least recently used files until three quarters of it
+  is left: a file's modification time is its last use (written, or touched, at most hourly, when a build finds its
+  pipeline there), so files no build names any more after a translator regeneration go first.
+  Measured on an RTX 4070 Ti (driver 630.20): 17 compute modules of 0.6-0.7 MB SPIR-V took 222 s to compile and
+  0.04 s to create from their cache; a boot's ~1000 warm-up builds of 128 KiB or more took 81 s cold and 1.8 s from
+  the journal, and the submissions' compile-gate waits went from 77 s to none. Nsight Aftermath crash dumps
+  (`LEONIDA_AFTERMATH=1`) appear to make the driver compile again whatever the caches hold: boots loading the same
+  317 MB session file logged no compute build of 2 s or more without Aftermath and 88-95 with it. The
+  VK_NV_device_diagnostics_config flags alone do not (vk_pipeline_check `--nv-diagnostics`: 17 of 17 cache hits).
+  `LEONIDA_PIPELINE_JOURNAL=0` (or `LEONIDA_PIPELINE_CACHE_BYTES=0`) turns the journal off.
+  `LEONIDA_PIPELINE_CACHE_DIR=<folder>` moves the journal with the other files, so builds of gta6rt in several
+  folders can share one; the file names and the driver's checks keep a pipeline from one build from being taken
+  for another's.
+  `gta6rt --precompile-pipelines [--threads N] [--big-threads N] [--all] [--smallest-first] [--limit N]
+  [--min-bytes N] [--max-bytes N] [--filter PART]... [--list]` fills the journal ahead of play, with no game: it
+  creates the Vulkan device as `--run` does (so the same environment gives the same journal names and driver keys:
+  LEONIDA_SHADERS, LEONIDA_PIPELINE_CACHE_DIR, and LEONIDA_DEVICE_FAULT/LEONIDA_AFTERMATH, whose diagnostics config
+  makes other pipelines) and builds every compute entry of the library through the dispatch path
+  (`build_compute_pipeline`), largest first, on below-normal-priority threads. Entries with a usable journal file are
+  skipped (only their header is read), so it can be stopped and started again. Running as gta6rt.exe it also fills
+  NVIDIA's disk cache, which that driver keys by the executable's name. Measured on an RTX 4070 Ti (driver 630.20),
+  4 threads: modules of 3.6-5.8 MB took 46-145 s each, 12 in 312 s, about 3.5 GB of host memory each while in the
+  driver (14.5 GB peak for four). Graphics pipelines are not covered: they are built at a title's draw from its PSO
+  description and the bound formats, and take milliseconds.
+  `LEONIDA_COMPILE_HELPER=1` (`shims/d3d12_compile_helper.h`) keeps first-ever compiles out of the title's process:
+  the driver's locks, which a long `vkCreateComputePipelines` holds and a `vkQueueSubmit` of the same process waits
+  for, are per process. A compute build of `LEONIDA_COMPILE_HELPER_MIN_BYTES` or more (128 KiB) with no journal file
+  writes a request beside the journal (`requests/<name>.req`: the entry and a priority, 0 for a use, the module size
+  for a warm-up) and starts the helper at the first one (`gta6rt --compile-server --parent <pid>`, the same executable
+  and environment, so the same device and journal names). With asynchronous builds (`LEONIDA_ASYNC_PIPELINES=1`, the
+  intended mode) nothing waits: the build answers deferred, the variant goes back to idle, the dispatch is skipped and
+  counted, and each later use looks at the request (a file check, the module is not read again) until the journal
+  file is there and the pipeline is created from it, a cache hit. A warm-up only asks, in either mode, so the warm-up
+  worker writes its requests ahead and the helper's threads (`LEONIDA_COMPILE_HELPER_THREADS`, 2) build them in
+  parallel, the most urgent first; a warm-up the helper builds is never held back while the title submits. Without
+  asynchronous builds a dispatch waits for its file, holding nothing of the driver's (`LEONIDA_COMPILE_HELPER_WAIT_MS`,
+  default 120 s, 0 for no limit). A failure (`requests/<name>.failed`, the helper gone) builds the pipeline here as
+  before, and so does a request that is no longer listed (`<name>.req` gone with no answer) or one still pending after
+  `LEONIDA_COMPILE_HELPER_PENDING_MS` (default 120 s): the helper cannot hold a dispatch forever. The helper
+  checks that its journal name is the one asked for before it compiles (the name is a hash of the module and the
+  device, no driver call), ends with the process that started it, runs alone per journal,
+  and with nothing asked fills the rest of the library, smallest module first, on
+  `LEONIDA_COMPILE_HELPER_IDLE_THREADS` (1, always one fewer than its threads) at idle priority; the journal names it
+  worked out are kept in `requests/names.idx` (with each module's size and time and what the names depend on), so a
+  later helper does not read every module again. `requests/<name>.building` is a lock file a process holds for the
+  whole build (no sharing, deleted by the OS when that process ends, killed or not), whose contents name the process:
+  the helper and `--precompile-pipelines` leave an entry its holder is building to it, and a file no process holds is
+  stale whatever process id it names. Measured, RTX 4070 Ti,
+  driver 630.20, a boot with an empty journal and the helper waiting (no asynchronous builds): the helper compiled 171
+  pipelines of 128 KiB or more (148 s in its driver), every one of them was a hit in the title's process (at most
+  2 ms), and no submission waited at the compile gate.
+  Under Proton, pass a Wine path, for example
+  `LEONIDA_PIPELINE_CACHE_DIR='Z:\opt\leonida\cache'`. Async warm-up workers publish to the same directory.
+  For a disposable session, `LEONIDA_PIPELINE_JOURNAL_SEED_DIR=<absolute existing directory>` can name a separate,
+  trusted read-only set of per-key compute journal files. The runtime prefers a compatible writable entry, then tries
+  the same key in the seed; both use the existing size and device/driver header checks. A seed hit neither copies an
+  entry nor refreshes its mtime. All writes, LRU touches, staging cleanup, eviction and byte accounting belong to the
+  writable journal only, including replacement of an incompatible local file. The seed must be distinct from the
+  writable `pipeline_cache.d`, not its ancestor or descendant; an explicitly unusable or overlapping root disables
+  the journal. This setting does not grant access or authenticate cache data. Use only trusted, privately produced
+  files on a read-only mount/ACL with stable, disjoint directories and no linked files between them. Leave unset for
+  the original single-directory behavior. Per-key names are unchanged: externally precompiled files for the same
+  pipeline identity can be read without a persistent *writable* shared journal.
+  During normal runtime, a compatible local or external entry is used before requesting the helper.
+  The offline precompiler and compile-server instead read and populate only the writable journal, even
+  when a separate seed is configured. An external hit is not a published response to a helper request;
+  its readiness check still requires a compatible file at the requested writable path. Both modes validate
+  the configured directory pair before enabling journaling.
+  To check the two tiers without game files, build `d3d12_compute_journal_test`, then run
+  `python scripts/check_compute_journal_overlay.py <path-to-d3d12_compute_journal_test.exe> --require-hit`.
+  This uses four fresh processes, two authored compute shaders and a disposable cache. It checks dispatch results,
+  reported application-cache hits (where supported), local publications, and that old seed contents/mtime stay put.
   `LEONIDA_TRACE_PIPELINE_COMPILE=1` records each graphics and compute build's trigger, thread, elapsed time,
   SPIR-V size, shader names and Vulkan application-cache feedback (1 hit, 0 miss, -1 unavailable). It also
   times cache reads, merges, writes and draw/dispatch pipeline lookups that take at least 1 ms.
-  `LEONIDA_ASYNC_PIPELINES=1` schedules cold first-use builds on the warm-up worker ahead of speculative work.
-  Replay skips a draw or dispatch while its pipeline is pending. Later uses find the completed handle.
-  A skipped dispatch can lose a one-time resource update. Synchronous first use is the default and strict
-  replay always uses it. `LEONIDA_COMPUTE_WARMUP=0` restricts the worker to pipelines requested by the title.
+  `LEONIDA_ASYNC_PIPELINES=1` schedules cold first-use builds on the warm-up worker ahead of speculative work; how long
+  a submission waits for them, and what is skipped, is "Pipelines still being built" below. Strict replay builds
+  synchronously and waits for every build. `LEONIDA_COMPUTE_WARMUP=0` restricts the worker to pipelines requested by
+  the title.
   A queued build holds no reference to its PSO or device (`PipelineCompiler`, `runtime/shims/d3d12_pipeline_compile.h`).
   A PSO's last release drops its queued builds and returns at once; one already running is left to finish, and the
   worker deletes the PSO after it (`PipelineState::last_release`). The PSO's device reference goes at the release, so
@@ -2630,6 +2728,28 @@ Pipeline creation:
   of SPIR-V here, and the driver keeps memory for each thread that compiles). With a budget of 1536 MiB, two at once,
   they take 18.5 s and peak 202 MiB over. Not measured: other drivers, and the title. Tested by `big_compile_gate`,
   `replay_pipeline_compiles` and `d3d12_big_compute`.
+
+**Pipelines still being built** (`PipelineState::queue_build` in `runtime/shims/d3d12_vulkan_device.cpp`). Lazy
+pipelines are built at first use, and on the 4070 Ti (NVIDIA 630.20) a large compute pipeline takes the driver 3-10 s,
+some 37 s. A submission builds the ones it needs through `PipelineCompiles` and `PipelineWorkers` (above), with
+`resource_mutex_` released while they compile and the large ones within the memory budget of `LargeModuleGate`.
+#2098 had a second path here, a pre-pass in `VulkanQueue::execute` that built them one after another on the
+submitting thread; at the maintainers' decision it was replaced by this one when #2098 was merged.
+
+- **Asynchronous builds** (`LEONIDA_ASYNC_PIPELINES=1`). Prepare asks `queue_build`, which answers the handle once
+  built and otherwise queues one compile-worker job at replay's priority and answers null: the draw or dispatch is
+  skipped, the list's other commands replay as recorded, and a later submission uses the pipeline. The job also starts
+  at record time already: at `SetPipelineState` for compute and at each draw for graphics, with the variant its bound
+  targets give (`request_pipeline_build`). A compute build the compile helper is still making (`LEONIDA_COMPILE_HELPER`)
+  publishes nothing, so its next use asks again.
+- **Warm-ups while the title submits.** A compute warm-up holds the compile gate for its whole create, and every
+  submission waits behind it: a native boot's submissions waited 140 s in all at the gate behind compute warm-ups, and
+  past the story load the worker went through 694 warm-ups of modules over 128 KiB (those over 640 KiB take 4-25 s
+  each) against 25 such builds a dispatch asked for (measured with a 128 KiB limit). With
+  `LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES=<n>` a warm-up of a module over n bytes of SPIR-V is not started while the
+  title submits (a submission in the last second, `src/pipeline_wait.h`); the pipeline is built at its first use
+  instead. Opt-in: unset or 0, every warm-up runs, as on `main`, and `LargeModuleGate` (#1889) orders them behind a
+  submission's compiles. Smaller warm-ups, and every warm-up before the first submission, run as before.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
@@ -3992,8 +4112,11 @@ will forward to. The queue-side calls ignore which queue they came on (one `VkQu
 - *Frame capture* (`LEONIDA_CAPTURE=<dir>`, `LEONIDA_CAPTURE_EVERY=<n>`, `LEONIDA_CAPTURE_LIMIT=<n>`): writes
   every n-th presented frame (default 30, at most 24) to `<dir>/frame_NNNNN.ppm`, a binary P6 of the swapchain image
   converted to 8-bit RGB, and appends one line per frame to `<dir>/index.txt` with the extent and the mean RGB. Off
-  unless the variable is set, and the folder is created. This is what a check reads when it has to know what the
-  layer actually presented: the window is not readable in every setup (under Wine it is not even mapped), and the
+  unless the variable is set, and the folder is created. Disk-only sampling copies frames 1, 1+n, 1+2n, … to host
+  staging until the file limit is reached; intervening frames still present normally. This avoids a full-image
+  transfer on every present when only occasional samples were requested. An explicit continuous readback request
+  and the temporary splash inspection still copy each frame they need. This lets a check inspect what the layer
+  actually presented: the window is not readable in every setup (under Wine it is not even mapped), and the
   mean is enough to tell a real frame from a black one. `d3d12_present_test` turns it on and checks the files against
   the colour it clears to.
 - *`SuspendX`/`ResumeX`*: suspend drops the interval, the origin event and the frames in flight, wakes blocked waits
@@ -4703,7 +4826,8 @@ uint32 mask;                 // slot count - 1
 struct entry {               // 10 uints = 40 bytes
     uint32 key[8];           // T#: 8 dwords; S#: 4 dwords then 0xFFFFFFFF x4
     uint32 index;            // bindless index
-    uint32 pad;              // unused by the shader
+    uint32 kind;             // 0 empty; bit 31 occupied; bits 0..5 the sampled arrays the index is bound in,
+                             // bits 8..11 its storage arrays (one bit per ImageDimension)
 } entries[mask + 1];
 ```
 
@@ -4716,6 +4840,18 @@ struct entry {               // 10 uints = 40 bytes
   `runtime/test/descriptor_table_test.cpp`.
 - Probe: `slot = (h + k) & mask` for `k = 0..7`; the first entry whose eight key dwords match yields its
   `index`; no match yields 0.
+- `kind` says which arrays that index is good for, because it was given out in the T#'s own dimension's index space
+  (`runtime/src/vulkan_bindless.h`, `ImageDimension`): bit `d` is dimension `d`'s sampled array, bit `8 + d` its
+  storage arrays. A module whose `index.json` meta says `"descriptor_table": "tagged"` reads it and uses the index
+  only in an array the entry names, else index 0 of the array its instruction reads; an absent key is the old plain
+  layout, which reads only the index. `DescriptorTable::insert` takes the kind, and `BindlessSet::image_kind_at`
+  derives it from what was bound at the index (its own arrays, storage views, and the 2D copy of a 2D-array image's
+  first layer, whose slot records that image as its owner so another dimension's image with the same slot number does
+  not inherit it). One layout serves the device: any module whose meta says `tagged` makes the table tagged, because
+  the kind word is additive (a plain module ignores the word and reads the index, which the tagged layout keeps at
+  the same place), so a plain majority never turns it off; no tagged module is the old plain layout.
+  `LEONIDA_DESCRIPTOR_TABLE=plain|tagged` overrides, and the runtime says so loudly when an override forces plain
+  while tagged modules exist.
 - The layer must keep the table sparse enough that no live key needs more than eight probes. When all eight slots are occupied,
   the runtime tries to move one resident to the next empty slot within that resident's own probe window.
   A relocation requires an idle flush because it overwrites a live slot. Grow when this fails or when the next

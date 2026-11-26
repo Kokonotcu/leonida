@@ -608,6 +608,15 @@ public:
         blend_factor_ = value;
     }
 
+    // ID3D12GraphicsCommandList1: the depth-bounds test's range for the draws after it, read by pipelines that enable
+    // the test (DEPTH_STENCIL1/2). D3D12's default is [0, 1].
+    void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT min, FLOAT max) override {
+        if (list_.closed()) return;
+        const std::array<float, 2> value{min, max};
+        if (defer([=](GraphicsCommandList& l) { l.depth_bounds_ = value; })) return;
+        depth_bounds_ = value;
+    }
+
     void STDMETHODCALLTYPE OMSetStencilRef(UINT reference) override {
         if (list_.closed()) return;
         if (defer([=](GraphicsCommandList& l) { l.front_stencil_ref_ = l.back_stencil_ref_ = reference; })) return;
@@ -665,6 +674,7 @@ public:
         note_direct_heap_indexing(graphics_.layout);
         draw.mesh = true;
         draw.viewports = draw_viewports();
+        draw.depth_bounds = depth_bounds_;
         check(list_.draw(std::move(draw)));
     }
 
@@ -1035,8 +1045,7 @@ public:
         d3d12_trace::record("ID3D12GraphicsCommandList::ClearRenderTargetView");
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         if (!view.ptr || !color) return check(false);
-        // LOCAL DIAGNOSTIC: what the title clears, and with which colour
-        if (leonida::local_diagnostics()) {
+        if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC: what the title clears, and with which colour
             static std::atomic<std::uint64_t> clears{0};
             const std::uint64_t n = ++clears;
             if (n <= 6 || n % 600 == 0) {
@@ -1796,8 +1805,10 @@ private:
             // No copy for the title's memory: the root view is 0, so the shader reads the arena's zero page instead
             // of storing at heap_base + a raw title address.
             if (!va && raw) leonida::note_unbacked_view("root view", raw, kRootViewBytes);
-        } else
+        } else {
+            if (descriptor_ring_diagnostics()) note_table_slots(va, p->table_descriptors);
             va = console_descriptor_table_va(va);
+        }
         if (type != rt::rootsig::ParamType::Descriptor && va && p->table_descriptors)
             remember_table(va, p->table_descriptors);
         const std::uint32_t first = first_dword(state, *p);
@@ -1827,6 +1838,9 @@ private:
     ID3D12DescriptorHeap* sampler_heap_ = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
     D3D12_GPU_VIRTUAL_ADDRESS sampler_base_ = 0;
+    UINT heap_slots_[2]{};  // NumDescriptors of the bound view and sampler heaps
+    std::uint64_t table_high_[3]{};  // this list's descriptor-ring marks: view, sampler, console heap (note_table_slots)
+    std::uint64_t console_high_base_ = 0;  // the console heap table_high_[2] is for
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
@@ -1851,6 +1865,7 @@ private:
     bool draw_views_stale_ = true;
     leonida::TargetView depth_{};
     std::array<float, 4> blend_factor_{1, 1, 1, 1};
+    std::array<float, 2> depth_bounds_{0, 1};
 
     // The root signatures and pipeline states this recording uses. D3D12 lets an application release them right
     // after Set*RootSignature / SetPipelineState; the list keeps them until Reset or its own release, so the root
@@ -1898,6 +1913,7 @@ private:
         hold(state);
         compute_pipeline_ = compute_pipeline_id(state);
         graphics_pipeline_ = graphics_pipeline_id(state);
+        if (compute_pipeline_) request_pipeline_build(compute_pipeline_, 0, false);  // starts its build, if asynchronous
         // A pipeline this device never registered: a LEONIDA_STUB_PIPELINES stub (its translated shader is missing),
         // or one from another device. Its draws resolve to nothing in replay; its dispatches are no-ops too
         // (record_dispatch), so the list still closes.
@@ -1912,6 +1928,81 @@ private:
         cbv_srv_uav_base_ = cbv_base;
         sampler_heap_ = smp;
         sampler_base_ = smp_base;
+        if (!descriptor_ring_diagnostics()) return;
+        for (int h = 0; h < 2; ++h) {
+            D3D12_DESCRIPTOR_HEAP_DESC desc{};
+            D3D12_GPU_VIRTUAL_ADDRESS base = 0;
+            heap_slots_[h] = descriptor_heap_info(h ? smp : cbv, desc, base) ? desc.NumDescriptors : 0;
+            table_high_[h] = 0;
+        }
+    }
+
+    // note_table_slots runs on every descriptor-table bind of the title's recording threads, and takes a global lock
+    // whenever a list's mark rises (almost every bind of a ring): only with LEONIDA_DEVICE_FAULT=1 or
+    // LEONIDA_DESCRIPTOR_RING=1.
+    static bool descriptor_ring_diagnostics() {
+        static const bool on = [] {
+            char v[2]{};
+            return (GetEnvironmentVariableA("LEONIDA_DEVICE_FAULT", v, 2) == 1 && (v[0] == '1' || v[0] == '2')) ||
+                   (GetEnvironmentVariableA("LEONIDA_DESCRIPTOR_RING", v, 2) == 1 && v[0] == '1');
+        }();
+        return on;
+    }
+
+    // LOCAL DIAGNOSTIC (early device loss; VIctory 3827767, a title table ring past the slots the layer backs hung
+    // NVIDIA ~45 s in): the highest slot a descriptor table reaches in each bound heap, against the heap's slots. Logged
+    // when a heap's high-water mark passes another eighth of the heap, every new mark past its end, and the first
+    // tables that lie in no bound heap. A list only takes the shared lock when its own mark rises.
+    void note_table_slots(std::uint64_t va, std::uint32_t declared) {
+        if (!va) return;
+        D3D12_GPU_VIRTUAL_ADDRESS bases[3]{cbv_srv_uav_base_, sampler_base_, 0};
+        std::uint64_t counts[3]{heap_slots_[0], heap_slots_[1], 0};
+        int heap = -1;
+        for (int h = 0; h < 2; ++h)
+            if (bases[h] && counts[h] && va >= bases[h] && va < bases[h] + counts[h] * descriptor_size)
+                heap = h;
+        std::uint64_t console_bytes = 0;
+        if (heap < 0 && console_descriptor_heap_range(va, bases[2], console_bytes)) {
+            heap = 2;  // a console descriptor heap (Xbox slot 14) in title memory, read from its arena copy
+            counts[2] = console_bytes / descriptor_size;
+        }
+        if (heap < 0) {
+            static std::atomic<int> outside{0};
+            if (outside.fetch_add(1) < 8)
+                std::fprintf(stderr, "[rt] descriptor-ring: table 0x%llx in no bound heap (view heap 0x%llx, %u slots; "
+                                     "sampler heap 0x%llx, %u slots)\n",
+                             (unsigned long long)va, (unsigned long long)bases[0], heap_slots_[0],
+                             (unsigned long long)bases[1], heap_slots_[1]);
+            return;
+        }
+        const std::uint64_t first = (va - bases[heap]) / descriptor_size;
+        const std::uint64_t end = first + (declared ? declared : 1);
+        if (heap == 2 && console_high_base_ != bases[2]) {
+            console_high_base_ = bases[2];
+            table_high_[2] = 0;
+        }
+        if (end <= table_high_[heap]) return;
+        table_high_[heap] = end;
+        struct Mark {
+            std::uint64_t high = 0;
+            std::uint64_t logged = 0;
+        };
+        static std::mutex mutex;
+        static std::map<std::uint64_t, Mark> marks;  // by heap base
+        std::lock_guard lock(mutex);
+        Mark& mark = marks[bases[heap]];
+        if (end <= mark.high) return;
+        mark.high = end;
+        const std::uint64_t slots = counts[heap];
+        const std::uint64_t step = (std::max)(slots / 8, std::uint64_t{1});
+        if (end > slots || end >= mark.logged + step) {
+            mark.logged = end;
+            std::fprintf(stderr, "[rt] descriptor-ring: %s heap 0x%llx: highest slot %llu (table at %llu, %u declared) "
+                                 "of %llu backed%s\n",
+                         heap == 2 ? "console" : heap ? "sampler" : "view", (unsigned long long)bases[heap], (unsigned long long)(end - 1),
+                         (unsigned long long)first, declared, (unsigned long long)slots,
+                         end > slots ? " -- PAST THE HEAP" : "");
+        }
     }
 
     // D3D12 bundle rule: every non-null heap bound by a bundle's SetDescriptorHeaps must match the parent list's
@@ -1929,20 +2020,26 @@ private:
 
     void note_direct_heap_indexing(const RootArgumentLayout* layout) {
         if (!layout) return;
+        // Called at every draw and dispatch: each note has its own flag, so after its first time a site skips
+        // note_once's process-wide mutex, std::string and set lookup.
+        static std::atomic<bool> told[4];
+        const auto once = [](int site, const char* what) {
+            if (!told[site].load(std::memory_order_relaxed) && !told[site].exchange(true)) note_once(what);
+        };
         if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED) {
             if (!cbv_srv_uav_heap_)
-                note_once("draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
+                once(0, "draw/dispatch uses CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED with no CBV/SRV/UAV heap bound");
             else {
                 const auto shader_va = console_descriptor_table_va(cbv_srv_uav_base_);
                 remember_table(shader_va, cbv_srv_uav_heap_->GetDesc().NumDescriptors);
-                note_once("CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list");
+                once(1, "CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED heap base tracked on list");
             }
         }
         if (layout->flags & D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED) {
             if (!sampler_heap_)
-                note_once("draw/dispatch uses SAMPLER_HEAP_DIRECTLY_INDEXED with no sampler heap bound");
+                once(2, "draw/dispatch uses SAMPLER_HEAP_DIRECTLY_INDEXED with no sampler heap bound");
             else
-                note_once("SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list");
+                once(3, "SAMPLER_HEAP_DIRECTLY_INDEXED heap base tracked on list");
         }
     }
 
@@ -1999,6 +2096,7 @@ private:
         draw_views_stale_ = true;
         depth_ = {};
         blend_factor_ = {1, 1, 1, 1};
+        depth_bounds_ = {0, 1};
         set_pipeline(state);
     }
 
@@ -2130,9 +2228,12 @@ private:
         }
         const std::uint32_t end = layout.graphics_arguments_end;
         if (end >= rt::rootsig::kMaxUserSgprs) {
-            note_once(layout.graphics_console
-                          ? "graphics direct heaps: not supplied, the explicit arguments fill s8..s31"
-                          : "graphics direct heaps: not supplied, the signature keeps the s0 graphics layout");
+            static std::atomic<bool> told[2];  // per draw: the site's own flag before note_once's mutex
+            const int site = layout.graphics_console ? 0 : 1;
+            if (!told[site].load(std::memory_order_relaxed) && !told[site].exchange(true))
+                note_once(layout.graphics_console
+                              ? "graphics direct heaps: not supplied, the explicit arguments fill s8..s31"
+                              : "graphics direct heaps: not supplied, the signature keeps the s0 graphics layout");
             return graphics_.data;
         }
         static std::atomic<bool> logged{false};
@@ -2279,8 +2380,12 @@ private:
         note_direct_heap_indexing(graphics_.layout);
         // No viewport (never set, or unbound with RSSetViewports(0)) or every bound viewport empty: D3D12 rasterizes
         // nothing, and Vulkan forbids a 0x0 viewport, so the draw is not recorded.
-        // LOCAL DIAGNOSTIC: the state each draw is recorded with
-        if (leonida::local_diagnostics()) {
+        static const bool draw_diag = [] {
+            const char* value = std::getenv("LEONIDA_DRAW_DIAG");
+            if (value) return std::strcmp(value, "0") != 0;
+            return leonida::local_diagnostics() || leonida::fsdraw::enabled();
+        }();
+        if (draw_diag) {
             static std::atomic<std::uint64_t> draws{0}, skipped{0};
             const bool skip = !any_nonempty_viewport();
             const std::uint64_t n = ++draws, k = skip ? ++skipped : skipped.load();
@@ -2294,16 +2399,18 @@ private:
                              scissor_.left, scissor_.top, scissor_.right, scissor_.bottom, count, instances);
             // LOCAL DIAGNOSTIC (fsdraw): the first draw of each pipeline, and one frame's draws every ~300 frames,
             // with the pipeline's description, the root data and what the bound descriptor tables hold.
+            // Only with LEONIDA_FSDRAW_PROBE=1.
             static std::mutex seen_mutex;
             static std::set<std::uintptr_t> seen;
-            bool first_seen;
-            {
+            const bool fsdraw = leonida::fsdraw::enabled();
+            bool first_seen = false;
+            if (fsdraw) {
                 std::lock_guard lock(seen_mutex);
                 first_seen = seen.insert(graphics_pipeline_).second;
             }
             const bool fullscreen = render_target_count_ >= 1 && count == 3 && viewport_.width >= 1000;
             if (fullscreen) leonida::fsdraw::note_target(render_targets_[0].resource);
-            if (first_seen || (n - 1) % 600 < 2 || (n > 2 && n < 9)) {
+            if (fsdraw && (first_seen || (n - 1) % 600 < 2 || (n > 2 && n < 9))) {
                 std::fprintf(stderr, "[rt] fsdraw: draw #%llu pso %p%s rt0 0x%llx rts %u depth 0x%llx count %u x%u: %s\n",
                              static_cast<unsigned long long>(n), reinterpret_cast<const void*>(graphics_pipeline_),
                              first_seen ? " (first use)" : "", static_cast<unsigned long long>(render_targets_[0].resource),
@@ -2373,6 +2480,7 @@ private:
                            first, base_vertex, first_instance};
         draw.mesh = mesh;
         draw.viewports = draw_viewports();
+        draw.depth_bounds = depth_bounds_;  // OMSetDepthBounds (upstream): read by depth-bounds pipelines only
         return draw;
     }
 
@@ -2467,6 +2575,11 @@ public:
         if (!event) return fence_.wait(value, UINT64_MAX) ? S_OK : E_FAIL;
         context_.enqueue_fence_wait(fence_.semaphore(), value, event);
         return S_OK;
+    }
+
+    // `fn` on the dispatcher's thread once the fence reaches `value` (rt::d3d12::fence_callback_at).
+    void callback_at(UINT64 value, std::function<void()> fn) {
+        context_.enqueue_fence_callback(fence_.semaphore(), value, std::move(fn));
     }
 
     // Counts `waiter` down once this fence reaches `value`: now if it has, else via the centralized dispatcher.
@@ -2945,7 +3058,7 @@ public:
             // LOCAL DIAGNOSTIC (fsdraw): what the bound tables hold when the lists are submitted
             if (leonida::local_diagnostics()) {
                 static std::atomic<std::uint64_t> submits{0};
-                const std::uint64_t n = tables.empty() ? 0 : ++submits;
+                const std::uint64_t n = tables.empty() || !leonida::fsdraw::enabled() ? 0 : ++submits;
                 if (n && (n <= 6 || n % 300 == 0)) {
                     char tag[48];
                     std::snprintf(tag, sizeof tag, "submit #%llu", static_cast<unsigned long long>(n));
@@ -3124,6 +3237,10 @@ public:
                                      "(reported once per cause)\n",
                              name(last_result_), leonida::VulkanQueue::describe(failure).c_str());
         }
+        // A batch or Signal that failed after its call returned (held, or on the queue's worker with
+        // LEONIDA_SUBMIT_ASYNC; reported on stderr there) is this call's result, one call late.
+        if (last_result_ == leonida::ReplayResult::success)
+            if (const auto held = queue_.take_held_failure(); held != leonida::ReplayResult::success) last_result_ = held;
     }
 
     // A copy list's timestamps go to COPY_QUEUE_TIMESTAMP heaps and every other list's to TIMESTAMP heaps.
@@ -3709,6 +3826,13 @@ HRESULT build_indirect_signature(const D3D12_COMMAND_SIGNATURE_DESC* desc, ID3D1
     sig->arguments_size = offset;
     out = std::move(sig);
     return S_OK;
+}
+
+bool fence_callback_at(ID3D12Fence* fence, std::uint64_t value, std::function<void()> fn) {
+    Fence* f = Fence::from(fence);
+    if (!f) return false;
+    f->callback_at(value, std::move(fn));
+    return true;
 }
 
 leonida::ReplayResult last_execute_result(ID3D12CommandQueue* queue) {

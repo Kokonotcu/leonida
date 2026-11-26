@@ -907,6 +907,17 @@ if(BUILD_TESTING)
   add_executable(pipeline_cache_store_test test/pipeline_cache_store_test.cpp)
   add_test(NAME pipeline_cache_store COMMAND pipeline_cache_store_test)
 
+  # The per-pipeline journal files compute pipelines are kept in: naming, header check, atomic replacement.
+  add_executable(pipeline_cache_journal_test test/pipeline_cache_journal_test.cpp)
+  add_test(NAME pipeline_cache_journal COMMAND pipeline_cache_journal_test)
+
+  # The compile helper's request files and building markers (shims/d3d12_compile_helper.h): Win32 file calls only.
+  if(WIN32)
+    add_executable(compile_helper_test test/compile_helper_test.cpp)
+    target_compile_definitions(compile_helper_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME compile_helper COMMAND compile_helper_test)
+  endif()
+
   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
 
@@ -1892,6 +1903,12 @@ if(BUILD_TESTING)
     target_compile_options(active_input_test PRIVATE /W4 /permissive- /utf-8)
   endif()
   add_test(NAME active_input COMMAND active_input_test)
+  # The same keyboard connection lifecycle as the shim, with a fake clock and virtual-device backend only.
+  add_executable(keyboard_pad_retry_test test/keyboard_pad_retry_test.cpp)
+  if(MSVC)
+    target_compile_options(keyboard_pad_retry_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  add_test(NAME keyboard_pad_retry COMMAND keyboard_pad_retry_test)
   if(WIN32 AND TARGET gameinput_no_sdl_test)
     add_test(NAME gameinput_no_sdl COMMAND gameinput_no_sdl_test)
     # LEONIDA_INPUT_SCRIPT without SDL3: the scripted pad, its device callbacks and its readings on a fake clock.
@@ -2060,10 +2077,21 @@ if(TARGET Vulkan::Headers)
   add_executable(vulkan_device_fault_test test/vulkan_device_fault_test.cpp)
   target_link_libraries(vulkan_device_fault_test PRIVATE Vulkan::Headers)
   add_test(NAME vulkan_device_fault COMMAND vulkan_device_fault_test)
+  # The submit lock's owner tracking, waiter count, submit handoff and compile gate (SubmitMutex), on the CPU.
+  if(WIN32)
+    add_executable(submit_mutex_test test/submit_mutex_test.cpp)
+    target_link_libraries(submit_mutex_test PRIVATE Vulkan::Headers)
+    target_compile_definitions(submit_mutex_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(MSVC)
+      target_compile_options(submit_mutex_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    add_test(NAME submit_mutex COMMAND submit_mutex_test)
+    set_tests_properties(submit_mutex PROPERTIES TIMEOUT 60)
+  endif()
 
   foreach(tool vk_harness vk_ps_sweep vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_pipeline_check vk_command_replay_test
           vk_bindless_test vk_image_fuzz vk_descriptor_bench depth24_convert_test vk_predicate_capture_test vk_predicated_copy_test
-          vk_xdxr_build_test vk_queue_test vk_sandbox)
+          vk_xdxr_build_test vk_queue_test vk_sandbox vk_console_heap_gpu_test)
     add_executable(${tool} test/${tool}.cpp)
     target_link_libraries(${tool} PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
     if(WIN32)
@@ -2151,7 +2179,7 @@ if(TARGET Vulkan::Headers)
     # Self-checking Vulkan tests with no shaders or game data; each exits 77 without a Vulkan device (TEST-514).
     # indirect_clamp is registered next to its own add_executable above, where tests/test_ctest_registration.py
     # can see it.
-    foreach(test vk_command_replay vk_predicated_copy vk_predicate_capture vk_queue)
+    foreach(test vk_command_replay vk_predicated_copy vk_predicate_capture vk_queue vk_console_heap_gpu)
       add_test(NAME ${test} COMMAND ${test}_test)
       set_tests_properties(${test} PROPERTIES SKIP_RETURN_CODE 77)
     endforeach()
@@ -2336,6 +2364,23 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_view_cache COMMAND vk_view_cache_test)
     set_tests_properties(vk_view_cache PROPERTIES SKIP_RETURN_CODE 77
                          FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+  endif()
+  # Fence and queue teardown with submissions pending: a fence released after an unheld Signal, the bindless upload
+  # queue destroyed before another queue submits, the device-fault submit ring forgetting destroyed semaphores.
+  add_executable(vk_semaphore_lifetime_test test/vk_semaphore_lifetime_test.cpp)
+  target_link_libraries(vk_semaphore_lifetime_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+  if(WIN32)
+    target_compile_definitions(vk_semaphore_lifetime_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(vk_semaphore_lifetime_test PRIVATE Threads::Threads)
+  endif()
+  if(MSVC)
+    target_compile_options(vk_semaphore_lifetime_test PRIVATE /W4 /permissive- /utf-8)
+  endif()
+  if(BUILD_TESTING)
+    add_test(NAME vk_semaphore_lifetime COMMAND vk_semaphore_lifetime_test)
+    set_tests_properties(vk_semaphore_lifetime PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
   # With LEONIDA_VK_VALIDATION=1: synchronization validation reports a missing barrier (and not a present one), so
   # the other GPU tests' "0 validation errors" was checked by an active layer. 77 without validation or a device.
@@ -2576,7 +2621,7 @@ if(TARGET Vulkan::Headers)
                          ENVIRONMENT "LEONIDA_VK_VALIDATION=1;VK_VALIDATE_SYNC=1")
     # VulkanPresenter tracker lock / failed-submit rollback and capture-buffer WAW synchronization.
     add_executable(vk_presenter_sync_test test/vk_presenter_sync_test.cpp)
-    target_link_libraries(vk_presenter_sync_test PRIVATE Vulkan::Headers user32)
+    target_link_libraries(vk_presenter_sync_test PRIVATE Vulkan::Headers user32 advapi32)
     target_compile_definitions(vk_presenter_sync_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     if(MSVC)
       target_compile_options(vk_presenter_sync_test PRIVATE /W4 /permissive- /utf-8)
@@ -2592,6 +2637,8 @@ if(TARGET Vulkan::Headers)
     endif()
     add_test(NAME vk_presenter_cost COMMAND vk_presenter_cost_test)
     set_tests_properties(vk_presenter_cost PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME vk_presenter_sparse_capture COMMAND vk_presenter_sync_test --sparse-capture)
+    set_tests_properties(vk_presenter_sync vk_presenter_sparse_capture PROPERTIES SKIP_RETURN_CODE 77)
     set(conformance_src ${CMAKE_CURRENT_SOURCE_DIR}/../tools/conformance/native/src)
     add_executable(vk_present_dump_test test/vk_present_dump_test.cpp
                    ${conformance_src}/png_io.cpp ${conformance_src}/diagnostics.cpp)
@@ -3129,6 +3176,9 @@ if(TARGET Vulkan::Headers)
     add_test(NAME d3d12_host_prefix COMMAND d3d12_existing_heap_test --host-prefix-only)
     set_tests_properties(d3d12_host_prefix PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(d3d12_existing_heap PROPERTIES SKIP_RETURN_CODE 77)
+    # LEONIDA_TEXTURE_REFRESH_ASYNC=1 (set by the test itself): a mapped plane's first submission reads its bytes.
+    add_test(NAME d3d12_mapped_plane_async COMMAND d3d12_existing_heap_test --mapped-plane-async)
+    set_tests_properties(d3d12_mapped_plane_async PROPERTIES SKIP_RETURN_CODE 77)
     # The same with write watching off: the guarded cases only, the concurrent writers among them.
     add_test(NAME d3d12_existing_heap_no_write_watch COMMAND d3d12_existing_heap_test)
     set_tests_properties(d3d12_existing_heap_no_write_watch PROPERTIES SKIP_RETURN_CODE 77
@@ -3356,6 +3406,26 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_indirect_group_budget PROPERTIES SKIP_RETURN_CODE 77
         ENVIRONMENT "LEONIDA_INDIRECT_GROUP_BUDGET=2")
       set_tests_properties(d3d12_indirect_dispatch_count PROPERTIES SKIP_RETURN_CODE 77)
+
+      # A single ordinary compute PSO and direct dispatch for cold/warm production journal comparisons;
+      # only the authored two-counter shader is shared with the indirect test.
+      set(_journal_second_spv ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_compute_journal_v2.spv)
+      add_custom_command(OUTPUT ${_journal_second_spv}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -DTEST_COUNTER_TERM=2u
+          -o ${_journal_second_spv} ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_indirect_dispatch_count.comp
+        COMMENT "Compiling the second authored compute journal control" VERBATIM)
+      # The first shader comes from gta6rt_indirect_count_shader: naming its output here too would give Make a second
+      # rule for the same file, and the two glslangValidator runs raced ("Failed to open file").
+      add_custom_target(gta6rt_compute_journal_shader DEPENDS ${_journal_second_spv})
+      add_executable(d3d12_compute_journal_test test/d3d12_compute_journal_test.cpp)
+      add_dependencies(d3d12_compute_journal_test gta6rt_indirect_count_shader gta6rt_compute_journal_shader)
+      target_link_libraries(d3d12_compute_journal_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_compute_journal_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+        LEONIDA_TEST_COUNTER_SPV="${_indirect_count_spv}" LEONIDA_TEST_COUNTER_V2_SPV="${_journal_second_spv}")
+      target_compile_options(d3d12_compute_journal_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_compute_journal COMMAND d3d12_compute_journal_test)
+      set_tests_properties(d3d12_compute_journal PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     endif()
 
     # The cache vk_pipeline_check saves has to hit on the runtime's device (docs/pipeline_check.md): the test

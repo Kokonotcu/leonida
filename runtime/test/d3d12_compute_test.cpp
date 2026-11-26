@@ -488,6 +488,15 @@ int main() {
                                                             D3D12_RESOURCE_STATE_COMMON, nullptr,
                                                             IID_PPV_ARGS(&inside.p))));
             EXPECT(inside->GetGPUVirtualAddress() + (1u << 20) <= capped_arena);
+            // The existing buffer and the reserved range prevent a contiguous arena-sized allocation.
+            // merge: such a default buffer is refused (E_OUTOFMEMORY, LEONIDA_ARENA_MB raises the arena). Upstream gives
+            // it a dedicated allocation with a VA relative to the arena past its end; here a VA past the arena is a
+            // title VA, which the translated shaders reach through the title-memory page table, not heap_base + VA.
+            const auto no_slice = buffer_desc(capped_arena, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            Ref<ID3D12Resource> dedicated;
+            EXPECT(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &no_slice, D3D12_RESOURCE_STATE_COMMON,
+                                                   nullptr, IID_PPV_ARGS(&dedicated.p)) == E_OUTOFMEMORY &&
+                   !dedicated.p);
             EXPECT(capped->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &too_large, D3D12_RESOURCE_STATE_COMMON,
                                                   nullptr, IID_PPV_ARGS(&past.p)) == E_OUTOFMEMORY && !past.p);
             std::printf("arena: %llu MiB (device limits: maxBufferSize %llu MiB, maxMemoryAllocationSize %llu MiB); "

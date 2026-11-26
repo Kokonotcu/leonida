@@ -43,6 +43,8 @@ public:
     // pipelineCreationCacheControl (1.3 core): a pipeline creation may ask to fail rather than compile
     // (VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT), which the optimised pipeline-library link uses to
     // take a cached pipeline without compiling one (docs/aot_pipelines.md step 3). Only on a 1.3 device.
+    // Upstream uses the same bit to ask a pipeline cache "do you have it?" without a
+    // compile (pipeline_cache_journal.h). Core 1.3 only; a 1.2 device goes without.
     bool pipeline_creation_cache_control = false;
 
     bool usable() const { return dynamic_rendering && synchronization2; }
@@ -65,6 +67,7 @@ public:
             synchronization2 = f13.synchronization2 == VK_TRUE;
             subgroup_size_control = f13.subgroupSizeControl == VK_TRUE;
             compute_full_subgroups = f13.computeFullSubgroups == VK_TRUE;
+            pipeline_creation_cache_control = f13.pipelineCreationCacheControl == VK_TRUE;
             extended_dynamic_state = true;  // core in 1.3, no feature bit
             pipeline_creation_cache_control = f13.pipelineCreationCacheControl == VK_TRUE;
             return;

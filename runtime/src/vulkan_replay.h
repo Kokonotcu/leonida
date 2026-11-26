@@ -71,6 +71,7 @@
 #include <span>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <type_traits>
 #include <optional>
 #include <unordered_map>
@@ -918,8 +919,9 @@ struct ComputePipeline {
     std::function<void()> request;
     std::shared_ptr<std::atomic<bool>> requested;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;  // set 0 of the layout, bound at every dispatch; null: none
-    // A pipeline built on first use: with `pipeline` null, `build(build_context)` returns the handle (building it if
-    // nobody has yet), or null when it cannot be built. Null `build`: `pipeline` is final.
+    // A pipeline built on first use: with `pipeline` null, `build(build_context)` returns the handle, or null when it
+    // cannot be built or (async_build) is still being built - it never waits for a build another thread runs, since
+    // prepare calls it with the resource lock held. Null `build`: `pipeline` is final.
     VkPipeline (*build)(void*) = nullptr;
     void* build_context = nullptr;
     bool async_build = false;  // a null handle may be waiting for the compile worker
@@ -965,6 +967,7 @@ struct GraphicsPipeline {
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
     bool viewport_with_count = false;     // pipeline uses VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT
+    bool depth_bounds = false;            // depthBoundsTestEnable: the bounds are dynamic (vkCmdSetDepthBounds)
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
     // and stencil. Null when it cannot be built.
@@ -1327,9 +1330,13 @@ struct ReplayFunctions {
     PFN_vkCmdSetPrimitiveRestartEnable set_primitive_restart_enable = nullptr;
     PFN_vkCmdSetStencilReference set_stencil_reference = nullptr;
     PFN_vkCmdSetBlendConstants set_blend_constants = nullptr;
+    PFN_vkCmdSetDepthBounds set_depth_bounds = nullptr;  // for depth-bounds pipelines only
     PFN_vkCmdDraw draw = nullptr;
     unsigned* mesh_draw_count = nullptr;  // opt-in count for this submission
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
+    // ExecuteIndirect with a DISPATCH_MESH signature. Its 12-byte record is VkDrawMeshTasksIndirectCommandEXT.
+    PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT draw_mesh_tasks_indirect_count = nullptr;
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
@@ -1389,9 +1396,6 @@ struct ReplayFunctions {
     std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t,
                        CountedDispatch&)> prepare_counted_dispatch;
     std::function<void(VkCommandBuffer, const CountedDispatch&)> emit_counted_dispatch;
-    // VK_EXT_mesh_shader: DISPATCH_MESH signatures. The count variant also needs drawIndirectCount.
-    PFN_vkCmdDrawMeshTasksIndirectEXT draw_mesh_tasks_indirect = nullptr;
-    PFN_vkCmdDrawMeshTasksIndirectCountEXT draw_mesh_tasks_indirect_count = nullptr;
     // multiDrawIndirect: one vkCmdDraw*Indirect may take a drawCount above 1; without it each command is its own call.
     bool multi_draw_indirect = false;
     // VkPhysicalDeviceLimits::maxDrawIndirectCount: a call takes at most this many records.
@@ -1418,6 +1422,7 @@ struct ReplayFunctions {
     std::function<bool(VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, std::uint32_t, std::uint32_t, std::uint32_t,
                        ClampedIndirect&)> prepare_indirect_clamp;
     std::function<void(VkCommandBuffer, const ClampedIndirect&)> emit_indirect_clamp;
+    bool external_graphics_scope = false;  // Caller supplies the rendering scope, pipeline and bindings for legacy draws.
     bool require_indirect_clamp = false;  // an enabled device refuses an indirect if scratch preparation fails
     // Optional VK_KHR_acceleration_structure: BuildRaytracingAccelerationStructure.
     PFN_vkCmdBuildAccelerationStructuresKHR build_acceleration_structures = nullptr;
@@ -1522,7 +1527,7 @@ struct Prepared {
     PredicateCapture predicate;
     std::vector<PredicatedCopyDispatch> predicated_copy;
     CountedDispatch counted_dispatch;
-    ClampedIndirect indirect_clamp;  // ExecuteIndirect: the clamped arguments the command reads, or null
+    ClampedIndirect indirect_clamp;  // an indirect command's clamped arguments it reads, or null
     ResourceBinding binding;
     VkImageSubresourceRange range{};  // the barrier range, or the cleared view (cleared aspects only)
     VkImageView view = VK_NULL_HANDLE;
@@ -3063,7 +3068,9 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
                           const IndirectDrawArgs* arguments = nullptr) {
     if (arguments) {
         const IndirectDrawArgs& arg = *arguments;
-        const VkDeviceSize record_size = draw.indexed ? sizeof(VkDrawIndexedIndirectCommand) : sizeof(VkDrawIndirectCommand);
+        const VkDeviceSize record_size = draw.mesh      ? sizeof(VkDrawMeshTasksIndirectCommandEXT)
+                                         : draw.indexed ? sizeof(VkDrawIndexedIndirectCommand)
+                                                        : sizeof(VkDrawIndirectCommand);
         if (!arg.argument_buffer || !arg.max_count || arg.stride < record_size ||
             (arg.stride | arg.argument_offset | arg.count_offset) % 4 || (!arg.count_buffer && arg.count_offset))
             return ReplayResult::invalid_indirect_arguments;
@@ -3071,8 +3078,10 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
         // independently of the supplied maxDrawCount. On a device with a smaller limit an
         // arbitrary D3D12 count requires a GPU clamp pass; keep that case guarded for now.
         const bool counted = arg.count_buffer != 0;
-        const bool entry_available = counted ? (draw.indexed ? vk.draw_indexed_indirect_count : vk.draw_indirect_count) != nullptr
-                                             : (draw.indexed ? vk.draw_indexed_indirect : vk.draw_indirect) != nullptr;
+        const bool entry_available =
+            draw.mesh ? (counted ? vk.draw_mesh_tasks_indirect_count != nullptr : vk.draw_mesh_tasks_indirect != nullptr)
+            : counted ? (draw.indexed ? vk.draw_indexed_indirect_count : vk.draw_indirect_count) != nullptr
+                      : (draw.indexed ? vk.draw_indexed_indirect : vk.draw_indirect) != nullptr;
         // The GPU supplies firstIndex/indexCount at execution (VUID-08798). A sized binding alone
         // does not guarantee a robust fetch, and the legacy binding covers the backing buffer's tail.
         const auto skip = [&](indirect_stats::Reason reason) {
@@ -3080,11 +3089,14 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             p.skipped = true;
             return ReplayResult::success;
         };
-        if (draw.mesh) return skip(indirect_stats::mesh);
+        // A mesh draw has no topology, first instance or index buffer; its records go through the clamp pass,
+        // which bounds x and sets y = z = 1 (the console's mesh dispatch is one-dimensional), or it is not drawn.
+        // merge: our replay clamps where the device requires it (require_indirect_clamp: enabled and supported).
+        if (draw.mesh && (!entry_available || !vk.require_indirect_clamp)) return skip(indirect_stats::mesh);
         static_assert(indirect_stats::topology_supported(topology_rect_list) &&
                       !indirect_stats::topology_supported(topology_quad_list));
-        if (!indirect_stats::topology_supported(draw.topology)) return skip(indirect_stats::topology);
-        if (!vk.draw_indirect_first_instance) return skip(indirect_stats::first_instance);
+        if (!draw.mesh && !indirect_stats::topology_supported(draw.topology)) return skip(indirect_stats::topology);
+        if (!draw.mesh && !vk.draw_indirect_first_instance) return skip(indirect_stats::first_instance);
         if (!entry_available) return skip(indirect_stats::entry);
         if (draw.indexed && !vk.bind_robust_index_view) return skip(indirect_stats::robust_index);
         if (arg.max_count > vk.max_draw_indirect_count) return skip(indirect_stats::count_limit);
@@ -3148,6 +3160,7 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
     if (pipeline->viewport_with_count && (!vk.set_viewport_with_count || !vk.set_scissor_with_count))
         return unsupported_at(__LINE__);
     if (pipeline->uses_set0 && (!vk.bind_descriptor_sets || !vk.bindless_set)) return unsupported_at(__LINE__);
+    if (pipeline->depth_bounds && !vk.set_depth_bounds) return unsupported_at(__LINE__);
     if (pipeline->color_formats.size() > max_render_targets) return unsupported_at(__LINE__);
     p.graphics = pipeline;
     p.pipeline = pipeline->pipeline;
@@ -4703,7 +4716,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     if (pipeline->bindless_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
                 }
             }
-            if (ind->kind != IndirectKind::dispatch && !ind->state && !ind->raw) return unsupported_at(__LINE__);
+            // merge: upstream's external_graphics_scope (the caller opened rendering and bound the pipeline for every
+            // state-less draw of the replay) makes each such call raw, as our per-command `raw` does.
+            if (ind->kind != IndirectKind::dispatch && !ind->state && !ind->raw && !vk.external_graphics_scope)
+                return unsupported_at(__LINE__);
             // A draw with the list's graphics state: prepared as a Draw is (the argument and count buffers stay in
             // p.binding and p.source). Recording uses p.draw, as for a Draw.
             if (ind->state && vk.graphics_pipeline && ind->state->pipeline &&
@@ -5006,7 +5022,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (!vk.prepare_indirect_clamp || !vk.emit_indirect_clamp || (statistics_active && !statistics_helpers) ||
                     !vk.prepare_indirect_clamp(prepared_draw.indirect_buffer, prepared_draw.indirect_offset,
                         prepared_draw.indirect_count_buffer, prepared_draw.indirect_count_offset,
-                        raster.state->indexed ? indirect_clamp_draw_indexed : indirect_clamp_draw,
+                        // merge: upstream's mesh records (prepare_draw now lets an indirect mesh draw through only
+                        // with the clamp) are clamped as mesh records, x bounded and y = z = 1.
+                        raster.state->mesh      ? indirect_clamp_mesh
+                        : raster.state->indexed ? indirect_clamp_draw_indexed
+                                                : indirect_clamp_draw,
                         arg.stride, arg.max_count, p.indirect_clamp))
                     return unsupported_at(__LINE__);
                 p.indirect_clamp.share_list_budget(indirect_list_budget);
@@ -6239,6 +6259,9 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
         } else if (const Draw* draw = raster.state ? raster.state : detail::draw_of(command)) {
             const detail::PreparedDraw& d = prepared.draws[p.draw];
             if (d.skipped) continue;  // could not be resolved in prepare: dropped
+            // merge: upstream emits a stateful indirect draw's clamp pass here; ours already did, with the other
+            // helper passes, before this command (outside any rendering scope, between statistics segments, out of
+            // the predicate), so it is not run twice.
             if constexpr (Checkpoints)
                 checkpoints->record(command_buffer, i, CheckpointKind::draw,
                                     d.pipeline, draw->pipeline);
@@ -6483,6 +6506,12 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
             vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
             vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+            if (graphics.depth_bounds) {
+                // Vulkan takes bounds in [0, 1] only (without VK_EXT_depth_range_unrestricted), as D3D12 does.
+                const float lo = std::clamp(draw->depth_bounds[0], 0.0f, 1.0f);
+                const float hi = std::clamp(draw->depth_bounds[1], 0.0f, 1.0f);
+                vk.set_depth_bounds(command_buffer, lo, hi);
+            }
             for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
                 if (!d.vertex_buffers[slot]) continue;
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
@@ -6510,14 +6539,29 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                     const VkDeviceSize bytes = draw->index.size - draw->index.size % width;
                     vk.bind_robust_index_view(command_buffer, d.index_buffer, d.index_offset, bytes, d.index_type);
                 }
-                const auto stride = p.indirect_clamp.buffer ? p.indirect_clamp.stride : arg.stride;
-                if (arg.count_buffer) {
+                // What the draw reads: the clamp pass's scratch (and its clamped count) when it ran, else the
+                // application's own buffer. Its records and stride are the clamp's then, not the signature's.
+                const bool clamped = p.indirect_clamp.buffer != VK_NULL_HANDLE;
+                const VkBuffer arguments_buffer = clamped ? p.indirect_clamp.buffer : d.indirect_buffer;
+                const VkDeviceSize arguments_offset = clamped ? p.indirect_clamp.offset : d.indirect_offset;
+                const VkBuffer count_buffer = clamped ? p.indirect_clamp.count_buffer : d.indirect_count_buffer;
+                const VkDeviceSize count_offset = clamped ? p.indirect_clamp.count_offset : d.indirect_count_offset;
+                const std::uint32_t records = clamped ? p.indirect_clamp.records : arg.max_count;
+                const std::uint32_t stride = clamped ? p.indirect_clamp.stride : arg.stride;
+                if (draw->mesh) {
+                    if (arg.count_buffer)
+                        vk.draw_mesh_tasks_indirect_count(command_buffer, arguments_buffer, arguments_offset, count_buffer,
+                                                          count_offset, records, stride);
+                    else
+                        vk.draw_mesh_tasks_indirect(command_buffer, arguments_buffer, arguments_offset, records, stride);
+                    if (vk.mesh_draw_count) ++*vk.mesh_draw_count;
+                } else if (arg.count_buffer) {
                     const auto emit_counted = draw->indexed ? vk.draw_indexed_indirect_count : vk.draw_indirect_count;
-                    emit_counted(command_buffer, d.indirect_buffer, d.indirect_offset, d.indirect_count_buffer,
-                                 d.indirect_count_offset, arg.max_count, stride);
+                    emit_counted(command_buffer, arguments_buffer, arguments_offset, count_buffer, count_offset,
+                                 records, stride);
                 } else {
                     const auto emit_fixed = draw->indexed ? vk.draw_indexed_indirect : vk.draw_indirect;
-                    emit_fixed(command_buffer, d.indirect_buffer, d.indirect_offset, arg.max_count, stride);
+                    emit_fixed(command_buffer, arguments_buffer, arguments_offset, records, stride);
                 }
             } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);

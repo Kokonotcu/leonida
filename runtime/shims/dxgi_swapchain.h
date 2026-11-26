@@ -129,7 +129,7 @@ public:
     // VK_KHR_get_surface_capabilities2 and the matching *_surface_maintenance1 on `instance` (VulkanDeviceInfo).
     VulkanSwapchain(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
                     PFN_vkGetDeviceProcAddr gdpa, VkDevice device, VkQueue queue, std::uint32_t queue_family,
-                    std::mutex& submit_mutex, bool swapchain_maintenance1 = false,
+                    SubmitMutex& submit_mutex, bool swapchain_maintenance1 = false,
                     DeviceFaultDiagnostics* diagnostics = nullptr)
         : instance_(instance), physical_(physical), device_(device), queue_(queue), queue_family_(queue_family),
           submit_mutex_(submit_mutex), diagnostics_(diagnostics) {
@@ -270,6 +270,7 @@ public:
         }
 #endif
         std::lock_guard lock(submit_mutex_);
+        const SubmitMutex::SubmitTurn turn(submit_mutex_);  // a queue operation: the compile gate
         const VkResult r = observe(fn_.queue_present(queue_, &pi), "vkQueuePresentKHR (DXGI)");
         presentable_ = false;  // handed to the engine (or abandoned): never present this image again
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) stale_ = true;
@@ -541,8 +542,12 @@ private:
             VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             si.commandBufferCount = 1;
             si.pCommandBuffers = &blit_cmd_;
-            if (fn_.queue_submit(queue_, 1, &si, blit_fence_) != VK_SUCCESS ||
-                fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+            bool submitted = false;
+            {
+                const SubmitMutex::SubmitTurn turn(submit_mutex_);  // a queue operation: the compile gate
+                submitted = fn_.queue_submit(queue_, 1, &si, blit_fence_) == VK_SUCCESS;
+            }
+            if (!submitted || fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
                 destroy_offscreen();
                 return false;
             }
@@ -627,7 +632,12 @@ private:
     }
 
     bool submit_blit_and_wait(const VkSubmitInfo& submit) {
-        return observe(fn_.queue_submit(queue_, 1, &submit, blit_fence_), "vkQueueSubmit (DXGI)") == VK_SUCCESS &&
+        VkResult submitted;
+        {
+            const SubmitMutex::SubmitTurn turn(submit_mutex_);  // the compile gate (VulkanContext::queue_submit)
+            submitted = fn_.queue_submit(queue_, 1, &submit, blit_fence_);
+        }
+        return observe(submitted, "vkQueueSubmit (DXGI)") == VK_SUCCESS &&
                observe(fn_.wait_for_fences(device_, 1, &blit_fence_, VK_TRUE, UINT64_MAX),
                        "vkWaitForFences (DXGI blit)") == VK_SUCCESS;
     }
@@ -820,7 +830,7 @@ private:
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue queue_ = VK_NULL_HANDLE;
     std::uint32_t queue_family_ = 0;
-    std::mutex& submit_mutex_;
+    SubmitMutex& submit_mutex_;
     DeviceFaultDiagnostics* diagnostics_;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
