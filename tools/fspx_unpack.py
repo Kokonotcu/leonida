@@ -24,7 +24,7 @@ corpus uses, so tools/rdna2spirv.py can read it:
     DIR/fspx/<name>.json     the decoded kind-0 entry, the directory and the code range
     DIR/fspx/<name>.code     the kind-6 program
     DIR/fspx/<name>.state    the kind-0 entry as it is (its SHA-256 is the index's fspx_state_sha256)
-    DIR/disasm/<name>.s      with --disasm: tools/shader_disasm.py output for the code after the prologue
+    DIR/disasm/<name>.s      with --disasm: tools/shader_disasm.py output for the code after the prologue (36 or 24 bytes)
 """
 import argparse
 import json
@@ -46,6 +46,11 @@ KINDS = (0, 1, 6, 7)
 # kind-7 hash; llvm-mc rejects them. Measured on all 29 shaders of the 1.0.2.1 DLL (docs/fspx.md).
 PROLOGUE_WORDS = (0, 3, 6)
 PROLOGUE_SIZE = 36
+# Some programs of the pipeline library in shaders.rpf carry only two of those words (0 and 3): a 24-byte prologue, with
+# the code starting at word 6 (50 of the 2,684 library programs of 1.0.2.1, docs/fspx.md). Read from word 0 they never
+# decode.
+SHORT_PROLOGUE_WORDS = (0, 3)
+SHORT_PROLOGUE_SIZE = 24
 STAGE_COMPUTE = 5  # PSVRuntimeInfo1 ShaderStage (DirectX): 5 = compute
 
 
@@ -141,15 +146,15 @@ def decode_kind0(b: bytes) -> dict:
 
 
 def code_range(code: bytes):
-    """(start, end) of the instructions in a kind-6 program: after the 36-byte prologue when it is there, through
+    """(start, end) of the instructions in a kind-6 program: after the 36- or 24-byte prologue when it is there, through
     the first s_endpgm. end is None when the program has no s_endpgm."""
     words = struct.unpack_from(f"<{len(code) // 4}I", code)
     start = PROLOGUE_SIZE if len(words) > 8 and all(words[k] >> 16 == 0xD580 for k in PROLOGUE_WORDS) else 0
     # Some pipeline programs have only the two hash carriers. Both must be literal-bearing
     # VOP3 NOPs of the form in fspx_prologue_probe; the first body instruction starts at byte 24.
     if not start and len(words) >= 6 and all(
-            words[k] >> 16 == 0xD580 and words[k + 1] & 0xFFFE0100 == 0x03FE0100 for k in (0, 3)):
-        start = 24
+            words[k] >> 16 == 0xD580 and words[k + 1] & 0xFFFE0100 == 0x03FE0100 for k in SHORT_PROLOGUE_WORDS):
+        start = SHORT_PROLOGUE_SIZE
     pos = code.find(ENDPGM, start)
     while pos >= 0 and pos % 4:
         pos = code.find(ENDPGM, pos + 1)

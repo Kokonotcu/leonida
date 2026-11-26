@@ -227,12 +227,20 @@ inline void log_all_threads() {
         event("thread", "\"id\":" + std::to_string(c.id) + ",\"stack\":" + stack_from(c.context));
 }
 
-// The retail watchdog (1.0.2.1, the store at RVA 0x2215c35) scans 64 records of 0x48 bytes at RVA 0x6844a20: a word,
-// a count at +4 and up to 8 QPC start times at +8 (read by PR #8134). The busy ones are logged with their ages.
-// Nothing happens unless the fault address is that store, so another build of the executable is not misread.
+// The retail watchdog scans 64 records of 0x48 bytes: a word, a count at +4 and up to 8 QPC start times at +8 (read
+// by PR #8134). The busy ones are logged with their ages. Its two places are measured locally and not kept here:
+// LEONIDA_WATCHDOG_TABLE="<store RVA>,<table RVA>" (hex) names the watchdog's write to 0 and its table. Unset, or
+// when the fault is not at that store, nothing is read, so another build of the executable is not misread.
 inline void log_watchdog_table(std::uint64_t fault_address) {
-    constexpr std::uint64_t kStore = 0x2215c35, kTable = 0x6844a20;
-    if (where(fault_address).find("+0x2215c35") == std::string::npos) return;
+    char value[64]{};
+    const DWORD n = GetEnvironmentVariableA("LEONIDA_WATCHDOG_TABLE", value, sizeof(value));
+    if (!n || n >= sizeof(value)) return;
+    char* rest = nullptr;
+    const std::uint64_t kStore = std::strtoull(value, &rest, 16);
+    if (!rest || *rest != ',') return;
+    const std::uint64_t kTable = std::strtoull(rest + 1, &rest, 16);
+    if (!rest || *rest || !kStore || !kTable) return;
+    if (!where(fault_address).ends_with("+" + hex(kStore))) return;
     const auto* table = reinterpret_cast<const std::uint8_t*>(fault_address - kStore + kTable);
     LARGE_INTEGER now{}, freq{};
     QueryPerformanceCounter(&now);
@@ -258,8 +266,10 @@ inline void log_watchdog_table(std::uint64_t fault_address) {
     }
 }
 
-// LOCAL DIAGNOSTIC for one of the title's asserts (docs/re/answers.md, "transient pool"): at the int3 at
-// game+0x2473e88 the title has just computed the peak of a list of resources with lifetimes against a fixed pool.
+// LOCAL DIAGNOSTIC for one of the title's asserts (docs/re/answers.md, "transient pool"): at that assert's int3
+// the title has just computed the peak of a list of resources with lifetimes against a fixed pool. The int3's
+// location is measured locally and not kept here: LEONIDA_POOL_DIAG_AT names it as the trace prints it
+// (`<module>+0x<offset>`), and the dump is off without it.
 // rdi = the list (24-byte records: entry pointer, u32 size rounded to 64 KiB), r13 = the count, rax = the peak,
 // rcx = the pool size. An entry is {record pointer, ..., u32 first pass at +16, u32 last pass at +20}; a record has
 // its usage word at +14, kind word at +16 and, for a texture, width/height/depth words at +56/+58/+60, the dimension
@@ -295,8 +305,13 @@ inline void dump_transient_pool(const CONTEXT& c) {
 inline void log_exception(const EXCEPTION_POINTERS& info) {
     const EXCEPTION_RECORD& r = *info.ExceptionRecord;
     try {
-        if (r.ExceptionCode == EXCEPTION_BREAKPOINT && info.ContextRecord &&
-            where(reinterpret_cast<uint64_t>(r.ExceptionAddress)).ends_with("master.exe+0x2473e88"))
+        static const std::string pool_diag_at = [] {
+            char at[128]{};
+            const DWORD n = GetEnvironmentVariableA("LEONIDA_POOL_DIAG_AT", at, sizeof(at));
+            return n && n < sizeof(at) ? std::string(at, n) : std::string();
+        }();
+        if (r.ExceptionCode == EXCEPTION_BREAKPOINT && info.ContextRecord && !pool_diag_at.empty() &&
+            where(reinterpret_cast<uint64_t>(r.ExceptionAddress)).ends_with(pool_diag_at))
             dump_transient_pool(*info.ContextRecord);
         if (r.ExceptionCode == kDbgPrint || r.ExceptionCode == kDbgPrintWide) {
             const ULONG_PTR fallback = wide_fallback;
@@ -364,8 +379,8 @@ inline void log_exception(const EXCEPTION_POINTERS& info) {
             if (info.ContextRecord) f += ",\"stack\":" + stack_from(*info.ContextRecord);
             event("exception", f);
             // A write to address 0 is how the retail title's watchdog stops the process when a thread stops making
-            // progress (PR #8134's boot runs: the store at RVA 0x2215c35 of 1.0.2.1). That thread's stack names only
-            // the watchdog, so every other thread's is logged, and the watchdog's own table when the address matches.
+            // progress (PR #8134's boot runs). That thread's stack names only the watchdog, so every other thread's is
+            // logged, and the watchdog's own table when LEONIDA_WATCHDOG_TABLE names this store.
             if (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r.NumberParameters >= 2 &&
                 r.ExceptionInformation[0] == 1 && r.ExceptionInformation[1] == 0) {
                 log_all_threads();

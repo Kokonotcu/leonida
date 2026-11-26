@@ -727,6 +727,21 @@ class Gen:
             self.emit(f"{h} = OpBitwiseAnd %uint {u} {self.cu(0xFFFF)}")
         return h
 
+    def replicate_bits16(self, u, hi=0):
+        """s_bitreplicate_b64_b32's word ``hi`` of u32 ``u``: each bit of that 16-bit half twice, bit i to 2i, 2i+1."""
+        t = self.u16_half(u, hi)
+        # Spread the 16 bits to the even positions, then copy each to the odd one above it.
+        for sh, m in ((8, 0x00FF00FF), (4, 0x0F0F0F0F), (2, 0x33333333), (1, 0x55555555)):
+            s, o, n = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{s} = OpShiftLeftLogical %uint {t} {self.cu(sh)}")
+            self.emit(f"{o} = OpBitwiseOr %uint {t} {s}")
+            self.emit(f"{n} = OpBitwiseAnd %uint {o} {self.cu(m)}")
+            t = n
+        s, r = self.tmp(), self.tmp()
+        self.emit(f"{s} = OpShiftLeftLogical %uint {t} {self.cu(1)}")
+        self.emit(f"{r} = OpBitwiseOr %uint {t} {s}")
+        return r
+
     def i16_half(self, u, hi=0):
         """Sign-extended 16-bit half of u32 ``u`` as ``%int`` (high half when ``hi`` is truthy).
         Avoids ``OpBitFieldSExtract (OpShiftRightLogical u 16) 0 16``, which hits the same AMD Windows LLPC
@@ -8081,6 +8096,10 @@ class Gen:
                 # %vcc and EXEC through set_exec.
                 mask = self.tmp()
                 self.emit(f"{mask} = OpISub %uint {self.cu(0)} {bit}")
+                if d["t"] == "vcc" and not self.wave64:
+                    # In wave32 VCC's high word is data, not lanes (an ordinary SGPR, %vcc_hi): source bits 16..31
+                    # replicated, as the scalar form writes them, so a later read of vcc_hi as data sees them.
+                    self.emit(f"OpStore %vcc_hi {self.replicate_bits16(word, 1)}")
                 self.mask_dst(d, mask)
                 return
             if mask_words is not None:
@@ -8091,20 +8110,7 @@ class Gen:
             else:
                 words = [self.src_u(x)]
             if op == "s_bitreplicate_b64_b32":
-                out = []
-                for hi in (0, 1):
-                    t = self.u16_half(words[0], hi)
-                    # Spread the 16 bits to the even positions, then copy each to the odd one above it.
-                    for sh, m in ((8, 0x00FF00FF), (4, 0x0F0F0F0F), (2, 0x33333333), (1, 0x55555555)):
-                        u, o, n = self.tmp(), self.tmp(), self.tmp()
-                        self.emit(f"{u} = OpShiftLeftLogical %uint {t} {self.cu(sh)}")
-                        self.emit(f"{o} = OpBitwiseOr %uint {t} {u}")
-                        self.emit(f"{n} = OpBitwiseAnd %uint {o} {self.cu(m)}")
-                        t = n
-                    u, r = self.tmp(), self.tmp()
-                    self.emit(f"{u} = OpShiftLeftLogical %uint {t} {self.cu(1)}")
-                    self.emit(f"{r} = OpBitwiseOr %uint {t} {u}")
-                    out.append(r)
+                out = [self.replicate_bits16(words[0], hi) for hi in (0, 1)]
                 self.dst64_data(d, out[0], out[1], op)
             else:
                 parts = []

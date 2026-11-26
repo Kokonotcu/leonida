@@ -283,7 +283,7 @@ void test_trace(const fs::path& dir) {
 }
 
 // #8134 port: the watchdog's write to 0 logs every other thread's stack. A thread parked on an event shows up once,
-// with a stack; the watchdog table is read only at the 1.0.2.1 store address, so any other address logs nothing.
+// with a stack; the watchdog table is read only at the store LEONIDA_WATCHDOG_TABLE names, so here it logs nothing.
 void test_all_threads(const fs::path& dir) {
     const fs::path trace = dir / "threads.jsonl";
     check(rt::startup_trace::open(trace.c_str()), "open the thread trace");

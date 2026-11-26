@@ -96,7 +96,7 @@ enough for the bundled middleware's `d3d12_xs` calls, not for the game. The laye
   out)`, `n` = 1..4 records of 0x14c bytes: a u32 tag, then the payload at +4) patches a copy of that stream and creates
   the PSO through the same path. Tags 0 (`D3D12_DEPTH_STENCIL_DESC`, on DEPTH_STENCIL or DEPTH_STENCIL1), 1
   (`D3D12_RASTERIZER_DESC`), 2 (`D3D12_BLEND_DESC`) and 3 (sample mask) are the TomBox layout (GPL-3.0,
-  `create_derived_pso_x`), checked against the title's record writes in the retail build (RVA 0x2479f40): tag 1 is the
+  `create_derived_pso_x`), checked against the title's record writes in the retail build: tag 1 is the
   rasterizer (0x2c bytes, always record 0 when present), tag 0 the DEPTH_STENCIL (0x34), tag 2 the BLEND (0x148). Tag 3 (sample mask, from TomBox)
   is served although that function does not write it. Tag 5 (0x16 bytes: 16 zero bytes, then the StencilReadMask and
   StencilWriteMask bytes at the DEPTH_STENCIL offsets 0x10/0x11, then zeros) overlays only those two bytes of the base's
@@ -4567,7 +4567,11 @@ to be recovered from call sites (or the NDA GDK headers, if a developer has acce
 | Mesh shader tier | Public `D3D12_MESH_SHADER_TIER` | `VK_EXT_mesh_shader`; the 9,282 translated mesh shaders make this a hard requirement for any content that uses them. |
 | Wave MMA | Public `D3D12_WAVE_MMA_TIER` | Not used: no shader sets `WAVE_MMA` in SFI0 and none contains `v_mfma`/`v_wmma` (all 26,503, `tools/feature_scan.py`). Answer the tier query truthfully; no cooperative-matrix mapping is needed. |
 | Enhanced barriers | Public Xbox Series `D3D12_BARRIER_GROUP` | `VK_KHR_synchronization2`; implement directly. |
+| List slot 146: texture barrier with no resource | The retail title records `D3D12_BARRIER_TYPE_TEXTURE` barriers whose `pResource` is null in its `Barrier(NumBarrierGroups, pBarrierGroups)` calls; on the console such a barrier is a global memory and execution barrier | `d3d12_xs_device.cpp` turns each into a `D3D12_GLOBAL_BARRIER` with the same `SyncBefore`/`SyncAfter`/`AccessBefore`/`AccessAfter` (layouts, subresource range and flags dropped) before it calls GCL7 `Barrier` (PC slot 80). A texture group with both kinds is split into runs, in order, in storage that lives for the call; a call with nothing to convert goes through with the title's own pointer. Without this the PC list goes into its error state, `Close` fails and `ExecuteCommandLists` drops the submission. A group array the proxy cannot read safely (null with a nonzero count, a group type it does not know, more than 1,024 groups or 65,536 barriers in one group) is refused whole, nothing recorded, and logged once per reason. **Confirmed by the mock tests only** (`xs_proxy_mock_test`), not by a retail run. |
+| List slot 52: clear of an RTV made with no resource | The title creates some render-target views with `CreateRenderTargetView(nullptr, ...)` and clears them every frame; on the console that clear does nothing | The device proxy marks the real handle when device slot 20 gets no resource; a view made there with a resource removes the mark, and `CopyDescriptors`/`CopyDescriptorsSimple` of RTVs move it with the descriptors. Releasing an RTV heap drops the marks in its real CPU range, so a heap made later at the same address starts unmarked. List slot 52 skips the clear of a marked view (logged the first time) and the list stays valid. The mark is the proxy's own because the real descriptor cannot tell: the Vulkan layer writes the same empty record for a view it could not make, and a PC runtime's handles are opaque. Any other view, valid or not, still reaches `ClearRenderTargetView` (PC slot 48); RTV records the title copies with its own `memcpy` are not followed. **Confirmed by the mock tests only** (`xs_proxy_mock_test`), not by a retail run. |
 | XDXR batched/streaming BVH | `XboxBvhBuilder.dll` exports | See 4.8. |
+
+The null-resource barrier and null-view clear behaviour were first reported by luizwidmer/palmetto.
 
 ### 4.10 Debug markers and private data
 

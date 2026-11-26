@@ -164,6 +164,14 @@ class QuadmaskBitreplicateTests(unittest.TestCase):
                                  "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"])
                 self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0], 0x40000000 + want)
 
+    def test_bitreplicate_into_vcc_keeps_the_high_word_as_data(self):
+        # Upstream refuses this in wave32 because VCC's high word is data a lane mask cannot carry; this tree
+        # translates it (6 pipeline-library programs) and writes vcc_hi as that data: source bits 16..31 replicated.
+        for x in (0x0F0F0F0F, 0x12345678, 0xFFFF0000, 0x80010000):
+            with self.subTest(x=hex(x)):
+                self.assertEqual(run([f"s_bitreplicate_b64_b32 vcc, {x:#x}", "s_mov_b32 s11, vcc_hi",
+                                      "s_mov_b32 s10, 0"])[:2], (0, bitreplicate(x) >> 32))
+
     def test_lane_masks_rejected(self):
         for lines in (["v_cmp_gt_u32_e32 vcc, 5, v0", "s_quadmask_b64 s[10:11], vcc"],
                       ["s_quadmask_b32 s10, exec_lo"],
