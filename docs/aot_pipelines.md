@@ -17,9 +17,8 @@ Switches: `LEONIDA_SHADER_OBJECTS=1` (shader objects, off by default; `=0` also 
 `LEONIDA_GPL=0/1` (graphics PSOs linked from pipeline libraries, step 3: on by default where shader objects are not in
 use and the device has `graphicsPipelineLibraryFastLinking`; `0` builds whole pipelines, `1` links even without fast
 linking), `LEONIDA_SHADER_BINARIES=<dir>` (where the binaries are, default `shader_binaries` beside `gta6rt.exe`),
-`LEONIDA_PSO_RECORD=0` (record no recipes), `LEONIDA_PSO_RECIPES=<file>` (record elsewhere than `pso_recipes.jsonl`),
-and `LEONIDA_DRAW_SCOPES=0` (one rendering scope per draw again instead of one for consecutive draws into the same
-attachments; vulkan_replay.h emit).
+`LEONIDA_PSO_RECORD=0` (record no recipes) and `LEONIDA_PSO_RECIPES=<file>` (record elsewhere than
+`pso_recipes.jsonl`).
 
 `make_game.py`'s pipelines stage runs both prebuilds. Checked on an RTX 3080 Laptop (NVIDIA 617.42) by
 `shader_object_draw_test`: the shader-object draw writes the pipeline draw's pixels, and after `--prebuild-shaders`

@@ -15,9 +15,8 @@ requests. A runtime configured with `-DLEONIDA_WS2_HOST_LOOPBACK=ON` uses upstre
 the network off remains good defence in depth either way.
 
 Loader switches for the first boot: `LEONIDA_TLS_GA_PATCH=0` turns off the rewrite of the executable's index-0 TLS
-reads (`gs:[58h]`, pe_loader.cpp); `LEONIDA_HEAP_PROBE=1` validates the CRT heap at each `GetModuleHandleW` and logs it
-(library_loader.cpp), to find which call first sees a corrupt heap; `LEONIDA_CPU_PATCH=0` and `LEONIDA_CPU_SITES` are
-in [cpu_features.md](cpu_features.md).
+reads (`gs:[58h]`, pe_loader.cpp); `LEONIDA_CPU_PATCH=0` and `LEONIDA_CPU_SITES` are in
+[cpu_features.md](cpu_features.md).
 
 ## 1. What the first boot produces
 
@@ -146,8 +145,8 @@ Useful switches:
     `QueryVideoMemoryInfo`, which reads 0 under Wine; with neither the field reads `VRAM n/a`, not a false 0.
     Both memory figures and their text come from `runtime/src/memory_figures.h`, which the dev overlay shows too;
   - the graphics and compute pipelines created, and the seconds spent in `vkCreate*Pipelines` in the last half
-    second. A pipeline compiled in the frame shows up there as a hitch. This needs `LEONIDA_MEM_PROBE`; without it
-    the field reads `PSO -`.
+    second (`runtime/src/pipeline_counters.h`). A pipeline compiled in the frame shows up there as a hitch. Until
+    the device has counted any, the field reads `PSO -`.
   - the time since the first present.
 
   A thread of its own sets the text with `SendMessageTimeout`, so a busy window thread never holds a present.

@@ -906,8 +906,6 @@ The compute path, end to end:
     `maxMemoryAllocationSize`. Nothing relies on this out-of-spec behaviour.
   - The device logs the arena's high-water mark when it is destroyed: the peak end offset against the size, the
     most bytes live at once (by use: buffers, descriptor heaps, shaders, heaps), allocations and refusals (D3D-55).
-    `LEONIDA_ARENA_LOG=1` also logs one line per VA handed out, per refused allocation, and per upload or readback
-    buffer VA outside the arena (one the arena had no room for).
   - Default-heap buffers are 64 KiB-aligned ranges in it, zeroed through its mapping; their console VA is the offset.
   - Every access to its free-block map is under the arena's mutex, and a walk holds no iterator across a call
     (`runtime/src/arena_blocks.h`): each step reads a block's offset and size, lets its iterator go, looks the next
@@ -2650,9 +2648,6 @@ Pipeline creation:
   `python scripts/check_compute_journal_overlay.py <path-to-d3d12_compute_journal_test.exe> --require-hit`.
   This uses four fresh processes, two authored compute shaders and a disposable cache. It checks dispatch results,
   reported application-cache hits (where supported), local publications, and that old seed contents/mtime stay put.
-  `LEONIDA_TRACE_PIPELINE_COMPILE=1` records each graphics and compute build's trigger, thread, elapsed time,
-  SPIR-V size, shader names and Vulkan application-cache feedback (1 hit, 0 miss, -1 unavailable). It also
-  times cache reads, merges, writes and draw/dispatch pipeline lookups that take at least 1 ms.
   `LEONIDA_ASYNC_PIPELINES=1` schedules cold first-use builds on the warm-up worker ahead of speculative work; how long
   a submission waits for them, and what is skipped, is "Pipelines still being built" below. Strict replay builds
   synchronously and waits for every build. `LEONIDA_COMPUTE_WARMUP=0` restricts the worker to pipelines requested by
@@ -2766,12 +2761,7 @@ The trace will enumerate them.
     console reading has a verified DXIL kind-13 mesh stage. Slot 86 keeps that selected layout with canonical
     tags and owned shader bytes so slot 55 can derive another PSO. `LEONIDA_XS_STREAM_ENUM=pc` selects PC only.
   - With D3D12 tracing, each unsupported stream has one `PipelineStream::Refused` reason. Accepted mesh PSOs
-    have a separate `PipelineStream::Mesh` count. `LEONIDA_PSO_STREAM_AUDIT=1` also prints raw tags,
-    shader stages and FSSM hashes for unsupported or failed streams. The call number joins to the backend result.
-  - `LEONIDA_PSO_PROFILE=1` measures wall time and calling-thread CPU time for each Vulkan pipeline creation.
-    Begin and end records share an ID.
-    Compute records distinguish warmup, dispatch and eager creation. Graphics records name the lazy recipe's
-    stages and unbound attachment mask. Mesh draw totals are reported per command buffer with its submit result.
+    have a separate `PipelineStream::Mesh` count.
   - Missing subobjects take the runtime's defaults: depth test on with `LESS`, back-face culling, no blending, sample
     mask `0xFFFFFFFF`, one sample.
   - The stream becomes the same descriptions `CreateGraphicsPipelineState` and `CreateComputePipelineState` take, so
@@ -3240,9 +3230,7 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
 - Small optimal Vulkan images synthesized for slot-70 texture views share memory pages. Each slice meets the
   image's size, alignment and memory type requirements. The GPU retirement queue destroys the image before its
   slice can be reused. Large images, dedicated-only images, and failed pool allocations use individual memory
-  allocations. `LEONIDA_TITLE_IMAGE_POOL=0` selects individual allocation for every image. With
-  `LEONIDA_MEM_PROBE` enabled, the texture census also reports logical Vulkan backing bytes for the registered
-  slot-70 and slot-133 images and the portion on non-device-local types.
+  allocations. `LEONIDA_TITLE_IMAGE_POOL=0` selects individual allocation for every image.
 - A refresh pass visits a snapshot of the title-image registry, taken under its mutex, instead of walking the
   registry itself. Filling a texture can submit, a submission destroys a retired image, and that image's destructor
   erases its registry entry. Windows' mutex is recursive for its owner, so the erase lands inside the pass, and a walk
@@ -3257,8 +3245,7 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   staged upload: the refresh before a submission has no other way to fill one, and without it the title's textures
   stayed zero (a flat green intro movie). An allocation failure retries the original host-copyable image.
   `LEONIDA_TITLE_IMAGE_STAGING=0`
-  restores the original placement policy. With `LEONIDA_MEM_PROBE`, each title image class logs its
-  Vulkan memory type mask, mask without host transfer, and selected type.
+  restores the original placement policy.
 - `WriteToSubresource`/`ReadFromSubresource` (implemented in `d3d12_vulkan_device.cpp`) complete before they
   return, as D3D12 requires; a read cannot wait for a later submit. Textures in CPU-visible custom heaps are
   created with `VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT` when the device supports that usage with the requested
@@ -4819,14 +4806,6 @@ it stopped; after a loss and a ring reset they may be stale, so read them as a p
 the switch on is two marker writes per dispatch (a command-processor write and an end-of-pipe event, no wait) plus
 one entry in the history; with it off nothing is recorded. Without the extension, or without
 `LEONIDA_DEVICE_FAULT`, the runtime logs one `device-markers: unavailable` line and runs as before.
-
-For a local pre-submit inspection, also set `LEONIDA_COMPUTE_INPUTS` to comma-separated shader name fragments and
-`LEONIDA_COMPUTE_INPUT_SLOTS` to comma-separated decimal `root/slot` pairs. For example, `4/86,5/0,5/2,7/0` reads
-four 32-byte descriptors. The probe logs the bound heap and root layout, the saved user SGPRs, observed descriptor
-writer, buffer address, stride, record count and readable backing. It also follows the per-group scene indices of
-the Prop and Tree cullers when both `5/0` and `4/86` are selected. Each sample is taken after CPU-side shadow
-refresh and before queue submission. Earlier GPU writes may still be in flight. An imported heap can have a valid
-shader offset beyond the arena. Keep probe output local. Unset `LEONIDA_COMPUTE_INPUTS` to disable it.
 
 ## 5. Producing the shader contract
 
