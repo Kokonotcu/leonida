@@ -15791,8 +15791,10 @@ private:
         {
             std::unique_lock lock(variants_mutex_, std::try_to_lock);
             if (!lock.owns_lock()) return false;
-            if (variants_.count(unbound)) return true;
-            if (!variants_requested_.insert(unbound).second) return false;
+            if (find_variant(unbound)) return true;
+            if (std::find(variants_requested_.begin(), variants_requested_.end(), unbound) != variants_requested_.end())
+                return false;
+            variants_requested_.push_back(unbound);
         }
         AddRef();
         device_.compile_enqueue([this, unbound] { variant_job(unbound); });
@@ -15826,13 +15828,13 @@ private:
     // Built on first use and kept until the PSO is released (replay may call this from any queue).
     VkPipeline variant(std::uint32_t unbound) {
         std::lock_guard lock(variants_mutex_);
-        if (const auto it = variants_.find(unbound); it != variants_.end()) return it->second;
+        if (const VkPipeline built = find_variant(unbound)) return built;
         const VkPipeline pipeline = build(unbound);
         if (!pipeline) {
             log_once("a pipeline variant for unbound attachment slots could not be built; slots", int(unbound));
             return VK_NULL_HANDLE;
         }
-        variants_.emplace(unbound, pipeline);
+        variants_.emplace_back(unbound, pipeline);
         if (unbound == 0) base_built_.store(true, std::memory_order_release);
         return pipeline;
     }
@@ -15872,8 +15874,16 @@ private:
     std::uint32_t layout_push_size_ = 0;
     bool layout_bindless_ = false;
     std::shared_mutex variants_mutex_;  // 8 bytes, not std::mutex's 80: one per PSO (~85k live)
-    std::map<std::uint32_t, VkPipeline> variants_;
-    std::set<std::uint32_t> variants_requested_;  // queued by variant_ready_or_request (under variants_mutex_)
+    // A PSO has a handful of variants at most (none for most): vectors, not a std::map and std::set, whose head nodes
+    // MSVC allocates even when they stay empty (112 bytes of heap in each of ~109,000 PSOs).
+    std::vector<std::pair<std::uint32_t, VkPipeline>> variants_;
+    std::vector<std::uint32_t> variants_requested_;  // queued by variant_ready_or_request (under variants_mutex_)
+    // The variant built for `unbound`, null when there is none (none is stored null). Under variants_mutex_.
+    VkPipeline find_variant(std::uint32_t unbound) const {
+        for (const auto& [slots, pipeline] : variants_)
+            if (slots == unbound) return pipeline;
+        return VK_NULL_HANDLE;
+    }
     std::atomic<bool> base_built_{false};      // variant 0 exists (GraphicsPipeline::ready)
     std::atomic<bool> base_requested_{false};  // its background build was asked for (GraphicsPipeline::request)
     std::uint32_t vs_outputs_ = 0;              // the VS's output locations: the rect-list geometry shader's size
